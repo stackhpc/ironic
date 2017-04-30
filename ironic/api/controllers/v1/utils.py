@@ -302,6 +302,26 @@ def check_allowed_fields(fields):
             raise exception.NotAcceptable()
 
 
+def check_allowed_port_fields(fields):
+    """Check if fetching a particular field of a port is allowed.
+
+    This method checks if the required version is being requested for fields
+    that are only allowed to be fetched in a particular API version.
+    """
+    if fields is None:
+        return
+    advanced_net_fields = ['pxe_enabled', 'local_link_connection']
+    if (not allow_port_advanced_net_fields() and
+            set(fields).intersection(advanced_net_fields)):
+        raise exception.NotAcceptable()
+    if ('portgroup_uuid' in fields and not
+            allow_portgroups_subcontrollers()):
+        raise exception.NotAcceptable()
+    if ('physical_network' in fields and not
+            allow_port_physical_network()):
+        raise exception.NotAcceptable()
+
+
 def check_allowed_portgroup_fields(fields):
     """Check if fetching a particular field of a portgroup is allowed.
 
@@ -547,6 +567,16 @@ def allow_dynamic_interfaces():
     """
     return (pecan.request.version.minor >=
             versions.MINOR_31_DYNAMIC_INTERFACES)
+
+
+def allow_port_physical_network():
+    """Check if port physical network fields are allowed.
+
+    Version 1.32 of the API added the physical network field to the port
+    object.
+    """
+    return (pecan.request.version.minor >=
+            versions.MINOR_32_PORT_PHYSICAL_NETWORK)
 
 
 def get_controller_reserved_names(cls):

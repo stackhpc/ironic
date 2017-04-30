@@ -133,6 +133,49 @@ class TestListPorts(test_api_base.BaseApiTest):
                              headers={api_base.Version.string: "1.18"})
         self.assertEqual({"foo": "bar"}, data['internal_info'])
 
+    def test_hide_fields_in_newer_versions_advanced_net(self):
+        llc = {'switch_info': 'switch', 'switch_id': 'aa:bb:cc:dd:ee:ff',
+               'port_id': 'Gig0/1'}
+        port = obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                          pxe_enabled=True,
+                                          local_link_connection=llc)
+        data = self.get_json(
+            '/ports/%s' % port.uuid,
+            headers={api_base.Version.string: "1.18"})
+        self.assertNotIn('pxe_enabled', data)
+        self.assertNotIn('local_link_connection', data)
+
+        data = self.get_json('/ports/%s' % port.uuid,
+                             headers={api_base.Version.string: "1.19"})
+        self.assertEqual(True, data['pxe_enabled'])
+        self.assertEqual(llc, data['local_link_connection'])
+
+    def test_hide_fields_in_newer_versions_portgroup_uuid(self):
+        portgroup = obj_utils.create_test_portgroup(self.context,
+                                                    node_id=self.node.id)
+        port = obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                          portgroup_id=portgroup.id)
+        data = self.get_json(
+            '/ports/%s' % port.uuid,
+            headers={api_base.Version.string: "1.23"})
+        self.assertNotIn('portgroup_uuid', data)
+
+        data = self.get_json('/ports/%s' % port.uuid,
+                             headers={api_base.Version.string: "1.24"})
+        self.assertEqual(portgroup.uuid, data['portgroup_uuid'])
+
+    def test_hide_fields_in_newer_versions_physical_network(self):
+        port = obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                          physical_network='physnet1')
+        data = self.get_json(
+            '/ports/%s' % port.uuid,
+            headers={api_base.Version.string: "1.31"})
+        self.assertNotIn('physical_network', data)
+
+        data = self.get_json('/ports/%s' % port.uuid,
+                             headers={api_base.Version.string: "1.32"})
+        self.assertEqual("physnet1", data['physical_network'])
+
     def test_get_collection_custom_fields(self):
         fields = 'uuid,extra'
         for i in range(3):
@@ -170,6 +213,22 @@ class TestListPorts(test_api_base.BaseApiTest):
             expect_errors=True)
         self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_int)
 
+    def test_get_custom_fields_physical_network(self):
+        port = obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                          physical_network='physnet1')
+        fields = 'uuid,physical_network'
+        response = self.get_json(
+            '/ports/%s?fields=%s' % (port.uuid, fields),
+            headers={api_base.Version.string: "1.31"},
+            expect_errors=True)
+        self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_int)
+
+        response = self.get_json(
+            '/ports/%s?fields=%s' % (port.uuid, fields),
+            headers={api_base.Version.string: "1.32"})
+        # We always append "links".
+        self.assertItemsEqual(['uuid', 'physical_network', 'links'], response)
+
     def test_detail(self):
         llc = {'switch_info': 'switch', 'switch_id': 'aa:bb:cc:dd:ee:ff',
                'port_id': 'Gig0/1'}
@@ -178,7 +237,8 @@ class TestListPorts(test_api_base.BaseApiTest):
         port = obj_utils.create_test_port(self.context, node_id=self.node.id,
                                           portgroup_id=portgroup.id,
                                           pxe_enabled=False,
-                                          local_link_connection=llc)
+                                          local_link_connection=llc,
+                                          physical_network='physnet1')
         data = self.get_json(
             '/ports/detail',
             headers={api_base.Version.string: str(api_v1.MAX_VER)}
@@ -190,6 +250,7 @@ class TestListPorts(test_api_base.BaseApiTest):
         self.assertIn('pxe_enabled', data['ports'][0])
         self.assertIn('local_link_connection', data['ports'][0])
         self.assertIn('portgroup_uuid', data['ports'][0])
+        self.assertIn('physical_network', data['ports'][0])
         # never expose the node_id and portgroup_id
         self.assertNotIn('node_id', data['ports'][0])
         self.assertNotIn('portgroup_id', data['ports'][0])
@@ -934,6 +995,186 @@ class TestPatch(test_api_base.BaseApiTest):
         self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_int)
         self.assertFalse(mock_upd.called)
 
+    def test_update_physical_network(self, mock_upd):
+        physical_network = 'physnet1'
+        mock_upd.return_value = self.port
+        mock_upd.return_value.physical_network = physical_network
+        headers = {api_base.Version.string: '1.32'}
+
+        response = self.patch_json('/ports/%s' % self.port.uuid,
+                                   [{'path': '/physical_network',
+                                     'value': physical_network,
+                                     'op': 'add'}],
+                                   headers=headers)
+        self.assertEqual(http_client.OK, response.status_code)
+        self.assertEqual(physical_network, response.json['physical_network'])
+
+        mock_upd.reset_mock()
+        response = self.patch_json('/ports/%s' % self.port.uuid,
+                                   [{'path': '/physical_network',
+                                     'value': physical_network,
+                                     'op': 'replace'}],
+                                   headers=headers)
+        self.assertEqual(http_client.OK, response.status_code)
+        self.assertEqual(physical_network, response.json['physical_network'])
+
+        mock_upd.reset_mock()
+        response = self.patch_json('/ports/%s' % self.port.uuid,
+                                   [{'path': '/physical_network',
+                                     'op': 'remove'}],
+                                   headers=headers)
+        self.assertEqual(http_client.OK, response.status_code)
+        self.assertEqual(physical_network, response.json['physical_network'])
+
+    def test_update_physical_network_old_api_version(self, mock_upd):
+        mock_upd.return_value = self.port
+        headers = {api_base.Version.string: '1.31'}
+
+        response = self.patch_json('/ports/%s' % self.port.uuid,
+                                   [{'path': '/physical_network',
+                                     'value': 'physnet1',
+                                     'op': 'replace'}],
+                                   expect_errors=True,
+                                   headers=headers)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_int)
+        self.assertFalse(mock_upd.called)
+
+        mock_upd.reset_mock()
+        response = self.patch_json('/ports/%s' % self.port.uuid,
+                                   [{'path': '/physical_network',
+                                     'op': 'remove'}],
+                                   expect_errors=True,
+                                   headers=headers)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_int)
+        self.assertFalse(mock_upd.called)
+
+    def test_update_port_in_portgroup_with_different_physnet(self, mock_upd):
+        headers = {api_base.Version.string: str(api_v1.MAX_VER)}
+        pg = obj_utils.create_test_portgroup(self.context,
+                                             node_id=self.node.id,
+                                             uuid=uuidutils.generate_uuid(),
+                                             address='bb:bb:bb:bb:bb:bb',
+                                             name='bar')
+        self.port.portgroup_id = pg.id
+        self.port.physical_network = 'physnet1'
+        self.port.save()
+        obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                   uuid=uuidutils.generate_uuid(),
+                                   address='52:55:00:cf:2d:31',
+                                   portgroup_id=pg.id,
+                                   physical_network='physnet1')
+        response = self.patch_json('/ports/%s' % self.port.uuid,
+                                   [{'path': '/physical_network',
+                                     'value': 'physnet2',
+                                     'op': 'replace'}],
+                                   headers=headers,
+                                   expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.CONFLICT, response.status_int)
+        self.assertFalse(mock_upd.called)
+
+    def test_update_port_with_no_physnet_in_portgroup_with_physnet(self,
+                                                                   mock_upd):
+        headers = {api_base.Version.string: str(api_v1.MAX_VER)}
+        pg = obj_utils.create_test_portgroup(self.context,
+                                             node_id=self.node.id,
+                                             uuid=uuidutils.generate_uuid(),
+                                             address='bb:bb:bb:bb:bb:bb',
+                                             name='bar')
+        self.port.portgroup_id = pg.id
+        self.port.physical_network = 'physnet1'
+        self.port.save()
+        obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                   uuid=uuidutils.generate_uuid(),
+                                   address='52:55:00:cf:2d:31',
+                                   portgroup_id=pg.id,
+                                   physical_network='physnet1')
+        response = self.patch_json('/ports/%s' % self.port.uuid,
+                                   [{'path': '/physical_network',
+                                     'op': 'remove'}],
+                                   headers=headers,
+                                   expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.CONFLICT, response.status_int)
+        self.assertFalse(mock_upd.called)
+
+    def test_update_port_with_physnet_in_portgroup_with_no_physnet(self,
+                                                                   mock_upd):
+        headers = {api_base.Version.string: str(api_v1.MAX_VER)}
+        pg = obj_utils.create_test_portgroup(self.context,
+                                             node_id=self.node.id,
+                                             uuid=uuidutils.generate_uuid(),
+                                             address='bb:bb:bb:bb:bb:bb',
+                                             name='bar')
+        self.port.portgroup_id = pg.id
+        self.port.save()
+        obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                   uuid=uuidutils.generate_uuid(),
+                                   address='52:55:00:cf:2d:31',
+                                   portgroup_id=pg.id)
+        response = self.patch_json('/ports/%s' % self.port.uuid,
+                                   [{'path': '/physical_network',
+                                     'value': 'physnet1',
+                                     'op': 'replace'}],
+                                   headers=headers,
+                                   expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.CONFLICT, response.status_int)
+        self.assertFalse(mock_upd.called)
+
+    def test_update_port_in_portgroup_with_inconsistent_physnets(self,
+                                                                 mock_upd):
+        headers = {api_base.Version.string: str(api_v1.MAX_VER)}
+        pg = obj_utils.create_test_portgroup(self.context,
+                                             node_id=self.node.id,
+                                             uuid=uuidutils.generate_uuid(),
+                                             address='bb:bb:bb:bb:bb:bb',
+                                             name='bar')
+        self.port.portgroup_id = pg.id
+        self.port.physical_network = 'physnet1'
+        self.port.save()
+        obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                   uuid=uuidutils.generate_uuid(),
+                                   address='52:55:00:cf:2d:31',
+                                   portgroup_id=pg.id,
+                                   physical_network='physnet2')
+        response = self.patch_json('/ports/%s' % self.port.uuid,
+                                   [{'path': '/physical_network',
+                                     'value': 'physnet2',
+                                     'op': 'add'}],
+                                   headers=headers,
+                                   expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.CONFLICT, response.status_int)
+        self.assertFalse(mock_upd.called)
+
+    def test_update_add_to_portgroup_with_different_physnet(self, mock_upd):
+        headers = {api_base.Version.string: str(api_v1.MAX_VER)}
+        pg = obj_utils.create_test_portgroup(self.context,
+                                             node_id=self.node.id,
+                                             uuid=uuidutils.generate_uuid(),
+                                             address='bb:bb:bb:bb:bb:bb',
+                                             name='bar')
+        self.port.portgroup_id = None
+        self.port.physical_network = 'physnet1'
+        self.port.save()
+        obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                   uuid=uuidutils.generate_uuid(),
+                                   address='52:55:00:cf:2d:31',
+                                   portgroup_id=pg.id,
+                                   physical_network='physnet2')
+        response = self.patch_json('/ports/%s' % self.port.uuid,
+                                   [{'path': '/portgroup_uuid',
+                                     'value': pg.uuid,
+                                     'op': 'replace'}],
+                                   headers=headers,
+                                   expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.CONFLICT, response.status_int)
+        self.assertFalse(mock_upd.called)
+
     def test_portgroups_subresource_patch(self, mock_upd):
         portgroup = obj_utils.create_test_portgroup(self.context,
                                                     node_id=self.node.id)
@@ -1001,6 +1242,7 @@ class TestPost(test_api_base.BaseApiTest):
         pdict.pop('local_link_connection')
         pdict.pop('pxe_enabled')
         pdict.pop('extra')
+        pdict.pop('physical_network')
         headers = {api_base.Version.string: str(api_v1.MIN_VER)}
         response = self.post_json('/ports', pdict, headers=headers)
         self.assertEqual('application/json', response.content_type)
@@ -1260,6 +1502,14 @@ class TestPost(test_api_base.BaseApiTest):
         self.assertEqual('application/json', response.content_type)
         self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_int)
 
+    def test_create_port_with_physical_network_old_api_version(self):
+        headers = {api_base.Version.string: '1.31'}
+        pdict = post_get_test_port(physical_network='physnet1')
+        response = self.post_json('/ports', pdict, headers=headers,
+                                  expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_int)
+
     def test_portgroups_subresource_post(self):
         headers = {api_base.Version.string: '1.24'}
         pdict = post_get_test_port()
@@ -1374,6 +1624,87 @@ class TestPost(test_api_base.BaseApiTest):
                                pxe_enabled=False,
                                standalone_ports=False,
                                http_status=http_client.CONFLICT)
+
+    def test_create_port_invalid_physnet_non_text(self):
+        physnet = 1234
+        pdict = post_get_test_port(physical_network=physnet)
+        response = self.post_json('/ports', pdict, expect_errors=True,
+                                  headers=self.headers)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.BAD_REQUEST, response.status_int)
+        self.assertTrue(response.json['error_message'])
+
+    def test_create_port_invalid_physnet_too_long(self):
+        physnet = 'p' * 65
+        pdict = post_get_test_port(physical_network=physnet)
+        response = self.post_json('/ports', pdict, expect_errors=True,
+                                  headers=self.headers)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.BAD_REQUEST, response.status_int)
+        self.assertTrue(response.json['error_message'])
+
+    def test_create_port_in_portgroup_with_different_physnet(self):
+        obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                   uuid=uuidutils.generate_uuid(),
+                                   address='52:55:00:cf:2d:31',
+                                   portgroup_id=self.portgroup.id,
+                                   physical_network='physnet1')
+        pdict = post_get_test_port(node_id=self.node.id,
+                                   portgroup_uuid=self.portgroup.uuid,
+                                   physical_network='physnet2')
+        response = self.post_json('/ports', pdict,
+                                  headers=self.headers,
+                                  expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.CONFLICT, response.status_int)
+
+    def test_create_port_with_no_physnet_in_portgroup_with_physnet(self):
+        obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                   uuid=uuidutils.generate_uuid(),
+                                   address='52:55:00:cf:2d:31',
+                                   portgroup_id=self.portgroup.id,
+                                   physical_network='physnet1')
+        pdict = post_get_test_port(node_id=self.node.id,
+                                   portgroup_uuid=self.portgroup.uuid)
+        response = self.post_json('/ports', pdict,
+                                  headers=self.headers,
+                                  expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.CONFLICT, response.status_int)
+
+    def test_create_port_with_physnet_in_portgroup_with_no_physnet(self):
+        obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                   uuid=uuidutils.generate_uuid(),
+                                   address='52:55:00:cf:2d:31',
+                                   portgroup_id=self.portgroup.id)
+        pdict = post_get_test_port(node_id=self.node.id,
+                                   portgroup_uuid=self.portgroup.uuid,
+                                   physical_network='physnet2')
+        response = self.post_json('/ports', pdict,
+                                  headers=self.headers,
+                                  expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.CONFLICT, response.status_int)
+
+    def test_create_port_in_portgroup_with_inconsistent_physnets(self):
+        obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                   uuid=uuidutils.generate_uuid(),
+                                   address='52:55:00:cf:2d:31',
+                                   portgroup_id=self.portgroup.id,
+                                   physical_network='physnet1')
+        obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                   uuid=uuidutils.generate_uuid(),
+                                   address='52:55:00:cf:2d:32',
+                                   portgroup_id=self.portgroup.id,
+                                   physical_network='physnet2')
+        pdict = post_get_test_port(node_id=self.node.id,
+                                   portgroup_uuid=self.portgroup.uuid,
+                                   physical_network='physnet1')
+        response = self.post_json('/ports', pdict,
+                                  headers=self.headers,
+                                  expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.CONFLICT, response.status_int)
 
 
 @mock.patch.object(rpcapi.ConductorAPI, 'destroy_port')

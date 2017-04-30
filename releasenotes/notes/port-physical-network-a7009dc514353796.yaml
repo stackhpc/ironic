@@ -1,0 +1,7 @@
+---
+features:
+  - |
+    Adds physical network field to the port object.
+
+    This field specifies the name of the physical network to which the port is
+    connected.  Defaults to unset.

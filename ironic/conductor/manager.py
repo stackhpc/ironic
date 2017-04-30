@@ -1880,13 +1880,15 @@ class ConductorManager(base_manager.BaseConductorManager):
                                                            'port': port_uuid})
 
             # If port update is modifying the portgroup membership of the port
-            # or modifying the local_link_connection or pxe_enabled flags then
-            # node should be in MANAGEABLE/INSPECTING/ENROLL provisioning state
-            # or in maintenance mode.
+            # or modifying the local_link_connection, pxe_enabled or physical
+            # network fields then node should be in
+            # MANAGEABLE/INSPECTING/ENROLL provisioning state or in maintenance
+            # mode.
             # Otherwise InvalidState exception is raised.
             connectivity_attr = {'portgroup_id',
                                  'pxe_enabled',
-                                 'local_link_connection'}
+                                 'local_link_connection',
+                                 'physical_network'}
             allowed_update_states = [states.ENROLL,
                                      states.INSPECTING,
                                      states.MANAGEABLE]

@@ -54,6 +54,46 @@ def hide_fields_in_newer_versions(obj):
     # if requested version is < 1.24, hide portgroup_uuid field
     if not api_utils.allow_portgroups_subcontrollers():
         obj.portgroup_uuid = wsme.Unset
+    # if requested version is < 1.32, hide physical_network field.
+    if not api_utils.allow_port_physical_network():
+        obj.physical_network = wsme.Unset
+
+
+def _validate_portgroup_physnet(portgroup_id, portgroup_uuid, physnet):
+    """Validate the consistency of physical networks of ports in a portgroup.
+
+    :param portgroup_id: The ID of the portgroup.
+    :param portgroup_uuid: The UUID of the portgroup.
+    :param physnet: The physical network of the port.
+    :raises: Conflict if validation fails.
+    """
+    # Ensure the physical network matches other ports in the group.
+    pg_ports = objects.Port.list_by_portgroup_id(pecan.request.context,
+                                                 portgroup_id)
+
+    # Sanity check that all existing ports in the group have the same
+    # physical network.
+    pg_physnets = {port.physical_network for port in pg_ports}
+    if len(pg_physnets) > 1:
+        msg = _("Port group %(portgroup)s has existing member ports with "
+                "different physical networks: %(physnets)s. All ports "
+                "in a port group must have the same physical network.")
+        raise exception.Conflict(
+            msg % {'portgroup': portgroup_uuid,
+                   'physnets': ", ".join(pg_physnets)})
+
+    if not pg_physnets:
+        return
+
+    # Check that the port has the same physical network as any existing
+    # member ports.
+    pg_physnet = pg_physnets.pop()
+    if physnet != pg_physnet:
+        msg = _("Port group %(portgroup)s is in physical network "
+                "%(physnet)s. This port cannot be a member of that port "
+                "group while it has a different physical network.")
+        raise exception.Conflict(
+            msg % {'portgroup': portgroup_uuid, 'physnet': pg_physnet})
 
 
 class Port(base.APIBase):
@@ -145,6 +185,9 @@ class Port(base.APIBase):
     local_link_connection = types.locallinkconnectiontype
     """The port binding profile for the port"""
 
+    physical_network = wtypes.StringType(max_length=64)
+    """The name of the physical network to which this port is connected."""
+
     links = wsme.wsattr([link.Link], readonly=True)
     """A list containing a self link and associated port links"""
 
@@ -224,7 +267,8 @@ class Port(base.APIBase):
                      pxe_enabled=True,
                      local_link_connection={
                          'switch_info': 'host', 'port_id': 'Gig0/1',
-                         'switch_id': 'aa:bb:cc:dd:ee:ff'})
+                         'switch_id': 'aa:bb:cc:dd:ee:ff'},
+                     physical_network='physnet1')
         # NOTE(lucasagomes): node_uuid getter() method look at the
         # _node_uuid variable
         sample._node_uuid = '7ae81bb3-dec3-4289-8d6c-da80bd8001ae'
@@ -389,13 +433,7 @@ class PortsController(rest.RestController):
         policy.authorize('baremetal:port:get', cdict, cdict)
 
         api_utils.check_allow_specify_fields(fields)
-        if fields:
-            if (not api_utils.allow_port_advanced_net_fields() and
-                    set(fields).intersection(self.advanced_net_fields)):
-                raise exception.NotAcceptable()
-            if ('portgroup_uuid' in fields and not
-                    api_utils.allow_portgroups_subcontrollers()):
-                    raise exception.NotAcceptable()
+        api_utils.check_allowed_port_fields(fields)
 
         if portgroup and not api_utils.allow_portgroups_subcontrollers():
             raise exception.NotAcceptable()
@@ -484,6 +522,7 @@ class PortsController(rest.RestController):
             raise exception.OperationNotPermitted()
 
         api_utils.check_allow_specify_fields(fields)
+        api_utils.check_allowed_port_fields(fields)
 
         rpc_port = objects.Port.get_by_uuid(pecan.request.context, port_uuid)
         return Port.convert_with_links(rpc_port, fields=fields)
@@ -504,28 +543,28 @@ class PortsController(rest.RestController):
             raise exception.OperationNotPermitted()
 
         pdict = port.as_dict()
-        if (not api_utils.allow_port_advanced_net_fields() and
-                set(pdict).intersection(self.advanced_net_fields)):
-            raise exception.NotAcceptable()
-        if (not api_utils.allow_portgroups_subcontrollers() and
-            'portgroup_uuid' in pdict):
-            raise exception.NotAcceptable()
+        api_utils.check_allowed_port_fields(set(pdict))
 
         extra = pdict.get('extra')
         vif = extra.get('vif_port_id') if extra else None
         if vif:
             common_utils.warn_about_deprecated_extra_vif_port_id()
-        if (pdict.get('portgroup_uuid') and
-                (pdict.get('pxe_enabled') or vif)):
+
+        if pdict.get('portgroup_uuid'):
             rpc_pg = objects.Portgroup.get_by_uuid(context,
                                                    pdict['portgroup_uuid'])
-            if not rpc_pg.standalone_ports_supported:
-                msg = _("Port group %s doesn't support standalone ports. "
-                        "This port cannot be created as a member of that "
-                        "port group because either 'extra/vif_port_id' "
-                        "was specified or 'pxe_enabled' was set to True.")
-                raise exception.Conflict(
-                    msg % pdict['portgroup_uuid'])
+
+            if pdict.get('pxe_enabled') or vif:
+                if not rpc_pg.standalone_ports_supported:
+                    msg = _("Port group %s doesn't support standalone ports. "
+                            "This port cannot be created as a member of that "
+                            "port group because either 'extra/vif_port_id' "
+                            "was specified or 'pxe_enabled' was set to True.")
+                    raise exception.Conflict(
+                        msg % pdict['portgroup_uuid'])
+
+            _validate_portgroup_physnet(rpc_pg.id, rpc_pg.uuid,
+                                        pdict.get('physical_network'))
 
         # NOTE(yuriyz): UUID is mandatory for notifications payload
         if not pdict.get('uuid'):
@@ -564,17 +603,13 @@ class PortsController(rest.RestController):
             raise exception.OperationNotPermitted()
 
         fields_to_check = set()
-        for field in self.advanced_net_fields + ['portgroup_uuid']:
+        for field in (self.advanced_net_fields +
+                      ['portgroup_uuid', 'physical_network']):
             field_path = '/%s' % field
             if (api_utils.get_patch_values(patch, field_path) or
                     api_utils.is_path_removed(patch, field_path)):
                 fields_to_check.add(field)
-        if (fields_to_check.intersection(self.advanced_net_fields) and
-                not api_utils.allow_port_advanced_net_fields()):
-            raise exception.NotAcceptable()
-        if ('portgroup_uuid' in fields_to_check and
-                not api_utils.allow_portgroups_subcontrollers()):
-            raise exception.NotAcceptable()
+        api_utils.check_allowed_port_fields(fields_to_check)
 
         rpc_port = objects.Port.get_by_uuid(context, port_uuid)
         try:
@@ -607,6 +642,13 @@ class PortsController(rest.RestController):
                 patch_val = None
             if rpc_port[field] != patch_val:
                 rpc_port[field] = patch_val
+
+        physnet_fields = {'portgroup_id', 'physical_network'}
+        if (rpc_port.portgroup_id is not None and
+                rpc_port.obj_what_changed() & physnet_fields):
+            _validate_portgroup_physnet(rpc_port.portgroup_id,
+                                        port.portgroup_uuid,
+                                        rpc_port.physical_network)
 
         rpc_node = objects.Node.get_by_id(context, rpc_port.node_id)
         notify_extra = {'node_uuid': rpc_node.uuid,

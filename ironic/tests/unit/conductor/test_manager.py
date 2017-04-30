@@ -3336,6 +3336,37 @@ class UpdatePortTestCase(mgr_utils.ServiceSetUpMixin,
         mock_val.assert_called_once_with(mock.ANY, mock.ANY)
         mock_pc.assert_called_once_with(mock.ANY, mock.ANY, port)
 
+    @mock.patch.object(n_flat.FlatNetwork, 'port_changed', autospec=True)
+    @mock.patch.object(n_flat.FlatNetwork, 'validate', autospec=True)
+    def test_update_port_physnet_maintenance(self, mock_val, mock_pc):
+        node = obj_utils.create_test_node(
+            self.context, driver='fake', maintenance=True,
+            instance_uuid=uuidutils.generate_uuid(), provision_state='active')
+        port = obj_utils.create_test_port(self.context,
+                                          node_id=node.id,
+                                          extra={'vif_port_id': 'fake-id'})
+        new_physnet = 'physnet1'
+        port.physical_network = new_physnet
+        res = self.service.update_port(self.context, port)
+        self.assertEqual(new_physnet, res.physical_network)
+        mock_val.assert_called_once_with(mock.ANY, mock.ANY)
+        mock_pc.assert_called_once_with(mock.ANY, mock.ANY, port)
+
+    def test_update_port_physnet_node_deleting_state(self):
+        node = obj_utils.create_test_node(self.context, driver='fake',
+                                          provision_state=states.DELETING)
+        port = obj_utils.create_test_port(self.context,
+                                          node_id=node.id,
+                                          extra={'foo': 'bar'})
+        old_physnet = port.physical_network
+        port.physical_network = 'physnet1'
+        exc = self.assertRaises(messaging.rpc.ExpectedException,
+                                self.service.update_port,
+                                self.context, port)
+        self.assertEqual(exception.InvalidState, exc.exc_info[0])
+        port.refresh()
+        self.assertEqual(old_physnet, port.physical_network)
+
     def test__filter_out_unsupported_types_all(self):
         self._start_service()
         CONF.set_override('send_sensor_data_types', ['All'], group='conductor')
