@@ -39,6 +39,8 @@ fields.
 
 API microversion 1.24 added the portgroup_uuid field.
 
+API microversion 1.32 added the physical_network field.
+
 Normal response code: 200
 
 Request
@@ -108,6 +110,7 @@ Response
     - portgroup_uuid: portgroup_uuid
     - local_link_connection: local_link_connection
     - pxe_enabled: pxe_enabled
+    - physical_network: physical_network
     - internal_info: internal_info
     - extra: extra
     - created_at: created_at
@@ -162,6 +165,7 @@ Response
     - portgroup_uuid: portgroup_uuid
     - local_link_connection: local_link_connection
     - pxe_enabled: pxe_enabled
+    - physical_network: physical_network
     - internal_info: internal_info
     - extra: extra
     - created_at: created_at
@@ -209,6 +213,7 @@ Response
     - portgroup_uuid: portgroup_uuid
     - local_link_connection: local_link_connection
     - pxe_enabled: pxe_enabled
+    - physical_network: physical_network
     - internal_info: internal_info
     - extra: extra
     - created_at: created_at
@@ -256,6 +261,7 @@ Response
     - portgroup_uuid: portgroup_uuid
     - local_link_connection: local_link_connection
     - pxe_enabled: pxe_enabled
+    - physical_network: physical_network
     - internal_info: internal_info
     - extra: extra
     - created_at: created_at

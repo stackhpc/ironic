@@ -2,6 +2,11 @@
 REST API Version History
 ========================
 
+**1.32** (Pike)
+
+    Adds a ``physical_network`` field to the port object. All ports in a
+    portgroup must have the same value in their ``physical_network`` field.
+
 **1.31** (Ocata)
 
     Added the following fields to the node object, to allow getting and

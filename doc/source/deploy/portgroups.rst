@@ -92,6 +92,10 @@ CLI commands below specify it for completeness.
    ``enroll``, ``manageable``, or ``inspecting`` states. A port group can have
    the same or different address as individual ports.
 
+   All ports in a portgroup must have the same value in their
+   ``physical_network`` field. This restriction is enforced by the ironic API
+   when creating and updating ports.
+
 #. Boot an instance (or node directly, in case of using standalone ironic)
    providing an image that has cloud-init version 0.7.7 or later and supports
    bonding.

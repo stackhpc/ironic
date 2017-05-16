@@ -758,6 +758,13 @@ pg_ports:
   in: body
   required: true
   type: array
+physical_network:
+  description: |
+    The name of the physical network to which a port is connected. May be
+    empty. Added in microversion 1.32.
+  in: body
+  required: true
+  type: string
 port_address:
   description: |
     Physical hardware address of this network Port, typically the hardware

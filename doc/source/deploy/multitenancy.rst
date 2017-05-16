@@ -105,6 +105,13 @@ Configuring nodes
           vendor-specific identifier. Some ML2 plugins may require this
           field.
 
+   Ports may be associated with a physical network. The Bare Metal service will
+   use this information when mapping between virtual ports in the Networking
+   service and physical ports and portgroups in the Bare Metal service. The
+   physical network of a portgroup is defined by the physical network of its
+   constituent ports. The Bare Metal service ensures that all ports in a
+   portgroup are in the same physical network.
+
    Create a port as follows:
 
    - ``ironic`` command::
@@ -118,7 +125,8 @@ Configuring nodes
       openstack baremetal port create $HW_MAC_ADDRESS --node $NODE_UUID \
       --local-link-connection switch_id=$SWITCH_MAC_ADDRESS \
       --local-link-connection switch_info=$SWITCH_HOSTNAME \
-      --local-link-connection port_id=$SWITCH_PORT --pxe-enabled true
+      --local-link-connection port_id=$SWITCH_PORT --pxe-enabled true \
+      --physical-network $PHYSICAL_NETWORK
 
 #. Check the port configuration:
 

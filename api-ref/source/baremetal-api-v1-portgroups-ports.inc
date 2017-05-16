@@ -87,6 +87,7 @@ Response
     - local_link_connection: local_link_connection
     - pxe_enabled: pxe_enabled
     - internal_info: internal_info
+    - physical_network: physical_network
     - extra: extra
     - portgroup_uuid: portgroup_uuid
     - created_at: created_at
