@@ -83,6 +83,7 @@ Response
     - node_uuid: node_uuid
     - local_link_connection: local_link_connection
     - pxe_enabled: pxe_enabled
+    - physical_network: physical_network
     - internal_info: internal_info
     - extra: extra
     - created_at: created_at

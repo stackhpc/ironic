@@ -568,6 +568,20 @@ def allow_storage_interface():
             versions.MINOR_33_STORAGE_INTERFACE)
 
 
+def allow_port_physical_network():
+    """Check if port physical network fields are allowed.
+
+    Version 1.34 of the API added the physical network field to the port
+    object.
+    """
+    # TODO(mgoddard): In order to support a rolling upgrade from the release
+    # that introduces the physical network field to the Port object, we will
+    # need to check the Port object version here as an additional condition for
+    # exposing this feature.
+    return (pecan.request.version.minor >=
+            versions.MINOR_34_PORT_PHYSICAL_NETWORK)
+
+
 def get_controller_reserved_names(cls):
     """Get reserved names for a given controller.
 
