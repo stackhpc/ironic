@@ -361,31 +361,17 @@ class VIFPortIDMixin(object):
 
         port_like_obj = get_free_port_like_object(task, vif_id)
 
-        client = neutron.get_client()
         # Address is optional for portgroups
         if port_like_obj.address:
-            # Check if the requested vif_id is a neutron port. If it is
-            # then attempt to update the port's MAC address.
             try:
-                client.show_port(vif_id)
-            except neutron_exceptions.NeutronClientException:
-                # NOTE(sambetts): If a client error occurs this is because
-                # either neutron doesn't exist because we're running in
-                # standalone environment or we can't find a matching neutron
-                # port which means a user might be requesting a non-neutron
-                # port. So skip trying to update the neutron port MAC address
-                # in these cases.
-                pass
-            else:
-                try:
-                    neutron.update_port_address(vif_id, port_like_obj.address)
-                except exception.FailedToUpdateMacOnPort:
-                    raise exception.NetworkError(_(
-                        "Unable to attach VIF %(vif)s because Ironic can not "
-                        "update Neutron port %(port)s MAC address to match "
-                        "physical MAC address %(mac)s") % {
-                            'vif': vif_id, 'port': vif_id,
-                            'mac': port_like_obj.address})
+                neutron.update_port_address(vif_id, port_like_obj.address)
+            except exception.FailedToUpdateMacOnPort:
+                raise exception.NetworkError(_(
+                    "Unable to attach VIF %(vif)s because Ironic can not "
+                    "update Neutron port %(port)s MAC address to match "
+                    "physical MAC address %(mac)s") % {
+                        'vif': vif_id, 'port': vif_id,
+                        'mac': port_like_obj.address})
 
         int_info = port_like_obj.internal_info
         int_info[TENANT_VIF_KEY] = vif_id
@@ -393,7 +379,7 @@ class VIFPortIDMixin(object):
         port_like_obj.save()
         # NOTE(vsaienko) allow to attach VIF to active instance.
         if task.node.provision_state == states.ACTIVE:
-            plug_port_to_tenant_network(task, port_like_obj, client=client)
+            plug_port_to_tenant_network(task, port_like_obj)
 
     def vif_detach(self, task, vif_id):
         """Detach a virtual network interface from a node

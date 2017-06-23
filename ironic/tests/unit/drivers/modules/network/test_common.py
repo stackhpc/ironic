@@ -328,9 +328,8 @@ class TestVifPortIDMixin(db_base.DbTestCase):
             self.assertEqual([{'id': vif_id}], vifs)
 
     @mock.patch.object(common, 'get_free_port_like_object', autospec=True)
-    @mock.patch.object(neutron_common, 'get_client', autospec=True)
     @mock.patch.object(neutron_common, 'update_port_address', autospec=True)
-    def test_vif_attach(self, mock_upa, mock_client, moc_gfp):
+    def test_vif_attach(self, mock_upa, moc_gfp):
         self.port.extra = {}
         self.port.save()
         vif = {'id': "fake_vif_id"}
@@ -340,14 +339,11 @@ class TestVifPortIDMixin(db_base.DbTestCase):
             self.port.refresh()
             self.assertEqual("fake_vif_id", self.port.internal_info.get(
                 common.TENANT_VIF_KEY))
-            mock_client.assert_called_once_with()
             mock_upa.assert_called_once_with("fake_vif_id", self.port.address)
 
     @mock.patch.object(common, 'get_free_port_like_object', autospec=True)
-    @mock.patch.object(neutron_common, 'get_client')
     @mock.patch.object(neutron_common, 'update_port_address')
-    def test_vif_attach_portgroup_no_address(self, mock_upa, mock_client,
-                                             mock_gfp):
+    def test_vif_attach_portgroup_no_address(self, mock_upa, mock_gfp):
         pg = obj_utils.create_test_portgroup(
             self.context, node_id=self.node.id, address=None)
         mock_gfp.return_value = pg
@@ -361,11 +357,9 @@ class TestVifPortIDMixin(db_base.DbTestCase):
             self.assertEqual(vif['id'],
                              pg.internal_info[common.TENANT_VIF_KEY])
             self.assertFalse(mock_upa.called)
-            self.assertTrue(mock_client.called)
 
-    @mock.patch.object(neutron_common, 'get_client')
     @mock.patch.object(neutron_common, 'update_port_address')
-    def test_vif_attach_update_port_exception(self, mock_upa, mock_client):
+    def test_vif_attach_update_port_exception(self, mock_upa):
         self.port.extra = {}
         self.port.save()
         vif = {'id': "fake_vif_id"}
@@ -375,7 +369,6 @@ class TestVifPortIDMixin(db_base.DbTestCase):
             self.assertRaisesRegex(
                 exception.NetworkError, "can not update Neutron port",
                 self.interface.vif_attach, task, vif)
-            mock_client.assert_called_once_with()
 
     def test_vif_detach_in_extra(self):
         with task_manager.acquire(self.context, self.node.id) as task:
