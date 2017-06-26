@@ -282,8 +282,6 @@ class TestVifPortIDMixin(db_base.DbTestCase):
             address='52:54:00:cf:2d:32',
             extra={'vif_port_id': uuidutils.generate_uuid(),
                    'client-id': 'fake1'})
-        self.neutron_port = {'id': '132f871f-eaec-4fed-9475-0d54465e0f00',
-                             'mac_address': '52:54:00:cf:2d:32'}
 
     def test_vif_list_extra(self):
         vif_id = uuidutils.generate_uuid()
@@ -326,6 +324,99 @@ class TestVifPortIDMixin(db_base.DbTestCase):
         with task_manager.acquire(self.context, self.node.id) as task:
             vifs = self.interface.vif_list(task)
             self.assertEqual([{'id': vif_id}], vifs)
+
+    def test_get_current_vif_extra_vif_port_id(self):
+        extra = {'vif_port_id': 'foo'}
+        self.port.extra = extra
+        self.port.save()
+        with task_manager.acquire(self.context, self.node.id) as task:
+            vif = self.interface.get_current_vif(task, self.port)
+            self.assertEqual('foo', vif)
+
+    def test_get_current_vif_internal_info_cleaning(self):
+        internal_info = {'cleaning_vif_port_id': 'foo',
+                         'tenant_vif_port_id': 'bar'}
+        self.port.internal_info = internal_info
+        self.port.save()
+        with task_manager.acquire(self.context, self.node.id) as task:
+            vif = self.interface.get_current_vif(task, self.port)
+            self.assertEqual('foo', vif)
+
+    def test_get_current_vif_internal_info_provisioning(self):
+        internal_info = {'provisioning_vif_port_id': 'foo',
+                         'vif_port_id': 'bar'}
+        self.port.internal_info = internal_info
+        self.port.save()
+        with task_manager.acquire(self.context, self.node.id) as task:
+            vif = self.interface.get_current_vif(task, self.port)
+            self.assertEqual('foo', vif)
+
+    def test_get_current_vif_internal_info_tenant_vif(self):
+        internal_info = {'tenant_vif_port_id': 'bar'}
+        self.port.internal_info = internal_info
+        self.port.save()
+        with task_manager.acquire(self.context, self.node.id) as task:
+            vif = self.interface.get_current_vif(task, self.port)
+            self.assertEqual('bar', vif)
+
+    def test_get_current_vif_none(self):
+        internal_info = extra = {}
+        self.port.internal_info = internal_info
+        self.port.extra = extra
+        self.port.save()
+        with task_manager.acquire(self.context, self.node.id) as task:
+            vif = self.interface.get_current_vif(task, self.port)
+            self.assertIsNone(vif)
+
+    @mock.patch.object(common, 'get_free_port_like_object', autospec=True)
+    def test_vif_attach(self, moc_gfp):
+        self.port.extra = {}
+        self.port.save()
+        vif = {'id': "fake_vif_id"}
+        moc_gfp.return_value = self.port
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.interface.vif_attach(task, vif)
+            self.port.refresh()
+            self.assertEqual("fake_vif_id", self.port.internal_info.get(
+                common.TENANT_VIF_KEY))
+
+    def test_vif_detach_in_extra(self):
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.interface.vif_detach(
+                task, self.port.extra['vif_port_id'])
+            self.port.refresh()
+            self.assertFalse('vif_port_id' in self.port.extra)
+            self.assertFalse(common.TENANT_VIF_KEY in self.port.internal_info)
+
+    def test_vif_detach_in_internal_info(self):
+        self.port.internal_info = {
+            common.TENANT_VIF_KEY: self.port.extra['vif_port_id']}
+        self.port.extra = {}
+        self.port.save()
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.interface.vif_detach(
+                task, self.port.internal_info[common.TENANT_VIF_KEY])
+            self.port.refresh()
+            self.assertFalse('vif_port_id' in self.port.extra)
+            self.assertFalse(common.TENANT_VIF_KEY in self.port.internal_info)
+
+
+class TestNeutronVifPortIDMixin(db_base.DbTestCase):
+
+    def setUp(self):
+        super(TestNeutronVifPortIDMixin, self).setUp()
+        self.config(enabled_drivers=['fake'])
+        mgr_utils.mock_the_extension_manager()
+        self.interface = common.NeutronVIFPortIDMixin()
+        self.node = obj_utils.create_test_node(self.context,
+                                               network_interface='neutron')
+        self.port = obj_utils.create_test_port(
+            self.context, node_id=self.node.id,
+            address='52:54:00:cf:2d:32',
+            extra={'vif_port_id': uuidutils.generate_uuid(),
+                   'client-id': 'fake1'})
+        self.neutron_port = {'id': '132f871f-eaec-4fed-9475-0d54465e0f00',
+                             'mac_address': '52:54:00:cf:2d:32'}
 
     @mock.patch.object(common, 'get_free_port_like_object', autospec=True)
     @mock.patch.object(neutron_common, 'get_client', autospec=True)
@@ -465,49 +556,6 @@ class TestVifPortIDMixin(db_base.DbTestCase):
                 task, self.port.internal_info[common.TENANT_VIF_KEY])
             self.port.refresh()
             mock_unp.assert_called_once_with(vif_id)
-
-    def test_get_current_vif_extra_vif_port_id(self):
-        extra = {'vif_port_id': 'foo'}
-        self.port.extra = extra
-        self.port.save()
-        with task_manager.acquire(self.context, self.node.id) as task:
-            vif = self.interface.get_current_vif(task, self.port)
-            self.assertEqual('foo', vif)
-
-    def test_get_current_vif_internal_info_cleaning(self):
-        internal_info = {'cleaning_vif_port_id': 'foo',
-                         'tenant_vif_port_id': 'bar'}
-        self.port.internal_info = internal_info
-        self.port.save()
-        with task_manager.acquire(self.context, self.node.id) as task:
-            vif = self.interface.get_current_vif(task, self.port)
-            self.assertEqual('foo', vif)
-
-    def test_get_current_vif_internal_info_provisioning(self):
-        internal_info = {'provisioning_vif_port_id': 'foo',
-                         'vif_port_id': 'bar'}
-        self.port.internal_info = internal_info
-        self.port.save()
-        with task_manager.acquire(self.context, self.node.id) as task:
-            vif = self.interface.get_current_vif(task, self.port)
-            self.assertEqual('foo', vif)
-
-    def test_get_current_vif_internal_info_tenant_vif(self):
-        internal_info = {'tenant_vif_port_id': 'bar'}
-        self.port.internal_info = internal_info
-        self.port.save()
-        with task_manager.acquire(self.context, self.node.id) as task:
-            vif = self.interface.get_current_vif(task, self.port)
-            self.assertEqual('bar', vif)
-
-    def test_get_current_vif_none(self):
-        internal_info = extra = {}
-        self.port.internal_info = internal_info
-        self.port.extra = extra
-        self.port.save()
-        with task_manager.acquire(self.context, self.node.id) as task:
-            vif = self.interface.get_current_vif(task, self.port)
-            self.assertIsNone(vif)
 
     @mock.patch.object(common_utils, 'warn_about_deprecated_extra_vif_port_id',
                        autospec=True)

@@ -210,7 +210,117 @@ def plug_port_to_tenant_network(task, port_like_obj, client=None):
         raise exception.NetworkError(msg)
 
 
+def save_vif_to_port_like_obj(port_like_obj, vif_id):
+    """Save the ID of a VIF to a port or portgroup.
+
+    :param port_like_obj: port-like object to check.
+    :param vif_id: VIF ID to save.
+    """
+    int_info = port_like_obj.internal_info
+    int_info[TENANT_VIF_KEY] = vif_id
+    port_like_obj.internal_info = int_info
+    port_like_obj.save()
+
+
+def clear_vif_from_port_like_obj(port_like_obj):
+    """Clear the VIF ID field from a port or portgroup.
+
+    :param port_like_obj: port-like object to check.
+    """
+    int_info = port_like_obj.internal_info
+    extra = port_like_obj.extra
+    int_info.pop(TENANT_VIF_KEY, None)
+    extra.pop('vif_port_id', None)
+    port_like_obj.extra = extra
+    port_like_obj.internal_info = int_info
+    port_like_obj.save()
+
+
+def get_port_like_obj_by_vif_id(task, vif_id):
+    """Lookup a port or portgroup by its attached VIF ID.
+
+    :param task: A TaskManager instance.
+    :param vif_id: ID of the attached VIF.
+    :returns: A Port or Portgroup object to which the VIF is attached.
+    :raises: VifNotAttached if the VIF is not attached.
+    """
+    for port_like_obj in task.portgroups + task.ports:
+        # FIXME(sambetts) Remove this when we no longer support a nova
+        # driver that uses port.extra
+        vif_port_id = port_like_obj.internal_info.get(
+            TENANT_VIF_KEY, port_like_obj.extra.get("vif_port_id"))
+        if vif_port_id == vif_id:
+            return port_like_obj
+    raise exception.VifNotAttached(vif=vif_id, node=task.node.uuid)
+
+
 class VIFPortIDMixin(object):
+
+    def vif_list(self, task):
+        """List attached VIF IDs for a node
+
+        :param task: A TaskManager instance.
+        :returns: List of VIF dictionaries, each dictionary will have an 'id'
+            entry with the ID of the VIF.
+        """
+        vifs = []
+        for port_like_obj in task.ports + task.portgroups:
+            vif_id = port_like_obj.internal_info.get(
+                TENANT_VIF_KEY, port_like_obj.extra.get('vif_port_id'))
+            if vif_id:
+                vifs.append({'id': vif_id})
+        return vifs
+
+    def vif_attach(self, task, vif_info):
+        """Attach a virtual network interface to a node
+
+        Attach a virtual interface to a node. It will use the first free port
+        group. If there are no free port groups, then the first available port
+        (pxe_enabled preferably) is used.
+
+        :param task: A TaskManager instance.
+        :param vif_info: a dictionary of information about a VIF.
+             It must have an 'id' key, whose value is a unique
+             identifier for that VIF.
+        :raises: NetworkError, VifAlreadyAttached, NoFreePhysicalPorts
+        """
+        vif_id = vif_info['id']
+        port_like_obj = get_free_port_like_object(task, vif_id)
+        save_vif_to_port_like_obj(port_like_obj, vif_id)
+
+    def vif_detach(self, task, vif_id):
+        """Detach a virtual network interface from a node
+
+        :param task: A TaskManager instance.
+        :param vif_id: A VIF ID to detach
+        :raises: VifNotAttached if VIF not attached.
+        """
+        # NOTE(vsaienko) We picking object to attach on vif-attach side.
+        # Here we should only detach VIF and shouldn't duplicate/follow
+        # attach rules, just walk over all objects and detach VIF.
+        port_like_obj = get_port_like_obj_by_vif_id(task, vif_id)
+        clear_vif_from_port_like_obj(port_like_obj)
+
+    def get_current_vif(self, task, p_obj):
+        """Returns the currently used VIF associated with port or portgroup
+
+        We are booting the node only in one network at a time, and presence of
+        cleaning_vif_port_id means we're doing cleaning, of
+        provisioning_vif_port_id - provisioning.
+        Otherwise it's a tenant network
+
+        :param task: A TaskManager instance.
+        :param p_obj: Ironic port or portgroup object.
+        :returns: VIF ID associated with p_obj or None.
+        """
+
+        return (p_obj.internal_info.get('cleaning_vif_port_id') or
+                p_obj.internal_info.get('provisioning_vif_port_id') or
+                p_obj.internal_info.get(TENANT_VIF_KEY) or
+                p_obj.extra.get('vif_port_id') or None)
+
+
+class NeutronVIFPortIDMixin(VIFPortIDMixin):
 
     def port_changed(self, task, port_obj):
         """Handle any actions required when a port changes
@@ -329,21 +439,6 @@ class VIFPortIDMixin(object):
                                'reason': ', '.join(reason)})
                         raise exception.Conflict(msg)
 
-    def vif_list(self, task):
-        """List attached VIF IDs for a node
-
-        :param task: A TaskManager instance.
-        :returns: List of VIF dictionaries, each dictionary will have an 'id'
-            entry with the ID of the VIF.
-        """
-        vifs = []
-        for port_like_obj in task.ports + task.portgroups:
-            vif_id = port_like_obj.internal_info.get(
-                TENANT_VIF_KEY, port_like_obj.extra.get('vif_port_id'))
-            if vif_id:
-                vifs.append({'id': vif_id})
-        return vifs
-
     def vif_attach(self, task, vif_info):
         """Attach a virtual network interface to a node
 
@@ -387,10 +482,8 @@ class VIFPortIDMixin(object):
                             'vif': vif_id, 'port': vif_id,
                             'mac': port_like_obj.address})
 
-        int_info = port_like_obj.internal_info
-        int_info[TENANT_VIF_KEY] = vif_id
-        port_like_obj.internal_info = int_info
-        port_like_obj.save()
+        save_vif_to_port_like_obj(port_like_obj, vif_id)
+
         # NOTE(vsaienko) allow to attach VIF to active instance.
         if task.node.provision_state == states.ACTIVE:
             plug_port_to_tenant_network(task, port_like_obj, client=client)
@@ -403,44 +496,11 @@ class VIFPortIDMixin(object):
         :raises: VifNotAttached if VIF not attached.
         :raises: NetworkError: if unbind Neutron port failed.
         """
-
         # NOTE(vsaienko) We picking object to attach on vif-attach side.
         # Here we should only detach VIF and shouldn't duplicate/follow
         # attach rules, just walk over all objects and detach VIF.
-        for port_like_obj in task.portgroups + task.ports:
-            # FIXME(sambetts) Remove this when we no longer support a nova
-            # driver that uses port.extra
-            vif_port_id = port_like_obj.internal_info.get(
-                TENANT_VIF_KEY, port_like_obj.extra.get("vif_port_id"))
-            if vif_port_id == vif_id:
-                int_info = port_like_obj.internal_info
-                extra = port_like_obj.extra
-                int_info.pop(TENANT_VIF_KEY, None)
-                extra.pop('vif_port_id', None)
-                port_like_obj.extra = extra
-                port_like_obj.internal_info = int_info
-                port_like_obj.save()
-                # NOTE(vsaienko) allow to unplug VIFs from ACTIVE instance.
-                if task.node.provision_state == states.ACTIVE:
-                    neutron.unbind_neutron_port(vif_port_id)
-                break
-        else:
-            raise exception.VifNotAttached(vif=vif_id, node=task.node.uuid)
-
-    def get_current_vif(self, task, p_obj):
-        """Returns the currently used VIF associated with port or portgroup
-
-        We are booting the node only in one network at a time, and presence of
-        cleaning_vif_port_id means we're doing cleaning, of
-        provisioning_vif_port_id - provisioning.
-        Otherwise it's a tenant network
-
-        :param task: A TaskManager instance.
-        :param p_obj: Ironic port or portgroup object.
-        :returns: VIF ID associated with p_obj or None.
-        """
-
-        return (p_obj.internal_info.get('cleaning_vif_port_id') or
-                p_obj.internal_info.get('provisioning_vif_port_id') or
-                p_obj.internal_info.get(TENANT_VIF_KEY) or
-                p_obj.extra.get('vif_port_id') or None)
+        port_like_obj = get_port_like_obj_by_vif_id(task, vif_id)
+        clear_vif_from_port_like_obj(port_like_obj)
+        # NOTE(vsaienko) allow to unplug VIFs from ACTIVE instance.
+        if task.node.provision_state == states.ACTIVE:
+            neutron.unbind_neutron_port(vif_id)
