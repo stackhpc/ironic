@@ -16,6 +16,7 @@
 import datetime
 
 import mock
+from oslo_config import cfg
 from testtools import matchers
 
 from ironic.common import exception
@@ -23,6 +24,8 @@ from ironic import objects
 from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.db import utils as db_utils
 from ironic.tests.unit.objects import utils as obj_utils
+
+CONF = cfg.CONF
 
 
 class TestPortObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
@@ -141,6 +144,18 @@ class TestPortObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
             self.assertThat(ports, matchers.HasLength(1))
             self.assertIsInstance(ports[0], objects.Port)
             self.assertEqual(self.context, ports[0]._context)
+
+    def test_supports_physical_network_unpinned(self):
+        self.assertTrue(objects.Port.supports_physical_network())
+
+    def test_supports_physical_network_pinned_8_0(self):
+        CONF.set_override('pin_release_version', '8.0')
+        self.assertFalse(objects.Port.supports_physical_network())
+
+    # TODO(mgoddard): Uncomment this when Pike branch is cut.
+    # def test_supports_physical_network_pinned_9_0(self):
+    #     CONF.set_override('pin_release_version', '9.0')
+    #     self.assertTrue(objects.Port.supports_physical_network())
 
     def test_payload_schemas(self):
         self._check_payload_schemas(objects.port, objects.Port.fields)

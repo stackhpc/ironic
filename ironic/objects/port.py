@@ -299,6 +299,15 @@ class Port(base.IronicObject, object_base.VersionedObjectDictCompat):
         self.obj_refresh(current)
         self.obj_reset_changes()
 
+    @classmethod
+    def supports_physical_network(cls):
+        """Return whether the physical_network field is supported.
+
+        :returns: Whether the physical_network field is supported
+        :raises: ovo_exception.IncompatibleObjectVersion
+        """
+        return cls.supports_version((1, 7))
+
 
 @base.IronicObjectRegistry.register
 class PortCRUDNotification(notification.NotificationBase):
