@@ -153,6 +153,18 @@ class ConductorAPI(object):
         host = random.choice(list(ring.nodes))
         return self.topic + "." + host
 
+    def _can_send_version(self, version):
+        """Return whether the RPCAPI supports sending a particular version.
+
+        :param version: The version to check.
+        :returns: Whether the version can be sent.
+        """
+        return self.client.can_send_version(version)
+
+    def can_send_create_port(self):
+        """Return whether the RPCAPI supports the create_port method."""
+        return self._can_send_version("1.41")
+
     def create_node(self, context, node_obj, topic=None):
         """Synchronously, have a conductor validate and create a node.
 

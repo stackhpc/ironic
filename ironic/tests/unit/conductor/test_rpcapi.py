@@ -146,6 +146,37 @@ class RPCAPITestCase(db_base.DbTestCase):
         self.assertEqual('fake-topic.fake-host',
                          rpcapi.get_topic_for_driver('fake-driver'))
 
+    def _test__can_send_version(self, can_send_version):
+        rpcapi = conductor_rpcapi.ConductorAPI(topic='fake-topic')
+        with mock.patch.object(rpcapi.client,
+                               "can_send_version") as mock_can_send_version:
+            mock_can_send_version.return_value = can_send_version
+            result = rpcapi._can_send_version("1.23")
+            self.assertEqual(can_send_version, result)
+            mock_can_send_version.assert_called_once_with("1.23")
+
+    def test__can_send_version_True(self):
+        self._test__can_send_version(True)
+
+    def test__can_send_version_False(self):
+        self._test__can_send_version(False)
+
+    @mock.patch.object(conductor_rpcapi.ConductorAPI, '_can_send_version',
+                       autospec=True)
+    def test_can_send_create_port(self, mock_can_send):
+        mock_can_send.return_value = True
+        rpcapi = conductor_rpcapi.ConductorAPI(topic='fake-topic')
+        self.assertTrue(rpcapi.can_send_create_port())
+        mock_can_send.assert_called_once_with(mock.ANY, "1.41")
+
+    @mock.patch.object(conductor_rpcapi.ConductorAPI, '_can_send_version',
+                       autospec=True)
+    def test_can_send_create_port_pinned(self, mock_can_send):
+        mock_can_send.return_value = False
+        rpcapi = conductor_rpcapi.ConductorAPI(topic='fake-topic')
+        self.assertFalse(rpcapi.can_send_create_port())
+        mock_can_send.assert_called_once_with(mock.ANY, "1.41")
+
     def _test_rpcapi(self, method, rpc_method, **kwargs):
         rpcapi = conductor_rpcapi.ConductorAPI(topic='fake-topic')
 
