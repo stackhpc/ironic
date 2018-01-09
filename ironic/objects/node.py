@@ -21,6 +21,7 @@ from oslo_versionedobjects import base as object_base
 from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.db import api as db_api
+from ironic import objects
 from ironic.objects import base
 from ironic.objects import fields as object_fields
 from ironic.objects import notification
@@ -57,7 +58,8 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
     # Version 1.20: Type of network_interface changed to just nullable string
     # Version 1.21: Add storage_interface field
     # Version 1.22: Add rescue_interface field
-    VERSION = '1.22'
+    # Version 1.23: Add traits field
+    VERSION = '1.23'
 
     dbapi = db_api.get_instance()
 
@@ -128,6 +130,8 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         'rescue_interface': object_fields.StringField(nullable=True),
         'storage_interface': object_fields.StringField(nullable=True),
         'vendor_interface': object_fields.StringField(nullable=True),
+
+        'traits': object_fields.ObjectField('TraitList', nullable=True),
     }
 
     def _validate_property_values(self, properties):
@@ -156,6 +160,14 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
                      'but provided values are: %(msgs)s') %
                    {'node': self.uuid, 'msgs': ', '.join(invalid_msgs_list)})
             raise exception.InvalidParameterValue(msg)
+
+    def _set_from_db_object(self, context, db_object, fields=None):
+        fields = set(fields or self.fields) - {'traits'}
+        super(Node, self)._set_from_db_object(context, db_object, fields)
+        self.traits = object_base.obj_make_list(
+            context, objects.TraitList(context),
+            objects.Trait, db_object['traits'])
+        self.traits.obj_reset_changes()
 
     # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
     # methods can be used in the future to replace current explicit RPC calls.
@@ -329,7 +341,12 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         """
         values = self.do_version_changes_for_db()
         self._validate_property_values(values.get('properties'))
+        if 'traits' in values:
+            values.pop('traits')
         db_node = self.dbapi.create_node(values)
+        # NOTE(johngarbutt) refetch with joins to avoid DetachedInstanceError
+        # when loading joined things like traits
+        db_node = self.dbapi.get_node_by_id(db_node['id'])
         self._from_db_object(self._context, self, db_node)
 
     # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
@@ -375,7 +392,12 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
             # Clean driver_internal_info when changes driver
             self.driver_internal_info = {}
             updates = self.do_version_changes_for_db()
-        db_node = self.dbapi.update_node(self.uuid, updates)
+        if 'traits' in updates:
+            updates.pop('traits')
+        self.dbapi.update_node(self.uuid, updates)
+        # NOTE(johngarbutt) refetch with joins to avoid DetachedInstanceError
+        # when loading joined things like traits
+        db_node = self.dbapi.get_node_by_uuid(self.uuid)
         self._from_db_object(self._context, self, db_node)
 
     # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
@@ -452,6 +474,17 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
             elif self.rescue_interface is not None:
                 # DB: set unavailable field to the default of None.
                 self.rescue_interface = None
+
+        traits_is_set = self.obj_attr_is_set('traits')
+        if target_version >= (1, 23):
+            # Target version supports rescue_interface.
+            if not traits_is_set:
+                self.traits = None
+        else:
+            if remove_unavailable_fields:
+                delattr(self, 'traits')
+            elif self.traits is not None:
+                self.traits = None
 
 
 @base.IronicObjectRegistry.register

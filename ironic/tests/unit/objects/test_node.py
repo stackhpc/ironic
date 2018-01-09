@@ -76,12 +76,14 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
         test_time = datetime.datetime(2000, 1, 1, 0, 0)
         with mock.patch.object(self.dbapi, 'get_node_by_uuid',
                                autospec=True) as mock_get_node:
-            mock_get_node.return_value = self.fake_node
+            mock_get_node.side_effect = [
+                db_utils.get_test_node(),
+                db_utils.get_test_node(
+                    properties={"fake": "property"}, driver='fake-driver',
+                    driver_internal_info={}, updated_at=test_time)]
             with mock.patch.object(self.dbapi, 'update_node',
                                    autospec=True) as mock_update_node:
-                mock_update_node.return_value = db_utils.get_test_node(
-                    properties={"fake": "property"}, driver='fake-driver',
-                    driver_internal_info={}, updated_at=test_time)
+                mock_update_node.return_value = db_utils.get_test_node()
                 n = objects.Node.get(self.context, uuid)
                 self.assertEqual({"private_state": "secret value"},
                                  n.driver_internal_info)
@@ -89,7 +91,8 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
                 n.driver = "fake-driver"
                 n.save()
 
-                mock_get_node.assert_called_once_with(uuid)
+                mock_get_node.assert_has_calls([
+                    mock.call(uuid), mock.call(uuid)])
                 mock_update_node.assert_called_once_with(
                     uuid, {'properties': {"fake": "property"},
                            'driver': 'fake-driver',
@@ -99,37 +102,6 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
                 res_updated_at = (n.updated_at).replace(tzinfo=None)
                 self.assertEqual(test_time, res_updated_at)
                 self.assertEqual({}, n.driver_internal_info)
-
-    def test_save_updated_at_field(self):
-        uuid = self.fake_node['uuid']
-        extra = {"test": 123}
-        test_time = datetime.datetime(2000, 1, 1, 0, 0)
-        with mock.patch.object(self.dbapi, 'get_node_by_uuid',
-                               autospec=True) as mock_get_node:
-            mock_get_node.return_value = self.fake_node
-            with mock.patch.object(self.dbapi, 'update_node',
-                                   autospec=True) as mock_update_node:
-                mock_update_node.return_value = (
-                    db_utils.get_test_node(extra=extra, updated_at=test_time))
-                n = objects.Node.get(self.context, uuid)
-                self.assertEqual({"private_state": "secret value"},
-                                 n.driver_internal_info)
-                n.properties = {"fake": "property"}
-                n.extra = extra
-                n.driver = "fake-driver"
-                n.driver_internal_info = {}
-                n.save()
-
-                mock_get_node.assert_called_once_with(uuid)
-                mock_update_node.assert_called_once_with(
-                    uuid, {'properties': {"fake": "property"},
-                           'driver': 'fake-driver',
-                           'driver_internal_info': {},
-                           'extra': {'test': 123},
-                           'version': objects.Node.VERSION})
-                self.assertEqual(self.context, n._context)
-                res_updated_at = n.updated_at.replace(tzinfo=None)
-                self.assertEqual(test_time, res_updated_at)
 
     def test_refresh(self):
         uuid = self.fake_node['uuid']
@@ -215,18 +187,24 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
                 mock_touch.assert_called_once_with(node.id)
 
     def test_create(self):
-        node = objects.Node(self.context, **self.fake_node)
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
         with mock.patch.object(self.dbapi, 'create_node',
                                autospec=True) as mock_create_node:
             mock_create_node.return_value = db_utils.get_test_node()
 
-            node.create()
+            with mock.patch.object(self.dbapi, 'get_node_by_id',
+                                   autospec=True) as mock_get_node:
+                mock_get_node.return_value = db_utils.get_test_node()
 
-            args, _kwargs = mock_create_node.call_args
-            self.assertEqual(objects.Node.VERSION, args[0]['version'])
+                node.create()
+
+                args, _kwargs = mock_create_node.call_args
+                self.assertEqual(objects.Node.VERSION, args[0]['version'])
+                self.assertEqual(1, mock_create_node.call_count)
+                mock_get_node.assert_called_once_with(self.fake_node['id'])
 
     def test_create_with_invalid_properties(self):
-        node = objects.Node(self.context, **self.fake_node)
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
         node.properties = {"local_gb": "5G"}
         self.assertRaises(exception.InvalidParameterValue, node.create)
 
@@ -271,7 +249,7 @@ class TestConvertToVersion(db_base.DbTestCase):
 
     def test_rescue_supported_missing(self):
         # rescue_interface not set, should be set to default.
-        node = objects.Node(self.context, **self.fake_node)
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
         delattr(node, 'rescue_interface')
         node.obj_reset_changes()
 
@@ -283,7 +261,7 @@ class TestConvertToVersion(db_base.DbTestCase):
 
     def test_rescue_supported_set(self):
         # rescue_interface set, no change required.
-        node = objects.Node(self.context, **self.fake_node)
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
 
         node.rescue_interface = 'fake'
         node.obj_reset_changes()
@@ -293,7 +271,7 @@ class TestConvertToVersion(db_base.DbTestCase):
 
     def test_rescue_unsupported_missing(self):
         # rescue_interface not set, no change required.
-        node = objects.Node(self.context, **self.fake_node)
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
 
         delattr(node, 'rescue_interface')
         node.obj_reset_changes()
@@ -303,7 +281,7 @@ class TestConvertToVersion(db_base.DbTestCase):
 
     def test_rescue_unsupported_set_remove(self):
         # rescue_interface set, should be removed.
-        node = objects.Node(self.context, **self.fake_node)
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
 
         node.rescue_interface = 'fake'
         node.obj_reset_changes()
@@ -313,20 +291,96 @@ class TestConvertToVersion(db_base.DbTestCase):
 
     def test_rescue_unsupported_set_no_remove_non_default(self):
         # rescue_interface set, should be set to default.
-        node = objects.Node(self.context, **self.fake_node)
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
 
         node.rescue_interface = 'fake'
         node.obj_reset_changes()
         node._convert_to_version("1.21", False)
         self.assertIsNone(node.rescue_interface)
-        self.assertEqual({'rescue_interface': None}, node.obj_get_changes())
+        self.assertEqual({'rescue_interface': None, 'traits': None},
+                         node.obj_get_changes())
 
     def test_rescue_unsupported_set_no_remove_default(self):
         # rescue_interface set, no change required.
-        node = objects.Node(self.context, **self.fake_node)
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
 
         node.rescue_interface = None
+        node.traits = None
         node.obj_reset_changes()
         node._convert_to_version("1.21", False)
+        self.assertIsNone(node.rescue_interface)
+        self.assertEqual({}, node.obj_get_changes())
+
+    def test_traits(self):
+        pass
+
+    def test_traits_supported_missing(self):
+        # traits not set, should be set to default.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+        delattr(node, 'traits')
+        node.obj_reset_changes()
+
+        node._convert_to_version("1.23")
+
+        self.assertIsNone(node.traits)
+        self.assertEqual({'traits': None},
+                         node.obj_get_changes())
+
+    def test_traits_supported_set(self):
+        # traits set, no change required.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+        traits = objects.TraitList(
+            objects=[objects.Trait('CUSTOM_TRAIT')])
+        traits.obj_reset_changes()
+        node.traits = traits
+        node.obj_reset_changes()
+
+        node._convert_to_version("1.23")
+
+        self.assertEqual(traits, node.traits)
+        self.assertEqual({}, node.obj_get_changes())
+
+    def test_traits_unsupported_missing(self):
+        # traits not set, no change required.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+        node.obj_reset_changes()
+
+        node._convert_to_version("1.22")
+
+        self.assertNotIn('traits', node)
+        self.assertEqual({}, node.obj_get_changes())
+
+    def test_traits_unsupported_set_remove(self):
+        # traits set, should be removed.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+        node.traits = None
+        node.obj_reset_changes()
+
+        node._convert_to_version("1.22")
+
+        self.assertNotIn('trait', node)
+        self.assertEqual({}, node.obj_get_changes())
+
+    def test_trait_unsupported_set_no_remove_non_default(self):
+        # rescue_interface set, should be set to default.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+        node.traits = objects.TraitList(self.ctxt)
+        node.traits.obj_reset_changes()
+        node.obj_reset_changes()
+
+        node._convert_to_version("1.22", False)
+
+        self.assertIsNone(node.rescue_interface)
+        self.assertEqual({'traits': None},
+                         node.obj_get_changes())
+
+    def test_trait_unsupported_set_no_remove_default(self):
+        # rescue_interface set, no change required.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+        node.traits = None
+        node.obj_reset_changes()
+
+        node._convert_to_version("1.22", False)
+
         self.assertIsNone(node.rescue_interface)
         self.assertEqual({}, node.obj_get_changes())
