@@ -822,6 +822,7 @@ class ConductorManager(base_manager.BaseConductorManager):
             try:
                 task.driver.power.validate(task)
                 task.driver.deploy.validate(task)
+                utils.validate_instance_info_traits(task.node)
             except exception.InvalidParameterValue as e:
                 raise exception.InstanceDeployFailure(
                     _("Failed to validate deploy or power info for node "
@@ -1850,6 +1851,12 @@ class ConductorManager(base_manager.BaseConductorManager):
                 ret_dict[iface_name]['result'] = result
                 if reason is not None:
                     ret_dict[iface_name]['reason'] = reason
+            try:
+                utils.validate_instance_info_traits(task.node)
+            except exception.InvalidParameterValue as e:
+                ret_dict.setdefault('deploy', {})
+                ret_dict['deploy']['result'] = False
+                ret_dict['deploy']['reason'] = str(e)
         return ret_dict
 
     @METRICS.timer('ConductorManager.destroy_node')
