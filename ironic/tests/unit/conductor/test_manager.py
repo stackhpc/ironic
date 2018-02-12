@@ -707,6 +707,36 @@ class UpdateNodeTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
             states.ACTIVE, resource_class='old', new_resource_class=None,
             expect_error=True)
 
+    def test_update_instance_info_with_node_traits(self):
+        # Allow setting instance_info.traits when all instance traits are node
+        # traits.
+        node = obj_utils.create_test_node(self.context, driver='fake')
+        traits = ['trait1', 'trait2']
+        objects.TraitList.create(self.context, node.id, traits)
+        instance_info = {'traits': ['trait1']}
+        node.instance_info = instance_info
+        res = self.service.update_node(self.context, node)
+        self.assertEqual(instance_info, res.instance_info)
+
+    def test_update_instance_info_with_non_node_traits(self):
+        # Prevent setting instance_info.traits when any instance traits are not
+        # node traits.
+        node = obj_utils.create_test_node(self.context, driver='fake')
+        traits = ['trait1', 'trait2']
+        objects.TraitList.create(self.context, node.id, traits)
+        old_instance_info = node.instance_info
+        node.instance_info = {'traits': ['notatrait']}
+        exc = self.assertRaises(messaging.rpc.ExpectedException,
+                                self.service.update_node,
+                                self.context,
+                                node)
+        # Compare true exception hidden by @messaging.expected_exceptions
+        self.assertEqual(exception.InvalidParameterValue, exc.exc_info[0])
+
+        # verify change did not happen
+        res = objects.Node.get_by_uuid(self.context, node['uuid'])
+        self.assertEqual(old_instance_info, res['instance_info'])
+
 
 @mgr_utils.mock_record_keepalive
 class VendorPassthruTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
@@ -7075,3 +7105,40 @@ class NodeTraitsTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
 
     def test_remove_node_traits_node_trait_not_found(self):
         self._test_remove_node_traits_exception(exception.NodeTraitNotFound)
+
+    def test_remove_node_traits_not_present_in_instance_info(self):
+        # Allow removal of node traits not present in instance_info.traits.
+        objects.TraitList.create(self.context, self.node.id, self.traits)
+        self.node.instance_info = {'traits': ['trait3']}
+        self.node.save()
+        self.service.remove_node_traits(self.context, self.node.id,
+                                        self.traits)
+        traits = objects.TraitList.get_by_node_id(self.context, self.node.id)
+        self.assertEqual([], traits.get_trait_names())
+
+    def test_remove_node_traits_present_in_instance_info(self):
+        # Prevent removal of any node traits present in instance_info.traits.
+        objects.TraitList.create(self.context, self.node.id, self.traits)
+        self.node.instance_info = {'traits': [self.traits[0]]}
+        self.node.save()
+        exc = self.assertRaises(messaging.rpc.ExpectedException,
+                                self.service.remove_node_traits,
+                                self.context, self.node.id, self.traits)
+        # Compare true exception hidden by @messaging.expected_exceptions
+        self.assertEqual(exception.InvalidParameterValue, exc.exc_info[0])
+        traits = objects.TraitList.get_by_node_id(self.context, self.node.id)
+        self.assertEqual(self.traits, traits.get_trait_names())
+
+    def test_remove_node_traits_all_present_in_instance_info(self):
+        # Prevent removal of all node traits when instance_info.traits is
+        # non-empty.
+        objects.TraitList.create(self.context, self.node.id, self.traits)
+        self.node.instance_info = {'traits': [self.traits[0]]}
+        self.node.save()
+        exc = self.assertRaises(messaging.rpc.ExpectedException,
+                                self.service.remove_node_traits,
+                                self.context, self.node.id, None)
+        # Compare true exception hidden by @messaging.expected_exceptions
+        self.assertEqual(exception.InvalidParameterValue, exc.exc_info[0])
+        traits = objects.TraitList.get_by_node_id(self.context, self.node.id)
+        self.assertEqual(self.traits, traits.get_trait_names())

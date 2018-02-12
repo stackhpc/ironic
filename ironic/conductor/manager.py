@@ -208,6 +208,23 @@ class ConductorManager(base_manager.BaseConductorManager):
                               'allowed': ', '.join(allowed_update_states),
                               'field': 'resource_class'})
 
+            # Prevent setting traits in instance_info that are not present on
+            # the node.
+            if 'instance_info' in delta:
+                instance_traits = node_obj.instance_info.get('traits', [])
+                # TODO(mgoddard): Remove the obj_attr_is_set() call in Rocky
+                # when all node objects will have a traits field.
+                node_traits = (task.node.traits.get_trait_names()
+                               if task.node.obj_attr_is_set('traits') else [])
+                missing = set(instance_traits) - set(node_traits)
+                if missing:
+                    err = (_("Cannot add traits to node %(node)s "
+                             "instance_info that are not set on the node. "
+                             "Missing traits: %(traits)s") %
+                           {'node': task.node.uuid,
+                            'traits': ', '.join(missing)})
+                    raise exception.InvalidParameterValue(err=err)
+
             node_obj.save()
 
         return node_obj
@@ -3091,7 +3108,8 @@ class ConductorManager(base_manager.BaseConductorManager):
                     trait.create()
 
     @METRICS.timer('ConductorManager.remove_node_traits')
-    @messaging.expected_exceptions(exception.NodeLocked,
+    @messaging.expected_exceptions(exception.InvalidParameterValue,
+                                   exception.NodeLocked,
                                    exception.NodeNotFound,
                                    exception.NodeTraitNotFound)
     def remove_node_traits(self, context, node_id, traits):
@@ -3101,6 +3119,8 @@ class ConductorManager(base_manager.BaseConductorManager):
         :param node_id: node ID or UUID.
         :param traits: a list of traits to remove from the node, or None. If
             None, all traits will be removed from the node.
+        :raises: InvalidParameterValue if any traits being removed are present
+            in instance_info.
         :raises: NodeLocked if node is locked by another conductor.
         :raises: NodeNotFound if the node does not exist.
         :raises: NodeTraitNotFound if one of the traits is not found. Traits
@@ -3110,7 +3130,20 @@ class ConductorManager(base_manager.BaseConductorManager):
                   "with traits %(traits)s",
                   {'node_id': node_id, 'traits': traits})
         with task_manager.acquire(context, node_id,
-                                  purpose='remove node traits'):
+                                  purpose='remove node traits') as task:
+            # Prevent removing traits from the node that are present in
+            # instance_info.
+            instance_traits = task.node.instance_info.get('traits', [])
+            removed_traits = (task.node.traits.get_trait_names()
+                              if traits is None else traits)
+            in_use = set(instance_traits) & set(removed_traits)
+            if in_use:
+                err = (_("Cannot remove traits from node %(node)s that are in "
+                         "instance_info. Traits in use: %(traits)s") %
+                       {'node': task.node.uuid,
+                        'traits': ', '.join(in_use)})
+                raise exception.InvalidParameterValue(err=err)
+
             if traits is None:
                 objects.TraitList.destroy(context, node_id=node_id)
             else:
