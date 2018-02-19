@@ -14,6 +14,7 @@
 #    under the License.
 
 import datetime
+import json
 
 import mock
 from oslo_utils import uuidutils
@@ -41,6 +42,8 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
         d = self.node.as_dict()
         self.assertEqual('fake', d['driver_info']['ipmi_password'])
         self.assertEqual('data', d['instance_info']['configdrive'])
+        # Ensure the node can be serialised.
+        json.dumps(d)
 
     def test_as_dict_secure(self):
         self.node.driver_info['ipmi_password'] = 'fake'
@@ -48,6 +51,8 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
         d = self.node.as_dict(secure=True)
         self.assertEqual('******', d['driver_info']['ipmi_password'])
         self.assertEqual('******', d['instance_info']['configdrive'])
+        # Ensure the node can be serialised.
+        json.dumps(d)
 
     def test_get_by_id(self):
         node_id = self.fake_node['id']
