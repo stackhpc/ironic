@@ -33,7 +33,10 @@ LOG = logging.getLogger(__name__)
 
 PXE_CFG_DIR_NAME = 'pxelinux.cfg'
 
-DHCP_CLIENT_ID = '61'  # rfc2132
+# NOTE(mgoddard): Use the 'client-id' string directly rather than the numeric
+# option 61, which Mellanox NEO does not seem to handle well.
+# See https://github.com/VerneGlobal/OpenStack-issues/issues/9 for details.
+DHCP_CLIENT_ID = 'client-id'  # rfc2132
 DHCP_TFTP_SERVER_NAME = '66'  # rfc2132
 DHCP_BOOTFILE_NAME = '67'  # rfc2132
 DHCP_TFTP_SERVER_ADDRESS = '150'  # rfc5859
