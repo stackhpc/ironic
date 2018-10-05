@@ -633,9 +633,6 @@ class TestPXEUtils(db_base.DbTestCase):
                           'ip_version': ip_version},
                          {'opt_name': 'tftp-server',
                           'opt_value': '192.0.2.1',
-                          'ip_version': ip_version},
-                         {'opt_name': 'server-ip-address',
-                          'opt_value': '192.0.2.1',
                           'ip_version': ip_version}
                          ]
         with task_manager.acquire(self.context, self.node.uuid) as task:
@@ -714,9 +711,6 @@ class TestPXEUtils(db_base.DbTestCase):
                           'ip_version': 4},
                          {'opt_name': 'bootfile-name',
                           'opt_value': expected_boot_script_url,
-                          'ip_version': 4},
-                         {'opt_name': 'server-ip-address',
-                          'opt_value': '192.0.2.1',
                           'ip_version': 4}]
 
         self.assertItemsEqual(expected_info,
@@ -735,9 +729,6 @@ class TestPXEUtils(db_base.DbTestCase):
                           'ip_version': 4},
                          {'opt_name': 'tag:ipxe,bootfile-name',
                           'opt_value': expected_boot_script_url,
-                          'ip_version': 4},
-                         {'opt_name': 'server-ip-address',
-                          'opt_value': '192.0.2.1',
                           'ip_version': 4}]
 
         self.assertItemsEqual(expected_info,

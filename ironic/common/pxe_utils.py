@@ -360,22 +360,6 @@ def dhcp_options_for_instance(task):
     dhcp_opts.append({'opt_name': 'tftp-server',
                       'opt_value': CONF.pxe.tftp_server})
 
-    # NOTE(vsaienko) set this option specially for dnsmasq case as it always
-    # sets `siaddr` field which is treated by pxe clients as TFTP server
-    # see page 9 https://tools.ietf.org/html/rfc2131.
-    # If `server-ip-address` is not provided dnsmasq sets `siaddr` to dnsmasq's
-    # IP which breaks PXE booting as TFTP server is configured on ironic
-    # conductor host.
-    # http://thekelleys.org.uk/gitweb/?p=dnsmasq.git;a=blob;f=src/dhcp-common.c;h=eae9ae3567fe16eb979a484976c270396322efea;hb=a3303e196e5d304ec955c4d63afb923ade66c6e8#l572 # noqa
-    # There is an informational RFC which describes how options related to
-    # tftp 150,66 and siaddr should be used https://tools.ietf.org/html/rfc5859
-    # All dhcp servers we've tried: contrail/dnsmasq/isc just silently ignore
-    # unknown options but potentially it may blow up with others.
-    # Related bug was opened on Neutron side:
-    # https://bugs.launchpad.net/neutron/+bug/1723354
-    dhcp_opts.append({'opt_name': 'server-ip-address',
-                      'opt_value': CONF.pxe.tftp_server})
-
     # Append the IP version for all the configuration options
     for opt in dhcp_opts:
         opt.update({'ip_version': int(CONF.pxe.ip_version)})
