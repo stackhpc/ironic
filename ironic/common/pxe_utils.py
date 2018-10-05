@@ -33,6 +33,7 @@ LOG = logging.getLogger(__name__)
 
 PXE_CFG_DIR_NAME = 'pxelinux.cfg'
 
+DHCP_CLIENT_ID = '61'  # rfc2132
 DEPLOY_KERNEL_RAMDISK_LABELS = ['deploy_kernel', 'deploy_ramdisk']
 RESCUE_KERNEL_RAMDISK_LABELS = ['rescue_kernel', 'rescue_ramdisk']
 KERNEL_RAMDISK_LABELS = {'deploy': DEPLOY_KERNEL_RAMDISK_LABELS,
