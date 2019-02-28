@@ -64,6 +64,22 @@ class FakePower(base.PowerInterface):
         return [states.POWER_ON, states.POWER_OFF, states.REBOOT,
                 states.SOFT_REBOOT, states.SOFT_POWER_OFF]
 
+    @base.deploy_step(priority=0,
+                      argsinfo={'arg1': {'description': 'desc1',
+                                         'required': True},
+                                'arg2': {'description': 'desc2',
+                                         'required': False}})
+    def power_step(self, task, arg1, arg2='default'):
+        LOG.error("Power step called with %s and %s", arg1, arg2)
+
+    @base.deploy_step(priority=1,
+                      argsinfo={'arg1': {'description': 'desc1',
+                                         'required': False},
+                                'arg2': {'description': 'desc2',
+                                         'required': False}})
+    def default_power_step(self, task, arg1='default', arg2='default'):
+        LOG.error("Default power step called with %s and %s", arg1, arg2)
+
 
 class FakeBoot(base.BootInterface):
     """Example implementation of a simple boot interface."""
@@ -119,6 +135,14 @@ class FakeDeploy(base.DeployInterface):
 
     def take_over(self, task):
         pass
+
+    @base.deploy_step(priority=0,
+                      argsinfo={'arg1': {'description': 'desc1',
+                                         'required': True},
+                                'arg2': {'description': 'desc2',
+                                         'required': False}})
+    def deploy_step(self, task, arg1, arg2='default'):
+        LOG.error("Deploy step called with %s and %s", arg1, arg2)
 
 
 class FakeVendorA(base.VendorInterface):
@@ -219,6 +243,22 @@ class FakeManagement(base.ManagementInterface):
     def get_sensors_data(self, task):
         return {}
 
+    @base.deploy_step(priority=0,
+                      argsinfo={'arg1': {'description': 'desc1',
+                                         'required': True},
+                                'arg2': {'description': 'desc2',
+                                         'required': False}})
+    def management_step(self, task, arg1, arg2='default'):
+        LOG.error("Management step called with %s and %s", arg1, arg2)
+
+    @base.deploy_step(priority=200,
+                      argsinfo={'arg1': {'description': 'desc1',
+                                         'required': False},
+                                'arg2': {'description': 'desc2',
+                                         'required': False}})
+    def default_management_step(self, task, arg1='default', arg2='default'):
+        LOG.error("Default management step called with %s and %s", arg1, arg2)
+
 
 class FakeInspect(base.InspectInterface):
 
@@ -246,6 +286,14 @@ class FakeRAID(base.RAIDInterface):
 
     def delete_configuration(self, task):
         pass
+
+    @base.deploy_step(priority=0,
+                      argsinfo={'arg1': {'description': 'desc1',
+                                'required': True},
+                                'arg2': {'description': 'desc2',
+                                         'required': False}})
+    def raid_step(self, task, arg1, arg2='default'):
+        LOG.error("RAID step called with %s and %s", arg1, arg2)
 
 
 class FakeBIOS(base.BIOSInterface):
@@ -305,6 +353,14 @@ class FakeBIOS(base.BIOSInterface):
         # refer to develop doc at https://docs.openstack.org/ironic/latest/
         # contributor/bios_develop.html.
         pass
+
+    @base.deploy_step(priority=0,
+                      argsinfo={'arg1': {'description': 'desc1',
+                                'required': True},
+                                'arg2': {'description': 'desc2',
+                                         'required': False}})
+    def bios_step(self, task, arg1, arg2='default'):
+        LOG.error("BIOS step called with %s and %s", arg1, arg2)
 
 
 class FakeStorage(base.StorageInterface):
