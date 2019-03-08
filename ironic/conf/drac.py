@@ -16,6 +16,12 @@ from oslo_config import cfg
 from ironic.common.i18n import _
 
 opts = [
+    cfg.IntOpt('query_bios_config_job_status_interval',
+               default=120,
+               min=1,
+               help=_('Interval (in seconds) between periodic BIOS job status '
+                      'checks to determine whether the asynchronous BIOS '
+                      'configuration was successfully finished or not.')),
     cfg.IntOpt('query_raid_config_job_status_interval',
                default=120,
                min=1,

@@ -18,6 +18,7 @@ DRAC Driver for remote system management using Dell Remote Access Card.
 from oslo_config import cfg
 
 from ironic.drivers import generic
+from ironic.drivers.modules.drac import bios
 from ironic.drivers.modules.drac import inspect as drac_inspect
 from ironic.drivers.modules.drac import management
 from ironic.drivers.modules.drac import power
@@ -46,6 +47,11 @@ class IDRACHardware(generic.GenericHardware):
         return [power.DracPower]
 
     # Optional hardware interfaces
+
+    @property
+    def supported_bios_interfaces(self):
+        """List of supported BIOS interfaces."""
+        return [bios.DracBIOS, noop.NoBIOS]
 
     @property
     def supported_inspect_interfaces(self):

@@ -31,6 +31,7 @@ class BaseDracTest(db_base.DbTestCase):
         self.config(enabled_hardware_types=['idrac', 'fake-hardware'],
                     enabled_power_interfaces=['idrac', 'fake'],
                     enabled_management_interfaces=['idrac', 'fake'],
+                    enabled_bios_interfaces=['idrac', 'fake', 'no-bios'],
                     enabled_inspect_interfaces=['idrac', 'fake', 'no-inspect'],
                     enabled_vendor_interfaces=['idrac', 'fake', 'no-vendor'],
                     enabled_raid_interfaces=['idrac', 'fake', 'no-raid'])
