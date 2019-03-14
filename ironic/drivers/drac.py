@@ -25,6 +25,7 @@ from ironic.drivers.modules.drac import power
 from ironic.drivers.modules.drac import raid
 from ironic.drivers.modules.drac import vendor_passthru
 from ironic.drivers.modules import inspector
+from ironic.drivers.modules import ipmitool
 from ironic.drivers.modules import noop
 
 
@@ -39,12 +40,12 @@ class IDRACHardware(generic.GenericHardware):
     @property
     def supported_management_interfaces(self):
         """List of supported management interfaces."""
-        return [management.DracManagement]
+        return [management.DracManagement, ipmitool.IPMIManagement]
 
     @property
     def supported_power_interfaces(self):
         """List of supported power interfaces."""
-        return [power.DracPower]
+        return [power.DracPower, ipmitool.IPMIPower]
 
     # Optional hardware interfaces
 
