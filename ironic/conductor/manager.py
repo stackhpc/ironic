@@ -916,6 +916,7 @@ class ConductorManager(base_manager.BaseConductorManager):
                      'state': node.provision_state,
                      'deploy_state': ', '.join(expected_states)})
 
+            save_required = False
             info = node.driver_internal_info
             try:
                 skip_current_step = info.pop('skip_current_deploy_step')
@@ -923,6 +924,10 @@ class ConductorManager(base_manager.BaseConductorManager):
                 skip_current_step = True
             else:
                 node.driver_internal_info = info
+                save_required = True
+            if info.pop('deployment_polling', None) is not None:
+                save_required = True
+            if save_required:
                 node.save()
 
             next_step_index = self._get_node_next_deploy_steps(
@@ -3944,6 +3949,7 @@ def _do_next_deploy_step(task, step_index, conductor_id):
     driver_internal_info['deploy_steps'] = None
     driver_internal_info.pop('deploy_step_index', None)
     driver_internal_info.pop('deployment_reboot', None)
+    driver_internal_info.pop('deployment_polling', None)
     node.driver_internal_info = driver_internal_info
     node.save()
 

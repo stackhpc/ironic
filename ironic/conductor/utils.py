@@ -465,8 +465,10 @@ def deploying_error_handler(task, logmsg, errmsg, traceback=False,
         node.deploy_step = {}
         info = node.driver_internal_info
         info.pop('deploy_step_index', None)
-        # Clear any leftover metadata about deployment reboots
+        # Clear any leftover metadata about deployment.
         info.pop('deployment_reboot', None)
+        info.pop('deployment_polling', None)
+        info.pop('skip_current_deploy_step', None)
         node.driver_internal_info = info
 
     if cleanup_err:

@@ -915,6 +915,10 @@ class DeployingErrorHandlerTestCase(tests_base.TestCase):
                           self.task)
 
     def test_deploying_error_handler(self):
+        info = self.node.driver_internal_info
+        info['deploy_step_index'] = 2
+        info['deployment_reboot'] = True
+        info['deployment_polling'] = True
         conductor_utils.deploying_error_handler(self.task, self.logmsg,
                                                 self.errmsg)
 
@@ -924,6 +928,7 @@ class DeployingErrorHandlerTestCase(tests_base.TestCase):
         self.assertEqual({}, self.node.deploy_step)
         self.assertNotIn('deploy_step_index', self.node.driver_internal_info)
         self.assertNotIn('deployment_reboot', self.node.driver_internal_info)
+        self.assertNotIn('deployment_polling', self.node.driver_internal_info)
         self.task.process_event.assert_called_once_with('fail')
 
     def _test_deploying_error_handler_cleanup(self, exc, expected_str):
