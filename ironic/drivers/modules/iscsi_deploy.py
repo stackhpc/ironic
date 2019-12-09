@@ -332,7 +332,19 @@ def validate(task):
 
 class AgentDeployMixin(agent_base_vendor.AgentDeployMixin):
 
+    @METRICS.timer('AgentDeployMixin.has_decomposed_deploy_steps')
+    def has_decomposed_deploy_steps(self):
+        """Return whether the driver supports decomposed deploy steps.
+
+        Previously (since Rocky), drivers used a single 'deploy' deploy step on
+        the deploy interface. Some additional steps were added for the 'direct'
+        and 'iscsi' deploy interfaces in the Ussuri cycle, which means that
+        more of the deployment flow is driven by deploy steps.
+        """
+        return True
+
     @METRICS.timer('AgentDeployMixin.continue_deploy')
+    @base.deploy_step(priority=90)
     @task_manager.require_exclusive_lock
     def continue_deploy(self, task):
         """Method invoked when deployed using iSCSI.
@@ -347,15 +359,48 @@ class AgentDeployMixin(agent_base_vendor.AgentDeployMixin):
         :raises: InstanceDeployFailure, if it encounters some error during
             the deploy.
         """
-        task.process_event('resume')
         node = task.node
         LOG.debug('Continuing the deployment on node %s', node.uuid)
 
+        # FIXME(mgoddard): Do this better.
         uuid_dict_returned = do_agent_iscsi_deploy(task, self._client)
+        driver_internal_info = node.driver_internal_info
+        driver_internal_info['uuid_dict_returned'] = uuid_dict_returned
+        node.driver_internal_info = driver_internal_info
+        node.save()
+
+    def _reboot_to_instance_no_image(self, task):
+        # Boot to an Storage Volume
+
+        # TODO(TheJulia): At some point, we should de-dupe this code
+        # as it is nearly identical to the agent deploy interface.
+        # This is not being done now as it is expected to be
+        # refactored in the near future.
+        manager_utils.node_power_action(task, states.POWER_OFF)
+        power_state_to_restore = (
+            manager_utils.power_on_node_if_needed(task))
+        task.driver.network.remove_provisioning_network(task)
+        task.driver.network.configure_tenant_networks(task)
+        manager_utils.restore_power_state_if_needed(
+            task, power_state_to_restore)
+        task.driver.boot.prepare_instance(task)
+        manager_utils.node_power_action(task, states.POWER_ON)
+
+    @METRICS.timer('AgentDeployMixin.reboot_to_instance')
+    @base.deploy_step(priority=80)
+    def reboot_to_instance(self, task):
+        if not task.driver.storage.should_write_image(task):
+            self._reboot_to_instance_no_image(task)
+            return
+
+        # FIXME(mgoddard): do this better.
+        node = task.node
+        uuid_dict_returned = node.driver_internal_info['uuid_dict_returned']
         root_uuid = uuid_dict_returned.get('root uuid')
         efi_sys_uuid = uuid_dict_returned.get('efi system partition uuid')
         prep_boot_part_uuid = uuid_dict_returned.get(
             'PrEP Boot partition uuid')
+
         self.prepare_instance_to_boot(task, root_uuid, efi_sys_uuid,
                                       prep_boot_part_uuid=prep_boot_part_uuid)
         self.reboot_and_finish_deploy(task)
@@ -409,14 +454,12 @@ class ISCSIDeploy(AgentDeployMixin, base.DeployInterface):
         """
         node = task.node
         if manager_utils.is_fast_track(task):
+            # NOTE(mgoddard): For fast track we can mostly skip this step and
+            # proceed to continue_deploy.
             LOG.debug('Performing a fast track deployment for %(node)s.',
                       {'node': task.node.uuid})
             deploy_utils.cache_instance_image(task.context, node)
             check_image_size(task)
-            # Update the database for the API and the task tracking resumes
-            # the state machine state going from DEPLOYWAIT -> DEPLOYING
-            task.process_event('wait')
-            self.continue_deploy(task)
         elif task.driver.storage.should_write_image(task):
             # Standard deploy process
             deploy_utils.cache_instance_image(task.context, node)
@@ -432,24 +475,6 @@ class ISCSIDeploy(AgentDeployMixin, base.DeployInterface):
             task.node.save()
 
             return states.DEPLOYWAIT
-        else:
-            # Boot to an Storage Volume
-
-            # TODO(TheJulia): At some point, we should de-dupe this code
-            # as it is nearly identical to the agent deploy interface.
-            # This is not being done now as it is expected to be
-            # refactored in the near future.
-            manager_utils.node_power_action(task, states.POWER_OFF)
-            power_state_to_restore = (
-                manager_utils.power_on_node_if_needed(task))
-            task.driver.network.remove_provisioning_network(task)
-            task.driver.network.configure_tenant_networks(task)
-            manager_utils.restore_power_state_if_needed(
-                task, power_state_to_restore)
-            task.driver.boot.prepare_instance(task)
-            manager_utils.node_power_action(task, states.POWER_ON)
-
-            return None
 
     @METRICS.timer('ISCSIDeploy.tear_down')
     @task_manager.require_exclusive_lock

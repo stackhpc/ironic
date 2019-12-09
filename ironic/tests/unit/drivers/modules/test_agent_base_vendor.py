@@ -215,6 +215,47 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
             self.assertFalse(rti_mock.called)
             self.assertFalse(in_resume_deploy_mock.called)
 
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_deploy',
+                       autospec=True)
+    @mock.patch.object(agent_base_vendor.HeartbeatMixin,
+                       'has_decomposed_deploy_steps', autospec=True)
+    @mock.patch.object(agent_base_vendor.HeartbeatMixin,
+                       'in_core_deploy_step', autospec=True)
+    @mock.patch.object(agent_base_vendor.HeartbeatMixin,
+                       'deploy_has_started', autospec=True)
+    @mock.patch.object(agent_base_vendor.HeartbeatMixin,
+                       'deploy_is_done', autospec=True)
+    @mock.patch.object(agent_base_vendor.HeartbeatMixin, 'continue_deploy',
+                       autospec=True)
+    @mock.patch.object(agent_base_vendor.HeartbeatMixin,
+                       'reboot_to_instance', autospec=True)
+    def test_heartbeat_decomposed_steps(self, rti_mock, cd_mock,
+                                        deploy_is_done_mock,
+                                        deploy_started_mock,
+                                        in_deploy_mock,
+                                        has_decomposed_mock,
+                                        in_resume_deploy_mock):
+        # Check that heartbeats do not trigger deployment actions when the
+        # driver has decomposed deploy steps.
+        self.node.provision_state = states.DEPLOYWAIT
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            self.deploy.heartbeat(task, 'url', '3.2.0')
+            self.assertFalse(task.shared)
+            self.assertEqual(
+                'url', task.node.driver_internal_info['agent_url'])
+            self.assertEqual(
+                '3.2.0',
+                task.node.driver_internal_info['agent_version'])
+            self.assertTrue(has_decomposed_mock.called)
+            self.assertFalse(in_deploy_mock.called)
+            self.assertFalse(deploy_started_mock.called)
+            self.assertFalse(deploy_is_done_mock.called)
+            self.assertFalse(cd_mock.called)
+            self.assertFalse(rti_mock.called)
+            self.assertTrue(in_resume_deploy_mock.called)
+
     @mock.patch.object(agent_base_vendor.HeartbeatMixin, 'continue_deploy',
                        autospec=True)
     @mock.patch.object(agent_base_vendor.HeartbeatMixin,
@@ -774,8 +815,11 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
                        spec=types.FunctionType)
     @mock.patch.object(agent_client.AgentClient, 'power_off',
                        spec=types.FunctionType)
+    @mock.patch.object(agent_base_vendor.HeartbeatMixin,
+                       'has_decomposed_deploy_steps', autospec=True,
+                       return_value=True)
     def test_reboot_and_finish_deploy(
-            self, power_off_mock, get_power_state_mock,
+            self, decomposed_mock, power_off_mock, get_power_state_mock,
             node_power_action_mock, collect_mock, resume_mock,
             power_on_node_if_needed_mock):
         cfg.CONF.set_override('deploy_logs_collect', 'always', 'agent')
@@ -796,6 +840,42 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
             node_power_action_mock.assert_called_once_with(
                 task, states.POWER_ON)
             self.assertEqual(states.DEPLOYING, task.node.provision_state)
+            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
+            collect_mock.assert_called_once_with(task.node)
+            self.assertFalse(resume_mock.called)
+
+    @mock.patch.object(manager_utils, 'power_on_node_if_needed')
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_deploy',
+                       autospec=True)
+    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
+    @mock.patch.object(time, 'sleep', lambda seconds: None)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(fake.FakePower, 'get_power_state',
+                       spec=types.FunctionType)
+    @mock.patch.object(agent_client.AgentClient, 'power_off',
+                       spec=types.FunctionType)
+    def test_reboot_and_finish_deploy_not_decomposed(
+            self, power_off_mock, get_power_state_mock,
+            node_power_action_mock, collect_mock, resume_mock,
+            power_on_node_if_needed_mock):
+        cfg.CONF.set_override('deploy_logs_collect', 'always', 'agent')
+        self.node.provision_state = states.DEPLOYWAIT
+        self.node.target_provision_state = states.ACTIVE
+        self.node.deploy_step = {
+            'step': 'deploy', 'priority': 50, 'interface': 'deploy'}
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            get_power_state_mock.side_effect = [states.POWER_ON,
+                                                states.POWER_OFF]
+
+            power_on_node_if_needed_mock.return_value = None
+            self.deploy.reboot_and_finish_deploy(task)
+            power_off_mock.assert_called_once_with(task.node)
+            self.assertEqual(2, get_power_state_mock.call_count)
+            node_power_action_mock.assert_called_once_with(
+                task, states.POWER_ON)
+            self.assertEqual(states.DEPLOYWAIT, task.node.provision_state)
             self.assertEqual(states.ACTIVE, task.node.target_provision_state)
             collect_mock.assert_called_once_with(task.node)
             resume_mock.assert_called_once_with(task)
@@ -1870,8 +1950,11 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
                        spec=types.FunctionType)
     @mock.patch.object(agent_client.AgentClient, 'power_off',
                        spec=types.FunctionType)
+    @mock.patch.object(agent_base_vendor.HeartbeatMixin,
+                       'has_decomposed_deploy_steps', autospec=True,
+                       return_value=True)
     def test_reboot_and_finish_deploy_with_smartnic_port(
-            self, power_off_mock, get_power_state_mock,
+            self, decomposed_mock, power_off_mock, get_power_state_mock,
             node_power_action_mock, collect_mock, resume_mock,
             power_on_node_if_needed_mock, restore_power_state_mock):
         cfg.CONF.set_override('deploy_logs_collect', 'always', 'agent')
@@ -1893,7 +1976,7 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
             self.assertEqual(states.DEPLOYING, task.node.provision_state)
             self.assertEqual(states.ACTIVE, task.node.target_provision_state)
             collect_mock.assert_called_once_with(task.node)
-            resume_mock.assert_called_once_with(task)
+            self.assertFalse(resume_mock.called)
             power_on_node_if_needed_mock.assert_called_once_with(task)
             restore_power_state_mock.assert_called_once_with(
                 task, states.POWER_OFF)

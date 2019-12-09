@@ -421,6 +421,17 @@ class AnsibleDeploy(agent_base.HeartbeatMixin, base.DeployInterface):
         # TODO(pas-ha) validate that all playbooks and ssh key (if set)
         # are pointing to actual files
 
+    @METRICS.timer('AnsibleDeploy.has_decomposed_deploy_steps')
+    def has_decomposed_deploy_steps(self):
+        """Return whether the driver supports decomposed deploy steps.
+
+        Previously (since Rocky), drivers used a single 'deploy' deploy step on
+        the deploy interface. Some additional steps were added for the 'direct'
+        and 'iscsi' deploy interfaces in the Ussuri cycle, which means that
+        more of the deployment flow is driven by deploy steps.
+        """
+        return True
+
     def _ansible_deploy(self, task, node_address):
         """Internal function for deployment to a node."""
         node = task.node
@@ -593,18 +604,18 @@ class AnsibleDeploy(agent_base.HeartbeatMixin, base.DeployInterface):
             task, power_state_to_restore)
 
     @METRICS.timer('AnsibleDeploy.continue_deploy')
+    @base.deploy_step(priority=90)
     def continue_deploy(self, task):
         # NOTE(pas-ha) the lock should be already upgraded in heartbeat,
         # just setting its purpose for better logging
         task.upgrade_lock(purpose='deploy')
-        task.process_event('resume')
         # NOTE(pas-ha) this method is called from heartbeat processing only,
         # so we are sure we need this particular method, not the general one
         node_address = _get_node_ip(task)
         self._ansible_deploy(task, node_address)
-        self.reboot_to_instance(task)
 
     @METRICS.timer('AnsibleDeploy.reboot_to_instance')
+    @base.deploy_step(priority=80)
     def reboot_to_instance(self, task):
         node = task.node
         LOG.info('Ansible complete deploy on node %s', node.uuid)
@@ -620,8 +631,6 @@ class AnsibleDeploy(agent_base.HeartbeatMixin, base.DeployInterface):
             # After which we will always notify_conductor_resume_deploy().
             task.process_event('done')
             LOG.info('Deployment to node %s done', task.node.uuid)
-        else:
-            manager_utils.notify_conductor_resume_deploy(task)
 
     @METRICS.timer('AnsibleDeploy.reboot_and_finish_deploy')
     def reboot_and_finish_deploy(self, task):

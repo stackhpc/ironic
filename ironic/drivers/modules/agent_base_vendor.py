@@ -241,6 +241,16 @@ class HeartbeatMixin(object):
         :param task: a TaskManager instance
         """
 
+    def has_decomposed_deploy_steps(self):
+        """Return whether the driver supports decomposed deploy steps.
+
+        Previously (since Rocky), drivers used a single 'deploy' deploy step on
+        the deploy interface. Some additional steps were added for the 'direct'
+        and 'iscsi' deploy interfaces in the Ussuri cycle, which means that
+        more of the deployment flow is driven by deploy steps.
+        """
+        return False
+
     def deploy_has_started(self, task):
         """Check if the deployment has started already.
 
@@ -382,7 +392,11 @@ class HeartbeatMixin(object):
             # may cause the agent to boot, but we should not trigger deployment
             # at that point if the driver is polling for completion of a step.
             if node.provision_state == states.DEPLOYWAIT:
-                if self.in_core_deploy_step(task):
+                if (not self.has_decomposed_deploy_steps() and
+                        self.in_core_deploy_step(task)):
+                    # NOTE(mgoddard): support backwards compatibility for
+                    # drivers which do not implement continue_deploy and
+                    # reboot_to_instance as deploy steps.
                     if not self.deploy_has_started(task):
                         msg = _('Node failed to deploy.')
                         self.continue_deploy(task)
@@ -392,6 +406,7 @@ class HeartbeatMixin(object):
                     else:
                         node.touch_provisioning()
                 else:
+                    node.touch_provisioning()
                     # The exceptions from RPC are not possible as we using cast
                     # here
                     # Check if the driver is polling for completion of a step,
@@ -400,7 +415,6 @@ class HeartbeatMixin(object):
                         'deployment_polling', False)
                     if not polling:
                         manager_utils.notify_conductor_resume_deploy(task)
-                    node.touch_provisioning()
             elif node.provision_state == states.CLEANWAIT:
                 node.touch_provisioning()
                 if not node.clean_step:
@@ -759,7 +773,9 @@ class AgentDeployMixin(HeartbeatMixin):
             # After which we will always notify_conductor_resume_deploy().
             task.process_event('done')
             LOG.info('Deployment to node %s done', task.node.uuid)
-        else:
+        elif not self.has_decomposed_deploy_steps():
+            # NOTE(mgoddard): If this method is executed from the 'core' deploy
+            # step, resume the deployment.
             manager_utils.notify_conductor_resume_deploy(task)
 
     @METRICS.timer('AgentDeployMixin.prepare_instance_to_boot')

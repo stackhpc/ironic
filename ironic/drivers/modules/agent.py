@@ -168,6 +168,17 @@ def validate_http_provisioning_configuration(node):
 
 class AgentDeployMixin(agent_base_vendor.AgentDeployMixin):
 
+    @METRICS.timer('AgentDeployMixin.has_decomposed_deploy_steps')
+    def has_decomposed_deploy_steps(self):
+        """Return whether the driver supports decomposed deploy steps.
+
+        Previously (since Rocky), drivers used a single 'deploy' deploy step on
+        the deploy interface. Some additional steps were added for the 'direct'
+        and 'iscsi' deploy interfaces in the Ussuri cycle, which means that
+        more of the deployment flow is driven by deploy steps.
+        """
+        return True
+
     @METRICS.timer('AgentDeployMixin.deploy_has_started')
     def deploy_has_started(self, task):
         commands = self._client.get_commands_status(task.node)
@@ -178,28 +189,42 @@ class AgentDeployMixin(agent_base_vendor.AgentDeployMixin):
                 return True
         return False
 
+    # FIXME(mgoddard): backwards compatibility.
+    # TODO(mgoddard): Can we do this as an in-band deploy step, and poll using
+    # the normal method?
     @METRICS.timer('AgentDeployMixin.deploy_is_done')
+    @base.deploy_step(priority=89)
     def deploy_is_done(self, task):
+        if not task.driver.storage.should_write_image(task):
+            return
+
+        def _wait():
+            """Deploy not finished - wait until next heartbeat."""
+            deploy_utils.set_async_step_flags(task.node,
+                                              skip_current_step=False)
+            return states.DEPLOYWAIT
+
         commands = self._client.get_commands_status(task.node)
         if not commands:
-            return False
+            return _wait()
 
         last_command = commands[-1]
 
         if last_command['command_name'] != 'prepare_image':
             # catches race condition where prepare_image is still processing
             # so deploy hasn't started yet
-            return False
+            return _wait()
 
-        if last_command['command_status'] != 'RUNNING':
-            return True
+        if last_command['command_status'] == 'RUNNING':
+            return _wait()
 
-        return False
-
+    # FIXME(mgoddard): could this be an in-band deploy step?
     @METRICS.timer('AgentDeployMixin.continue_deploy')
+    @base.deploy_step(priority=90)
     @task_manager.require_exclusive_lock
     def continue_deploy(self, task):
-        task.process_event('resume')
+        if not task.driver.storage.should_write_image(task):
+            return
         node = task.node
         image_source = node.instance_info.get('image_source')
         LOG.debug('Continuing deploy for node %(node)s with image %(img)s',
@@ -253,8 +278,7 @@ class AgentDeployMixin(agent_base_vendor.AgentDeployMixin):
 
         # Tell the client to download and write the image with the given args
         self._client.prepare_image(node, image_info)
-
-        task.process_event('wait')
+        return states.DEPLOYWAIT
 
     def _get_uuid_from_result(self, task, type_uuid):
         command = self._client.get_commands_status(task.node)[-1]
@@ -285,9 +309,29 @@ class AgentDeployMixin(agent_base_vendor.AgentDeployMixin):
         if command['command_status'] == 'FAILED':
             return command['command_error']
 
+    def _reboot_to_instance_no_image(self, task):
+        # TODO(TheJulia): At some point, we should de-dupe this code
+        # as it is nearly identical to the iscsi deploy interface.
+        # This is not being done now as it is expected to be
+        # refactored in the near future.
+        manager_utils.node_power_action(task, states.POWER_OFF)
+        power_state_to_restore = (
+            manager_utils.power_on_node_if_needed(task))
+        task.driver.network.remove_provisioning_network(task)
+        task.driver.network.configure_tenant_networks(task)
+        manager_utils.restore_power_state_if_needed(
+            task, power_state_to_restore)
+        task.driver.boot.prepare_instance(task)
+        manager_utils.node_power_action(task, states.POWER_ON)
+        LOG.info('Deployment to node %s done', task.node.uuid)
+
     @METRICS.timer('AgentDeployMixin.reboot_to_instance')
+    @base.deploy_step(priority=80)
     def reboot_to_instance(self, task):
-        task.process_event('resume')
+        if not task.driver.storage.should_write_image(task):
+            self._reboot_to_instance_no_image(task)
+            return
+
         node = task.node
         iwdi = task.node.driver_internal_info.get('is_whole_disk_image')
         cpu_arch = task.node.properties.get('cpu_arch')
@@ -456,12 +500,10 @@ class AgentDeploy(AgentDeployMixin, base.DeployInterface):
         :returns: status of the deploy. One of ironic.common.states.
         """
         if manager_utils.is_fast_track(task):
+            # NOTE(mgoddard): For fast track we can skip this step and proceed
+            # immediately to continue_deploy.
             LOG.debug('Performing a fast track deployment for %(node)s.',
                       {'node': task.node.uuid})
-            # Update the database for the API and the task tracking resumes
-            # the state machine state going from DEPLOYWAIT -> DEPLOYING
-            task.process_event('wait')
-            self.continue_deploy(task)
         elif task.driver.storage.should_write_image(task):
             # Check if the driver has already performed a reboot in a previous
             # deploy step.
@@ -472,22 +514,6 @@ class AgentDeploy(AgentDeployMixin, base.DeployInterface):
             task.node.driver_internal_info = info
             task.node.save()
             return states.DEPLOYWAIT
-        else:
-            # TODO(TheJulia): At some point, we should de-dupe this code
-            # as it is nearly identical to the iscsi deploy interface.
-            # This is not being done now as it is expected to be
-            # refactored in the near future.
-            manager_utils.node_power_action(task, states.POWER_OFF)
-            power_state_to_restore = (
-                manager_utils.power_on_node_if_needed(task))
-            task.driver.network.remove_provisioning_network(task)
-            task.driver.network.configure_tenant_networks(task)
-            manager_utils.restore_power_state_if_needed(
-                task, power_state_to_restore)
-            task.driver.boot.prepare_instance(task)
-            manager_utils.node_power_action(task, states.POWER_ON)
-            LOG.info('Deployment to node %s done', task.node.uuid)
-            return None
 
     @METRICS.timer('AgentDeploy.tear_down')
     @task_manager.require_exclusive_lock

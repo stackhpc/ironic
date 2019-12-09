@@ -934,24 +934,23 @@ class TestAnsibleDeploy(AnsibleDeployTestCaseBase):
     @mock.patch.object(ansible_deploy, '_get_node_ip', autospec=True,
                        return_value='1.2.3.4')
     def test_continue_deploy(self, getip_mock):
-        self.node.provision_state = states.DEPLOYWAIT
+        self.node.provision_state = states.DEPLOYING
         self.node.target_provision_state = states.ACTIVE
         self.node.save()
         with task_manager.acquire(self.context, self.node.uuid) as task:
             with mock.patch.multiple(self.driver, autospec=True,
                                      _ansible_deploy=mock.DEFAULT,
                                      reboot_to_instance=mock.DEFAULT):
-                self.driver.continue_deploy(task)
+                result = self.driver.continue_deploy(task)
+                self.assertIsNone(result)
                 getip_mock.assert_called_once_with(task)
                 self.driver._ansible_deploy.assert_called_once_with(
                     task, '1.2.3.4')
-                self.driver.reboot_to_instance.assert_called_once_with(task)
             self.assertEqual(states.ACTIVE, task.node.target_provision_state)
             self.assertEqual(states.DEPLOYING, task.node.provision_state)
 
-    @mock.patch.object(utils, 'notify_conductor_resume_deploy', autospec=True)
     @mock.patch.object(utils, 'node_set_boot_device', autospec=True)
-    def test_reboot_to_instance(self, bootdev_mock, resume_mock):
+    def test_reboot_to_instance(self, bootdev_mock):
         self.node.provision_state = states.DEPLOYING
         self.node.deploy_step = {
             'step': 'deploy', 'priority': 100, 'interface': 'deploy'}
@@ -960,18 +959,17 @@ class TestAnsibleDeploy(AnsibleDeployTestCaseBase):
             with mock.patch.object(self.driver, 'reboot_and_finish_deploy',
                                    autospec=True):
                 task.driver.boot = mock.Mock()
-                self.driver.reboot_to_instance(task)
+                result = self.driver.reboot_to_instance(task)
+                self.assertIsNone(result)
                 bootdev_mock.assert_called_once_with(task, 'disk',
                                                      persistent=True)
-                resume_mock.assert_called_once_with(task)
                 self.driver.reboot_and_finish_deploy.assert_called_once_with(
                     task)
                 task.driver.boot.clean_up_ramdisk.assert_called_once_with(
                     task)
 
-    @mock.patch.object(utils, 'notify_conductor_resume_deploy', autospec=True)
     @mock.patch.object(utils, 'node_set_boot_device', autospec=True)
-    def test_reboot_to_instance_deprecated(self, bootdev_mock, resume_mock):
+    def test_reboot_to_instance_deprecated(self, bootdev_mock):
         # TODO(rloo): no deploy steps; delete this when we remove support
         # for handling no deploy steps.
         self.node.provision_state = states.DEPLOYING
@@ -985,7 +983,6 @@ class TestAnsibleDeploy(AnsibleDeployTestCaseBase):
                 self.driver.reboot_to_instance(task)
                 bootdev_mock.assert_called_once_with(task, 'disk',
                                                      persistent=True)
-                self.assertFalse(resume_mock.called)
                 task.process_event.assert_called_once_with('done')
                 self.driver.reboot_and_finish_deploy.assert_called_once_with(
                     task)
