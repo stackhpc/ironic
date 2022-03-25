@@ -22,12 +22,12 @@ from ironic.drivers.modules import agent
 from ironic.drivers.modules import fake
 from ironic.drivers.modules import inspector
 from ironic.drivers.modules import ipxe
-from ironic.drivers.modules import noop
-from ironic.drivers.modules import noop_mgmt
-from ironic.drivers.modules import pxe
 from ironic.drivers.modules.network import flat as flat_net
 from ironic.drivers.modules.network import neutron
 from ironic.drivers.modules.network import noop as noop_net
+from ironic.drivers.modules import noop
+from ironic.drivers.modules import noop_mgmt
+from ironic.drivers.modules import pxe
 from ironic.drivers.modules.redfish import bios as redfish_bios
 from ironic.drivers.modules.redfish import boot as redfish_boot
 from ironic.drivers.modules.redfish import inspect as redfish_inspect
@@ -81,7 +81,7 @@ class RedfishHardware(generic.GenericHardware):
 
 
 class RedfishNetworkAppliance(hardware_type.AbstractHardwareType):
-    """Redfish appliance moved between networks and rebooted using OpenStack."""
+    """Redfish appliance moved between networks and rebooted using Ironic."""
 
     @property
     def supported_power_interfaces(self):
@@ -90,7 +90,7 @@ class RedfishNetworkAppliance(hardware_type.AbstractHardwareType):
     @property
     def supported_inspect_interfaces(self):
         """List of supported power interfaces."""
-        # TODO: maybe we only want the port detection?
+        # TODO(johng): maybe we only want the port detection?
         return [redfish_inspect.RedfishInspect, noop.NoInspect]
 
     @property
@@ -122,10 +122,6 @@ class NetworkOnlyDeploy(fake.FakeDeploy):
     letting DHCP do the heavy lifting.
     """
 
-    def validate(self, task):
-        # TODO: probably need to check we have some baremetal ports!
-        pass
-
     @base.deploy_step(priority=100)
     def deploy(self, task):
         task.driver.network.configure_tenant_networks(task)
@@ -133,6 +129,6 @@ class NetworkOnlyDeploy(fake.FakeDeploy):
 
     def tear_down(self, task):
         task.driver.network.unconfigure_tenant_networks(task)
-        # TODO: should we power it off?
+        # TODO(johng): should we power it off?
         task.driver.power.reboot(task)
         return states.DELETED
