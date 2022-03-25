@@ -14,12 +14,20 @@
 #    under the License.
 
 from ironic.drivers import generic
+from ironic.common import states
+from ironic.drivers import base
+from ironic.drivers import generic
+from ironic.drivers import hardware_type
 from ironic.drivers.modules import agent
+from ironic.drivers.modules import fake
 from ironic.drivers.modules import inspector
 from ironic.drivers.modules import ipxe
 from ironic.drivers.modules import noop
 from ironic.drivers.modules import noop_mgmt
 from ironic.drivers.modules import pxe
+from ironic.drivers.modules.network import flat as flat_net
+from ironic.drivers.modules.network import neutron
+from ironic.drivers.modules.network import noop as noop_net
 from ironic.drivers.modules.redfish import bios as redfish_bios
 from ironic.drivers.modules.redfish import boot as redfish_boot
 from ironic.drivers.modules.redfish import inspect as redfish_inspect
@@ -70,3 +78,61 @@ class RedfishHardware(generic.GenericHardware):
     def supported_raid_interfaces(self):
         """List of supported raid interfaces."""
         return [redfish_raid.RedfishRAID, noop.NoRAID, agent.AgentRAID]
+
+
+class RedfishNetworkAppliance(hardware_type.AbstractHardwareType):
+    """Redfish appliance moved between networks and rebooted using OpenStack."""
+
+    @property
+    def supported_power_interfaces(self):
+        [redfish_power.RedfishPower, fake.FakePower]
+
+    @property
+    def supported_inspect_interfaces(self):
+        """List of supported power interfaces."""
+        # TODO: maybe we only want the port detection?
+        return [redfish_inspect.RedfishInspect, noop.NoInspect]
+
+    @property
+    def supported_network_interfaces(self):
+        """List of supported network interfaces."""
+        return [neutron.NeutronNetwork, flat_net.FlatNetwork,
+                noop_net.NoopNetwork]
+
+    @property
+    def supported_boot_interfaces(self):
+        """List of classes of supported boot interfaces."""
+        return [fake.FakeBoot]
+
+    @property
+    def supported_deploy_interfaces(self):
+        """List of supported deploy interfaces."""
+        return [NetworkOnlyDeploy]
+
+    @property
+    def supported_management_interfaces(self):
+        return [noop_mgmt.NoopManagement]
+
+
+class NetworkOnlyDeploy(fake.FakeDeploy):
+    """Class for only doing the network part of a typical deployment.
+
+    This does only the network setup,
+    then (optionally?) reboots the appliance via redfish,
+    letting DHCP do the heavy lifting.
+    """
+
+    def validate(self, task):
+        # TODO: probably need to check we have some baremetal ports!
+        pass
+
+    @base.deploy_step(priority=100)
+    def deploy(self, task):
+        task.driver.network.configure_tenant_networks(task)
+        task.driver.power.reboot(task)
+
+    def tear_down(self, task):
+        task.driver.network.unconfigure_tenant_networks(task)
+        # TODO: should we power it off?
+        task.driver.power.reboot(task)
+        return states.DELETED
