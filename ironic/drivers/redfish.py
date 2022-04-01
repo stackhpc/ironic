@@ -35,6 +35,7 @@ from ironic.drivers.modules.redfish import management as redfish_mgmt
 from ironic.drivers.modules.redfish import power as redfish_power
 from ironic.drivers.modules.redfish import raid as redfish_raid
 from ironic.drivers.modules.redfish import vendor as redfish_vendor
+from ironic.drivers.modules.storage import noop as noop_storage
 
 
 class RedfishHardware(generic.GenericHardware):
@@ -112,6 +113,18 @@ class RedfishNetworkAppliance(hardware_type.AbstractHardwareType):
     @property
     def supported_management_interfaces(self):
         return [noop_mgmt.NoopManagement]
+
+    @property
+    def supported_raid_interfaces(self):
+        return [noop.NoRAID]
+
+    @property
+    def supported_rescue_interfaces(self):
+        return [noop.NoRescue]
+
+    @property
+    def supported_storage_interfaces(self):
+        return [noop_storage.NoopStorage]
 
 
 class NetworkOnlyDeploy(fake.FakeDeploy):
