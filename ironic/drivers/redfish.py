@@ -86,7 +86,7 @@ class RedfishNetworkAppliance(hardware_type.AbstractHardwareType):
 
     @property
     def supported_power_interfaces(self):
-        [redfish_power.RedfishPower, fake.FakePower]
+        return [redfish_power.RedfishPower, fake.FakePower]
 
     @property
     def supported_inspect_interfaces(self):
