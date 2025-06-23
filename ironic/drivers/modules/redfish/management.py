@@ -129,7 +129,36 @@ def _set_boot_device(task, system, device, persistent=False,
     # Supermicro BMCs handle it in the opposite manner - the
     # persistent setting must be set when setting the boot device
     # (see https://storyboard.openstack.org/#!/story/2008547).
+    #
+    # Some BMCs (e.g. MegaRAC & Gigabyte) require that the
+    # BootSourceOverrideTarget, BootSourceOverrideMode, and 
+    # BootSourceOverrideEnabled properties all be set in the
+    # same request.
+
     vendor = task.node.properties.get('vendor', None)
+
+    if vendor and vendor.lower() in ['redfish_compatible', 'megarac','megarac-spx']:
+        enabled = BOOT_DEVICE_PERSISTENT_MAP_REV[persistent]
+        mode = sushy.BOOT_SOURCE_MODE_UEFI
+        LOG.debug('Setting BootSourceOverrideTarget to %(target)s, '
+                  'BootSourceOverrideMode to %(mode)s, '
+                  'BootSourceOverrideEnabled to %(enable)s, '
+                  'on RedFish compatible BMC, node %(node)s',
+                  {'target': device, 'mode': mode, 'enable': enabled,
+                   'node': task.node.uuid})
+        try:
+            system.set_system_boot_options(
+                device, enabled=enabled,
+                boot_source_mode=mode,
+                http_boot_uri=http_boot_url
+            )
+        except sushy.exceptions.SushyError as e:
+            LOG.error('Failed to set boot options for the RedFish compatible BMC on '
+                      ' node %(node)s: %(error)s',
+                      {'node': task.node.uuid, 'error': e})
+            raise
+        return
+
     if vendor and vendor.lower() == 'supermicro':
         enabled = BOOT_DEVICE_PERSISTENT_MAP_REV[persistent]
         LOG.debug('Setting BootSourceOverrideEnable to %(enable)s '
