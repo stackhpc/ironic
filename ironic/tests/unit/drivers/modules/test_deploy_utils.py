@@ -24,6 +24,7 @@ from oslo_utils import fileutils
 from oslo_utils import uuidutils
 
 from ironic.common import boot_devices
+from ironic.common import checksum_utils
 from ironic.common import exception
 from ironic.common import faults
 from ironic.common import image_service
@@ -604,9 +605,33 @@ class OtherFunctionTestCase(db_base.DbTestCase):
         utils.fetch_images(None, mock_cache, [('uuid', 'path')])
         mock_clean_up_caches.assert_called_once_with(None, 'master_dir',
                                                      [('uuid', 'path')])
-        mock_cache.fetch_image.assert_called_once_with('uuid', 'path',
-                                                       ctx=None,
-                                                       force_raw=True)
+        mock_cache.fetch_image.assert_called_once_with(
+            'uuid', 'path',
+            ctx=None,
+            force_raw=True,
+            expected_format=None,
+            expected_checksum=None,
+            expected_checksum_algo=None)
+
+    @mock.patch.object(image_cache, 'clean_up_caches', autospec=True)
+    def test_fetch_images_checksum(self, mock_clean_up_caches):
+
+        mock_cache = mock.MagicMock(
+            spec_set=['fetch_image', 'master_dir'], master_dir='master_dir')
+        utils.fetch_images(None, mock_cache, [('uuid', 'path')],
+                           force_raw=True,
+                           expected_format='qcow2',
+                           expected_checksum='f00',
+                           expected_checksum_algo='sha256')
+        mock_clean_up_caches.assert_called_once_with(None, 'master_dir',
+                                                     [('uuid', 'path')])
+        mock_cache.fetch_image.assert_called_once_with(
+            'uuid', 'path',
+            ctx=None,
+            force_raw=True,
+            expected_format='qcow2',
+            expected_checksum='f00',
+            expected_checksum_algo='sha256')
 
     @mock.patch.object(image_cache, 'clean_up_caches', autospec=True)
     def test_fetch_images_fail(self, mock_clean_up_caches):
@@ -987,6 +1012,35 @@ class AgentMethodsTestCase(db_base.DbTestCase):
             build_options_mock.assert_called_once_with(task.node)
             self.assertFalse(power_on_if_needed_mock.called)
 
+    @mock.patch.object(pxe.PXEBoot, 'clean_up_instance', autospec=True)
+    @mock.patch.object(pxe.PXEBoot, 'prepare_ramdisk', autospec=True)
+    @mock.patch('ironic.conductor.utils.node_power_action', autospec=True)
+    @mock.patch.object(utils, 'build_agent_options', autospec=True)
+    @mock.patch('ironic.drivers.modules.network.flat.FlatNetwork.'
+                'add_servicing_network', autospec=True)
+    def _test_prepare_inband_service(
+            self, add_service_network_mock,
+            build_options_mock, power_mock, prepare_ramdisk_mock,
+            clean_up_instance_mock,
+            manage_boot=True):
+        build_options_mock.return_value = {'a': 'b'}
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            result = utils.prepare_inband_service(task)
+            add_service_network_mock.assert_called_once_with(
+                task.driver.network, task)
+            self.assertEqual(states.SERVICEWAIT, result)
+            power_mock.assert_has_calls([
+                mock.call(task, states.POWER_OFF),
+                mock.call(task, states.POWER_ON)])
+            prepare_ramdisk_mock.assert_called_once_with(
+                mock.ANY, mock.ANY, {'a': 'b'})
+            build_options_mock.assert_called_once_with(task.node)
+            clean_up_instance_mock.assert_called_once_with(mock.ANY, task)
+
+    def test_prepare_inband_service(self):
+        self._test_prepare_inband_service()
+
     @mock.patch('ironic.conductor.utils.is_fast_track', autospec=True)
     @mock.patch.object(pxe.PXEBoot, 'clean_up_ramdisk', autospec=True)
     @mock.patch('ironic.drivers.modules.network.flat.FlatNetwork.'
@@ -1025,6 +1079,49 @@ class AgentMethodsTestCase(db_base.DbTestCase):
 
     def test_tear_down_inband_cleaning_cleaning_error(self):
         self._test_tear_down_inband_cleaning(cleaning_error=True)
+
+    @mock.patch.object(pxe.PXEBoot, 'prepare_instance', autospec=True)
+    @mock.patch.object(pxe.PXEBoot, 'clean_up_ramdisk', autospec=True)
+    @mock.patch('ironic.drivers.modules.network.flat.FlatNetwork.'
+                'remove_servicing_network', autospec=True)
+    @mock.patch('ironic.conductor.utils.node_power_action', autospec=True)
+    def test_tear_down_inband_service(
+            self, power_mock, remove_service_network_mock,
+            clean_up_ramdisk_mock, prepare_instance_mock):
+        # NOTE(TheJulia): This should be back to servicing upon a heartbeat
+        # operation, before we go back to WAIT. We wouldn't know to teardown
+        # in a wait state anyway.
+        self.node.provision_state = states.SERVICING
+        self.node.save()
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            utils.tear_down_inband_service(task)
+            power_mock.assert_has_calls([
+                mock.call(task, states.POWER_OFF),
+                mock.call(task, states.POWER_ON),
+            ])
+            remove_service_network_mock.assert_called_once_with(
+                task.driver.network, task)
+            clean_up_ramdisk_mock.assert_called_once_with(
+                task.driver.boot, task)
+            prepare_instance_mock.assert_called_once_with(task.driver.boot,
+                                                          task)
+
+    @mock.patch.object(pxe.PXEBoot, 'clean_up_ramdisk', autospec=True)
+    @mock.patch('ironic.drivers.modules.network.flat.FlatNetwork.'
+                'remove_servicing_network', autospec=True)
+    @mock.patch('ironic.conductor.utils.node_power_action', autospec=True)
+    def test_tear_down_inband_service_service_error(
+            self, power_mock, remove_service_network_mock,
+            clean_up_ramdisk_mock):
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            task.node.fault = faults.SERVICE_FAILURE
+            utils.tear_down_inband_service(task)
+            self.assertFalse(power_mock.called)
+            remove_service_network_mock.assert_not_called()
+            clean_up_ramdisk_mock.assert_called_once_with(
+                task.driver.boot, task)
 
     def test_build_agent_options_conf(self):
         self.config(endpoint_override='https://api-url',
@@ -1614,13 +1711,18 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
                                                deploy_interface='direct')
         cfg.CONF.set_override('image_download_source', 'swift', group='agent')
 
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
     @mock.patch.object(image_service.HttpImageService, 'validate_href',
                        autospec=True)
     @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
     def test_build_instance_info_for_deploy_glance_image(self, glance_mock,
-                                                         validate_mock):
+                                                         validate_mock,
+                                                         mock_cache_image):
+        # NOTE(TheJulia): For humans later: This test is geared towards the
+        # swift backed glance path where temprul will be used.
         i_info = self.node.instance_info
         i_info['image_source'] = '733d1c44-a2ea-414b-aca7-69decf20d810'
+        i_info['image_url'] = 'invalid'
         driver_internal_info = self.node.driver_internal_info
         driver_internal_info['is_whole_disk_image'] = True
         self.node.driver_internal_info = driver_internal_info
@@ -1634,10 +1736,26 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
                                                        return_value=image_info)
         glance_mock.return_value.swift_temp_url.return_value = (
             'http://temp-url')
+        expected_info = {
+            'configdrive': 'TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQ=',
+            'foo': 'bar',
+            'image_checksum': 'aa',
+            'image_container_format': 'bare',
+            'image_disk_format': 'qcow2',
+            'image_os_hash_algo': 'sha512',
+            'image_os_hash_value': 'fake-sha512',
+            'image_properties': {},
+            'image_source': '733d1c44-a2ea-414b-aca7-69decf20d810',
+            'image_tags': [],
+            'image_type': 'whole-disk',
+            'image_url': 'http://temp-url'
+        }
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
+
         with task_manager.acquire(
                 self.context, self.node.uuid, shared=False) as task:
 
-            utils.build_instance_info_for_deploy(task)
+            info = utils.build_instance_info_for_deploy(task)
 
             glance_mock.assert_called_once_with(context=task.context)
             glance_mock.return_value.show.assert_called_once_with(
@@ -1646,13 +1764,77 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
                 image_info)
             validate_mock.assert_called_once_with(mock.ANY, 'http://temp-url',
                                                   secret=True)
+            self.assertEqual(expected_info, info)
+            mock_cache_image.assert_not_called()
 
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
+    def test_build_instance_info_for_deploy_glance_image_checked(
+            self, glance_mock, validate_mock, mock_cache_image):
+        # NOTE(TheJulia): For humans later: This test is geared towards the
+        # swift backed glance path where temprul will be used.
+        cfg.CONF.set_override('conductor_always_validates_images', True,
+                              group='conductor')
+        i_info = self.node.instance_info
+        i_info['image_source'] = '733d1c44-a2ea-414b-aca7-69decf20d810'
+        i_info['image_url'] = 'invalid'
+        driver_internal_info = self.node.driver_internal_info
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.driver_internal_info = driver_internal_info
+        self.node.instance_info = i_info
+        self.node.save()
+
+        image_info = {'checksum': 'aa', 'disk_format': 'qcow2',
+                      'os_hash_algo': 'sha512', 'os_hash_value': 'fake-sha512',
+                      'container_format': 'bare', 'properties': {}}
+        glance_mock.return_value.show = mock.MagicMock(spec_set=[],
+                                                       return_value=image_info)
+        glance_mock.return_value.swift_temp_url.return_value = (
+            'http://temp-url')
+        expected_info = {
+            'configdrive': 'TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQ=',
+            'foo': 'bar',
+            'image_checksum': 'aa',
+            'image_container_format': 'bare',
+            'image_disk_format': 'qcow2',
+            'image_os_hash_algo': 'sha512',
+            'image_os_hash_value': 'fake-sha512',
+            'image_properties': {},
+            'image_source': '733d1c44-a2ea-414b-aca7-69decf20d810',
+            'image_tags': [],
+            'image_type': 'whole-disk',
+            'image_url': 'http://temp-url'
+        }
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+
+            glance_mock.assert_called_once_with(context=task.context)
+            glance_mock.return_value.show.assert_called_once_with(
+                self.node.instance_info['image_source'])
+            glance_mock.return_value.swift_temp_url.assert_called_once_with(
+                image_info)
+            validate_mock.assert_called_once_with(mock.ANY, 'http://temp-url',
+                                                  secret=True)
+            self.assertEqual(expected_info, info)
+            mock_cache_image.assert_called_once_with(
+                mock.ANY, mock.ANY, force_raw=False, expected_format='qcow2')
+
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
     @mock.patch.object(image_service.HttpImageService, 'validate_href',
                        autospec=True)
     @mock.patch.object(utils, 'parse_instance_info', autospec=True)
     @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
     def test_build_instance_info_for_deploy_glance_partition_image(
-            self, glance_mock, parse_instance_info_mock, validate_mock):
+            self, glance_mock, parse_instance_info_mock, validate_mock,
+            mock_cache_image):
+        # NOTE(TheJulia): For humans later: This test is geared towards the
+        # swift backed glance path where temprul will be used.
         i_info = {}
         i_info['image_source'] = '733d1c44-a2ea-414b-aca7-69decf20d810'
         i_info['image_type'] = 'partition'
@@ -1661,6 +1843,7 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
         i_info['ephemeral_gb'] = 0
         i_info['ephemeral_format'] = None
         i_info['configdrive'] = 'configdrive'
+        i_info['image_url'] = 'invalid'
         driver_internal_info = self.node.driver_internal_info
         driver_internal_info['is_whole_disk_image'] = False
         self.node.driver_internal_info = driver_internal_info
@@ -1694,6 +1877,8 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
                            'image_os_hash_value': 'fake-sha512',
                            'image_container_format': 'bare',
                            'image_disk_format': 'qcow2'}
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
+
         with task_manager.acquire(
                 self.context, self.node.uuid, shared=False) as task:
 
@@ -1710,16 +1895,93 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
             self.assertEqual('partition', image_type)
             self.assertEqual(expected_i_info, info)
             parse_instance_info_mock.assert_called_once_with(task.node)
+            mock_cache_image.assert_not_called()
 
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    @mock.patch.object(utils, 'parse_instance_info', autospec=True)
+    @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
+    def test_build_instance_info_for_deploy_glance_partition_image_checked(
+            self, glance_mock, parse_instance_info_mock, validate_mock,
+            mock_cache_image):
+        # NOTE(TheJulia): For humans later: This test is geared towards the
+        # swift backed glance path where temprul will be used.
+        cfg.CONF.set_override('conductor_always_validates_images', True,
+                              group='conductor')
+        i_info = {}
+        i_info['image_source'] = '733d1c44-a2ea-414b-aca7-69decf20d810'
+        i_info['image_type'] = 'partition'
+        i_info['root_gb'] = 5
+        i_info['swap_mb'] = 4
+        i_info['ephemeral_gb'] = 0
+        i_info['ephemeral_format'] = None
+        i_info['configdrive'] = 'configdrive'
+        i_info['image_url'] = 'invalid'
+        driver_internal_info = self.node.driver_internal_info
+        driver_internal_info['is_whole_disk_image'] = False
+        self.node.driver_internal_info = driver_internal_info
+        self.node.instance_info = i_info
+        self.node.save()
+
+        image_info = {'checksum': 'aa', 'disk_format': 'qcow2',
+                      'os_hash_algo': 'sha512', 'os_hash_value': 'fake-sha512',
+                      'container_format': 'bare',
+                      'properties': {'kernel_id': 'kernel',
+                                     'ramdisk_id': 'ramdisk'}}
+        glance_mock.return_value.show = mock.MagicMock(spec_set=[],
+                                                       return_value=image_info)
+        glance_obj_mock = glance_mock.return_value
+        glance_obj_mock.swift_temp_url.return_value = 'http://temp-url'
+        parse_instance_info_mock.return_value = {'swap_mb': 4}
+        image_source = '733d1c44-a2ea-414b-aca7-69decf20d810'
+        expected_i_info = {'root_gb': 5,
+                           'swap_mb': 4,
+                           'ephemeral_gb': 0,
+                           'ephemeral_format': None,
+                           'configdrive': 'configdrive',
+                           'image_source': image_source,
+                           'image_url': 'http://temp-url',
+                           'image_type': 'partition',
+                           'image_tags': [],
+                           'image_properties': {'kernel_id': 'kernel',
+                                                'ramdisk_id': 'ramdisk'},
+                           'image_checksum': 'aa',
+                           'image_os_hash_algo': 'sha512',
+                           'image_os_hash_value': 'fake-sha512',
+                           'image_container_format': 'bare',
+                           'image_disk_format': 'qcow2'}
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+
+            glance_mock.assert_called_once_with(context=task.context)
+            glance_mock.return_value.show.assert_called_once_with(
+                self.node.instance_info['image_source'])
+            glance_mock.return_value.swift_temp_url.assert_called_once_with(
+                image_info)
+            validate_mock.assert_called_once_with(
+                mock.ANY, 'http://temp-url', secret=True)
+            image_type = task.node.instance_info['image_type']
+            self.assertEqual('partition', image_type)
+            self.assertEqual(expected_i_info, info)
+            parse_instance_info_mock.assert_called_once_with(task.node)
+            mock_cache_image.assert_called_once_with(
+                mock.ANY, mock.ANY, force_raw=False, expected_format='qcow2')
+
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
     @mock.patch.object(utils, 'get_boot_option', autospec=True,
                        return_value='kickstart')
     @mock.patch.object(image_service.HttpImageService, 'validate_href',
                        autospec=True)
     @mock.patch.object(utils, 'parse_instance_info', autospec=True)
     @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
-    def test_build_instance_info_for_deploy_glance_partition_image_anaconda(
+    def test_build_instance_info_for_deploy_glance_anaconda(
             self, glance_mock, parse_instance_info_mock, validate_mock,
-            boot_opt_mock):
+            boot_opt_mock, mock_cache_image):
         i_info = {}
         i_info['image_source'] = '733d1c44-a2ea-414b-aca7-69decf20d810'
         i_info['kernel'] = '13ce5a56-1de3-4916-b8b2-be778645d003'
@@ -1764,6 +2026,7 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
                            'image_os_hash_value': 'fake-sha512',
                            'image_container_format': 'bare',
                            'image_disk_format': 'qcow2'}
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
         with task_manager.acquire(
                 self.context, self.node.uuid, shared=False) as task:
 
@@ -1782,22 +2045,104 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
             self.assertEqual('ramdisk', info['ramdisk'])
             self.assertEqual(expected_i_info, info)
             parse_instance_info_mock.assert_called_once_with(task.node)
+            mock_cache_image.assert_not_called()
 
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
+    @mock.patch.object(utils, 'get_boot_option', autospec=True,
+                       return_value='kickstart')
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    @mock.patch.object(utils, 'parse_instance_info', autospec=True)
+    @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
+    def test_build_instance_info_for_deploy_glance_anaconda_img_checked(
+            self, glance_mock, parse_instance_info_mock, validate_mock,
+            boot_opt_mock, mock_cache_image):
+        cfg.CONF.set_override('conductor_always_validates_images', True,
+                              group='conductor')
+        i_info = {}
+        i_info['image_source'] = '733d1c44-a2ea-414b-aca7-69decf20d810'
+        i_info['kernel'] = '13ce5a56-1de3-4916-b8b2-be778645d003'
+        i_info['ramdisk'] = 'a5a370a8-1b39-433f-be63-2c7d708e4b4e'
+        i_info['root_gb'] = 5
+        i_info['swap_mb'] = 4
+        i_info['ephemeral_gb'] = 0
+        i_info['ephemeral_format'] = None
+        i_info['configdrive'] = 'configdrive'
+        driver_internal_info = self.node.driver_internal_info
+        driver_internal_info['is_whole_disk_image'] = False
+        self.node.driver_internal_info = driver_internal_info
+        self.node.instance_info = i_info
+        self.node.save()
+
+        image_info = {'checksum': 'aa', 'disk_format': 'qcow2',
+                      'os_hash_algo': 'sha512', 'os_hash_value': 'fake-sha512',
+                      'container_format': 'bare',
+                      'properties': {'kernel_id': 'kernel',
+                                     'ramdisk_id': 'ramdisk'}}
+        glance_mock.return_value.show = mock.MagicMock(spec_set=[],
+                                                       return_value=image_info)
+        glance_obj_mock = glance_mock.return_value
+        glance_obj_mock.swift_temp_url.return_value = 'http://temp-url'
+        parse_instance_info_mock.return_value = {'swap_mb': 4}
+        image_source = '733d1c44-a2ea-414b-aca7-69decf20d810'
+        expected_i_info = {'root_gb': 5,
+                           'swap_mb': 4,
+                           'ephemeral_gb': 0,
+                           'ephemeral_format': None,
+                           'configdrive': 'configdrive',
+                           'image_source': image_source,
+                           'image_url': 'http://temp-url',
+                           'kernel': 'kernel',
+                           'ramdisk': 'ramdisk',
+                           'image_type': 'partition',
+                           'image_tags': [],
+                           'image_properties': {'kernel_id': 'kernel',
+                                                'ramdisk_id': 'ramdisk'},
+                           'image_checksum': 'aa',
+                           'image_os_hash_algo': 'sha512',
+                           'image_os_hash_value': 'fake-sha512',
+                           'image_container_format': 'bare',
+                           'image_disk_format': 'qcow2'}
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+
+            glance_mock.assert_called_once_with(context=task.context)
+            glance_mock.return_value.show.assert_called_once_with(
+                self.node.instance_info['image_source'])
+            glance_mock.return_value.swift_temp_url.assert_called_once_with(
+                image_info)
+            validate_mock.assert_called_once_with(
+                mock.ANY, 'http://temp-url', secret=True)
+            image_type = task.node.instance_info['image_type']
+            self.assertEqual('partition', image_type)
+            self.assertEqual('kernel', info['kernel'])
+            self.assertEqual('ramdisk', info['ramdisk'])
+            self.assertEqual(expected_i_info, info)
+            parse_instance_info_mock.assert_called_once_with(task.node)
+            mock_cache_image.assert_called_once_with(
+                mock.ANY, mock.ANY, force_raw=False, expected_format='qcow2')
+
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
     @mock.patch.object(image_service.HttpImageService, 'validate_href',
                        autospec=True)
     def test_build_instance_info_for_deploy_nonglance_image(
-            self, validate_href_mock):
+            self, validate_href_mock, mock_cache_image):
         i_info = self.node.instance_info
         driver_internal_info = self.node.driver_internal_info
         i_info['image_source'] = 'http://image-ref'
         i_info['image_checksum'] = 'aa'
         i_info['root_gb'] = 10
         i_info['image_checksum'] = 'aa'
+        i_info['image_url'] = 'prior_failed_url'
         driver_internal_info['is_whole_disk_image'] = True
         self.node.instance_info = i_info
         self.node.driver_internal_info = driver_internal_info
         self.node.save()
 
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
         with task_manager.acquire(
                 self.context, self.node.uuid, shared=False) as task:
 
@@ -1807,12 +2152,82 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
                              info['image_url'])
             validate_href_mock.assert_called_once_with(
                 mock.ANY, 'http://image-ref', False)
+            mock_cache_image.assert_not_called()
 
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    def test_build_instance_info_for_deploy_nonglance_image_fmt_checked(
+            self, validate_href_mock, mock_cache_image):
+        cfg.CONF.set_override('conductor_always_validates_images', True,
+                              group='conductor')
+        i_info = self.node.instance_info
+        driver_internal_info = self.node.driver_internal_info
+        i_info['image_source'] = 'http://image-ref'
+        i_info['image_checksum'] = 'aa'
+        i_info['root_gb'] = 10
+        i_info['image_checksum'] = 'aa'
+        i_info['image_url'] = 'prior_failed_url'
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.instance_info = i_info
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+
+            self.assertEqual(self.node.instance_info['image_source'],
+                             info['image_url'])
+            validate_href_mock.assert_called_once_with(
+                mock.ANY, 'http://image-ref', False)
+            mock_cache_image.assert_called_once_with(
+                mock.ANY, mock.ANY, force_raw=False, expected_format=None)
+
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    def test_build_instance_info_for_deploy_nonglance_image_fmt_not_checked(
+            self, validate_href_mock, mock_cache_image):
+        cfg.CONF.set_override('conductor_always_validates_images', True,
+                              group='conductor')
+        cfg.CONF.set_override('disable_deep_image_inspection', True,
+                              group='conductor')
+        i_info = self.node.instance_info
+        driver_internal_info = self.node.driver_internal_info
+        i_info['image_source'] = 'http://image-ref'
+        i_info['image_checksum'] = 'aa'
+        i_info['root_gb'] = 10
+        i_info['image_checksum'] = 'aa'
+        i_info['image_url'] = 'prior_failed_url'
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.instance_info = i_info
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+
+            self.assertEqual(self.node.instance_info['image_source'],
+                             info['image_url'])
+            validate_href_mock.assert_called_once_with(
+                mock.ANY, 'http://image-ref', False)
+            mock_cache_image.assert_not_called()
+
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
     @mock.patch.object(utils, 'parse_instance_info', autospec=True)
     @mock.patch.object(image_service.HttpImageService, 'validate_href',
                        autospec=True)
-    def test_build_instance_info_for_deploy_nonglance_partition_image(
-            self, validate_href_mock, parse_instance_info_mock):
+    def test_build_instance_info_for_deploy_nonglance_part_img_checked(
+            self, validate_href_mock, parse_instance_info_mock,
+            mock_cache_image):
+        cfg.CONF.set_override('conductor_always_validates_images', True,
+                              group='conductor')
         i_info = {}
         driver_internal_info = self.node.driver_internal_info
         i_info['image_source'] = 'http://image-ref'
@@ -1821,6 +2236,7 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
         i_info['image_checksum'] = 'aa'
         i_info['root_gb'] = 10
         i_info['configdrive'] = 'configdrive'
+        i_info['image_url'] = 'invalid'
         driver_internal_info['is_whole_disk_image'] = False
         self.node.instance_info = i_info
         self.node.driver_internal_info = driver_internal_info
@@ -1839,6 +2255,8 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
                            'root_gb': 10,
                            'swap_mb': 5,
                            'configdrive': 'configdrive'}
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
+
         with task_manager.acquire(
                 self.context, self.node.uuid, shared=False) as task:
 
@@ -1851,6 +2269,58 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
             self.assertEqual('partition', info['image_type'])
             self.assertEqual(expected_i_info, info)
             parse_instance_info_mock.assert_called_once_with(task.node)
+            mock_cache_image.assert_called_once_with(
+                mock.ANY, mock.ANY, force_raw=False, expected_format=None)
+
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
+    @mock.patch.object(utils, 'parse_instance_info', autospec=True)
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    def test_build_instance_info_for_deploy_nonglance_partition_image(
+            self, validate_href_mock, parse_instance_info_mock,
+            mock_cache_image):
+        i_info = {}
+        driver_internal_info = self.node.driver_internal_info
+        i_info['image_source'] = 'http://image-ref'
+        i_info['kernel'] = 'http://kernel-ref'
+        i_info['ramdisk'] = 'http://ramdisk-ref'
+        i_info['image_checksum'] = 'aa'
+        i_info['root_gb'] = 10
+        i_info['configdrive'] = 'configdrive'
+        i_info['image_url'] = 'invalid'
+        driver_internal_info['is_whole_disk_image'] = False
+        self.node.instance_info = i_info
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+
+        validate_href_mock.side_effect = ['http://image-ref',
+                                          'http://kernel-ref',
+                                          'http://ramdisk-ref']
+        parse_instance_info_mock.return_value = {'swap_mb': 5}
+        expected_i_info = {'image_source': 'http://image-ref',
+                           'image_url': 'http://image-ref',
+                           'image_type': 'partition',
+                           'kernel': 'http://kernel-ref',
+                           'ramdisk': 'http://ramdisk-ref',
+                           'image_checksum': 'aa',
+                           'root_gb': 10,
+                           'swap_mb': 5,
+                           'configdrive': 'configdrive'}
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+
+            self.assertEqual(self.node.instance_info['image_source'],
+                             info['image_url'])
+            validate_href_mock.assert_called_once_with(
+                mock.ANY, 'http://image-ref', False)
+            self.assertEqual('partition', info['image_type'])
+            self.assertEqual(expected_i_info, info)
+            parse_instance_info_mock.assert_called_once_with(task.node)
+            mock_cache_image.assert_not_called()
 
     @mock.patch.object(image_service.HttpImageService, 'validate_href',
                        autospec=True)
@@ -1861,6 +2331,7 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
         i_info = self.node.instance_info
         i_info['image_source'] = 'http://img.qcow2'
         i_info['image_checksum'] = 'aa'
+        i_info['image_url'] = 'invalid'
         self.node.instance_info = i_info
         self.node.save()
 
@@ -1877,6 +2348,7 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
         i_info = self.node.instance_info
         driver_internal_info = self.node.driver_internal_info
         i_info['image_source'] = 'http://image-url/folder/'
+        i_info['image_url'] = 'invalid'
         driver_internal_info.pop('is_whole_disk_image', None)
         driver_internal_info['is_source_a_path'] = True
         self.node.instance_info = i_info
@@ -1923,6 +2395,50 @@ class TestBuildInstanceInfoForDeploy(db_base.DbTestCase):
             validate_href_mock.assert_called_once_with(
                 mock.ANY, 'http://image-url/folder', False)
 
+    @mock.patch.object(utils, 'cache_instance_image', autospec=True)
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    def test_build_instance_info_for_deploy_source_redirect_not_path(
+            self, validate_href_mock, mock_cache_image):
+        cfg.CONF.set_override('conductor_always_validates_images', True,
+                              group='conductor')
+        mock_cache_image.return_value = ('fake', '/tmp/foo', 'qcow2')
+        i_info = self.node.instance_info
+        driver_internal_info = self.node.driver_internal_info
+        url = 'http://image-url/file'
+        r_url = 'https://image-url/file'
+        i_info['image_source'] = url
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.instance_info = i_info
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+        validate_href_mock.side_effect = iter([
+            exception.ImageRefIsARedirect(
+                image_ref=url,
+                redirect_url=r_url),
+            None])
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+
+            self.assertNotEqual(self.node.instance_info['image_source'],
+                                info['image_url'])
+            self.assertEqual(r_url, info['image_url'])
+            validate_href_mock.assert_has_calls([
+                mock.call(mock.ANY, 'http://image-url/file', False),
+                mock.call(mock.ANY, 'https://image-url/file', False)
+            ])
+            mock_cache_image.assert_called_once_with(mock.ANY,
+                                                     task.node,
+                                                     force_raw=False,
+                                                     expected_format=None)
+            self.assertEqual('https://image-url/file',
+                             task.node.instance_info['image_url'])
+            self.assertEqual('https://image-url/file',
+                             task.node.instance_info['image_source'])
+
 
 class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
     def setUp(self):
@@ -1940,7 +2456,7 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
         self.node.save()
 
         self.checksum_mock = self.useFixture(fixtures.MockPatchObject(
-            fileutils, 'compute_file_checksum')).mock
+            fileutils, 'compute_file_checksum', autospec=True)).mock
         self.checksum_mock.return_value = 'fake-checksum'
         self.cache_image_mock = self.useFixture(fixtures.MockPatchObject(
             utils, 'cache_instance_image', autospec=True)).mock
@@ -1948,7 +2464,8 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
             self.node.uuid)
         self.cache_image_mock.return_value = (
             '733d1c44-a2ea-414b-aca7-69decf20d810',
-            self.fake_path)
+            self.fake_path,
+            'qcow2')
         self.ensure_tree_mock = self.useFixture(fixtures.MockPatchObject(
             utils.fileutils, 'ensure_tree', autospec=True)).mock
         self.create_link_mock = self.useFixture(fixtures.MockPatchObject(
@@ -1970,19 +2487,25 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
                        autospec=True)
     @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
     def _test_build_instance_info(self, glance_mock, validate_mock,
-                                  image_info={}, expect_raw=False):
+                                  image_info={}, expect_raw=False,
+                                  expect_format='qcow2',
+                                  expect_checksum='fake-sha512',
+                                  expect_checksum_algo='sha512'):
         glance_mock.return_value.show = mock.MagicMock(spec_set=[],
                                                        return_value=image_info)
         with task_manager.acquire(
                 self.context, self.node.uuid, shared=False) as task:
             instance_info = utils.build_instance_info_for_deploy(task)
-
             glance_mock.assert_called_once_with(context=task.context)
             glance_mock.return_value.show.assert_called_once_with(
                 self.node.instance_info['image_source'])
-            self.cache_image_mock.assert_called_once_with(task.context,
-                                                          task.node,
-                                                          force_raw=expect_raw)
+            self.cache_image_mock.assert_called_once_with(
+                task.context,
+                task.node,
+                force_raw=expect_raw,
+                expected_format=expect_format,
+                expected_checksum=expect_checksum,
+                expected_checksum_algo=expect_checksum_algo)
             symlink_dir = utils._get_http_image_symlink_dir_path()
             symlink_file = utils._get_http_image_symlink_file_path(
                 self.node.uuid)
@@ -2012,20 +2535,49 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
             image_info=self.image_info, expect_raw=True)
 
         self.assertIsNone(instance_info['image_checksum'])
+        self.assertEqual(instance_info['image_os_hash_algo'], 'sha512')
+        self.assertEqual(instance_info['image_os_hash_value'],
+                         'fake-checksum')
         self.assertEqual(instance_info['image_disk_format'], 'raw')
-        calls = [mock.call(image_path, algorithm='sha512')]
-        self.checksum_mock.assert_has_calls(calls)
+        self.checksum_mock.assert_called_once_with(image_path,
+                                                   algorithm='sha512')
+
+    def test_build_instance_info_already_raw(self):
+        cfg.CONF.set_override('force_raw_images', True)
+        self.image_info['disk_format'] = 'raw'
+        image_path, instance_info = self._test_build_instance_info(
+            image_info=self.image_info, expect_raw=True, expect_format='raw')
+
+        self.assertEqual(instance_info['image_checksum'], 'aa')
+        self.assertEqual(instance_info['image_os_hash_algo'], 'sha512')
+        self.assertEqual(instance_info['image_os_hash_value'],
+                         'fake-sha512')
+        self.assertEqual(instance_info['image_disk_format'], 'raw')
+        self.checksum_mock.assert_not_called()
 
     def test_build_instance_info_force_raw_drops_md5(self):
         cfg.CONF.set_override('force_raw_images', True)
         self.image_info['os_hash_algo'] = 'md5'
         image_path, instance_info = self._test_build_instance_info(
-            image_info=self.image_info, expect_raw=True)
+            image_info=self.image_info, expect_raw=True,
+            expect_checksum_algo='md5')
 
         self.assertIsNone(instance_info['image_checksum'])
         self.assertEqual(instance_info['image_disk_format'], 'raw')
         calls = [mock.call(image_path, algorithm='sha256')]
         self.checksum_mock.assert_has_calls(calls)
+
+    def test_build_instance_info_already_raw_keeps_md5(self):
+        cfg.CONF.set_override('force_raw_images', True)
+        self.image_info['os_hash_algo'] = 'md5'
+        self.image_info['disk_format'] = 'raw'
+        image_path, instance_info = self._test_build_instance_info(
+            image_info=self.image_info, expect_raw=True, expect_format='raw',
+            expect_checksum_algo='md5')
+
+        self.assertEqual(instance_info['image_checksum'], 'aa')
+        self.assertEqual(instance_info['image_disk_format'], 'raw')
+        self.checksum_mock.assert_not_called()
 
     @mock.patch.object(image_service.HttpImageService, 'validate_href',
                        autospec=True)
@@ -2035,7 +2587,6 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
         i_info['image_source'] = 'file://image-ref'
         i_info['image_checksum'] = 'aa'
         i_info['root_gb'] = 10
-        i_info['image_checksum'] = 'aa'
         driver_internal_info['is_whole_disk_image'] = True
         self.node.instance_info = i_info
         self.node.driver_internal_info = driver_internal_info
@@ -2052,8 +2603,12 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
             self.assertEqual(expected_url, info['image_url'])
             self.assertEqual('sha256', info['image_os_hash_algo'])
             self.assertEqual('fake-checksum', info['image_os_hash_value'])
+            self.assertEqual('raw', info['image_disk_format'])
             self.cache_image_mock.assert_called_once_with(
-                task.context, task.node, force_raw=True)
+                task.context, task.node, force_raw=True,
+                expected_format=None,
+                expected_checksum='aa',
+                expected_checksum_algo=None)
             self.checksum_mock.assert_called_once_with(
                 self.fake_path, algorithm='sha256')
             validate_href_mock.assert_called_once_with(
@@ -2068,7 +2623,6 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
         i_info['image_source'] = 'http://image-ref'
         i_info['image_checksum'] = 'aa'
         i_info['root_gb'] = 10
-        i_info['image_checksum'] = 'aa'
         driver_internal_info['is_whole_disk_image'] = True
         self.node.instance_info = i_info
         self.node.driver_internal_info = driver_internal_info
@@ -2086,7 +2640,10 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
             self.assertEqual('sha256', info['image_os_hash_algo'])
             self.assertEqual('fake-checksum', info['image_os_hash_value'])
             self.cache_image_mock.assert_called_once_with(
-                task.context, task.node, force_raw=True)
+                task.context, task.node, force_raw=True,
+                expected_format=None,
+                expected_checksum='aa',
+                expected_checksum_algo=None)
             self.checksum_mock.assert_called_once_with(
                 self.fake_path, algorithm='sha256')
             validate_href_mock.assert_called_once_with(
@@ -2102,8 +2659,8 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
         i_info['image_source'] = 'http://image-ref'
         i_info['image_checksum'] = 'aa'
         i_info['root_gb'] = 10
-        i_info['image_checksum'] = 'aa'
         i_info['image_download_source'] = 'local'
+        i_info['image_disk_format'] = 'qcow2'
         driver_internal_info['is_whole_disk_image'] = True
         self.node.instance_info = i_info
         self.node.driver_internal_info = driver_internal_info
@@ -2121,11 +2678,58 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
             self.assertEqual('sha256', info['image_os_hash_algo'])
             self.assertEqual('fake-checksum', info['image_os_hash_value'])
             self.cache_image_mock.assert_called_once_with(
-                task.context, task.node, force_raw=True)
+                task.context, task.node, force_raw=True,
+                expected_format='qcow2',
+                expected_checksum='aa',
+                expected_checksum_algo=None)
             self.checksum_mock.assert_called_once_with(
                 self.fake_path, algorithm='sha256')
             validate_href_mock.assert_called_once_with(
                 mock.ANY, expected_url, False)
+
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    def test_build_instance_info_remote_image_via_http_verified(
+            self, validate_href_mock):
+        cfg.CONF.set_override('stream_raw_images', False, group='agent')
+        cfg.CONF.set_override('image_download_source', 'http', group='agent')
+        cfg.CONF.set_override('conductor_always_validates_images', True,
+                              group='conductor')
+        i_info = self.node.instance_info
+        driver_internal_info = self.node.driver_internal_info
+        i_info['image_source'] = 'http://image-ref'
+        i_info['image_checksum'] = 'aa'
+        i_info['root_gb'] = 10
+        i_info['image_download_source'] = 'local'
+        i_info['image_disk_format'] = 'qcow2'
+        # NOTE(TheJulia): This is the override ability, and we need to
+        # explicitly exercise the alternate path
+        del i_info['image_download_source']
+        del i_info['image_url']
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.instance_info = i_info
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+
+        expected_url = 'http://image-ref'
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            info = utils.build_instance_info_for_deploy(task)
+
+            self.assertEqual(expected_url, info['image_url'])
+            # Image is not extracted, checksum is not changed,
+            # due to not being forced to raw.
+            self.assertNotIn('image_os_hash_algo', info)
+            self.assertNotIn('image_os_hash_value', info)
+            self.cache_image_mock.assert_called_once_with(
+                mock.ANY, mock.ANY, force_raw=False,
+                expected_format='qcow2')
+            self.checksum_mock.assert_not_called()
+            validate_href_mock.assert_called_once_with(
+                mock.ANY, expected_url, False)
+            self.assertEqual(expected_url,
+                             task.node.instance_info['image_url'])
 
     @mock.patch.object(image_service.HttpImageService, 'validate_href',
                        autospec=True)
@@ -2138,7 +2742,6 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
         i_info['image_source'] = 'http://image-ref'
         i_info['image_checksum'] = 'aa'
         i_info['root_gb'] = 10
-        i_info['image_checksum'] = 'aa'
         d_info['image_download_source'] = 'local'
         driver_internal_info['is_whole_disk_image'] = True
         self.node.instance_info = i_info
@@ -2158,11 +2761,213 @@ class TestBuildInstanceInfoForHttpProvisioning(db_base.DbTestCase):
             self.assertEqual('sha256', info['image_os_hash_algo'])
             self.assertEqual('fake-checksum', info['image_os_hash_value'])
             self.cache_image_mock.assert_called_once_with(
-                task.context, task.node, force_raw=True)
+                task.context, task.node, force_raw=True,
+                expected_format=None,
+                expected_checksum='aa',
+                expected_checksum_algo=None)
             self.checksum_mock.assert_called_once_with(
                 self.fake_path, algorithm='sha256')
             validate_href_mock.assert_called_once_with(
                 mock.ANY, expected_url, False)
+
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    def test_build_instance_info_local_image_already_raw(self,
+                                                         validate_href_mock):
+        cfg.CONF.set_override('image_download_source', 'local', group='agent')
+        i_info = self.node.instance_info
+        driver_internal_info = self.node.driver_internal_info
+        i_info['image_source'] = 'http://image-ref'
+        i_info['image_checksum'] = 'aa'
+        i_info['root_gb'] = 10
+        i_info['image_disk_format'] = 'raw'
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.instance_info = i_info
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+
+        expected_url = (
+            'http://172.172.24.10:8080/agent_images/%s' % self.node.uuid)
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+            self.assertEqual(expected_url, info['image_url'])
+            self.assertEqual('aa', info['image_checksum'])
+            self.assertEqual('raw', info['image_disk_format'])
+            self.assertIsNone(info['image_os_hash_algo'])
+            self.assertIsNone(info['image_os_hash_value'])
+            self.cache_image_mock.assert_called_once_with(
+                task.context, task.node, force_raw=True,
+                expected_format='raw', expected_checksum='aa',
+                expected_checksum_algo=None)
+            self.checksum_mock.assert_not_called()
+            validate_href_mock.assert_called_once_with(
+                mock.ANY, expected_url, False)
+
+    @mock.patch.object(image_service.HttpImageService, 'get',
+                       autospec=True)
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    def test_build_instance_info_remote_checksum_image(self,
+                                                       validate_href_mock,
+                                                       get_mock):
+        # Test case where we would download both the image and the checksum
+        # and ultimately convert the image.
+        get_mock.return_value = 'd8e8fca2dc0f896fd7cb4cb0031ba249'
+        cfg.CONF.set_override('image_download_source', 'local', group='agent')
+        i_info = self.node.instance_info
+        driver_internal_info = self.node.driver_internal_info
+        i_info['image_source'] = 'http://image-ref'
+        i_info['image_checksum'] = 'http://image-checksum'
+        i_info['root_gb'] = 10
+        i_info['image_disk_format'] = 'qcow2'
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.instance_info = i_info
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+
+        expected_url = (
+            'http://172.172.24.10:8080/agent_images/%s' % self.node.uuid)
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+            self.assertEqual(expected_url, info['image_url'])
+            self.assertEqual('raw', info['image_disk_format'])
+            self.cache_image_mock.assert_called_once_with(
+                task.context, task.node, force_raw=True,
+                expected_format='qcow2',
+                expected_checksum='d8e8fca2dc0f896fd7cb4cb0031ba249',
+                expected_checksum_algo=None)
+            self.checksum_mock.assert_called_once_with(
+                self.fake_path, algorithm='sha256')
+            validate_href_mock.assert_called_once_with(
+                mock.ANY, expected_url, False)
+            get_mock.assert_called_once_with('http://image-checksum')
+
+    @mock.patch.object(image_service.HttpImageService, 'get',
+                       autospec=True)
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    def test_build_instance_info_remote_checksum_sha256(self,
+                                                        validate_href_mock,
+                                                        get_mock):
+        # Test case where we would download both the image and the checksum
+        # and ultimately convert the image.
+        get_mock.return_value = 'a' * 64 + '\n'
+        cfg.CONF.set_override('image_download_source', 'local', group='agent')
+        i_info = self.node.instance_info
+        driver_internal_info = self.node.driver_internal_info
+        i_info['image_source'] = 'https://image-ref'
+        i_info['image_checksum'] = 'https://image-checksum'
+        i_info['root_gb'] = 10
+        i_info['image_disk_format'] = 'qcow2'
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.instance_info = i_info
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+
+        expected_url = (
+            'http://172.172.24.10:8080/agent_images/%s' % self.node.uuid)
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+            self.assertEqual(expected_url, info['image_url'])
+            self.assertEqual('raw', info['image_disk_format'])
+            self.cache_image_mock.assert_called_once_with(
+                task.context, task.node, force_raw=True,
+                expected_format='qcow2',
+                expected_checksum='a' * 64,
+                expected_checksum_algo='sha256')
+            self.checksum_mock.assert_called_once_with(
+                self.fake_path, algorithm='sha256')
+            validate_href_mock.assert_called_once_with(
+                mock.ANY, expected_url, False)
+            get_mock.assert_called_once_with('https://image-checksum')
+
+    @mock.patch.object(image_service.HttpImageService, 'get',
+                       autospec=True)
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    def test_build_instance_info_remote_checksum_sha512(self,
+                                                        validate_href_mock,
+                                                        get_mock):
+        # Test case where we would download both the image and the checksum
+        # and ultimately convert the image.
+        get_mock.return_value = 'a' * 128 + '\n'
+        cfg.CONF.set_override('image_download_source', 'local', group='agent')
+        i_info = self.node.instance_info
+        driver_internal_info = self.node.driver_internal_info
+        i_info['image_source'] = 'https://image-ref'
+        i_info['image_checksum'] = 'https://image-checksum'
+        i_info['root_gb'] = 10
+        i_info['image_disk_format'] = 'qcow2'
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.instance_info = i_info
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+
+        expected_url = (
+            'http://172.172.24.10:8080/agent_images/%s' % self.node.uuid)
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            info = utils.build_instance_info_for_deploy(task)
+            self.assertEqual(expected_url, info['image_url'])
+            self.assertEqual('raw', info['image_disk_format'])
+            self.cache_image_mock.assert_called_once_with(
+                task.context, task.node, force_raw=True,
+                expected_format='qcow2',
+                expected_checksum='a' * 128,
+                expected_checksum_algo='sha512')
+            self.checksum_mock.assert_called_once_with(
+                self.fake_path, algorithm='sha256')
+            validate_href_mock.assert_called_once_with(
+                mock.ANY, expected_url, False)
+            get_mock.assert_called_once_with('https://image-checksum')
+
+    @mock.patch.object(checksum_utils, 'get_checksum_from_url',
+                       autospec=True)
+    @mock.patch.object(image_service.HttpImageService, 'validate_href',
+                       autospec=True)
+    def test_build_instance_info_md5_not_permitted(
+            self,
+            validate_href_mock,
+            get_from_url_mock):
+        cfg.CONF.set_override('allow_md5_checksum', False, group='agent')
+        # Test case where we would download both the image and the checksum
+        # and ultimately convert the image.
+        cfg.CONF.set_override('image_download_source', 'local', group='agent')
+        i_info = self.node.instance_info
+        driver_internal_info = self.node.driver_internal_info
+        i_info['image_source'] = 'image-ref'
+        i_info['image_checksum'] = 'ad606d6a24a2dec982bc2993aaaf9160'
+        i_info['root_gb'] = 10
+        i_info['image_disk_format'] = 'qcow2'
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.instance_info = i_info
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            self.assertRaisesRegex(exception.ImageChecksumAlgorithmFailure,
+                                   'The requested image checksum algorithm '
+                                   'cannot be loaded',
+                                   utils.build_instance_info_for_deploy,
+                                   task)
+
+            self.cache_image_mock.assert_not_called()
+            self.checksum_mock.assert_not_called()
+            validate_href_mock.assert_not_called()
+            get_from_url_mock.assert_not_called()
 
 
 class TestStorageInterfaceUtils(db_base.DbTestCase):
@@ -2464,4 +3269,16 @@ class AsyncStepTestCase(db_base.DbTestCase):
         utils.set_async_step_flags(self.node, reboot=True,
                                    skip_current_step=True,
                                    polling=True)
+        self.assertEqual(expected, self.node.driver_internal_info)
+
+    def test_set_async_step_flags_clears_polling_if_not_set(self):
+        self.node.clean_step = {'step': 'create_configuration',
+                                'interface': 'raid'}
+        self.node.driver_internal_info = {'agent_secret_token': 'test',
+                                          'cleaning_polling': True}
+        expected = {'cleaning_reboot': True,
+                    'skip_current_clean_step': True}
+        self.node.save()
+        utils.set_async_step_flags(self.node, reboot=True,
+                                   skip_current_step=True)
         self.assertEqual(expected, self.node.driver_internal_info)

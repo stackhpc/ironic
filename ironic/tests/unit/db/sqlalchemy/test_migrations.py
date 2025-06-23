@@ -37,6 +37,7 @@ For postgres on Ubuntu this can be done with the following commands:
 import collections
 import contextlib
 import json
+import os
 from unittest import mock
 
 from alembic import script
@@ -61,7 +62,8 @@ LOG = logging.getLogger(__name__)
 
 # NOTE(vdrok): This was introduced after migration tests started taking more
 # time in gate. Timeout value in seconds for tests performing migrations.
-MIGRATIONS_TIMEOUT = 300
+# Can be modified in tox.ini as env variable.
+MIGRATIONS_TIMEOUT = os.getenv('MIGRATIONS_TIMEOUT', 60)
 
 
 @contextlib.contextmanager
@@ -188,8 +190,8 @@ class MigrationCheckersMixin(object):
         self.engine = enginefacade.writer.get_engine()
         self.config = migration._alembic_config()
         self.migration_api = migration
-        self.useFixture(fixtures.Timeout(MIGRATIONS_TIMEOUT,
-                                         gentle=True))
+        self.useFixture(fixtures.Timeout(int(MIGRATIONS_TIMEOUT),
+                                         gentle=False))
 
     def test_walk_versions(self):
         self._walk_versions(self.engine, self.config)
@@ -309,7 +311,7 @@ class MigrationCheckersMixin(object):
 
             for row in result:
                 old = _get_state(row.uuid)
-                new = row['provision_state']
+                new = row.provision_state
                 if old is None:
                     self.assertEqual('available', new)
                 else:
@@ -348,6 +350,22 @@ class MigrationCheckersMixin(object):
                               sqlalchemy.types.DateTime)
         self.assertIsInstance(nodes.c.inspection_finished_at.type,
                               sqlalchemy.types.DateTime)
+
+    def _check_01f21d5e5195(self, engine, data):
+        node_history = db_utils.get_table(engine, 'node_history')
+        bigstring = 'a' * 64
+        uuid = uuidutils.generate_uuid()
+        data = {'uuid': uuid, 'user': bigstring}
+        with engine.begin() as connection:
+            insert_node_history = node_history.insert().values(data)
+            connection.execute(insert_node_history)
+            node_history_stmt = sqlalchemy.select(
+                models.NodeHistory.user
+            ).where(
+                models.NodeHistory.uuid == uuid
+            )
+            node_history = connection.execute(node_history_stmt).first()
+            self.assertEqual(bigstring, node_history.user)
 
     def _check_4f399b21ae71(self, engine, data):
         nodes = db_utils.get_table(engine, 'nodes')
@@ -481,8 +499,8 @@ class MigrationCheckersMixin(object):
                         return True
 
             for row in result:
-                if _was_inserted(row['uuid']):
-                    self.assertTrue(row['pxe_enabled'])
+                if _was_inserted(row.uuid):
+                    self.assertTrue(row.pxe_enabled)
 
     def _check_e294876e8028(self, engine, data):
         nodes = db_utils.get_table(engine, 'nodes')
@@ -525,8 +543,8 @@ class MigrationCheckersMixin(object):
         return data
 
     def _check_c14cef6dfedf(self, engine, data):
-        counts = collections.defaultdict(int)
         with engine.begin() as connection:
+            counts = collections.defaultdict(int)
             result = connection.execute(
                 sqlalchemy.select(
                     models.Node.uuid,
@@ -538,13 +556,13 @@ class MigrationCheckersMixin(object):
                         return True
 
             for row in result:
-                if _was_inserted(row['uuid']):
-                    counts[row['network_interface']] += 1
+                if _was_inserted(row.uuid):
+                    counts[row.network_interface] += 1
 
-        # using default config values, we should have 2 flat and one neutron
-        self.assertEqual(2, counts['flat'])
-        self.assertEqual(1, counts['neutron'])
-        self.assertEqual(0, counts[None])
+            # using default conf values, we should have 2 flat and one neutron
+            self.assertEqual(2, counts['flat'])
+            self.assertEqual(1, counts['neutron'])
+            self.assertEqual(0, counts[None])
 
     def _check_60cf717201bc(self, engine, data):
         portgroups = db_utils.get_table(engine, 'portgroups')
@@ -640,8 +658,8 @@ class MigrationCheckersMixin(object):
             result = connection.execute(
                 sqlalchemy.select(models.Portgroup.mode)
             )
-        for row in result:
-            self.assertEqual(CONF.default_portgroup_mode, row['mode'])
+            for row in result:
+                self.assertEqual(CONF.default_portgroup_mode, row.mode)
 
     def _check_1d6951876d68(self, engine, data):
         nodes = db_utils.get_table(engine, 'nodes')
@@ -717,7 +735,9 @@ class MigrationCheckersMixin(object):
                 models.Node.uuid == data['uuid']
             )
             node = connection.execute(node_stmt).first()
-            data['id'] = node.id
+            # WARNING: Always copy, never directly return a db object or
+            # piece of a db object. It is a sqlalchemy thing.
+            data['id'] = int(node.id)
         return data
 
     def _check_b4130a7fc904(self, engine, data):
@@ -753,7 +773,9 @@ class MigrationCheckersMixin(object):
                 models.Node.id
             ).where(models.Node.uuid == data['uuid'])
             node = connection.execute(node_stmt).first()
-            data['id'] = node.id
+            # WARNING: Always copy, never directly return a db object or
+            # piece of a db object. It is a sqlalchemy thing.
+            data['id'] = int(node.id)
         return data
 
     def _check_82c315d60161(self, engine, data):
@@ -788,7 +810,7 @@ class MigrationCheckersMixin(object):
                 models.BIOSSetting.name == setting['name']
             )
             setting = connection.execute(setting_stmt).first()
-            self.assertEqual('on', setting['value'])
+            self.assertEqual('on', setting[0])
 
     def _check_2bbd96b6ccb9(self, engine, data):
         bios_settings = db_utils.get_table(engine, 'bios_settings')
@@ -1257,6 +1279,80 @@ class MigrationCheckersMixin(object):
         self.assertIsInstance(node_inventory.c.node_id.type,
                               sqlalchemy.types.Integer)
 
+    def _check_4dbec778866e(self, engine, data):
+        nodes = db_utils.get_table(engine, 'nodes')
+        self.assertIsInstance(nodes.c.shard.type, sqlalchemy.types.String)
+
+    def _pre_upgrade_163040c5513f(self, engine):
+        # Create a node to which firmware information can be added.
+        data = {'uuid': uuidutils.generate_uuid()}
+        nodes = db_utils.get_table(engine, 'nodes')
+        with engine.begin() as connection:
+            insert_node = nodes.insert().values(data)
+            connection.execute(insert_node)
+            node_stmt = sqlalchemy.select(
+                models.Node.id
+            ).where(models.Node.uuid == data['uuid'])
+            node = connection.execute(node_stmt).first()
+            # WARNING: Always copy, never directly return a db object or
+            # piece of a db object. It is a sqlalchemy thing.
+            data['id'] = int(node.id)
+
+        return data
+
+    def _check_163040c5513f(self, engine, data):
+        fw_information = db_utils.get_table(engine, 'firmware_information')
+        col_names = [column.name for column in fw_information.c]
+        expected_names = ['created_at', 'updated_at', 'id', 'node_id',
+                          'component', 'initial_version', 'current_version',
+                          'last_version_flashed', 'version']
+        self.assertEqual(sorted(expected_names), sorted(col_names))
+        self.assertIsInstance(fw_information.c.created_at.type,
+                              sqlalchemy.types.DateTime)
+        self.assertIsInstance(fw_information.c.updated_at.type,
+                              sqlalchemy.types.DateTime)
+        self.assertIsInstance(fw_information.c.id.type,
+                              sqlalchemy.types.Integer)
+        self.assertIsInstance(fw_information.c.node_id.type,
+                              sqlalchemy.types.Integer)
+        self.assertIsInstance(fw_information.c.component.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(fw_information.c.initial_version.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(fw_information.c.current_version.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(fw_information.c.last_version_flashed.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(fw_information.c.version.type,
+                              sqlalchemy.types.String)
+
+        nodes = db_utils.get_table(engine, 'nodes')
+        col_names = [column.name for column in nodes.c]
+        self.assertIn('firmware_interface', col_names)
+        self.assertIsInstance(nodes.c.firmware_interface.type,
+                              sqlalchemy.types.String)
+
+        with engine.begin() as connection:
+            fw_data = {'node_id': data['id'],
+                       'component': 'bmc',
+                       'initial_version': 'v1.0.0'}
+            insert_fw_cmp = fw_information.insert().values(fw_data)
+            connection.execute(insert_fw_cmp)
+            fw_cmp_stmt = sqlalchemy.select(
+                models.FirmwareComponent.initial_version
+            ).where(
+                models.FirmwareComponent.node_id == data['id'],
+                models.FirmwareComponent.component == fw_data['component']
+            )
+            fw_component = connection.execute(fw_cmp_stmt).first()
+            self.assertEqual('v1.0.0', fw_component[0])
+            del_stmt = (
+                sqlalchemy.delete(
+                    models.FirmwareComponent
+                ).where(models.FirmwareComponent.node_id == data['id'])
+            )
+            connection.execute(del_stmt)
+
     def test_upgrade_and_version(self):
         with patch_with_engine(self.engine):
             self.migration_api.upgrade('head')
@@ -1370,8 +1466,8 @@ class ModelsMigrationSyncMixin(object):
     def setUp(self):
         super(ModelsMigrationSyncMixin, self).setUp()
         self.engine = enginefacade.writer.get_engine()
-        self.useFixture(fixtures.Timeout(MIGRATIONS_TIMEOUT,
-                                         gentle=True))
+        self.useFixture(fixtures.Timeout(int(MIGRATIONS_TIMEOUT),
+                                         gentle=False))
 
     def get_metadata(self):
         return models.Base.metadata

@@ -537,7 +537,8 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
                 autospec=True)
     def test__do_next_deploy_step_in_deploywait(self, mock_execute):
         driver_internal_info = {'deploy_step_index': None,
-                                'deploy_steps': self.deploy_steps}
+                                'deploy_steps': self.deploy_steps,
+                                'deployment_polling': True}
         self._start_service()
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
@@ -562,6 +563,7 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
         self.assertEqual(states.ACTIVE, node.target_provision_state)
         self.assertEqual(expected_first_step, node.deploy_step)
         self.assertEqual(0, node.driver_internal_info['deploy_step_index'])
+        self.assertNotIn('deployment_polling', node.driver_internal_info)
         mock_execute.assert_called_once_with(mock.ANY, task,
                                              self.deploy_steps[0])
 
@@ -965,6 +967,34 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
         self.assertIsNotNone(node.last_error)
         mock_execute.assert_called_once_with(
             mock.ANY, mock.ANY, self.deploy_steps[0])
+
+    def _test_do_next_deploy_step_handles(self, start_state):
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=start_state,
+            driver_internal_info={
+                'deploy_steps': [
+                    {
+                        'step': 'hold',
+                        'priority': 10,
+                        'interface': 'deploy'
+                    }
+                ],
+                'deploy_step_index': None},
+            clean_step=None)
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            deployments.do_next_deploy_step(task, 0)
+        node.refresh()
+        self.assertEqual(states.DEPLOYHOLD, node.provision_state)
+
+    def test_do_next_deploy_step_handles_hold_from_active(self):
+        # Prior step/action was out of the conductor
+        self._test_do_next_deploy_step_handles(states.DEPLOYING)
+
+    def test_do_next_deploy_step_handles_hold_from_wait(self):
+        # Prior step was async in a wait state
+        self._test_do_next_deploy_step_handles(states.DEPLOYWAIT)
 
     @mock.patch.object(deployments, 'do_next_deploy_step', autospec=True)
     @mock.patch.object(conductor_steps, '_get_steps', autospec=True)

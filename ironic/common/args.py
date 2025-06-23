@@ -14,6 +14,7 @@ import functools
 import inspect
 
 import jsonschema
+from oslo_utils import netutils
 from oslo_utils import strutils
 from oslo_utils import uuidutils
 
@@ -88,6 +89,18 @@ def name(name, value):
     return value
 
 
+def host_port(name, value):
+    if value is None:
+        return
+    try:
+        host, port = netutils.parse_host_port(value)
+    except (ValueError, TypeError) as exc:
+        raise exception.InvalidParameterValue(f'{name}: {exc}')
+    if not host:
+        raise exception.InvalidParameterValue(_('Missing host in %s') % name)
+    return value
+
+
 def uuid_or_name(name, value):
     """Validate that the value is a UUID or logical name
 
@@ -115,9 +128,12 @@ def string_list(name, value):
               same order, or None if value is None
     :raises: InvalidParameterValue if the value is not a string
     """
-    value = string(name, value)
     if value is None:
         return
+    if isinstance(value, list):
+        return [string(name, item) for item in value]
+
+    value = string(name, value)
     items = []
     for v in str(value).split(','):
         v_norm = v.strip().lower()
@@ -314,7 +330,7 @@ def validate(*args, **kwargs):
     """Decorator which validates and transforms function arguments
 
     """
-    assert not args, 'Validators must be specifed by argument name'
+    assert not args, 'Validators must be specified by argument name'
     assert kwargs, 'No validators specified'
     validators = kwargs
 

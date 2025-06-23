@@ -27,6 +27,7 @@ from ironic.conductor import utils as manager_utils
 from ironic.conf import CONF
 from ironic.drivers import base
 from ironic.drivers.modules import agent_base
+from ironic.drivers.modules import boot_mode_utils
 from ironic.drivers.modules import deploy_utils
 from ironic.drivers.modules import pxe_base
 LOG = logging.getLogger(__name__)
@@ -42,6 +43,17 @@ class PXEBoot(pxe_base.PXEBaseMixin, base.BootInterface):
         pxe_utils.place_common_config()
         pxe_utils.place_loaders_for_boot(CONF.deploy.http_root)
         pxe_utils.place_loaders_for_boot(CONF.pxe.tftp_root)
+
+
+class HttpBoot(pxe_base.PXEBaseMixin, base.BootInterface):
+
+    http_boot_enabled = True
+
+    capabilities = ['ramdisk_boot', 'pxe_boot']
+
+    def __init__(self):
+        pxe_utils.place_common_config()
+        pxe_utils.place_loaders_for_boot(CONF.deploy.http_root)
 
 
 class PXEAnacondaDeploy(agent_base.AgentBaseMixin, agent_base.HeartbeatMixin,
@@ -114,21 +126,11 @@ class PXEAnacondaDeploy(agent_base.AgentBaseMixin, agent_base.HeartbeatMixin,
     def reboot_to_instance(self, task):
         node = task.node
         try:
-            # anaconda deploy will install the bootloader and the node is ready
-            # to boot from disk.
-
-            deploy_utils.try_set_boot_device(task, boot_devices.DISK)
-        except Exception as e:
-            msg = (_("Failed to change the boot device to %(boot_dev)s "
-                     "when deploying node %(node)s. Error: %(error)s") %
-                   {'boot_dev': boot_devices.DISK, 'node': node.uuid,
-                    'error': e})
-            agent_base.log_and_raise_deployment_error(task, msg)
-
-        try:
             task.process_event('resume')
             self.clean_up(task)
             manager_utils.node_power_action(task, states.POWER_OFF)
+            deploy_utils.try_set_boot_device(task, boot_devices.DISK)
+            boot_mode_utils.configure_secure_boot_if_needed(task)
             task.driver.network.remove_provisioning_network(task)
             task.driver.network.configure_tenant_networks(task)
             manager_utils.node_power_action(task, states.POWER_ON)

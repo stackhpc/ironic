@@ -676,11 +676,11 @@ class TestObject(_LocalTest, _TestObject):
 # version bump. It is an MD5 hash of the object fields and remotable methods.
 # The fingerprint values should only be changed if there is a version bump.
 expected_object_fingerprints = {
-    'Node': '1.36-8a080e31ba89ca5f09e859bd259b54dc',
+    'Node': '1.40-2182d4660bb5d5e4cc5670c37012ef71',
     'MyObj': '1.5-9459d30d6954bffc7a9afd347a807ca6',
     'Chassis': '1.3-d656e039fd8ae9f34efc232ab3980905',
     'Port': '1.11-97bf15b61224f26c65e90f007d78bfd2',
-    'Portgroup': '1.4-71923a81a86743b313b190f5c675e258',
+    'Portgroup': '1.5-df4dc15967f67114d51176a98a901a83',
     'Conductor': '1.3-d3f53e853b4d58cae5bfbd9a8341af4a',
     'EventType': '1.1-aa2ba1afd38553e3880c267404e8d370',
     'NotificationPublisher': '1.0-51a09397d6c0687771fb5be9a999605d',
@@ -722,6 +722,8 @@ expected_object_fingerprints = {
     'Deployment': '1.0-ff10ae028c5968f1596131d85d7f5f9d',
     'NodeHistory': '1.0-9b576c6481071e7f7eac97317fa29418',
     'NodeInventory': '1.0-97692fec24e20ab02022b9db54e8f539',
+    'FirmwareComponent': '1.0-0e0720dab959e20247bbcfd5f28958c5',
+    'FirmwareComponentList': '1.0-33a2e1bb91ad4082f9f63429b77c1244',
 }
 
 
@@ -978,6 +980,7 @@ class TestObjectSerializer(test_base.TestCase):
 class TestRegistry(test_base.TestCase):
     @mock.patch('ironic.objects.base.objects', autospec=True)
     def test_hook_chooses_newer_properly(self, mock_objects):
+        del mock_objects.MyObj
         reg = base.IronicObjectRegistry()
         reg.registration_hook(MyObj, 0)
 
@@ -994,6 +997,7 @@ class TestRegistry(test_base.TestCase):
 
     @mock.patch('ironic.objects.base.objects', autospec=True)
     def test_hook_keeps_newer_properly(self, mock_objects):
+        del mock_objects.MyObj
         reg = base.IronicObjectRegistry()
         reg.registration_hook(MyObj, 0)
 

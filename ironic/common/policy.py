@@ -36,7 +36,9 @@ LOG = log.getLogger(__name__)
 # once oslo_policy change the default value to 'policy.yaml'.
 # https://github.com/openstack/oslo.policy/blob/a626ad12fe5a3abd49d70e3e5b95589d279ab578/oslo_policy/opts.py#L49
 DEFAULT_POLICY_FILE = 'policy.yaml'
-opts.set_defaults(cfg.CONF, DEFAULT_POLICY_FILE)
+opts.set_defaults(cfg.CONF, DEFAULT_POLICY_FILE,
+                  enforce_scope=True,
+                  enforce_new_defaults=True)
 
 # Generic policy check string for system administrators. These are the people
 # who need the highest level of authorization to operate the deployment.
@@ -49,15 +51,22 @@ SYSTEM_ADMIN = 'role:admin and system_scope:all'
 # authorization that system administrators typically have. This persona, or
 # check string, typically isn't used by default, but it's existence it useful
 # in the event a deployment wants to offload some administrative action from
-# system administrator to system members
-SYSTEM_MEMBER = 'role:member and system_scope:all'
+# system administrator to system members.
+# The rule:service_role match here is to enable an elevated level of API
+# access for a specialized service role and users with appropriate
+# service role access.
+SYSTEM_MEMBER = '(role:member and system_scope:all) or rule:service_role'  # noqa
 
-# Generic policy check string for read-only access to system-level resources.
-# This persona is useful for someone who needs access for auditing or even
-# support. These uses are also able to view project-specific resources where
-# applicable (e.g., listing all volumes in the deployment, regardless of the
-# project they belong to).
-SYSTEM_READER = '(role:reader and system_scope:all) or (role:service and system_scope:all)'  # noqa
+# Generic policy check string for read-only access to system-level
+# resources. This persona is useful for someone who needs access
+# for auditing or even support. These uses are also able to view
+# project-specific resources where applicable (e.g., listing all
+# volumes in the deployment, regardless of the project they belong to).
+# The rule:service_role match here is to enable an elevated level of API
+# access for a specialized service role and users with appropriate
+# role access, specifically because 'service" role is outside of the RBAC
+# model defaults and does not imply reader access.
+SYSTEM_READER = '(role:reader and system_scope:all) or (role:service and system_scope:all) or rule:service_role'  # noqa
 
 # This check string is reserved for actions that require the highest level of
 # authorization on a project or resources within the project (e.g., setting the
@@ -96,7 +105,7 @@ PROJECT_SERVICE = ('role:service and project_id:%(node.owner)s')
 # administrator should be able to delete any baremetal host in the deployment,
 # a project member should only be able to delete hosts in their project).
 SYSTEM_OR_PROJECT_MEMBER = (
-    '(' + SYSTEM_MEMBER + ') or (' + PROJECT_MEMBER + ')'
+    '(' + SYSTEM_MEMBER + ') or (' + PROJECT_MEMBER + ') or (' + SYSTEM_SERVICE + ')'  # noqa
 )
 SYSTEM_OR_PROJECT_READER = (
     '(' + SYSTEM_READER + ') or (' + PROJECT_READER + ') or (' + PROJECT_SERVICE + ')'  # noqa
@@ -208,6 +217,13 @@ default_policies = [
     policy.RuleDefault('show_instance_secrets',
                        '!',
                        description='Show or mask secrets within instance information in API responses'),  # noqa
+    # NOTE(TheJulia): This is a special rule to allow customization of the
+    # service role check. The config.service_project_name is a reserved
+    # target check field which is loaded from configuration to the
+    # check context in ironic/common/context.py.
+    policy.RuleDefault('service_role',
+                       'role:service and project_name:%(config.service_project_name)s',  # noqa
+                       description='Rule to match service role usage with a service project, delineated as a separate rule to enable customization.'),  # noqa
     # Roles likely to be overridden by operator
     # TODO(TheJulia): Lets nuke demo from high orbit.
     policy.RuleDefault('is_member',
@@ -464,7 +480,7 @@ node_policies = [
     policy.DocumentedRuleDefault(
         name='baremetal:node:create:self_owned_node',
         check_str=('(role:admin) or (role:service)'),
-        scope_types=['project'],
+        scope_types=['system', 'project'],
         description='Create node records which will be tracked '
                     'as owned by the associated user project.',
         operations=[{'path': '/nodes', 'method': 'POST'}],
@@ -482,7 +498,7 @@ node_policies = [
     policy.DocumentedRuleDefault(
         name='baremetal:node:list_all',
         check_str=SYSTEM_READER,
-        scope_types=['system'],
+        scope_types=['system', 'project'],
         description='Retrieve multiple Node records',
         operations=[{'path': '/nodes', 'method': 'GET'},
                     {'path': '/nodes/detail', 'method': 'GET'}],
@@ -693,7 +709,7 @@ node_policies = [
     policy.DocumentedRuleDefault(
         name='baremetal:node:delete:self_owned_node',
         check_str=PROJECT_ADMIN,
-        scope_types=['project'],
+        scope_types=['system', 'project'],
         description='Delete node records which are associated with '
                     'the requesting project.',
         operations=[{'path': '/nodes/{node_ident}', 'method': 'DELETE'}],
@@ -732,7 +748,7 @@ node_policies = [
         deprecated_rule=deprecated_node_clear_maintenance
     ),
 
-    # NOTE(TheJulia): This should liekly be deprecated and be replaced with
+    # NOTE(TheJulia): This should likely be deprecated and be replaced with
     # a cached object.
     policy.DocumentedRuleDefault(
         name='baremetal:node:get_boot_device',
@@ -961,7 +977,7 @@ node_policies = [
         name='baremetal:node:history:get',
         check_str=SYSTEM_OR_OWNER_READER,
         scope_types=['system', 'project'],
-        description='Filter to allow operators to retreive history records '
+        description='Filter to allow operators to retrieve history records '
                     'for a node.',
         operations=[
             {'path': '/nodes/{node_ident}/history', 'method': 'GET'},
@@ -986,8 +1002,56 @@ node_policies = [
         # operating context.
         deprecated_rule=deprecated_node_get
     ),
-
-
+    policy.DocumentedRuleDefault(
+        name='baremetal:node:update:shard',
+        check_str=SYSTEM_ADMIN,
+        scope_types=['system', 'project'],
+        description='Governs if node shard field can be updated via '
+                    'the API clients.',
+        operations=[{'path': '/nodes/{node_ident}', 'method': 'PATCH'}],
+    ),
+    policy.DocumentedRuleDefault(
+        name='baremetal:shards:get',
+        check_str=SYSTEM_READER,
+        scope_types=['system', 'project'],
+        description='Governs if shards can be read via the API clients.',
+        operations=[{'path': '/shards', 'method': 'GET'}],
+    ),
+    policy.DocumentedRuleDefault(
+        name='baremetal:node:update:parent_node',
+        check_str=SYSTEM_MEMBER,
+        scope_types=['system', 'project'],
+        description='Governs if node parent_node field can be updated via '
+                    'the API clients.',
+        operations=[{'path': '/nodes/{node_ident}', 'method': 'PATCH'}],
+    ),
+    policy.DocumentedRuleDefault(
+        name='baremetal:node:firmware:get',
+        check_str=SYSTEM_OR_PROJECT_READER,
+        scope_types=['system', 'project'],
+        description='Retrieve Node Firmware components information',
+        operations=[
+            {'path': '/nodes/{node_ident}/firmware', 'method': 'GET'}
+        ],
+    ),
+    policy.DocumentedRuleDefault(
+        name='baremetal:node:vmedia:attach',
+        check_str=SYSTEM_OR_PROJECT_MEMBER,
+        scope_types=['system', 'project'],
+        description='Attach a virtual media device to a node',
+        operations=[
+            {'path': '/nodes/{node_ident}/vmedia', 'method': 'POST'}\
+        ],
+    ),
+    policy.DocumentedRuleDefault(
+        name='baremetal:node:vmedia:detach',
+        check_str=SYSTEM_OR_PROJECT_MEMBER,
+        scope_types=['system', 'project'],
+        description='Detach a virtual media device from a node',
+        operations=[
+            {'path': '/nodes/{node_ident}/vmedia', 'method': 'DELETE'}
+        ],
+    ),
 ]
 
 deprecated_port_reason = """
@@ -1422,6 +1486,12 @@ utility_policies = [
         operations=[{'path': '/lookup', 'method': 'GET'}],
         deprecated_rule=deprecated_ipa_lookup
     ),
+    policy.DocumentedRuleDefault(
+        name='baremetal:driver:ipa_continue_inspection',
+        check_str='',
+        description='Receive inspection data from the ramdisk',
+        operations=[{'path': '/continue_inspection', 'method': 'POST'}],
+    ),
 ]
 
 
@@ -1568,7 +1638,7 @@ conductor_policies = [
     policy.DocumentedRuleDefault(
         name='baremetal:conductor:get',
         check_str=SYSTEM_READER,
-        scope_types=['system'],
+        scope_types=['system', 'project'],
         description='Retrieve Conductor records',
         operations=[
             {'path': '/conductors', 'method': 'GET'},
@@ -1699,7 +1769,7 @@ allocation_policies = [
         # The latter is more for projects and services using admin project
         # rights. Specific checking because of the expanded rights of
         # this functionality.
-        check_str=('(rule:is_member and role:baremetal_admin) or (is_admin_project:True and role:admin)'),  # noqa 
+        check_str=('(rule:is_member and role:baremetal_admin) or (is_admin_project:True and role:admin)'),  # noqa
         scope_types=['project'],
         description=('Logical restrictor to prevent legacy allocation rule '
                      'missuse - Requires blank allocations to originate from '
@@ -1769,7 +1839,7 @@ deploy_template_policies = [
     policy.DocumentedRuleDefault(
         name='baremetal:deploy_template:get',
         check_str=SYSTEM_READER,
-        scope_types=['system'],
+        scope_types=['system', 'project'],
         description='Retrieve Deploy Template records',
         operations=[
             {'path': '/deploy_templates', 'method': 'GET'},
@@ -1781,7 +1851,7 @@ deploy_template_policies = [
     policy.DocumentedRuleDefault(
         name='baremetal:deploy_template:create',
         check_str=SYSTEM_ADMIN,
-        scope_types=['system'],
+        scope_types=['system', 'project'],
         description='Create Deploy Template records',
         operations=[{'path': '/deploy_templates', 'method': 'POST'}],
         deprecated_rule=deprecated_deploy_template_create
@@ -1789,7 +1859,7 @@ deploy_template_policies = [
     policy.DocumentedRuleDefault(
         name='baremetal:deploy_template:delete',
         check_str=SYSTEM_ADMIN,
-        scope_types=['system'],
+        scope_types=['system', 'project'],
         description='Delete Deploy Template records',
         operations=[
             {'path': '/deploy_templates/{deploy_template_ident}',
@@ -1800,7 +1870,7 @@ deploy_template_policies = [
     policy.DocumentedRuleDefault(
         name='baremetal:deploy_template:update',
         check_str=SYSTEM_ADMIN,
-        scope_types=['system'],
+        scope_types=['system', 'project'],
         description='Update Deploy Template records',
         operations=[
             {'path': '/deploy_templates/{deploy_template_ident}',
@@ -1859,7 +1929,7 @@ def init_enforcer(policy_file=None, rules=None,
         rules=rules,
         default_rule=default_rule,
         use_conf=use_conf)
-    # NOTE(melwitt): Explictly disable the warnings for policies
+    # NOTE(melwitt): Explicitly disable the warnings for policies
     # changing their default check_str. During policy-defaults-refresh
     # work, all the policy defaults have been changed and warning for
     # each policy started filling the logs limit for various tool.

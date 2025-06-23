@@ -34,7 +34,6 @@ from ironic.drivers.modules.redfish import utils as redfish_utils
 from ironic import objects
 
 drac_exceptions = importutils.try_import('dracclient.exceptions')
-sushy = importutils.try_import('sushy')
 
 LOG = logging.getLogger(__name__)
 
@@ -176,8 +175,6 @@ class DracWSManInspect(base.InspectInterface):
                 [memory.size_mb for memory in client.list_memory()])
             cpus = client.list_cpus()
             if cpus:
-                properties['cpus'] = sum(
-                    [self._calculate_cpus(cpu) for cpu in cpus])
                 properties['cpu_arch'] = 'x86_64' if cpus[0].arch64 else 'x86'
 
             bios_settings = client.list_bios_settings()
@@ -187,9 +184,9 @@ class DracWSManInspect(base.InspectInterface):
                 'boot_mode': bios_settings["BootMode"].current_value.lower(),
                 'pci_gpu_devices': self._calculate_gpus(video_controllers)}
 
-            capabilties = utils.get_updated_capabilities(current_capabilities,
-                                                         new_capabilities)
-            properties['capabilities'] = capabilties
+            capabilities = utils.get_updated_capabilities(current_capabilities,
+                                                          new_capabilities)
+            properties['capabilities'] = capabilities
 
             virtual_disks = client.list_virtual_disks()
             root_disk = self._guess_root_disk(virtual_disks)
@@ -263,18 +260,6 @@ class DracWSManInspect(base.InspectInterface):
         for disk in disks:
             if disk.size_mb >= min_size_required_mb:
                 return disk
-
-    def _calculate_cpus(self, cpu):
-        """Find actual CPU count.
-
-        :param cpu: Pass cpu.
-
-        :returns: returns total cpu count.
-        """
-        if cpu.ht_enabled:
-            return cpu.cores * 2
-        else:
-            return cpu.cores
 
     def _calculate_gpus(self, video_controllers):
         """Find actual GPU count.

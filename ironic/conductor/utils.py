@@ -29,6 +29,7 @@ from oslo_utils import excutils
 from oslo_utils import strutils
 from oslo_utils import timeutils
 
+from ironic.common import async_steps
 from ironic.common import boot_devices
 from ironic.common import exception
 from ironic.common import faults
@@ -297,14 +298,23 @@ def node_power_action(task, new_state, timeout=None):
     node = task.node
 
     if _can_skip_state_change(task, new_state):
+        # NOTE(TheJulia): Even if we are not changing the power state,
+        # we need to wipe the token out, just in case for some reason
+        # the power was turned off outside of our interaction/management.
+        if new_state in (states.POWER_OFF, states.SOFT_POWER_OFF,
+                         states.REBOOT, states.SOFT_REBOOT):
+            wipe_internal_info_on_power_off(node)
+            node.save()
         return
     target_state = _calculate_target_state(new_state)
 
     # Set the target_power_state and clear any last_error, if we're
     # starting a new operation. This will expose to other processes
-    # and clients that work is in progress.
-    node['target_power_state'] = target_state
-    node['last_error'] = None
+    # and clients that work is in progress. Keep the last_error intact
+    # if the power action happens as a result of a failure.
+    node.target_power_state = target_state
+    if node.provision_state not in states.FAILURE_STATES:
+        node.last_error = None
     node.timestamp_driver_internal_info('last_power_state_change')
     # NOTE(dtantsur): wipe token on shutting down, otherwise a reboot in
     # fast-track (or an accidentally booted agent) will cause subsequent
@@ -402,7 +412,12 @@ def provisioning_error_handler(e, node, provision_state,
         node.provision_state = provision_state
         node.target_provision_state = target_provision_state
         error = (_("No free conductor workers available"))
-        node_history_record(node, event=error, event_type=states.PROVISIONING,
+        if provision_state in (states.INSPECTING, states.INSPECTWAIT,
+                               states.INSPECTFAIL):
+            event_type = states.INTROSPECTION
+        else:
+            event_type = states.PROVISIONING
+        node_history_record(node, event=error, event_type=event_type,
                             error=True)
         node.save()
         LOG.warning("No free conductor workers available to perform "
@@ -466,7 +481,10 @@ def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
             msg2 = ('Failed to tear down cleaning on node %(uuid)s, '
                     'reason: %(err)s' % {'err': e, 'uuid': node.uuid})
             LOG.exception(msg2)
-            errmsg = _('%s. Also failed to tear down cleaning.') % errmsg
+            errmsg = _(
+                '%(orig_err)s. '
+                'Also %(msg2)s'
+            ) % {'orig_err': errmsg, 'msg2': msg2}
 
     if node.provision_state in (
             states.CLEANING,
@@ -476,12 +494,10 @@ def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
         node.clean_step = {}
         # Clear any leftover metadata about cleaning
         node.del_driver_internal_info('clean_step_index')
-        node.del_driver_internal_info('cleaning_reboot')
-        node.del_driver_internal_info('cleaning_polling')
-        node.del_driver_internal_info('skip_current_clean_step')
-        # We don't need to keep the old agent URL
+        async_steps.remove_node_flags(node)
+        # We don't need to keep the old agent URL, or token
         # as it should change upon the next cleaning attempt.
-        node.del_driver_internal_info('agent_url')
+        wipe_token_and_url(task)
     # For manual cleaning, the target provision state is MANAGEABLE, whereas
     # for automated cleaning, it is AVAILABLE.
     manual_clean = node.target_provision_state == states.MANAGEABLE
@@ -490,6 +506,11 @@ def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
     # NOTE(dtantsur): avoid overwriting existing maintenance_reason
     if not node.maintenance_reason and set_maintenance:
         node.maintenance_reason = errmsg
+
+    if CONF.conductor.poweroff_in_cleanfail:
+        # NOTE(NobodyCam): Power off node in clean fail
+        node_power_action(task, states.POWER_OFF)
+
     node.save()
 
     if set_fail_state and node.provision_state != states.CLEANFAIL:
@@ -534,10 +555,8 @@ def wipe_deploy_internal_info(task):
     node.del_driver_internal_info('user_deploy_steps')
     node.del_driver_internal_info('agent_cached_deploy_steps')
     node.del_driver_internal_info('deploy_step_index')
-    node.del_driver_internal_info('deployment_reboot')
-    node.del_driver_internal_info('deployment_polling')
-    node.del_driver_internal_info('skip_current_deploy_step')
     node.del_driver_internal_info('steps_validated')
+    async_steps.remove_node_flags(node)
 
 
 def wipe_cleaning_internal_info(task):
@@ -548,11 +567,21 @@ def wipe_cleaning_internal_info(task):
     node.set_driver_internal_info('clean_steps', None)
     node.del_driver_internal_info('agent_cached_clean_steps')
     node.del_driver_internal_info('clean_step_index')
-    node.del_driver_internal_info('cleaning_reboot')
-    node.del_driver_internal_info('cleaning_polling')
     node.del_driver_internal_info('cleaning_disable_ramdisk')
-    node.del_driver_internal_info('skip_current_clean_step')
     node.del_driver_internal_info('steps_validated')
+    async_steps.remove_node_flags(node)
+
+
+def wipe_service_internal_info(task):
+    """Remove temporary servicing fields from driver_internal_info."""
+    wipe_token_and_url(task)
+    node = task.node
+    node.set_driver_internal_info('service_steps', None)
+    node.del_driver_internal_info('agent_cached_service_steps')
+    node.del_driver_internal_info('service_step_index')
+    node.del_driver_internal_info('service_disable_ramdisk')
+    node.del_driver_internal_info('steps_validated')
+    async_steps.remove_node_flags(node)
 
 
 def deploying_error_handler(task, logmsg, errmsg=None, traceback=False,
@@ -794,7 +823,6 @@ def power_state_error_handler(e, node, power_state):
                     {'node': node.uuid, 'power_state': power_state})
 
 
-@task_manager.require_exclusive_lock
 def validate_port_physnet(task, port_obj):
     """Validate the consistency of physical networks of ports in a portgroup.
 
@@ -1022,7 +1050,7 @@ def power_state_for_network_configuration(task):
 def build_configdrive(node, configdrive):
     """Build a configdrive from provided meta_data, network_data and user_data.
 
-    If uuid or name are not provided in the meta_data, they're defauled to the
+    If uuid or name are not provided in the meta_data, they're defaulted to the
     node's uuid and name accordingly.
 
     :param node: an Ironic node object.
@@ -1085,7 +1113,10 @@ def fast_track_able(task):
             # TODO(TheJulia): Should we check the provisioning/deployment
             # networks match config wise? Do we care? #decisionsdecisions
             and task.driver.storage.should_write_image(task)
-            and task.node.last_error is None)
+            and task.node.last_error is None
+            # NOTE(dtantsur): Fast track makes zero sense for servicing and
+            # may prevent normal clean-up from happening.
+            and task.node.provision_state not in states.SERVICING_STATES)
 
 
 def value_within_timeout(value, timeout):
@@ -1095,7 +1126,7 @@ def value_within_timeout(value, timeout):
     :param timeout: timeout in seconds.
     """
     # use native datetime objects for conversion and compare
-    # slightly odd because py2 compatability :(
+    # slightly odd because py2 compatibility :(
     last = datetime.datetime.strptime(value or '1970-01-01T00:00:00.000000',
                                       "%Y-%m-%dT%H:%M:%S.%f")
     # If we found nothing, we assume that the time is essentially epoch.
@@ -1107,7 +1138,7 @@ def value_within_timeout(value, timeout):
 def agent_is_alive(node, timeout=None):
     """Check that the agent is likely alive.
 
-    The method then checks for the last agent heartbeat, and if it occured
+    The method then checks for the last agent heartbeat, and if it occurred
     within the timeout set by [deploy]fast_track_timeout, then agent is
     presumed alive.
 
@@ -1132,7 +1163,7 @@ def is_fast_track(task):
     have a ramdisk running through another means like discovery.
     If not valid, False is returned.
 
-    The method then checks for the last agent heartbeat, and if it occured
+    The method then checks for the last agent heartbeat, and if it occurred
     within the timeout set by [deploy]fast_track_timeout and the power
     state for the machine is POWER_ON, then fast track is permitted.
 
@@ -1191,7 +1222,7 @@ def _get_node_next_steps(task, step_type, skip_current_step=True):
     :returns: index of the next step; None if there are none to execute.
 
     """
-    valid_types = set(['clean', 'deploy'])
+    valid_types = set(['clean', 'deploy', 'service'])
     if step_type not in valid_types:
         # NOTE(rloo): No need to i18n this, since this would be a
         # developer error; it isn't user-facing.
@@ -1233,14 +1264,8 @@ def update_next_step_index(task, step_type):
     :param step_type: The type of steps to process: 'clean' or 'deploy'.
     :returns: Index of the next step.
     """
-    skip_current_step = task.node.del_driver_internal_info(
-        'skip_current_%s_step' % step_type, True)
-    if step_type == 'clean':
-        task.node.del_driver_internal_info('cleaning_polling')
-    else:
-        task.node.del_driver_internal_info('deployment_polling')
-    task.node.save()
-
+    skip_current_step = async_steps.prepare_node_for_next_step(
+        task.node, step_type)
     return _get_node_next_steps(task, step_type,
                                 skip_current_step=skip_current_step)
 
@@ -1304,7 +1329,7 @@ def is_agent_token_pregenerated(node):
 
     This method helps us identify WHEN we did so as we don't need to remove
     records of the token prior to rebooting the token. This is important as
-    tokens provided through out of band means presist in the virtual media
+    tokens provided through out of band means persist in the virtual media
     image, are loaded as part of the agent ramdisk, and do not require
     regeneration of the token upon the initial lookup, ultimately making
     the overall usage of virtual media and pregenerated tokens far more
@@ -1409,18 +1434,18 @@ def store_agent_certificate(node, agent_verify_ca):
         return fname
 
 
-def node_cache_bios_settings(task, node):
+def node_cache_bios_settings(task):
     """Do caching of bios settings if supported by driver"""
     try:
-        LOG.debug('Getting BIOS info for node %s', node.uuid)
+        LOG.debug('Getting BIOS info for node %s', task.node.uuid)
         task.driver.bios.cache_bios_settings(task)
     except exception.UnsupportedDriverExtension:
         LOG.warning('BIOS settings are not supported for node %s, '
-                    'skipping', node.uuid)
-    # TODO(zshi) remove this check when classic drivers are removed
+                    'skipping', task.node.uuid)
     except Exception:
+        # NOTE(dtantsur): the caller expects this function to never fail
         msg = (_('Caching of bios settings failed on node %(node)s.')
-               % {'node': node.uuid})
+               % {'node': task.node.uuid})
         LOG.exception(msg)
 
 
@@ -1442,6 +1467,7 @@ def node_cache_vendor(task):
     except exception.UnsupportedDriverExtension:
         return
     except Exception as exc:
+        # NOTE(dtantsur): the caller expects this function to never fail
         LOG.warning('Unexpected exception when trying to detect vendor '
                     'for node %(node)s. %(class)s: %(exc)s',
                     {'node': task.node.uuid,
@@ -1617,7 +1643,7 @@ def node_history_record(node, conductor=None, event=None,
                        based upon the activity. The purpose is to help guide
                        an API consumer/operator to have a better contextual
                        understanding of what was going on *when* the "event"
-                       occured.
+                       occurred.
     :param user: The user_id value which triggered the request,
                  if available.
     :param error: Boolean value, default false, to signify if the event
@@ -1626,11 +1652,11 @@ def node_history_record(node, conductor=None, event=None,
     :returns: None. No value is returned by this method.
     """
     if not event:
-        # No error has occured, apparently.
+        # No error has occurred, apparently.
         return
     if error:
         # When the task exits out or is saved, the event
-        # or error is saved, but that is outside of ceating an
+        # or error is saved, but that is outside of creating an
         # entry in the history table.
         node.last_error = event
     if not conductor:
@@ -1670,7 +1696,7 @@ def update_image_type(context, node):
         # idea since it is also user-settable, but laregely is just geared
         # to take what is in glance. Line below should we wish to uncomment.
         # node.set_instance_info('image_type', images.IMAGE_TYPE_DIRECTORY)
-        # An alternative is to explictly allow it to be configured by the
+        # An alternative is to explicitly allow it to be configured by the
         # caller/requester.
         return True
 
@@ -1711,7 +1737,7 @@ def get_token_project_from_request(ctx):
     This method evaluates the ``auth_token_info`` field, which is used to
     pass information returned from keystone as a token's
     verification. This information is based upon the actual, original
-    requestor context provided ``auth_token``.
+    requester context provided ``auth_token``.
 
     When a service, such as Nova proxies a request, the request provided
     auth token value is intended to be from the original user.
@@ -1725,5 +1751,129 @@ def get_token_project_from_request(ctx):
             if project:
                 return project.get('id')
     except AttributeError:
-        LOG.warning('Attempted to identify requestor project ID value, '
+        LOG.warning('Attempted to identify requester project ID value, '
                     'however we were unable to do so. Possible older API?')
+
+
+def servicing_error_handler(task, logmsg, errmsg=None, traceback=False,
+                            tear_down_service=True, set_fail_state=True,
+                            set_maintenance=None):
+    """Put a failed node in SERVICEFAIL and maintenance (if needed).
+
+    :param task: a TaskManager instance.
+    :param logmsg: Message to be logged.
+    :param errmsg: Message for the user. Optional, if not provided `logmsg` is
+        used.
+    :param traceback: Whether to log a traceback. Defaults to False.
+    :param tear_down_service: Whether to clean up the PXE and DHCP files after
+        service. Default to True.
+    :param set_fail_state: Whether to set node to failed state. Default to
+        True.
+    :param set_maintenance: Whether to set maintenance mode. If None,
+        maintenance mode will be set if and only if a clean step is being
+        executed on a node.
+    """
+    if set_maintenance is None:
+        set_maintenance = bool(task.node.service_step)
+
+    errmsg = errmsg or logmsg
+    LOG.error(logmsg, exc_info=traceback)
+    node = task.node
+    if set_maintenance:
+        node.fault = faults.SERVICE_FAILURE
+        node.maintenance = True
+
+    if tear_down_service:
+        try:
+            task.driver.deploy.tear_down_service(task)
+        except Exception as e:
+            msg2 = ('Failed to tear down servicing on node %(uuid)s, '
+                    'reason: %(err)s' % {'err': e, 'uuid': node.uuid})
+            LOG.exception(msg2)
+            errmsg = _('%s. Also failed to tear down servicing.') % errmsg
+
+    if node.provision_state in (
+            states.SERVICING,
+            states.SERVICEWAIT,
+            states.SERVICEFAIL):
+        # Clear clean step, msg should already include current step
+        node.service_step = {}
+        # Clear any leftover metadata about cleaning
+        node.del_driver_internal_info('service_step_index')
+        async_steps.remove_node_flags(node)
+        # We don't need to keep the old agent URL, or token
+        # as it should change upon the next cleaning attempt.
+        wipe_token_and_url(task)
+    # For manual cleaning, the target provision state is MANAGEABLE, whereas
+    # for automated cleaning, it is AVAILABLE.
+    node_history_record(node, event=errmsg, event_type=states.SERVICING,
+                        error=True)
+    # NOTE(dtantsur): avoid overwriting existing maintenance_reason
+    if not node.maintenance_reason and set_maintenance:
+        node.maintenance_reason = errmsg
+
+    if CONF.conductor.poweroff_in_servicefail:
+        # NOTE(NobodyCam): Power off node in service fail
+        node_power_action(task, states.POWER_OFF)
+
+    node.save()
+
+    if set_fail_state and node.provision_state != states.SERVICEFAIL:
+        task.process_event('fail')
+
+
+def node_cache_firmware_components(task):
+    """Do caching of firmware components if supported by driver"""
+
+    try:
+        LOG.debug('Getting Firmware Components for node %s', task.node.uuid)
+        task.driver.firmware.validate(task)
+        task.driver.firmware.cache_firmware_components(task)
+    except exception.UnsupportedDriverExtension:
+        LOG.warning('Firmware Components are not supported for node %s, '
+                    'skipping', task.node.uuid)
+    except Exception:
+        # NOTE(dtantsur): the caller expects this function to never fail
+        LOG.exception('Caching of firmware components failed on node %s',
+                      task.node.uuid)
+
+
+def run_node_action(task, call, error_msg, success_msg=None, **kwargs):
+    """Run a node action and report any errors via last_error.
+
+    :param task: A TaskManager instance containing the node to act on.
+    :param call: A callable object to invoke.
+    :param error_msg: A template for a failure message. Can use %(node)s,
+        %(exc)s and any variables from kwargs.
+    :param success_msg: A template for a success message. Can use %(node)s
+        and any variables from kwargs.
+    :param kwargs: Arguments to pass to the call.
+    """
+    error = None
+    try:
+        call(task, **kwargs)
+    except Exception as exc:
+        error = error_msg % dict(kwargs, node=task.node.uuid, exc=exc)
+        node_history_record(task.node, event=error, error=True)
+        LOG.error(
+            error, exc_info=not isinstance(exc, exception.IronicException))
+
+    task.node.save()
+    if not error and success_msg:
+        LOG.info(success_msg, dict(kwargs, node=task.node.uuid))
+
+
+def node_update_cache(task):
+    """Updates various cached information.
+
+    Includes vendor, boot mode, BIOS settings and firmware components.
+
+    :param task: A TaskManager instance containing the node to act on.
+    """
+    # FIXME(dtantsur): in case of Redfish, these 4 calls may result in the
+    # System object loaded at least 4 times. "Cache whatever you can" should
+    # probably be a driver call, just not clear in which interface.
+    node_cache_vendor(task)
+    node_cache_boot_mode(task)
+    node_cache_bios_settings(task)
+    node_cache_firmware_components(task)

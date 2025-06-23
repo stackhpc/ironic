@@ -34,10 +34,6 @@ from ironic.common import utils
 from ironic.conf import CONF
 
 IMAGE_CHUNK_SIZE = 1024 * 1024  # 1mb
-# NOTE(kaifeng) Image will be truncated to 2GiB by sendfile,
-# we use a large chunk size here for a better performance
-# while keep the chunk size less than the size limit.
-SENDFILE_CHUNK_SIZE = 1024 * 1024 * 1024  # 1Gb
 LOG = log.getLogger(__name__)
 
 
@@ -78,6 +74,60 @@ class BaseImageService(object, metaclass=abc.ABCMeta):
 class HttpImageService(BaseImageService):
     """Provides retrieval of disk images using HTTP."""
 
+    @staticmethod
+    def gen_auth_from_conf_user_pass(image_href):
+        """This function is used to pass the credentials to the chosen
+
+           credential verifier and in case the verification is successful
+           generate the compatible authentication object that will be used
+           with the request(s). This function handles the authentication object
+           generation for authentication strategies that are username+password
+           based. Credentials are collected from the oslo.config framework.
+
+        :param image_href: href of the image that is being acted upon
+
+        :return: Authentication object used directly by the request library
+        :rtype: requests.auth.HTTPBasicAuth
+        """
+
+        image_server_user = None
+        image_server_password = None
+
+        if CONF.deploy.image_server_auth_strategy == 'http_basic':
+            HttpImageService.verify_basic_auth_cred_format(
+                CONF.deploy.image_server_user,
+                CONF.deploy.image_server_password,
+                image_href)
+            image_server_user = CONF.deploy.image_server_user
+            image_server_password = CONF.deploy.image_server_password
+        else:
+            return None
+
+        return requests.auth.HTTPBasicAuth(image_server_user,
+                                           image_server_password)
+
+    @staticmethod
+    def verify_basic_auth_cred_format(image_href, user=None, password=None):
+        """Verify basic auth credentials used for image head request.
+
+        :param user: auth username
+        :param password: auth password
+        :raises: exception.ImageRefValidationFailed if the credentials are not
+            present
+        """
+        expected_creds = {'image_server_user': user,
+                          'image_server_password': password}
+        missing_creds = []
+        for key, value in expected_creds.items():
+            if not value:
+                missing_creds.append(key)
+        if missing_creds:
+            raise exception.ImageRefValidationFailed(
+                image_href=image_href,
+                reason=_("Missing %s fields from HTTP(S) "
+                         "basic auth config") % missing_creds
+            )
+
     def validate_href(self, image_href, secret=False):
         """Validate HTTP image reference.
 
@@ -100,6 +150,7 @@ class HttpImageService(BaseImageService):
             verify = CONF.webserver_verify_ca
 
         try:
+            auth = HttpImageService.gen_auth_from_conf_user_pass(image_href)
             # NOTE(TheJulia): Head requests do not work on things that are not
             # files, but they can be responded with redirects or a 200 OK....
             # We don't want to permit endless redirects either, thus not
@@ -108,8 +159,8 @@ class HttpImageService(BaseImageService):
             # HTTPForbidden or a list of files. Both should be okay to at
             # least know things are okay in a limited fashion.
             response = requests.head(image_href, verify=verify,
-                                     timeout=CONF.webserver_connection_timeout)
-
+                                     timeout=CONF.webserver_connection_timeout,
+                                     auth=auth)
             if response.status_code == http_client.MOVED_PERMANENTLY:
                 # NOTE(TheJulia): In the event we receive a redirect, we need
                 # to notify the caller. Before this we would just fail,
@@ -165,14 +216,17 @@ class HttpImageService(BaseImageService):
         """
 
         try:
+
             verify = strutils.bool_from_string(CONF.webserver_verify_ca,
                                                strict=True)
         except ValueError:
             verify = CONF.webserver_verify_ca
 
         try:
+            auth = HttpImageService.gen_auth_from_conf_user_pass(image_href)
             response = requests.get(image_href, stream=True, verify=verify,
-                                    timeout=CONF.webserver_connection_timeout)
+                                    timeout=CONF.webserver_connection_timeout,
+                                    auth=auth)
             if response.status_code != http_client.OK:
                 raise exception.ImageRefValidationFailed(
                     image_href=image_href,
@@ -233,6 +287,43 @@ class HttpImageService(BaseImageService):
             'no_cache': no_cache,
         }
 
+    @staticmethod
+    def get(image_href):
+        """Downloads content and returns the response text.
+
+        :param image_href: Image reference.
+        :raises: exception.ImageRefValidationFailed if GET request returned
+            response code not equal to 200.
+        :raises: exception.ImageDownloadFailed if:
+            * IOError happened during file write;
+            * GET request failed.
+        """
+
+        try:
+
+            verify = strutils.bool_from_string(CONF.webserver_verify_ca,
+                                               strict=True)
+        except ValueError:
+            verify = CONF.webserver_verify_ca
+
+        try:
+            auth = HttpImageService.gen_auth_from_conf_user_pass(image_href)
+            response = requests.get(image_href, stream=False, verify=verify,
+                                    timeout=CONF.webserver_connection_timeout,
+                                    auth=auth)
+            if response.status_code != http_client.OK:
+                raise exception.ImageRefValidationFailed(
+                    image_href=image_href,
+                    reason=_("Got HTTP code %s instead of 200 in response "
+                             "to GET request.") % response.status_code)
+
+            return response.text
+
+        except (OSError, requests.ConnectionError, requests.RequestException,
+                IOError) as e:
+            raise exception.ImageDownloadFailed(image_href=image_href,
+                                                reason=str(e))
+
 
 class FileImageService(BaseImageService):
     """Provides retrieval of disk images available locally on the conductor."""
@@ -242,14 +333,32 @@ class FileImageService(BaseImageService):
 
         :param image_href: Image reference.
         :raises: exception.ImageRefValidationFailed if source image file
-            doesn't exist.
-        :returns: Path to image file if it exists.
+            doesn't exist, is in a blocked path, or is not in an allowed path.
+        :returns: Path to image file if it exists and is allowed.
         """
         image_path = urlparse.urlparse(image_href).path
+
+        # Check if the path is in the blocklist
+        rpath = os.path.abspath(image_path)
+
+        # Check if the path is in the allowlist
+        for allowed in CONF.conductor.file_url_allowed_paths:
+            if rpath == allowed or rpath.startswith(allowed + os.sep):
+                break
+        else:
+            raise exception.ImageRefValidationFailed(
+                image_href=image_href,
+                reason=_(
+                    "Security: Path %s is not allowed for image source "
+                    "file URLs" % image_path)
+            )
+
+        # Check if the file exists
         if not os.path.isfile(image_path):
             raise exception.ImageRefValidationFailed(
                 image_href=image_href,
                 reason=_("Specified image file not found."))
+
         return image_path
 
     def download(self, image_href, image_file):
@@ -264,26 +373,31 @@ class FileImageService(BaseImageService):
         """
         source_image_path = self.validate_href(image_href)
         dest_image_path = image_file.name
-        local_device = os.stat(dest_image_path).st_dev
         try:
-            # We should have read and write access to source file to create
-            # hard link to it.
-            if (local_device == os.stat(source_image_path).st_dev
-                    and os.access(source_image_path, os.R_OK | os.W_OK)):
-                image_file.close()
-                os.remove(dest_image_path)
-                os.link(source_image_path, dest_image_path)
+            image_file.close()
+            os.remove(dest_image_path)
+
+            # NOTE(dtantsur): os.link is supposed to follow symlinks, but it
+            # does not: https://github.com/python/cpython/issues/81793
+            real_image_path = os.path.realpath(source_image_path)
+            try:
+                os.link(real_image_path, dest_image_path)
+            except OSError as exc:
+                orig = (f' (real path {real_image_path})'
+                        if real_image_path != source_image_path
+                        else '')
+
+                LOG.debug('Could not create a link from %(src)s%(orig)s to '
+                          '%(dest)s, will copy the content instead. '
+                          'Error: %(exc)s.',
+                          {'src': source_image_path, 'dest': dest_image_path,
+                           'orig': orig, 'exc': exc})
             else:
-                filesize = os.path.getsize(source_image_path)
-                offset = 0
-                with open(source_image_path, 'rb') as input_img:
-                    while offset < filesize:
-                        count = min(SENDFILE_CHUNK_SIZE, filesize - offset)
-                        nbytes_out = os.sendfile(image_file.fileno(),
-                                                 input_img.fileno(),
-                                                 offset,
-                                                 count)
-                        offset += nbytes_out
+                return
+
+            # NOTE(dtantsur): starting with Python 3.8, copyfile() uses
+            # efficient copying (i.e. sendfile) under the hood.
+            shutil.copyfile(source_image_path, dest_image_path)
         except Exception as e:
             raise exception.ImageDownloadFailed(image_href=image_href,
                                                 reason=str(e))

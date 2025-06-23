@@ -77,12 +77,14 @@ class TestACLBase(base.BaseApiTest):
     def _fake_process_request(self, request, auth_token_request):
         pass
 
-    def _test_request(self, path, params=None, headers=None, method='get',
+    def _test_request(self, path, params=None, headers=None, method='get',  # noqa: C901, E501
                       body=None, assert_status=None,
                       assert_dict_contains=None,
                       assert_list_length=None,
                       deprecated=None,
-                      self_manage_nodes=True):
+                      self_manage_nodes=True,
+                      enable_service_project=False,
+                      service_project='service'):
         path = path.format(**self.format_data)
         self.mock_auth.side_effect = self._fake_process_request
 
@@ -92,6 +94,13 @@ class TestACLBase(base.BaseApiTest):
                 'project_admin_can_manage_own_nodes',
                 False,
                 'api')
+        if enable_service_project:
+            cfg.CONF.set_override('rbac_service_role_elevated_access', True)
+        if service_project != 'service':
+            # Enable us to sort of gracefully test a name variation
+            # with existing ddt test modeling.
+            cfg.CONF.set_override('rbac_service_project_name',
+                                  service_project)
 
         # always request the latest api version
         version = api_versions.max_version_string()
@@ -102,7 +111,6 @@ class TestACLBase(base.BaseApiTest):
         # in troubleshooting ACL testing. This is a pattern
         # followed in API unit testing in ironic, and
         # really does help.
-        print('API ACL Testing Path %s %s' % (method, path))
         if headers:
             for k, v in headers.items():
                 rheaders[k] = v.format(**self.format_data)
@@ -157,7 +165,7 @@ class TestACLBase(base.BaseApiTest):
         #       Example: PATCH /v1/nodes/<uuid> as a reader.
         # 404 - Trying to access something where we don't have permissions
         #       in a project scope. This is particularly true where implied
-        #       permissions or assocation exists. Ports are attempted to be
+        #       permissions or association exists. Ports are attempted to be
         #       accessed when the underlying node is inaccessible as owner
         #       nor node matches.
         #       Example: GET /v1/portgroups or /v1/nodes/<uuid>/ports
@@ -185,14 +193,12 @@ class TestACLBase(base.BaseApiTest):
         if assert_dict_contains:
             for k, v in assert_dict_contains.items():
                 self.assertIn(k, response)
-                print(k)
-                print(v)
                 if str(v) == "None":
                     # Compare since the variable loaded from the
                     # json ends up being null in json or None.
                     self.assertIsNone(response.json[k])
                 elif str(v) == "{}":
-                    # Special match for signifying a dictonary.
+                    # Special match for signifying a dictionary.
                     self.assertEqual({}, response.json[k])
                 elif isinstance(v, dict):
                     # The value from the YAML can be a dictionary,
@@ -218,13 +224,6 @@ class TestACLBase(base.BaseApiTest):
                     # views, such as "other" admins being subjected to
                     # a filtered view in these cases.
                     self.assertEqual(0, len(items))
-
-        # NOTE(TheJulia): API tests in Ironic tend to have a pattern
-        # to print request and response data to aid in development
-        # and troubleshooting. As such the prints should remain,
-        # at least until we are through primary development of the
-        # this test suite.
-        print('ACL Test GOT %s' % response)
 
 
 @ddt.ddt
@@ -285,6 +284,10 @@ class TestRBACModelBeforeScopesBase(TestACLBase):
             value=fake_setting)
         db_utils.create_test_node_trait(
             node_id=fake_db_node['id'])
+        # Create a Fake Firmware Component BMC
+        db_utils.create_test_firmware_component(
+            node_id=fake_db_node['id'],
+        )
         fake_history = db_utils.create_test_history(node_id=fake_db_node.id)
         fake_inventory = db_utils.create_test_inventory(
             node_id=fake_db_node.id)
@@ -344,7 +347,7 @@ class TestRBACScoped(TestRBACModelBeforeScopes):
         # while we also enable the new ones in another test class with
         # the appropriate scope friendly chagnges. In other words, two
         # test changes will be needed for each which should also reduce
-        # risk of accidential policy changes. It may just be Julia being
+        # risk of accidental policy changes. It may just be Julia being
         # super risk-adverse, just let her roll with it and we will delete
         # this class later.
         # NOTE(TheJulia): This test class runs with test_rbac_legacy.yaml!
@@ -392,6 +395,17 @@ class TestRBACProjectScoped(TestACLBase):
             owner=owner_project_id,
             last_error='meow',
             reservation='lolcats')
+        # invisible child node, rbac + project query enforcement
+        # prevents it from being visible.
+        db_utils.create_test_node(
+            uuid='2b3b8adb-add7-4fd0-8e82-dcb714d848e7',
+            parent_node=owned_node.uuid)
+        # Child node which will appear in child node endpoint
+        # queries.
+        db_utils.create_test_node(
+            uuid='3c3b8adb-edd7-3ed0-8e82-aab714d8411a',
+            parent_node=owned_node.uuid,
+            owner=owner_project_id)
         owned_node_port = db_utils.create_test_port(
             uuid='ebe30f19-358d-41e1-8d28-fd7357a0164c',
             node_id=owned_node['id'],

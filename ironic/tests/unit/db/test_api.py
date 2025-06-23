@@ -13,17 +13,21 @@
 import random
 from unittest import mock
 
+from oslo_config import cfg
 from oslo_db.sqlalchemy import utils as db_utils
 from oslo_utils import uuidutils
 import sqlalchemy as sa
-from testtools import matchers
 
 from ironic.common import context
 from ironic.common import exception
 from ironic.common import release_mappings
+from ironic.common import states
 from ironic.db import api as db_api
 from ironic.tests.unit.db import base
 from ironic.tests.unit.db import utils
+
+
+CONF = cfg.CONF
 
 
 class UpgradingTestCase(base.DbTestCase):
@@ -103,45 +107,6 @@ class UpgradingTestCase(base.DbTestCase):
         conductor = self.dbapi.get_conductor(conductor.hostname)
         self.assertEqual('1.0', conductor.version)
         self.assertFalse(self.dbapi.check_versions())
-
-
-class GetNotVersionsTestCase(base.DbTestCase):
-
-    def setUp(self):
-        super(GetNotVersionsTestCase, self).setUp()
-        self.dbapi = db_api.get_instance()
-
-    def test_get_not_versions(self):
-        versions = ['1.1', '1.2', '1.3']
-        node_uuids = []
-        for v in versions:
-            node = utils.create_test_node(uuid=uuidutils.generate_uuid(),
-                                          version=v)
-            node_uuids.append(node.uuid)
-        self.assertEqual([], self.dbapi.get_not_versions('Node', versions))
-
-        res = self.dbapi.get_not_versions('Node', ['2.0'])
-        self.assertThat(res, matchers.HasLength(len(node_uuids)))
-        res_uuids = [n.uuid for n in res]
-        self.assertEqual(node_uuids, res_uuids)
-
-        res = self.dbapi.get_not_versions('Node', versions[1:])
-        self.assertThat(res, matchers.HasLength(1))
-        self.assertEqual(node_uuids[0], res[0].uuid)
-
-    def test_get_not_versions_null(self):
-        node = utils.create_test_node(uuid=uuidutils.generate_uuid(),
-                                      version=None)
-        node = self.dbapi.get_node_by_id(node.id)
-        self.assertIsNone(node.version)
-        res = self.dbapi.get_not_versions('Node', ['1.6'])
-        self.assertThat(res, matchers.HasLength(1))
-        self.assertEqual(node.uuid, res[0].uuid)
-
-    def test_get_not_versions_no_model(self):
-        utils.create_test_node(uuid=uuidutils.generate_uuid(), version='1.4')
-        self.assertRaises(exception.IronicException,
-                          self.dbapi.get_not_versions, 'NotExist', ['1.6'])
 
 
 class UpdateToLatestVersionsTestCase(base.DbTestCase):
@@ -226,6 +191,11 @@ class UpdateToLatestVersionsTestCase(base.DbTestCase):
         for i in range(0, num_nodes):
             node = utils.create_test_node(version=version,
                                           uuid=uuidutils.generate_uuid())
+            # Create entries on the tables so we force field upgrades
+            utils.create_test_node_trait(node_id=node.id, trait='foo',
+                                         version='0.0')
+            utils.create_test_bios_setting(node_id=node.id, version='1.0')
+
             nodes.append(node.uuid)
         for uuid in nodes:
             node = self.dbapi.get_node_by_uuid(uuid)
@@ -238,10 +208,15 @@ class UpdateToLatestVersionsTestCase(base.DbTestCase):
             return
 
         nodes = self._create_nodes(5)
+        # Check/migrate 2, 10 remain.
         self.assertEqual(
-            (5, 2), self.dbapi.update_to_latest_versions(self.context, 2))
+            (10, 2), self.dbapi.update_to_latest_versions(self.context, 2))
+        # Check/migrate 10, 8 migrated, 8 remain.
         self.assertEqual(
-            (3, 3), self.dbapi.update_to_latest_versions(self.context, 10))
+            (8, 8), self.dbapi.update_to_latest_versions(self.context, 10))
+        # Just make sure it is still 0, 0 in case more things are added.
+        self.assertEqual(
+            (0, 0), self.dbapi.update_to_latest_versions(self.context, 10))
         for uuid in nodes:
             node = self.dbapi.get_node_by_uuid(uuid)
             self.assertEqual(self.node_ver, node.version)
@@ -250,10 +225,77 @@ class UpdateToLatestVersionsTestCase(base.DbTestCase):
         if self.node_version_same:
             # can't test if we don't have diff versions of the node
             return
-
-        nodes = self._create_nodes(5)
+        vm_count = 5
+        nodes = self._create_nodes(vm_count)
+        # NOTE(TheJulia): Under current testing, 5 node will result in 10
+        # records implicitly needing to be migrated.
+        migrate_count = vm_count * 2
         self.assertEqual(
-            (5, 5), self.dbapi.update_to_latest_versions(self.context, 5))
+            (migrate_count, migrate_count),
+            self.dbapi.update_to_latest_versions(self.context,
+                                                 migrate_count))
+        self.assertEqual(
+            (0, 0), self.dbapi.update_to_latest_versions(self.context,
+                                                         migrate_count))
+
         for uuid in nodes:
             node = self.dbapi.get_node_by_uuid(uuid)
             self.assertEqual(self.node_ver, node.version)
+
+
+class MigrateToBuiltinInspectionTestCase(base.DbTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.context = context.get_admin_context()
+        self.dbapi = db_api.get_instance()
+        CONF.set_override('enabled_inspect_interfaces', 'agent,no-inspect')
+
+        for _ in range(3):
+            utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                                   inspect_interface='inspector')
+        for _ in range(2):
+            utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                                   inspect_interface='agent')
+        utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                               inspect_interface='no-inspect')
+
+    def _check(self, migrated, left):
+        current = sorted(x[0] for x in self.dbapi.get_nodeinfo_list(
+            columns=['inspect_interface']))
+        self.assertEqual(['agent'] * migrated + ['inspector'] * left
+                         + ['no-inspect'], current)
+
+    def test_migrate_all(self):
+        total, migrated = self.dbapi.migrate_to_builtin_inspection(
+            self.context, 0)
+        self.assertEqual(3, total)
+        self.assertEqual(3, migrated)
+        self._check(5, 0)
+
+    def test_cannot_migrate(self):
+        CONF.set_override('enabled_inspect_interfaces', 'inspector,no-inspect')
+        total, migrated = self.dbapi.migrate_to_builtin_inspection(
+            self.context, 0)
+        self.assertEqual(0, total)
+        self.assertEqual(0, migrated)
+        self._check(2, 3)
+
+    def test_cannot_migrate_some(self):
+        for state in [states.INSPECTING, states.INSPECTWAIT,
+                      states.INSPECTFAIL]:
+            utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                                   inspect_interface='inspector',
+                                   provision_state=state)
+        total, migrated = self.dbapi.migrate_to_builtin_inspection(
+            self.context, 0)
+        self.assertEqual(6, total)
+        self.assertEqual(3, migrated)
+        self._check(5, 3)
+
+    def test_migrate_with_limit(self):
+        total, migrated = self.dbapi.migrate_to_builtin_inspection(
+            self.context, 2)
+        self.assertEqual(3, total)
+        self.assertEqual(2, migrated)
+        self._check(4, 1)

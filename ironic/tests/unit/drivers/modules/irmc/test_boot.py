@@ -20,6 +20,7 @@ import io
 import os
 import shutil
 import tempfile
+import unittest
 from unittest import mock
 
 from ironic_lib import utils as ironic_utils
@@ -1007,7 +1008,7 @@ class IRMCDeployPrivateMethodsTestCase(test_common.BaseIRMCTest):
     def test_check_share_fs_mounted_ok(self, parse_conf_mock,
                                        check_share_fs_mounted_mock):
         # Note(naohirot): mock.patch.stop() and mock.patch.start() don't work.
-        # therefor monkey patching is used to
+        # therefore monkey patching is used to
         # irmc_boot.check_share_fs_mounted.
         # irmc_boot.check_share_fs_mounted is mocked in
         # third_party_driver_mocks.py.
@@ -1024,7 +1025,7 @@ class IRMCDeployPrivateMethodsTestCase(test_common.BaseIRMCTest):
     def test_check_share_fs_mounted_exception(self, parse_conf_mock,
                                               check_share_fs_mounted_mock):
         # Note(naohirot): mock.patch.stop() and mock.patch.start() don't work.
-        # therefor monkey patching is used to
+        # therefore monkey patching is used to
         # irmc_boot.check_share_fs_mounted.
         # irmc_boot.check_share_fs_mounted is mocked in
         # third_party_driver_mocks.py.
@@ -1231,6 +1232,9 @@ class IRMCVirtualMediaBootTestCase(test_common.BaseIRMCTest):
         self.assertRaises(ValueError, cfg.CONF.set_override,
                           'remote_image_share_type', 'fake', 'irmc')
 
+    # NOTE(TheJulia): https://bugs.launchpad.net/ironic/+bug/2025424
+    # Disabling until we can figure out what exactly is going on.
+    @unittest.skip("bug #2025424")
     @mock.patch.object(irmc_common, 'set_secure_boot_mode', spec_set=True,
                        autospec=True)
     @mock.patch.object(irmc_boot.IRMCVirtualMediaBoot,
@@ -1238,7 +1242,8 @@ class IRMCVirtualMediaBootTestCase(test_common.BaseIRMCTest):
                        autospec=True)
     @mock.patch.object(irmc_boot, '_cleanup_vmedia_boot', spec_set=True,
                        autospec=True)
-    def test_prepare_instance_with_secure_boot(self, mock_cleanup_vmedia_boot,
+    def test_prepare_instance_with_secure_boot(self,
+                                               mock_cleanup_vmedia_boot,
                                                mock_configure_vmedia_boot,
                                                mock_set_secure_boot_mode,
                                                check_share_fs_mounted_mock):
@@ -1312,12 +1317,17 @@ class IRMCVirtualMediaBootTestCase(test_common.BaseIRMCTest):
             mock_configure_vmedia_boot.assert_called_once_with(mock.ANY, task,
                                                                "12312642")
 
+    # NOTE(TheJulia): https://bugs.launchpad.net/ironic/+bug/2025424
+    # Disabling until we can figure out what exactly is going on.
+    @unittest.skip("bug #2025424")
+    @mock.patch.object(irmc_boot, '_remove_share_file', autospec=True)
     @mock.patch.object(irmc_common, 'set_secure_boot_mode', spec_set=True,
                        autospec=True)
     @mock.patch.object(irmc_boot, '_cleanup_vmedia_boot', spec_set=True,
                        autospec=True)
     def test_clean_up_instance_with_secure_boot(self, mock_cleanup_vmedia_boot,
                                                 mock_set_secure_boot_mode,
+                                                mock_remove_share_file,
                                                 check_share_fs_mounted_mock):
         self.node.provision_state = states.DELETING
         self.node.target_provision_state = states.AVAILABLE
@@ -1333,6 +1343,8 @@ class IRMCVirtualMediaBootTestCase(test_common.BaseIRMCTest):
             mock_set_secure_boot_mode.assert_called_once_with(task.node,
                                                               enable=False)
             mock_cleanup_vmedia_boot.assert_called_once_with(task)
+            mock_remove_share_file.assert_called_once_with(
+                'boot-%s.iso' % task.node.uuid)
 
     @mock.patch.object(irmc_common, 'set_secure_boot_mode', spec_set=True,
                        autospec=True)

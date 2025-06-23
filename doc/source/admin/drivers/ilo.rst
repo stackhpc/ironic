@@ -20,6 +20,11 @@ known issues, etc), please check the `iLO driver wiki page <https://wiki.opensta
 For enabling Gen10 systems and getting detailed information on Gen10 feature
 support in Ironic please check this `Gen10 wiki section`_.
 
+.. warning::
+   Starting from Gen11 servers and above (iLO6 and above) use ``redfish``
+   (see :doc:`redfish`) hardware type for baremetal provisioning and
+   management.
+
 Hardware type
 =============
 
@@ -29,9 +34,6 @@ hardware can be used with reference hardware type ``ipmi`` (see
 :doc:`ipmitool`) and ``redfish`` (see :doc:`redfish`). For information on how
 to enable the ``ilo`` and ``ilo5`` hardware type, see
 :ref:`enable-hardware-types`.
-
-.. note::
-   Only HPE ProLiant Gen10 servers supports hardware type ``redfish``.
 
 .. warning::
    It is important to note that while the HPE Edgeline series of servers may
@@ -359,7 +361,7 @@ Node configuration
      before the Xena release.
 
 * The  following parameters are mandatory in ``driver_info``
-  if ``ilo-inspect`` inspect inteface is used and SNMPv3 inspection
+  if ``ilo-inspect`` inspect interface is used and SNMPv3 inspection
   (`SNMPv3 Authentication` in `HPE iLO4 User Guide`_) is desired:
 
   * ``snmp_auth_user`` : The SNMPv3 user.
@@ -889,7 +891,7 @@ The hardware type ``ilo`` supports hardware inspection.
      an error. This feature is available in proliantutils release
      version >= 2.2.0.
    * The iLO must be updated with SNMPv3 authentication details.
-     Pleae refer to the section `SNMPv3 Authentication` in `HPE iLO4 User Guide`_
+     Please refer to the section `SNMPv3 Authentication` in `HPE iLO4 User Guide`_
      for setting up authentication details on iLO.
      The  following parameters are mandatory to be given in driver_info
      for SNMPv3 inspection:
@@ -908,12 +910,9 @@ The hardware type ``ilo`` supports hardware inspection.
      * ``snmp_auth_priv_protocol`` : The Privacy protocol. The valid
        values are "AES" and "DES". The iLO default value is "DES".
 
-The inspection process will discover the following essential properties
-(properties required for scheduling deployment):
+The inspection process will discover the following properties:
 
 * ``memory_mb``: memory size
-
-* ``cpus``: number of cpus
 
 * ``cpu_arch``: cpu architecture
 
@@ -1100,197 +1099,32 @@ Deploy Process
 Glance and swift for partition images
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-.. seqdiag::
-   :scale: 80
-
-   diagram {
-      Glance; Conductor; Baremetal; Swift; IPA; iLO;
-      activation = none;
-      span_height = 1;
-      edge_length = 250;
-      default_note_color = white;
-      default_fontsize = 14;
-
-      Conductor -> iLO [label = "Powers off the node"];
-      Conductor -> Glance [label = "Get the metadata for deploy ISO"];
-      Glance -> Conductor [label = "Returns the metadata for deploy ISO"];
-      Conductor -> Conductor [label = "Generates swift tempURL for deploy ISO"];
-      Conductor -> Conductor [label = "Creates the FAT32 image containing ironic API URL and driver name"];
-      Conductor -> Swift [label = "Uploads the FAT32 image"];
-      Conductor -> Conductor [label = "Generates swift tempURL for FAT32 image"];
-      Conductor -> iLO [label = "Attaches the FAT32 image swift tempURL as virtual media floppy"];
-      Conductor -> iLO [label = "Attaches the deploy ISO swift tempURL as virtual media CDROM"];
-      Conductor -> iLO [label = "Sets one time boot to CDROM"];
-      Conductor -> iLO [label = "Reboot the node"];
-      iLO -> Swift [label = "Downloads deploy ISO"];
-      Baremetal -> iLO [label = "Boots deploy kernel/ramdisk from iLO virtual media CDROM"];
-      IPA -> Conductor [label = "Lookup node"];
-      Conductor -> IPA [label = "Provides node UUID"];
-      IPA -> Conductor [label = "Heartbeat"];
-      Conductor -> IPA [label = "Sends the user image HTTP(S) URL"];
-      IPA -> Swift [label = "Retrieves the user image on bare metal"];
-      IPA -> IPA [label = "Writes user image to root partition"];
-      IPA -> IPA [label = "Installs boot loader"];
-      IPA -> Conductor [label = "Heartbeat"];
-      Conductor -> Baremetal [label = "Sets boot device to disk"];
-      Conductor -> IPA [label = "Power off the node"];
-      Conductor -> iLO [label = "Power on the node"];
-      Baremetal -> Baremetal [label = "Boot user image from disk"];
-   }
-
+.. figure:: ./../../images/glance-and-swift-for-partition-images.svg
+   :width: 100%
 
 Glance and swift with whole-disk images
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-.. seqdiag::
-   :scale: 80
-
-   diagram {
-      Glance; Conductor; Baremetal; Swift; IPA; iLO;
-      activation = none;
-      span_height = 1;
-      edge_length = 250;
-      default_note_color = white;
-      default_fontsize = 14;
-
-      Conductor -> iLO [label = "Powers off the node"];
-      Conductor -> Glance [label = "Get the metadata for deploy ISO"];
-      Glance -> Conductor [label = "Returns the metadata for deploy ISO"];
-      Conductor -> Conductor [label = "Generates swift tempURL for deploy ISO"];
-      Conductor -> Conductor [label = "Creates the FAT32 image containing ironic API URL and driver name"];
-      Conductor -> Swift [label = "Uploads the FAT32 image"];
-      Conductor -> Conductor [label = "Generates swift tempURL for FAT32 image"];
-      Conductor -> iLO [label = "Attaches the FAT32 image swift tempURL as virtual media floppy"];
-      Conductor -> iLO [label = "Attaches the deploy ISO swift tempURL as virtual media CDROM"];
-      Conductor -> iLO [label = "Sets one time boot to CDROM"];
-      Conductor -> iLO [label = "Reboot the node"];
-      iLO -> Swift [label = "Downloads deploy ISO"];
-      Baremetal -> iLO [label = "Boots deploy kernel/ramdisk from iLO virtual media CDROM"];
-      IPA -> Conductor [label = "Lookup node"];
-      Conductor -> IPA [label = "Provides node UUID"];
-      IPA -> Conductor [label = "Heartbeat"];
-      Conductor -> IPA [label = "Sends the user image HTTP(S) URL"];
-      IPA -> Swift [label = "Retrieves the user image on bare metal"];
-      IPA -> IPA [label = "Writes user image to disk"];
-      IPA -> Conductor [label = "Heartbeat"];
-      Conductor -> Baremetal [label = "Sets boot device to disk"];
-      Conductor -> IPA [label = "Power off the node"];
-      Conductor -> iLO [label = "Power on the node"];
-      Baremetal -> Baremetal [label = "Boot user image from disk"];
-   }
+.. figure:: ./../../images/glance-and-swift-whole-disk-images.svg
+   :width: 100%
 
 Swiftless deploy
 ^^^^^^^^^^^^^^^^
 
-.. seqdiag::
-   :scale: 80
-
-   diagram {
-      Glance; Conductor; Baremetal; ConductorWebserver; IPA; iLO;
-      activation = none;
-      span_height = 1;
-      edge_length = 250;
-      default_note_color = white;
-      default_fontsize = 14;
-
-      Conductor -> iLO [label = "Powers off the node"];
-      Conductor -> Glance [label = "Get the metadata for deploy ISO"];
-      Glance -> Conductor [label = "Returns the metadata for deploy ISO"];
-      Conductor -> Conductor [label = "Generates swift tempURL for deploy ISO"];
-      Conductor -> Conductor [label = "Creates the FAT32 image containing Ironic API URL and driver name"];
-      Conductor -> ConductorWebserver [label = "Uploads the FAT32 image"];
-      Conductor -> iLO [label = "Attaches the FAT32 image URL as virtual media floppy"];
-      Conductor -> iLO [label = "Attaches the deploy ISO swift tempURL as virtual media CDROM"];
-      Conductor -> iLO [label = "Sets one time boot to CDROM"];
-      Conductor -> iLO [label = "Reboot the node"];
-      iLO -> Swift [label = "Downloads deploy ISO"];
-      Baremetal -> iLO [label = "Boots deploy kernel/ramdisk from iLO virtual media CDROM"];
-      IPA -> Conductor [label = "Lookup node"];
-      Conductor -> IPA [label = "Provides node UUID"];
-      IPA -> Conductor [label = "Heartbeat"];
-      Conductor -> IPA [label = "Sends the user image HTTP(S) URL"];
-      IPA -> Swift [label = "Retrieves the user image on bare metal"];
-      IPA -> IPA [label = "Writes user image to disk"];
-      IPA -> Conductor [label = "Heartbeat"];
-      Conductor -> Baremetal [label = "Sets boot device to disk"];
-      Conductor -> IPA [label = "Power off the node"];
-      Conductor -> Baremetal [label = "Power on the node"];
-      Baremetal -> Baremetal [label = "Boot user image from disk"];
-   }
+.. figure:: ./../../images/swiftless-deploy.svg
+   :width: 100%
 
 HTTP(S) based deploy
 ^^^^^^^^^^^^^^^^^^^^
 
-.. seqdiag::
-   :scale: 80
-
-   diagram {
-      Webserver; Conductor; Baremetal; Swift; IPA; iLO;
-      activation = none;
-      span_height = 1;
-      edge_length = 250;
-      default_note_color = white;
-      default_fontsize = 14;
-
-      Conductor -> iLO [label = "Powers off the node"];
-      Conductor -> Conductor [label = "Creates the FAT32 image containing ironic API URL and driver name"];
-      Conductor -> Swift [label = "Uploads the FAT32 image"];
-      Conductor -> Conductor [label = "Generates swift tempURL for FAT32 image"];
-      Conductor -> iLO [label = "Attaches the FAT32 image swift tempURL as virtual media floppy"];
-      Conductor -> iLO [label = "Attaches the deploy ISO URL as virtual media CDROM"];
-      Conductor -> iLO [label = "Sets one time boot to CDROM"];
-      Conductor -> iLO [label = "Reboot the node"];
-      iLO -> Webserver [label = "Downloads deploy ISO"];
-      Baremetal -> iLO [label = "Boots deploy kernel/ramdisk from iLO virtual media CDROM"];
-      IPA -> Conductor [label = "Lookup node"];
-      Conductor -> IPA [label = "Provides node UUID"];
-      IPA -> Conductor [label = "Heartbeat"];
-      Conductor -> IPA [label = "Sends the user image HTTP(S) URL"];
-      IPA -> Webserver [label = "Retrieves the user image on bare metal"];
-      IPA -> IPA [label = "Writes user image to disk"];
-      IPA -> Conductor [label = "Heartbeat"];
-      Conductor -> Baremetal [label = "Sets boot device to disk"];
-      Conductor -> IPA [label = "Power off the node"];
-      Conductor -> Baremetal [label = "Power on the node"];
-      Baremetal -> Baremetal [label = "Boot user image from disk"];
-   }
+.. figure:: ./../../images/https-based-deploy.svg
+   :width: 100%
 
 Standalone ironic
 ^^^^^^^^^^^^^^^^^
 
-.. seqdiag::
-   :scale: 80
-
-   diagram {
-      Webserver; Conductor; Baremetal; ConductorWebserver; IPA; iLO;
-      activation = none;
-      span_height = 1;
-      edge_length = 250;
-      default_note_color = white;
-      default_fontsize = 14;
-
-      Conductor -> iLO [label = "Powers off the node"];
-      Conductor -> Conductor [label = "Creates the FAT32 image containing Ironic API URL and driver name"];
-      Conductor -> ConductorWebserver [label = "Uploads the FAT32 image"];
-      Conductor -> Conductor [label = "Generates URL for FAT32 image"];
-      Conductor -> iLO [label = "Attaches the FAT32 image URL as virtual media floppy"];
-      Conductor -> iLO [label = "Attaches the deploy ISO URL as virtual media CDROM"];
-      Conductor -> iLO [label = "Sets one time boot to CDROM"];
-      Conductor -> iLO [label = "Reboot the node"];
-      iLO -> Webserver [label = "Downloads deploy ISO"];
-      Baremetal -> iLO [label = "Boots deploy kernel/ramdisk from iLO virtual media CDROM"];
-      IPA -> Conductor [label = "Lookup node"];
-      Conductor -> IPA [label = "Provides node UUID"];
-      IPA -> Conductor [label = "Heartbeat"];
-      Conductor -> IPA [label = "Sends the user image HTTP(S) URL"];
-      IPA -> Webserver [label = "Retrieves the user image on bare metal"];
-      IPA -> IPA [label = "Writes user image to disk"];
-      IPA -> Conductor [label = "Heartbeat"];
-      Conductor -> Baremetal [label = "Sets boot device to disk"];
-      Conductor -> IPA [label = "Power off the node"];
-      Conductor -> Baremetal [label = "Power on the node"];
-      Baremetal -> Baremetal [label = "Boot user image from disk"];
-   }
+.. figure:: ./../../images/standalone-ironic.svg
+   :width: 100%
 
 Activating iLO Advanced license as manual clean step
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1382,17 +1216,17 @@ step could be::
                 },
                 {
                     "url": "http://my_address:port/firmwares/bios_vLatest.scexe",
-                    "checksum": "<md5-checksum-of-this-file>",
+                    "checksum": "<sha256-checksum-of-this-file>",
                     "component": "bios"
                 },
                 {
                     "url": "https://my_secure_address_url/firmwares/chassis_vLatest.scexe",
-                    "checksum": "<md5-checksum-of-this-file>",
+                    "checksum": "<sha512-checksum-of-this-file>",
                     "component": "chassis"
                 },
                 {
                     "url": "file:///home/ubuntu/firmware_images/power_pic/pmc_v3.0.bin",
-                    "checksum": "<md5-checksum-of-this-file>",
+                    "checksum": "<sha256-checksum-of-this-file>",
                     "component": "power_pic"
                 }
             ]
@@ -1415,7 +1249,7 @@ Each firmware image block is represented by a dictionary (JSON), in the form::
 
     {
       "url": "<url of firmware image file>",
-      "checksum": "<md5 checksum of firmware image file to verify the image>",
+      "checksum": "<SHA256, SHA512, or MD5 checksum of firmware image file to verify the image>",
       "component": "<device on which firmware image will be flashed>"
     }
 
@@ -1462,11 +1296,11 @@ All the fields in the firmware image block are mandatory.
   things were left off or where things failed. You can then fix or work around
   and then try again. A common cause of update failure is HPE Secure Digital
   Signature check failure for the firmware image file.
-* To compute ``md5`` checksum for your image file, you can use the following
+* To compute ``sha256`` checksum for your image file, you can use the following
   command::
 
-    $ md5sum image.rpm
-    66cdb090c80b71daa21a67f06ecd3f33  image.rpm
+    $ sha256sum image.rpm
+    24f6abba6fb6921b05afdb4f9a671aed72af3add90c912b5e3989f51f1b359e5  image.rpm
 
 Smart Update Manager (SUM) based firmware update
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1973,7 +1807,7 @@ refer to `HPE Integrated Lights-Out REST API Documentation <https://hewlettpacka
   Allowed values are ``Enabled``, ``Disabled``.
 
 - ``WorkloadProfile``:
-  Change the Workload Profile to accomodate your desired workload.
+  Change the Workload Profile to accommodate your desired workload.
   Allowed values are ``GeneralPowerEfficientCompute``,
   ``GeneralPeakFrequencyCompute``, ``GeneralThroughputCompute``,
   ``Virtualization-PowerEfficient``, ``Virtualization-MaxPerformance``,

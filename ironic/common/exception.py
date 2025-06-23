@@ -120,6 +120,10 @@ class VolumeTargetBootIndexAlreadyExists(Conflict):
                  "for the same node already exists.")
 
 
+class NodeInventoryAlreadyExists(Conflict):
+    _msg_fmt = _("A node inventory with ID %(id)s already exists.")
+
+
 class VifAlreadyAttached(Conflict):
     _msg_fmt = _("Unable to attach VIF because VIF %(vif)s is already "
                  "attached to Ironic %(object_type)s %(object_uuid)s")
@@ -267,6 +271,10 @@ class InputFileError(IronicException):
 
 class NodeNotFound(NotFound):
     _msg_fmt = _("Node %(node)s could not be found.")
+
+
+class DuplicateNodeOnLookup(NodeNotFound):
+    pass  # Same error message, the difference only matters internally
 
 
 class PortgroupNotFound(NotFound):
@@ -421,8 +429,8 @@ class Forbidden(IronicException):
     _msg_fmt = _("Requested OpenStack Images API is forbidden")
 
 
-class BadRequest(IronicException):
-    pass
+# TODO(dtantsur): leave only one variant
+BadRequest = Invalid
 
 
 class InvalidEndpoint(IronicException):
@@ -437,12 +445,8 @@ class HTTPForbidden(NotAuthorized):
     _msg_fmt = _("Access was denied to the following resource: %(resource)s")
 
 
-class Unauthorized(IronicException):
-    pass
-
-
-class HTTPNotFound(NotFound):
-    pass
+# TODO(dtantsur): leave only one variant
+HTTPNotFound = NotFound
 
 
 class ConfigNotFound(IronicException):
@@ -829,7 +833,7 @@ class NodeHistoryNotFound(NotFound):
 
 
 class NodeInventoryNotFound(NotFound):
-    _msg_fmt = _("Node inventory record %(inventory)s could not be found.")
+    _msg_fmt = _("Node inventory record for node %(node)s could not be found.")
 
 
 class IncorrectConfiguration(IronicException):
@@ -857,7 +861,7 @@ class ImageRefIsARedirect(IronicException):
             redirect_url=redirect_url)
 
 
-class ConcurrentActionLimit(IronicException):
+class ConcurrentActionLimit(TemporaryFailure):
     # NOTE(TheJulia): We explicitly don't report the concurrent
     # action limit configuration value as a security guard since
     # if informed of the limit, an attacker can tailor their attack.
@@ -865,3 +869,53 @@ class ConcurrentActionLimit(IronicException):
                  "The concurrent action limit for %(task_type)s "
                  "has been reached. Please contact your administrator "
                  "and try again later.")
+
+
+class SwiftObjectStillExists(IronicException):
+    _msg_fmt = _("Clean up failed for swift object %(obj)s during deletion"
+                 " of node %(node)s.")
+
+
+class FirmwareComponentAlreadyExists(Conflict):
+    _msg_fmt = _('A Firmware component %(name)s for node %(node)s'
+                 ' already exists.')
+
+
+class FirmwareComponentNotFound(NotFound):
+    _msg_fmt = _("Node %(node)s doesn't have Firmware component %(name)s")
+
+
+class InvalidNodeInventory(Invalid):
+    _msg_fmt = _("Inventory for node %(node)s is invalid: %(reason)s")
+
+
+class UnsupportedHardwareFeature(Invalid):
+    _msg_fmt = _("Node %(node)s hardware does not support feature "
+                 "%(feature)s, which is required based upon the "
+                 "requested configuration.")
+
+
+class InvalidImage(ImageUnacceptable):
+    _msg_fmt = _("The requested image is not valid for use.")
+
+
+class ImageChecksumError(InvalidImage):
+    """Exception indicating checksum failed to match."""
+    _msg_fmt = _("The supplied image checksum is invalid or does not match.")
+
+
+class ImageChecksumAlgorithmFailure(InvalidImage):
+    """Cannot load the requested or required checksum algorithm."""
+    _msg_fmt = _("The requested image checksum algorithm cannot be loaded.")
+
+
+class ImageChecksumURLNotSupported(InvalidImage):
+    """Exception indicating we cannot support the remote checksum file."""
+    _msg_fmt = _("Use of remote checksum files is not supported.")
+
+
+class ImageChecksumFileReadFailure(InvalidImage):
+    """An OSError was raised when trying to read the file."""
+    _msg_fmt = _("Failed to read the file from local storage "
+                 "to perform a checksum operation.")
+    code = http_client.SERVICE_UNAVAILABLE

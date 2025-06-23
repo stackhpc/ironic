@@ -52,19 +52,23 @@ import oslo_messaging as messaging
 from oslo_utils import excutils
 from oslo_utils import uuidutils
 
+from ironic.common import boot_devices
 from ironic.common import driver_factory
 from ironic.common import exception
 from ironic.common import faults
 from ironic.common.i18n import _
 from ironic.common import network
 from ironic.common import nova
+from ironic.common import rpc
 from ironic.common import states
 from ironic.conductor import allocations
 from ironic.conductor import base_manager
 from ironic.conductor import cleaning
 from ironic.conductor import deployments
+from ironic.conductor import inspection
 from ironic.conductor import notification_utils as notify_utils
 from ironic.conductor import periodics
+from ironic.conductor import servicing
 from ironic.conductor import steps as conductor_steps
 from ironic.conductor import task_manager
 from ironic.conductor import utils
@@ -73,6 +77,8 @@ from ironic.conf import CONF
 from ironic.drivers import base as drivers_base
 from ironic.drivers.modules import deploy_utils
 from ironic.drivers.modules import image_cache
+from ironic.drivers.modules import image_utils
+from ironic.drivers.modules import inspect_utils
 from ironic import objects
 from ironic.objects import base as objects_base
 from ironic.objects import fields
@@ -91,12 +97,14 @@ class ConductorManager(base_manager.BaseConductorManager):
     # NOTE(rloo): This must be in sync with rpcapi.ConductorAPI's.
     # NOTE(pas-ha): This also must be in sync with
     #               ironic.common.release_mappings.RELEASE_MAPPING['master']
-    RPC_API_VERSION = '1.55'
+    RPC_API_VERSION = '1.59'
 
     target = messaging.Target(version=RPC_API_VERSION)
 
-    def __init__(self, host, topic):
+    def __init__(self, host, topic=rpc.MANAGER_TOPIC):
         super(ConductorManager, self).__init__(host, topic)
+        # NOTE(TheJulia): This is less a metric-able count, but a means to
+        # sort out nodes and prioritise a subset (of non-responding nodes).
         self.power_state_sync_count = collections.defaultdict(int)
 
     @METRICS.timer('ConductorManager._clean_up_caches')
@@ -1300,8 +1308,19 @@ class ConductorManager(base_manager.BaseConductorManager):
             if (action == states.VERBS['abort']
                     and node.provision_state in (states.CLEANWAIT,
                                                  states.RESCUEWAIT,
-                                                 states.INSPECTWAIT)):
+                                                 states.INSPECTWAIT,
+                                                 states.CLEANHOLD,
+                                                 states.DEPLOYHOLD)):
                 self._do_abort(task)
+                return
+
+            if (action == states.VERBS['unhold']
+                    and node.provision_state in (states.CLEANHOLD,
+                                                 states.DEPLOYHOLD)):
+                # NOTE(TheJulia): Release the node from the hold, which
+                # allows the next heartbeat action to pick the node back
+                # up and it continue it's operation.
+                task.process_event('unhold')
                 return
 
             try:
@@ -1315,7 +1334,7 @@ class ConductorManager(base_manager.BaseConductorManager):
         """Handle node abort for certain states."""
         node = task.node
 
-        if node.provision_state == states.CLEANWAIT:
+        if node.provision_state in (states.CLEANWAIT, states.CLEANHOLD):
             # Check if the clean step is abortable; if so abort it.
             # Otherwise, indicate in that clean step, that cleaning
             # should be aborted after that step is done.
@@ -1348,7 +1367,8 @@ class ConductorManager(base_manager.BaseConductorManager):
                 callback=self._spawn_worker,
                 call_args=(cleaning.do_node_clean_abort, task),
                 err_handler=utils.provisioning_error_handler,
-                target_state=target_state)
+                target_state=target_state,
+                last_error=cleaning.get_last_error(node))
             return
 
         if node.provision_state == states.RESCUEWAIT:
@@ -1361,35 +1381,19 @@ class ConductorManager(base_manager.BaseConductorManager):
             return
 
         if node.provision_state == states.INSPECTWAIT:
-            try:
-                task.driver.inspect.abort(task)
-            except exception.UnsupportedDriverExtension:
-                with excutils.save_and_reraise_exception():
-                    intf_name = task.driver.inspect.__class__.__name__
-                    LOG.error('Inspect interface %(intf)s does not '
-                              'support abort operation when aborting '
-                              'inspection of node %(node)s',
-                              {'intf': intf_name, 'node': node.uuid})
-            except Exception as e:
-                with excutils.save_and_reraise_exception():
-                    LOG.exception('Error in aborting the inspection of '
-                                  'node %(node)s', {'node': node.uuid})
-                    error = _('Failed to abort inspection: %s') % e
-                    utils.node_history_record(task.node, event=error,
-                                              event_type=states.INTROSPECTION,
-                                              error=True,
-                                              user=task.context.user_id)
-                    node.save()
-            error = _('Inspection was aborted by request.')
-            utils.node_history_record(task.node, event=error,
-                                      event_type=states.INTROSPECTION,
-                                      error=True,
-                                      user=task.context.user_id)
-            utils.wipe_token_and_url(task)
-            task.process_event('abort')
-            LOG.info('Successfully aborted inspection of node %(node)s',
-                     {'node': node.uuid})
-            return
+            return inspection.abort_inspection(task)
+
+        if node.provision_state == states.DEPLOYHOLD:
+            # Immediately break agent API interaction
+            # and align with do_node_tear_down
+            utils.remove_agent_url(task.node)
+            # And then call the teardown
+            task.process_event(
+                'abort',
+                callback=self._spawn_worker,
+                call_args=(self._do_node_tear_down, task,
+                           task.node.provision_state),
+                err_handler=utils.provisioning_error_handler)
 
     @METRICS.timer('ConductorManager._sync_power_states')
     @periodics.periodic(spacing=CONF.conductor.sync_power_state_interval,
@@ -1432,6 +1436,14 @@ class ConductorManager(base_manager.BaseConductorManager):
         finally:
             waiters.wait_for_all(futures)
 
+        # report a count of the nodes
+        METRICS.send_gauge(
+            'ConductorManager.PowerSyncNodesCount',
+            len(nodes))
+
+        LOG.debug('Completed power state sync operation, evaluated %s '
+                  'nodes.', len(futures))
+
     def _sync_power_state_nodes_task(self, context, nodes):
         """Invokes power state sync on nodes from synchronized queue.
 
@@ -1450,6 +1462,7 @@ class ConductorManager(base_manager.BaseConductorManager):
         can do here to avoid failing a brand new deploy to a node that
         we've locked here, though.
         """
+
         # FIXME(comstud): Since our initial state checks are outside
         # of the lock (to try to avoid the lock), some checks are
         # repeated after grabbing the lock so we can unlock quickly.
@@ -1496,6 +1509,12 @@ class ConductorManager(base_manager.BaseConductorManager):
                 LOG.info("During sync_power_state, node %(node)s was not "
                          "found and presumed deleted by another process.",
                          {'node': node_uuid})
+                # TODO(TheJulia): The chance exists that we orphan a node
+                # in power_state_sync_count, albeit it is not much data,
+                # it could eventually cause the memory footprint to grow
+                # on an exceptionally large ironic deployment. We should
+                # make sure we clean it up at some point, but overall given
+                # minimal impact, it is definite low hanging fruit.
             except exception.NodeLocked:
                 LOG.info("During sync_power_state, node %(node)s was "
                          "already locked by another process. Skip.",
@@ -1512,6 +1531,7 @@ class ConductorManager(base_manager.BaseConductorManager):
         # regular power state checking, maintenance is still a required
         # condition.
         filters={'maintenance': True, 'fault': faults.POWER_FAILURE},
+        node_count_metric_name='ConductorManager.PowerSyncRecoveryNodeCount',
     )
     def _power_failure_recovery(self, task, context):
         """Periodic task to check power states for nodes in maintenance.
@@ -1773,10 +1793,6 @@ class ConductorManager(base_manager.BaseConductorManager):
         if task.node.console_enabled:
             notify_utils.emit_console_notification(
                 task, 'console_restore', fields.NotificationStatus.START)
-            # NOTE(kaifeng) Clear allocated_ipmi_terminal_port if exists,
-            # so current conductor can allocate a new free port from local
-            # resources.
-            task.node.del_driver_internal_info('allocated_ipmi_terminal_port')
             try:
                 task.driver.console.start_console(task)
             except Exception as err:
@@ -1858,6 +1874,7 @@ class ConductorManager(base_manager.BaseConductorManager):
         predicate=lambda n, m: n.conductor_affinity != m.conductor.id,
         limit=lambda: CONF.conductor.periodic_max_workers,
         shared_task=False,
+        node_count_metric_name='ConductorManager.SyncLocalStateNodeCount',
     )
     def _sync_local_state(self, task, context):
         """Perform any actions necessary to sync local state.
@@ -2023,6 +2040,26 @@ class ConductorManager(base_manager.BaseConductorManager):
                     node.console_enabled = False
                     notify_utils.emit_console_notification(
                         task, 'console_set', fields.NotificationStatus.END)
+            # Destroy Swift Inventory entries for this node
+            try:
+                inspect_utils.clean_up_swift_entries(task)
+            except exception.SwiftObjectStillExists as e:
+                if node.maintenance:
+                    # Maintenance -> Allow orphaning
+                    LOG.warning('Swift object orphaned during destruction of '
+                                'node %(node)s: %(e)s',
+                                {'node': node.uuid, 'e': e})
+                else:
+                    LOG.error('Swift object cannot be orphaned without '
+                              'maintenance mode during destruction of node '
+                              '%(node)s: %(e)s', {'node': node.uuid, 'e': e})
+                    raise
+            except Exception as err:
+                LOG.error('Failed to delete Swift entries related '
+                          'to the node %(node)s: %(err)s.',
+                          {'node': node.uuid, 'err': err})
+                raise
+
             node.destroy()
             LOG.info('Successfully deleted node %(node)s.',
                      {'node': node.uuid})
@@ -2277,10 +2314,13 @@ class ConductorManager(base_manager.BaseConductorManager):
         LOG.debug("RPC create_port called for port %s.", port_uuid)
 
         with task_manager.acquire(context, port_obj.node_id,
-                                  purpose='port create') as task:
+                                  purpose='port create',
+                                  shared=True) as task:
+            # NOTE(TheJulia): We're creating a port, we don't need
+            # an exclusive parent lock to do so.
             utils.validate_port_physnet(task, port_obj)
             port_obj.create()
-            return port_obj
+        return port_obj
 
     @METRICS.timer('ConductorManager.update_port')
     @messaging.expected_exceptions(exception.NodeLocked,
@@ -2366,7 +2406,7 @@ class ConductorManager(base_manager.BaseConductorManager):
 
             port_obj.save()
 
-            return port_obj
+        return port_obj
 
     @METRICS.timer('ConductorManager.update_portgroup')
     @messaging.expected_exceptions(exception.NodeLocked,
@@ -2445,7 +2485,7 @@ class ConductorManager(base_manager.BaseConductorManager):
 
             portgroup_obj.save()
 
-            return portgroup_obj
+        return portgroup_obj
 
     @METRICS.timer('ConductorManager.update_volume_connector')
     @messaging.expected_exceptions(
@@ -2489,7 +2529,7 @@ class ConductorManager(base_manager.BaseConductorManager):
             connector.save()
             LOG.info("Successfully updated volume connector %(connector)s.",
                      {'connector': connector.uuid})
-            return connector
+        return connector
 
     @METRICS.timer('ConductorManager.update_volume_target')
     @messaging.expected_exceptions(
@@ -2530,7 +2570,7 @@ class ConductorManager(base_manager.BaseConductorManager):
             target.save()
             LOG.info("Successfully updated volume target %(target)s.",
                      {'target': target.uuid})
-            return target
+        return target
 
     @METRICS.timer('ConductorManager.get_driver_properties')
     @messaging.expected_exceptions(exception.DriverNotFound)
@@ -2590,7 +2630,11 @@ class ConductorManager(base_manager.BaseConductorManager):
                     sensors_data = task.driver.management.get_sensors_data(
                         task)
             except NotImplementedError:
-                LOG.warning(
+                # NOTE(JayF): In mixed deployments with some nodes supporting
+                # sensor data and others not, logging this at warning level
+                # creates unreasonable levels of logging noise.
+                # See https://bugs.launchpad.net/ironic/+bug/2047709
+                LOG.debug(
                     'get_sensors_data is not implemented for driver'
                     ' %(driver)s, node_uuid is %(node)s',
                     {'node': node_uuid, 'driver': driver})
@@ -2623,14 +2667,63 @@ class ConductorManager(base_manager.BaseConductorManager):
                 # Yield on every iteration
                 eventlet.sleep(0)
 
+    def _sensors_conductor(self, context):
+        """Called to collect and send metrics "sensors" for the conductor."""
+        # populate the message which will be sent to ceilometer
+        # or other data consumer
+        message = {'message_id': uuidutils.generate_uuid(),
+                   'timestamp': datetime.datetime.utcnow(),
+                   'hostname': self.host}
+
+        try:
+            ev_type = 'ironic.metrics'
+            message['event_type'] = ev_type + '.update'
+            sensors_data = METRICS.get_metrics_data()
+        except AttributeError:
+            # TODO(TheJulia): Remove this at some point, but right now
+            # don't inherently break on version mismatches when people
+            # disregard requirements.
+            LOG.warning(
+                'get_sensors_data has been configured to collect '
+                'conductor metrics, however the installed ironic-lib '
+                'library lacks the functionality. Please update '
+                'ironic-lib to a minimum of version 5.4.0.')
+        except Exception as e:
+            LOG.exception(
+                "An unknown error occurred while attempting to collect "
+                "sensor data from within the conductor. Error: %(error)s",
+                {'error': e})
+        else:
+            message['payload'] = (
+                self._filter_out_unsupported_types(sensors_data))
+            if message['payload']:
+                self.sensors_notifier.info(
+                    context, ev_type, message)
+
     @METRICS.timer('ConductorManager._send_sensor_data')
-    @periodics.periodic(spacing=CONF.conductor.send_sensor_data_interval,
-                        enabled=CONF.conductor.send_sensor_data)
+    @periodics.periodic(spacing=CONF.sensor_data.interval,
+                        enabled=CONF.sensor_data.send_sensor_data)
     def _send_sensor_data(self, context):
         """Periodically collects and transmits sensor data notifications."""
 
+        if CONF.sensor_data.enable_for_conductor:
+            if CONF.sensor_data.workers == 1:
+                # Directly call the sensors_conductor when only one
+                # worker is permitted, so we collect data serially
+                # instead.
+                self._sensors_conductor(context)
+            else:
+                # Also, do not apply the general threshold limit to
+                # the self collection of "sensor" data from the conductor,
+                # as were not launching external processes, we're just reading
+                # from an internal data structure, if we can.
+                self._spawn_worker(self._sensors_conductor, context)
+        if not CONF.sensor_data.enable_for_nodes:
+            # NOTE(TheJulia): If node sensor data is not required, then
+            # skip the rest of this method.
+            return
         filters = {}
-        if not CONF.conductor.send_sensor_data_for_undeployed_nodes:
+        if not CONF.sensor_data.enable_for_undeployed_nodes:
             filters['provision_state'] = states.ACTIVE
 
         nodes = queue.Queue()
@@ -2638,7 +2731,7 @@ class ConductorManager(base_manager.BaseConductorManager):
                                          filters=filters):
             nodes.put_nowait(node_info)
 
-        number_of_threads = min(CONF.conductor.send_sensor_data_workers,
+        number_of_threads = min(CONF.sensor_data.workers,
                                 nodes.qsize())
         futures = []
         for thread_number in range(number_of_threads):
@@ -2654,7 +2747,7 @@ class ConductorManager(base_manager.BaseConductorManager):
                 break
 
         done, not_done = waiters.wait_for_all(
-            futures, timeout=CONF.conductor.send_sensor_data_wait_timeout)
+            futures, timeout=CONF.sensor_data.wait_timeout)
         if not_done:
             LOG.warning("%d workers for send sensors data did not complete",
                         len(not_done))
@@ -2663,13 +2756,14 @@ class ConductorManager(base_manager.BaseConductorManager):
         """Filters out sensor data types that aren't specified in the config.
 
         Removes sensor data types that aren't specified in
-        CONF.conductor.send_sensor_data_types.
+        CONF.sensor_data.data_types.
 
         :param sensors_data: dict containing sensor types and the associated
                data
         :returns: dict with unsupported sensor types removed
         """
-        allowed = set(x.lower() for x in CONF.conductor.send_sensor_data_types)
+        allowed = set(x.lower() for x in
+                      CONF.sensor_data.data_types)
 
         if 'all' in allowed:
             return sensors_data
@@ -2954,7 +3048,7 @@ class ConductorManager(base_manager.BaseConductorManager):
                 task.process_event(
                     'inspect',
                     callback=self._spawn_worker,
-                    call_args=(_do_inspect_hardware, task),
+                    call_args=(inspection.inspect_hardware, task),
                     err_handler=utils.provisioning_error_handler)
 
             except exception.InvalidState:
@@ -3123,7 +3217,10 @@ class ConductorManager(base_manager.BaseConductorManager):
             task.spawn_after(
                 self._spawn_worker, task.driver.deploy.heartbeat,
                 task, callback_url, agent_version, agent_verify_ca,
-                agent_status, agent_status_message)
+                agent_status, agent_status_message,
+                # NOTE(dtantsur): heartbeats are not that critical to allow
+                # them to potentially overload the conductor.
+                _allow_reserved_pool=False)
 
     @METRICS.timer('ConductorManager.vif_list')
     @messaging.expected_exceptions(exception.NetworkError,
@@ -3498,16 +3595,19 @@ class ConductorManager(base_manager.BaseConductorManager):
                             {'node': node_id})
                 # Allow lookup to work by returning a value, it is just an
                 # unusable value that can't be verified against.
-                # This is important if the agent lookup has occured with
+                # This is important if the agent lookup has occurred with
                 # pre-generation of tokens with virtual media usage.
                 node.set_driver_internal_info('agent_secret_token', "******")
                 return node
-            task.upgrade_lock()
+            # Do not retry the lock, fail immediately otherwise
+            # we can cause these requests to stack up on the API,
+            # all thinking they can process the node.
+            task.upgrade_lock(retry=False)
             LOG.debug('Generating agent token for node %(node)s',
                       {'node': task.node.uuid})
             utils.add_secret_token(task.node)
             task.node.save()
-            return task.node
+        return objects.Node.get(context, node_id)
 
     @METRICS.timer('ConductorManager.manage_node_history')
     @periodics.periodic(
@@ -3592,6 +3692,211 @@ class ConductorManager(base_manager.BaseConductorManager):
                 raise exception.ConcurrentActionLimit(
                     task_type=action)
 
+    @METRICS.timer('ConductorManager.continue_inspection')
+    @messaging.expected_exceptions(exception.NodeLocked,
+                                   exception.NotFound,
+                                   exception.Invalid)
+    def continue_inspection(self, context, node_id, inventory,
+                            plugin_data=None):
+        """Continue in-band inspection.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param inventory: hardware inventory from the node.
+        :param plugin_data: optional plugin-specific data.
+        :raises: NodeLocked if node is locked by another conductor.
+        :raises: NotFound if node is in invalid state.
+        """
+        LOG.debug("RPC continue_inspection called for the node %(node_id)s",
+                  {'node_id': node_id})
+        with task_manager.acquire(context, node_id,
+                                  purpose='continue inspection',
+                                  shared=False) as task:
+            # TODO(dtantsur): support active state (re-)inspection
+            accepted_states = {states.INSPECTWAIT}
+            if CONF.auto_discovery.enabled:
+                accepted_states.add(states.ENROLL)
+
+            if task.node.provision_state not in accepted_states:
+                LOG.error('Refusing to process inspection data for node '
+                          '%(node)s in invalid state %(state)s',
+                          {'node': task.node.uuid,
+                           'state': task.node.provision_state})
+                raise exception.NotFound()
+
+            if task.node.provision_state == states.ENROLL:
+                task.set_spawn_error_hook(
+                    utils.provisioning_error_handler,
+                    task.node, states.ENROLL, None)
+                task.spawn_after(
+                    self._spawn_worker,
+                    inspection.continue_inspection,
+                    task, inventory, plugin_data)
+            else:
+                task.process_event(
+                    'resume',
+                    callback=self._spawn_worker,
+                    call_args=(inspection.continue_inspection,
+                               task, inventory, plugin_data),
+                    err_handler=utils.provisioning_error_handler)
+
+    @METRICS.timer('ConductorManager.do_node_service')
+    @messaging.expected_exceptions(exception.InvalidParameterValue,
+                                   exception.InvalidStateRequested,
+                                   exception.NodeInMaintenance,
+                                   exception.NodeLocked,
+                                   exception.NoFreeConductorWorker,
+                                   exception.ConcurrentActionLimit)
+    def do_node_service(self, context, node_id, service_steps,
+                        disable_ramdisk=False):
+        """RPC method to initiate node service.
+
+        :param context: an admin context.
+        :param node_id: the ID or UUID of a node.
+        :param service_steps: an ordered list of steps that will be
+            performed on the node. A step is a dictionary with required
+            keys 'interface' and 'step', and optional key 'args'. If
+            specified, the 'args' arguments are passed to the clean step
+            method.::
+
+              { 'interface': <driver_interface>,
+                'step': <name_of__step>,
+                'args': {<arg1>: <value1>, ..., <argn>: <valuen>} }
+
+            For example (this isn't a real example, this service step
+            doesn't exist)::
+
+              { 'interface': deploy',
+                'step': 'upgrade_firmware',
+                'args': {'force': True} }
+        :param disable_ramdisk: Optional. Whether to disable the ramdisk boot.
+        :raises: InvalidParameterValue if power validation fails.
+        :raises: InvalidStateRequested if the node is not in manageable state.
+        :raises: NodeLocked if node is locked by another conductor.
+        :raises: NoFreeConductorWorker when there is no free worker to start
+                 async task.
+        :raises: ConcurrentActionLimit If this action would exceed the
+                 configured limits of the deployment.
+        """
+        self._concurrent_action_limit(action='service')
+        with task_manager.acquire(context, node_id, shared=False,
+                                  purpose='node service') as task:
+            node = task.node
+            if node.maintenance:
+                raise exception.NodeInMaintenance(op=_('service'),
+                                                  node=node.uuid)
+            # NOTE(TheJulia): service.do_node_service() will also make similar
+            # calls to validate power & network, but we are doing it again
+            # here so that the user gets immediate feedback of any issues.
+            # This behaviour (of validating) is consistent with other methods
+            # like self.do_node_deploy().
+            try:
+                task.driver.power.validate(task)
+                task.driver.network.validate(task)
+            except exception.InvalidParameterValue as e:
+                msg = (_('Validation of node %(node)s for servicing '
+                         'failed: %(msg)s') %
+                       {'node': node.uuid, 'msg': e})
+                raise exception.InvalidParameterValue(msg)
+            try:
+                task.process_event(
+                    'service',
+                    callback=self._spawn_worker,
+                    call_args=(servicing.do_node_service, task, service_steps,
+                               disable_ramdisk),
+                    err_handler=utils.provisioning_error_handler,
+                    target_state=states.ACTIVE)
+            except exception.InvalidState:
+                raise exception.InvalidStateRequested(
+                    action='service', node=node.uuid,
+                    state=node.provision_state)
+
+    @METRICS.timer('ConductorManager.attach_virtual_media')
+    @messaging.expected_exceptions(exception.InvalidParameterValue,
+                                   exception.NoFreeConductorWorker,
+                                   exception.NodeLocked,
+                                   exception.UnsupportedDriverExtension)
+    def attach_virtual_media(self, context, node_id, device_type, image_url,
+                             image_download_source='local'):
+        """Attach a virtual media device to the node.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param device_type: A device type from
+            :data:`ironic.common.boot_devices.VMEDIA_DEVICES`.
+        :param image_url: URL of the image to attach, HTTP or HTTPS.
+        :param image_download_source: Which way to serve the image to the BMC:
+            "http" to serve it from the provided location, "local" to serve
+            it from the local web server.
+        :raises: UnsupportedDriverExtension if the driver does not support
+                 this call.
+        :raises: InvalidParameterValue if validation of management driver
+                 interface failed.
+        :raises: NodeLocked if node is locked by another conductor.
+        :raises: NoFreeConductorWorker when there is no free worker to start
+                 async task.
+
+        """
+        LOG.debug("RPC attach_virtual_media called for node %(node)s "
+                  "for device type %(type)s",
+                  {'node': node_id, 'type': device_type})
+        with task_manager.acquire(context, node_id, shared=False,
+                                  purpose='attaching virtual media') as task:
+            task.driver.management.validate(task)
+            # Starting new operation, so clear the previous error.
+            # We'll be putting an error here soon if we fail task.
+            task.node.last_error = None
+            task.node.save()
+            task.set_spawn_error_hook(utils._spawn_error_handler,
+                                      task.node, "attaching virtual media")
+            task.spawn_after(self._spawn_worker,
+                             do_attach_virtual_media, task,
+                             device_type=device_type,
+                             image_url=image_url,
+                             image_download_source=image_download_source)
+
+    def detach_virtual_media(self, context, node_id, device_types=None):
+        """Detach some or all virtual media devices from the node.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param device_types: A collection of device type, ones from
+            :data:`ironic.common.boot_devices.VMEDIA_DEVICES`.
+            If not provided, all devices are detached.
+        :raises: UnsupportedDriverExtension if the driver does not support
+                 this call.
+        :raises: InvalidParameterValue if validation of management driver
+                 interface failed.
+        :raises: NodeLocked if node is locked by another conductor.
+        :raises: NoFreeConductorWorker when there is no free worker to start
+                 async task.
+
+        """
+        LOG.debug("RPC detach_virtual_media called for node %(node)s "
+                  "for device types %(type)s",
+                  {'node': node_id, 'type': device_types})
+        with task_manager.acquire(context, node_id, shared=False,
+                                  purpose='detaching virtual media') as task:
+            task.driver.management.validate(task)
+            # Starting new operation, so clear the previous error.
+            # We'll be putting an error here soon if we fail task.
+            task.node.last_error = None
+            task.node.save()
+            task.set_spawn_error_hook(utils._spawn_error_handler,
+                                      task.node, "detaching virtual media")
+            task.spawn_after(self._spawn_worker,
+                             utils.run_node_action,
+                             task, task.driver.management.detach_virtual_media,
+                             success_msg="Device(s) %(device_types)s detached "
+                             "from node %(node)s",
+                             error_msg="Could not detach device(s) "
+                             "%(device_types)s from node %(node)s: %(exc)s",
+                             device_types=device_types)
+
+
+# NOTE(TheJulia): This is the end of the class definition for the
+# conductor manager. Methods for RPC and stuffs should go above this
+# point in the File. Everything below is a helper or periodic.
 
 @METRICS.timer('get_vendor_passthru_metadata')
 def get_vendor_passthru_metadata(route_dict):
@@ -3776,51 +4081,49 @@ def do_sync_power_state(task, count):
     return count
 
 
-@task_manager.require_exclusive_lock
-def _do_inspect_hardware(task):
-    """Initiates inspection.
+def _virtual_media_file_name(task, device_type):
+    return "%s-%s.%s" % (
+        device_type.lower(),
+        task.node.uuid,
+        'iso' if device_type == boot_devices.CDROM else 'img'
+    )
 
-    :param task: a TaskManager instance with an exclusive lock
-                 on its node.
-    :raises: HardwareInspectionFailure if driver doesn't
-             return the state as states.MANAGEABLE, states.INSPECTWAIT.
 
-    """
-    node = task.node
-
-    def handle_failure(e, log_func=LOG.error):
-        utils.node_history_record(task.node, event=e,
-                                  event_type=states.INTROSPECTION,
-                                  error=True, user=task.context.user_id)
-        task.process_event('fail')
-        log_func("Failed to inspect node %(node)s: %(err)s",
-                 {'node': node.uuid, 'err': e})
-
-    # Inspection cannot start in fast-track mode, wipe token and URL.
-    utils.wipe_token_and_url(task)
-
+def do_attach_virtual_media(task, device_type, image_url,
+                            image_download_source):
+    success_msg = "Device %(device_type)s attached to node %(node)s",
+    error_msg = ("Could not attach device %(device_type)s "
+                 "to node %(node)s: %(exc)s")
     try:
-        new_state = task.driver.inspect.inspect_hardware(task)
-    except exception.IronicException as e:
-        with excutils.save_and_reraise_exception():
-            error = str(e)
-            handle_failure(error)
-    except Exception as e:
-        error = (_('Unexpected exception of type %(type)s: %(msg)s') %
-                 {'type': type(e).__name__, 'msg': e})
-        handle_failure(error, log_func=LOG.exception)
-        raise exception.HardwareInspectionFailure(error=error)
+        assert device_type in boot_devices.VMEDIA_DEVICES
+        file_name = _virtual_media_file_name(task, device_type)
+        image_utils.cleanup_remote_image(task, file_name)
+        image_url = image_utils.prepare_remote_image(
+            task, image_url, file_name=file_name,
+            download_source=image_download_source)
+        utils.run_node_action(
+            task, task.driver.management.attach_virtual_media,
+            success_msg=success_msg,
+            error_msg=error_msg,
+            device_type=device_type,
+            image_url=image_url)
+    except Exception as exc:
+        error = error_msg % {'node': task.node.uuid,
+                             'device_type': device_type,
+                             'exc': exc}
+        LOG.error(
+            error, exc_info=not isinstance(exc, exception.IronicException))
+        utils.node_history_record(task.node, event=error, error=True)
+        task.node.save()
 
-    if new_state == states.MANAGEABLE:
-        task.process_event('done')
-        LOG.info('Successfully inspected node %(node)s',
-                 {'node': node.uuid})
-    elif new_state == states.INSPECTWAIT:
-        task.process_event('wait')
-        LOG.info('Successfully started introspection on node %(node)s',
-                 {'node': node.uuid})
-    else:
-        error = (_("During inspection, driver returned unexpected "
-                   "state %(state)s") % {'state': new_state})
-        handle_failure(error)
-        raise exception.HardwareInspectionFailure(error=error)
+
+def do_detach_virtual_media(task, device_types):
+    utils.run_node_action(task, task.driver.management.detach_virtual_media,
+                          success_msg="Device(s) %(device_types)s detached "
+                          "from node %(node)s",
+                          error_msg="Could not detach device(s) "
+                          "%(device_types)s from node %(node)s: %(exc)s",
+                          device_types=device_types)
+    for device_type in device_types:
+        file_name = _virtual_media_file_name(task, device_type)
+        image_utils.cleanup_remote_image(task, file_name)

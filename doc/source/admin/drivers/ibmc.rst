@@ -5,6 +5,12 @@ iBMC driver
 Overview
 ========
 
+.. warning::
+   The ``ibmc`` driver has been deprecated and is anticipated to be removed
+   from Ironic at some point during or after the 2024.2 development cycle.
+   The anticipated forward management path is to migrate to the ``redfish``
+   hardware type.
+
 The ``ibmc`` driver is targeted for Huawei V5 series rack server such as
 2288H V5, CH121 V5. The iBMC hardware type enables the user to take advantage
 of features of `Huawei iBMC`_ to control Huawei server.
@@ -312,6 +318,6 @@ boot_up_seq               GET            Query boot up sequence
 get_raid_controller_list  GET            Query RAID controller summary info
 ========================  ============   ======================================
 
-.. _Huawei iBMC: https://e.huawei.com/en/products/cloud-computing-dc/servers/accessories/ibmc
+.. _Huawei iBMC: https://e.huawei.com/en/products/computing/kunpeng/accessories/ibmc
 .. _TLS: https://en.wikipedia.org/wiki/Transport_Layer_Security
 .. _HUAWEI iBMC Client library: https://pypi.org/project/python-ibmcclient/

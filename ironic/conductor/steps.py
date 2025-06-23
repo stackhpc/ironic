@@ -11,6 +11,7 @@
 #    under the License.
 
 import collections
+import time
 
 from oslo_config import cfg
 from oslo_log import log
@@ -18,6 +19,7 @@ from oslo_log import log
 from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.common import states
+from ironic.conductor import utils
 from ironic.objects import deploy_template
 
 LOG = log.getLogger(__name__)
@@ -29,8 +31,10 @@ CLEANING_INTERFACE_PRIORITY = {
     # by which interface is implementing the clean step. The clean step of the
     # interface with the highest value here, will be executed first in that
     # case.
-    'power': 5,
-    'management': 4,
+    'vendor': 7,
+    'power': 6,
+    'management': 5,
+    'firmware': 4,
     'deploy': 3,
     'bios': 2,
     'raid': 1,
@@ -43,23 +47,28 @@ DEPLOYING_INTERFACE_PRIORITY = {
     # TODO(rloo): If we think it makes sense to have the interface priorities
     # the same for cleaning & deploying, replace the two with one e.g.
     # 'INTERFACE_PRIORITIES'.
-    'power': 5,
-    'management': 4,
+    'vendor': 7,
+    'power': 6,
+    'management': 5,
+    'firmware': 4,
     'deploy': 3,
     'bios': 2,
     'raid': 1,
 }
+
+SERVICING_INTERFACE_PRIORITY = DEPLOYING_INTERFACE_PRIORITY.copy()
 
 VERIFYING_INTERFACE_PRIORITY = {
     # When two verify steps have the same priority, their order is determined
     # by which interface is implementing the verify step. The verifying step of
     # the interface with the highest value here, will be executed first in
     # that case.
-    'power': 12,
-    'management': 11,
-    'boot': 8,
+    'power': 13,
+    'management': 12,
+    'firmware': 11,
     'inspect': 10,
     'deploy': 9,
+    'boot': 8,
     'bios': 7,
     'raid': 6,
     'vendor': 5,
@@ -68,6 +77,20 @@ VERIFYING_INTERFACE_PRIORITY = {
     'console': 2,
     'rescue': 1,
 }
+
+# Reserved step names to to map to methods which need to be
+# called, where node conductor logic wraps a driver's internal
+# logic. Example, removing tokens based upon state before
+# rebooting the node.
+RESERVED_STEP_HANDLER_MAPPING = {
+    'power_on': [utils.node_power_action, states.POWER_ON],
+    'power_off': [utils.node_power_action, states.POWER_OFF],
+    'reboot': [utils.node_power_action, states.REBOOT],
+}
+
+# values to enable declariation of how to handle reserved step names
+USED_HANDLER = 'used_handler'
+EXIT_STEPS = 'exit_steps'
 
 
 def _clean_step_key(step):
@@ -194,9 +217,9 @@ def _get_cleaning_steps(task, enabled=False, sort=True):
                                     sort_step_key=sort_key,
                                     prio_overrides=csp_override)
 
-        LOG.debug("cleaning_steps after applying "
-                  "clean_step_priority_override for node %(node)s: %(step)s",
-                  task.node.uuid, cleaning_steps)
+        LOG.debug('cleaning_steps after applying '
+                  'clean_step_priority_override for node %(node)s: %(steps)s',
+                  {'node': task.node.uuid, 'steps': cleaning_steps})
     else:
         cleaning_steps = _get_steps(task, CLEANING_INTERFACE_PRIORITY,
                                     'get_clean_steps', enabled=enabled,
@@ -220,6 +243,23 @@ def _get_deployment_steps(task, enabled=False, sort=True):
     sort_key = _deploy_step_key if sort else None
     return _get_steps(task, DEPLOYING_INTERFACE_PRIORITY, 'get_deploy_steps',
                       enabled=enabled, sort_step_key=sort_key)
+
+
+def _get_service_steps(task, enabled=False, sort=True):
+    """Get service steps for task.node.
+
+    :param task: A TaskManager object
+    :param enabled: If True, returns only enabled (priority > 0) steps. If
+        False, returns all clean steps.
+    :param sort: Used for consistency, ignored.
+    :raises: NodeServicingFailure if there was a problem getting the
+        clean steps.
+    :returns: A list of clean step dictionaries
+    """
+    service_steps = _get_steps(task, SERVICING_INTERFACE_PRIORITY,
+                               'get_service_steps', enabled=enabled,
+                               sort_step_key=None)
+    return service_steps
 
 
 def _get_verify_steps(task, enabled=False, sort=True):
@@ -437,6 +477,34 @@ def set_node_deployment_steps(task, reset_current=True, skip_missing=False):
     node.save()
 
 
+def set_node_service_steps(task, disable_ramdisk=False):
+    """Set up the node with clean step information for cleaning.
+
+    For automated cleaning, get the clean steps from the driver.
+    For manual cleaning, the user's clean steps are known but need to be
+    validated against the driver's clean steps.
+
+    :param disable_ramdisk: If `True`, only steps with requires_ramdisk=False
+        are accepted.
+    :raises: InvalidParameterValue if there is a problem with the user's
+             clean steps.
+    :raises: NodeCleaningFailure if there was a problem getting the
+             service steps.
+    """
+    node = task.node
+    steps = _validate_user_service_steps(
+        task, node.driver_internal_info.get('service_steps', []),
+        disable_ramdisk=disable_ramdisk)
+    LOG.debug('List of the steps for service of node %(node)s: '
+              '%(steps)s', {'node': node.uuid,
+                            'steps': steps})
+
+    node.service_step = {}
+    node.set_driver_internal_info('service_steps', steps)
+    node.set_driver_internal_info('service_step_index', None)
+    node.save()
+
+
 def step_id(step):
     """Return the 'ID' of a deploy step.
 
@@ -541,7 +609,7 @@ def _validate_user_step(task, user_step, driver_step, step_type,
                   'unexpected': ', '.join(unexpected)})
         errors.append(error)
 
-    if step_type == 'clean' or user_step['priority'] > 0:
+    if step_type != 'deploy' or user_step['priority'] > 0:
         # Check that all required arguments were specified by the user
         missing = []
         for (arg_name, arg_info) in argsinfo.items():
@@ -557,10 +625,13 @@ def _validate_user_step(task, user_step, driver_step, step_type,
                       'miss': ', '.join(missing)})
             errors.append(error)
         if disable_ramdisk and driver_step.get('requires_ramdisk', True):
-            error = _('clean step %s requires booting a ramdisk') % user_step
+            error = _('%(type)s step %(step)s requires booting a ramdisk') % {
+                'type': step_type,
+                'step': user_step
+            }
             errors.append(error)
 
-    if step_type == 'clean':
+    if step_type != 'deploy':
         # Copy fields that should not be provided by a user
         user_step['abortable'] = driver_step.get('abortable', False)
         user_step['priority'] = driver_step.get('priority', 0)
@@ -646,6 +717,15 @@ def _validate_user_steps(task, user_steps, driver_steps, step_type,
     result = []
 
     for user_step in user_steps:
+        if user_step.get('execute_on_child_nodes'):
+            # NOTE(TheJulia): This input is validated on the API side
+            # as we have the original API request context to leverage
+            # for RBAC validation.
+            continue
+        if user_step.get('step') in ['power_on', 'power_off', 'reboot']:
+            # NOTE(TheJulia): These are flow related steps the conductor
+            # resolves internally.
+            continue
         # Check if this user-specified step isn't supported by the driver
         try:
             driver_step = driver_steps[step_id(user_step)]
@@ -678,7 +758,6 @@ def _validate_user_steps(task, user_steps, driver_steps, step_type,
         err = error_prefix or ''
         err += '; '.join(errors)
         raise exception.InvalidParameterValue(err=err)
-
     return result
 
 
@@ -742,6 +821,36 @@ def _validate_user_deploy_steps(task, user_steps, error_prefix=None,
                                 skip_missing=skip_missing)
 
 
+def _validate_user_service_steps(task, user_steps, disable_ramdisk=False):
+    """Validate the user-specified service steps.
+
+    :param task: A TaskManager object
+    :param user_steps: a list of clean steps. A clean step is a dictionary
+        with required keys 'interface' and 'step', and optional key 'args'::
+
+              { 'interface': <driver_interface>,
+                'step': <name_of_clean_step>,
+                'args': {<arg1>: <value1>, ..., <argn>: <valuen>} }
+
+            For example::
+
+              { 'interface': 'deploy',
+                'step': 'upgrade_firmware',
+                'args': {'force': True} }
+    :param disable_ramdisk: If `True`, only steps with requires_ramdisk=False
+        are accepted.
+    :raises: InvalidParameterValue if validation of clean steps fails.
+    :raises: NodeCleaningFailure if there was a problem getting the
+        clean steps from the driver.
+    :return: validated service steps update with information from the driver
+    """
+    # We call with enabled = False below so we pickup auto-disabled
+    # steps, since service steps are not automagic like cleaning can be.
+    driver_steps = _get_service_steps(task, enabled=False, sort=False)
+    return _validate_user_steps(task, user_steps, driver_steps, 'service',
+                                disable_ramdisk=disable_ramdisk)
+
+
 def _get_validated_user_deploy_steps(task, deploy_steps=None,
                                      skip_missing=False):
     """Validate the deploy steps for a node.
@@ -788,3 +897,56 @@ def validate_user_deploy_steps_and_templates(task, deploy_steps=None,
     _get_validated_steps_from_templates(task, skip_missing=skip_missing)
     # Validate steps from passed argument or stored on the node.
     _get_validated_user_deploy_steps(task, deploy_steps, skip_missing)
+
+
+def use_reserved_step_handler(task, step):
+    """Returns guidance for reserved step execution or process is used.
+
+    This method is utilized to handle some specific cases with the execution
+    of steps. For example, reserved step names, or reserved names which
+    have specific meaning in the state machine.
+
+    :param task: a TaskManager object.
+    :param step: The requested step.
+    """
+    step_name = step.get('step')
+    step_args = step.get('args', {})
+    if step_name and step_name in RESERVED_STEP_HANDLER_MAPPING.keys():
+        call_to_use = RESERVED_STEP_HANDLER_MAPPING[step_name]
+        method = call_to_use[0]
+        parameter = call_to_use[1]
+        method(task, parameter)
+        return USED_HANDLER
+    if step_name == 'hold':
+        task.process_event('hold')
+        return EXIT_STEPS
+    # If we've reached this point, we're going to return None as
+    # there is no work for us to do. This allows the caller to
+    # take its normal path.
+    if step_name == 'wait':
+        # By default, we enter a wait state.
+        task.process_event('wait')
+        if 'seconds' in step_args:
+            # If we have a seconds argument, just pause.
+            rec_seconds = int(step_args['seconds'])
+            if rec_seconds > CONF.conductor.max_conductor_wait_step_seconds:
+                warning = (
+                    _('A wait time exceeding the configured maximum '
+                      'has been requested. Holding for %s, got %s.') %
+                    (rec_seconds,
+                     CONF.conductor.max_conductor_wait_step_seconds)
+                )
+                utils.node_history_record(task.node, event=warning,
+                                          event_type=task.node.provision_state)
+                LOG.warning(warning)
+                rec_seconds = CONF.conductor.max_conductor_wait_step_seconds
+            _sleep_wrapper(rec_seconds)
+            # Explicitly resume.
+            task.process_event('resume')
+        # Return True, which closed out execution until the next heartbeat.
+        return EXIT_STEPS
+
+
+def _sleep_wrapper(seconds):
+    """Wrapper for sleep to allow for unit testing."""
+    time.sleep(seconds)

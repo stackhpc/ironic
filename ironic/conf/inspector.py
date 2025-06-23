@@ -12,10 +12,35 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import os
+
 from oslo_config import cfg
 
 from ironic.common.i18n import _
 from ironic.conf import auth
+
+
+VALID_ADD_PORTS_VALUES = {
+    'all': _('all MAC addresses'),
+    'active': _('MAC addresses of NICs with IP addresses'),
+    'pxe': _('only the MAC address of the PXE NIC'),
+    'disabled': _('do not create any ports'),
+}
+VALID_KEEP_PORTS_VALUES = {
+    'all': _('keep all ports, even ones with MAC addresses that are not '
+             'present in the inventory'),
+    'present': _('keep only ports with MAC addresses present in '
+                 'the inventory'),
+    'added': _('keep only ports determined by the add_ports option'),
+}
+DEFAULT_CPU_FLAGS_MAPPING = {
+    'vmx': 'cpu_vt',
+    'svm': 'cpu_vt',
+    'aes': 'cpu_aes',
+    'pse': 'cpu_hugepages',
+    'pdpe1gb': 'cpu_hugepages_1g',
+    'smx': 'cpu_txt',
+}
 
 opts = [
     cfg.IntOpt('status_check_period', default=60,
@@ -34,16 +59,126 @@ opts = [
                help=_('endpoint to use as a callback for posting back '
                       'introspection data when boot is managed by ironic. '
                       'Standard keystoneauth options are used by default.')),
-    cfg.BoolOpt('require_managed_boot', default=False,
+    # TODO(dtantsur): change the default to True when ironic-inspector is no
+    # longer supported (and update the help string).
+    cfg.BoolOpt('require_managed_boot', default=None,
                 help=_('require that the in-band inspection boot is fully '
-                       'managed by ironic. Set this to True if your '
-                       'installation of ironic-inspector does not have a '
-                       'separate PXE boot environment.')),
+                       'managed by the node\'s boot interface. Set this to '
+                       'False if your installation has a separate (i)PXE boot '
+                       'environment for node discovery or unmanaged '
+                       'inspection. You may need to set it to False to '
+                       'inspect nodes that are not supported by boot '
+                       'interfaces (e.g. because they don\'t have ports). '
+                       'The default value depends on which inspect interface '
+                       'is used: inspector uses False, agent - True.')),
+    cfg.StrOpt('add_ports',
+               default='pxe',
+               help=_('Which MAC addresses to add as ports during '
+                      'inspection.'),
+               choices=list(VALID_ADD_PORTS_VALUES.items())),
+    cfg.StrOpt('keep_ports',
+               default='all',
+               help=_('Which ports (already present on a node) to keep after '
+                      'inspection.'),
+               choices=list(VALID_KEEP_PORTS_VALUES.items())),
+    cfg.BoolOpt('update_pxe_enabled',
+                default=True,
+                help=_('Whether to update the ports\' pxe_enabled field '
+                       'according to the inspection data.')),
+    cfg.StrOpt('default_hooks',
+               default='ramdisk-error,validate-interfaces,ports,architecture',
+               help=_('A comma-separated lists of inspection hooks that are '
+                      'run by default. In most cases, the operators will not '
+                      'modify this. The default (somewhat conservative) hooks '
+                      'will raise an exception in case the ramdisk reports an '
+                      'error, validate interfaces in the inventory, create '
+                      'ports and set the node\'s cpu architecture property.')),
+    cfg.StrOpt('hooks',
+               default='$default_hooks',
+               help=_('Comma-separated list of enabled hooks for processing '
+                      'pipeline. The default for this is $default_hooks. '
+                      'Hooks can be added before or after the defaults '
+                      'like this: "prehook,$default_hooks,posthook".')),
+    cfg.StrOpt('known_accelerators',
+               default=os.path.join(
+                   '$pybasedir',
+                   'drivers/modules/inspector/hooks/known_accelerators.yaml'),
+               help=_('Path to the file which contains the known accelerator '
+                      'devices, to be used by the "accelerators" inspection '
+                      'hook.')),
+    cfg.DictOpt('cpu_capabilities',
+                default=DEFAULT_CPU_FLAGS_MAPPING,
+                help='Mapping between a CPU flag and a node capability to set '
+                     'if this CPU flag is present. This configuration option '
+                     'is used by the "cpu-capabilities" inspection hook.'),
+    cfg.BoolOpt('extra_hardware_strict',
+                default=False,
+                help=_('If True, refuse to parse extra data (in plugin_data) '
+                       'if at least one record is too short. Additionally, '
+                       'remove the incoming "data" even if parsing failed. '
+                       'This configuration option is used by the '
+                       '"extra-hardware" inspection hook.')),
+    cfg.MultiStrOpt('pci_device_alias',
+                    default=[],
+                    help=_('An alias for a PCI device identified by '
+                           '\'vendor_id\' and \'product_id\' fields. Format: '
+                           '{"vendor_id": "1234", "product_id": "5678", '
+                           '"name": "pci_dev1"}. Use double quotes for the '
+                           'keys and values.')),
+    cfg.ListOpt('physical_network_cidr_map',
+                default=[],
+                sample_default=('10.10.10.0/24:physnet_a,'
+                                '2001:db8::/64:physnet_b'),
+                help=_('Mapping of IP subnet CIDR to physical network. When '
+                       'the phyical-network inspection hook is enabled, the '
+                       '"physical_network" property of corresponding '
+                       'baremetal ports is populated based on this mapping.')),
+    cfg.BoolOpt('disk_partitioning_spacing',
+                default=True,
+                help=_('Whether to leave 1 GiB of disk size untouched for '
+                       'partitioning. Only has effect when used with the IPA '
+                       'as a ramdisk, for older ramdisk local_gb is '
+                       'calculated on the ramdisk side. This configuration '
+                       'option is used by the "root-device" inspection hook.'))
+]
+
+discovery_opts = [
+    cfg.BoolOpt('enabled',
+                default=False, mutable=True,
+                help=_("Setting this to True enables automatic enrollment "
+                       "of inspected nodes that are not recognized. "
+                       "When enabling this feature, keep in mind that any "
+                       "machine hitting the inspection callback endpoint "
+                       "will be automatically enrolled. The driver must be "
+                       "set when setting this to True.")),
+    cfg.StrOpt('driver',
+               mutable=True,
+               help=_("The default driver to use for newly enrolled nodes. "
+                      "Must be set when enabling auto-discovery.")),
+]
+
+pxe_filter_opts = [
+    cfg.StrOpt('dhcp_hostsdir',
+               help=_('The MAC address cache directory, exposed to dnsmasq.'
+                      'This directory is expected to be in exclusive control '
+                      'of the driver but must be purged by the operator. '
+                      'Required.')),
+    cfg.ListOpt('supported_inspect_interfaces',
+                default=['agent'], mutable=True,
+                help=_("List of inspect interfaces that will be considered "
+                       "by the PXE filter. Only nodes with these interfaces "
+                       "will be enabled.")),
+    cfg.IntOpt('sync_period',
+               default=45, mutable=True,
+               help=_("Period (in seconds) between synchronizing the state "
+                      "if dnsmasq with the database.")),
 ]
 
 
 def register_opts(conf):
     conf.register_opts(opts, group='inspector')
+    conf.register_opts(discovery_opts, group='auto_discovery')
+    conf.register_opts(pxe_filter_opts, group='pxe_filter')
     auth.register_auth_opts(conf, 'inspector',
                             service_type='baremetal-introspection')
 

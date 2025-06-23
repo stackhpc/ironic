@@ -111,9 +111,9 @@ class Conductor(base.IronicObject, object_base.VersionedObjectDictCompat):
     # methods can be used in the future to replace current explicit RPC calls.
     # Implications of calling new remote procedures should be thought through.
     # @object_base.remotable
-    def touch(self, context=None):
+    def touch(self, context=None, online=True):
         """Touch this conductor's DB record, marking it as up-to-date."""
-        self.dbapi.touch_conductor(self.hostname)
+        self.dbapi.touch_conductor(self.hostname, online=online)
 
     # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
     # methods can be used in the future to replace current explicit RPC calls.
@@ -160,7 +160,7 @@ class Conductor(base.IronicObject, object_base.VersionedObjectDictCompat):
         """Register hardware interfaces with the conductor.
 
         :param interfaces: List of interface to register, each entry should
-            be a dictionary conaining "hardware_type", "interface_type",
+            be a dictionary containing "hardware_type", "interface_type",
             "interface_name" and "default", e.g.
             {'hardware_type': 'hardware-type', 'interface_type': 'deploy',
             'interface_name': 'direct', 'default': True}

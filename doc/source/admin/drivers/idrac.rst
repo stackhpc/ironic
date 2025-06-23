@@ -5,6 +5,12 @@ iDRAC driver
 Overview
 ========
 
+.. warning::
+   The ``-wsman`` driver interfaces have been deprecated and are anticipated
+   to be removed from Ironic at some point during or after the 2024.2
+   development cycle. The anticipated forward management path is to migrate
+   to the ``-redfish`` driver interfaces or the ``redfish`` hardware type.
+
 The integrated Dell Remote Access Controller (iDRAC_) is an out-of-band
 management platform on Dell EMC servers, and is supported directly by
 the ``idrac`` hardware type. This driver uses the Dell Web Services for
@@ -81,6 +87,7 @@ following configuration:
     [DEFAULT]
     enabled_hardware_types=idrac
     enabled_bios_interfaces=idrac-redfish
+    enabled_firmware_interfaces=redfish
     enabled_inspect_interfaces=idrac-redfish
     enabled_management_interfaces=idrac-redfish
     enabled_power_interfaces=idrac-redfish
@@ -97,6 +104,7 @@ Interface            Supported Implementations
 ``boot``             ``ipxe``, ``pxe``, ``idrac-redfish-virtual-media``
 ``console``          ``no-console``
 ``deploy``           ``direct``, ``ansible``, ``ramdisk``
+``firmware``         ``redfish``, ``no-firmware``
 ``inspect``          ``idrac-wsman``, ``idrac``, ``idrac-redfish``,
                      ``inspector``, ``no-inspect``
 ``management``       ``idrac-wsman``, ``idrac``, ``idrac-redfish``
@@ -250,7 +258,6 @@ without affecting the operation of the system being inspected.
 The inspection discovers the following properties:
 
 * ``cpu_arch``: cpu architecture
-* ``cpus``: number of cpus
 * ``local_gb``: disk size in gigabytes
 * ``memory_mb``: memory size in megabytes
 
@@ -280,6 +287,11 @@ The management interface for ``idrac-redfish`` supports:
 
 Import and export configuration
 -------------------------------
+
+.. warning::
+   This feature has been deprecated and is anticipated to be removed once
+   Ironic has a generalized interface for doing step template articulation
+   for aspects beyond just "deployment" of baremetal nodes.
 
 The clean and deploy steps provided in this section allow to configure the
 system and collect the system inventory using configuration mold files.
@@ -708,7 +720,7 @@ Set BIOS Config
   baremetal node passthru call <node> set_bios_config --arg "name=value"
 
 
-Walkthrough of perfoming a BIOS configuration change:
+Walkthrough of performing a BIOS configuration change:
 
 The following section demonstrates how to change BIOS configuration settings,
 detect that a commit and reboot are required, and act on them accordingly. The

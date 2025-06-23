@@ -32,6 +32,8 @@ the services.
    Booting a Ramdisk or an ISO <ramdisk-boot>
    Hardware Burn-in <hardware-burn-in>
    Vendor Passthru <vendor-passthru>
+   Servicing <servicing>
+   Authentication Support for Instance Images <user-image-basic-auth>
 
 Drivers, Hardware Types and Hardware Interfaces
 -----------------------------------------------
@@ -58,6 +60,8 @@ Advanced Topics
    Tuning Ironic <tuning>
    Role Based Access Control <secure-rbac>
    Deploying with Anaconda <anaconda-deploy-interface>
+   Steps <steps>
+   OVN Networking <ovn-networking>
 
 .. toctree::
   :hidden:

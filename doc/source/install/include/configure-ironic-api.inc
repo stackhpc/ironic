@@ -72,9 +72,10 @@ Configuring ironic-api service
 
 #. Configure the ironic-api service to use these credentials with the Identity
    service. Replace ``PUBLIC_IDENTITY_IP`` with the public IP of the Identity
-   server, ``PRIVATE_IDENTITY_IP`` with the private IP of the Identity server
-   and replace ``IRONIC_PASSWORD`` with the password you chose for the
-   ``ironic`` user in the Identity service:
+   server, ``PRIVATE_IDENTITY_IP`` with the private IP of the Identity server,
+   replace ``IRONIC_PASSWORD`` with the password you chose for the
+   ``ironic`` user in the Identity service and replace ``MEMCACHED_SERVER``
+   with the hostname of the memcached server:
 
    .. code-block:: ini
 
@@ -112,6 +113,9 @@ Configuring ironic-api service
       # User's domain name (string value)
       user_domain_name=Default
 
+      # memcached setting (string value)
+      memcached_servers=MEMCACHED_SERVER:11211
+
 #. Create the Bare Metal service database tables:
 
    .. code-block:: bash
@@ -120,10 +124,10 @@ Configuring ironic-api service
 
 #. Restart the ironic-api service:
 
-   Fedora/RHEL8/CentOS8/SUSE::
+   RHEL/CentOS/SUSE::
 
        sudo systemctl restart openstack-ironic-api
 
-   Ubuntu::
+   Ubuntu/Debian::
 
        sudo service ironic-api restart

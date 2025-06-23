@@ -39,6 +39,27 @@ their specific implementations of the PXE boot interface.
 Additional configuration is required for this boot interface - see
 :doc:`/install/configure-pxe` for details.
 
+HTTP Boot
+---------
+
+The ``http`` and ``http-ipxe`` boot interfaces are based upon the Ironic
+implementation of the ``pxe`` and ``ipxe`` boot interfaces, respectively,
+and utilize HTTP in the transmission of the location to start the
+boot sequence from. These interfaces are specific to UEFI as they are rooted
+in the UEFI standard v2.5's support for booting from an HTTP URL.
+
+One caveat to keep in mind is that these interfaces require hardware support
+and the ability to signal to the remote BMC that the node should boot
+utilizing ``UEFIHTTP``. If a hardware type does not support that as an option,
+we will fallback and request ``PXE`` boot, but that realistically may only
+work if the firmware on the machine is smart enough to check and evaluate
+for an HTTP Boot URL instead of a PXE boot server and file name.
+
+It should be noted, that these boot interfaces are available for the vendor
+independent, generic hardware types of ``ipmi`` and ``redfish``. Hardware
+vendors typically only include additional interfaces after they have performed
+their own verification and qualification testing.
+
 Kernel parameters
 ~~~~~~~~~~~~~~~~~
 
@@ -49,7 +70,7 @@ configuration option:
 .. code-block:: ini
 
     [pxe]
-    kernel_append_params = nofb nomodeset vga=normal
+    kernel_append_params = nofb vga=normal
 
 .. note::
    The option was called ``pxe_append_params`` before the Xena cycle.
@@ -59,9 +80,9 @@ Per-node and per-instance overrides are also possible, for example:
 .. code-block:: bash
 
   baremetal node set node-0 \
-    --driver-info kernel_append_params="nofb nomodeset vga=normal"
+    --driver-info kernel_append_params="nofb vga=normal"
   baremetal node set node-0 \
-    --instance-info kernel_append_params="nofb nomodeset vga=normal"
+    --instance-info kernel_append_params="nofb vga=normal"
 
 Starting with the Zed cycle, you can combine the parameters from the
 configuration and from the node using the special ``%default%`` syntax:
@@ -74,12 +95,20 @@ configuration and from the node using the special ``%default%`` syntax:
 Together with the configuration above, the following parameters will be
 appended to the kernel command line::
 
-    nofb nomodeset vga=normal console=ttyS0,115200n8
+    nofb vga=normal console=ttyS0,115200n8
 
 .. note::
    Ironic does not do any de-duplication of the resulting kernel parameters.
    Both kernel itself and dracut seem to give priority to the last instance
    of the same parameter.
+
+.. warning::
+   Previously our documentation listed the Linux kernel parameter
+   ``nomodeset`` as an option. This option is intended for troubleshooting,
+   and can greatly degrade performance with Matrox/Aspeed BMC Graphics
+   controllers which is very commonly used on physical servers. The
+   performance degradation can greatly reduce IO capacity upon every
+   console graphics update being written to the screen.
 
 Common options
 --------------

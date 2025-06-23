@@ -1,3 +1,4 @@
+---
 - project:
     templates:
       - check-requirements
@@ -9,18 +10,28 @@
       - release-notes-jobs-python3
     check:
       jobs:
+        - ironic-tox-bandit
+        - ironic-tox-unit-mysql-migrations
         - ironic-tox-unit-with-driver-libs
         - ironic-cross-sushy:
             voting: false
         - ironic-tempest-functional-python3
-        - ironic-tempest-functional-rbac-scope-enforced
-        - ironic-grenade
-        - ironic-standalone
-        - ironic-standalone-redfish
+        # NOTE(rpittau) moving to non-voting until we fix the tests
+        # see also https://review.opendev.org/c/openstack/ironic-tempest-plugin/+/882312
+        - ironic-tempest-functional-rbac-scope-enforced:
+            voting: false
+        # NOTE(TheJulia): Disabling grenade job on 20240227 from voting
+        # because we need to backport the same fix to the prior release branch.
+        - ironic-grenade:
+            voting: false
+        - ironic-grenade-skip-level:
+            voting: false
+        - ironic-standalone-redfish:
+            voting: false
         - ironic-tempest-bios-redfish-pxe
         - ironic-tempest-uefi-redfish-vmedia
-        - ironic-tempest-wholedisk-bios-snmp-pxe
-        - ironic-tempest-partition-uefi-ipmi-pxe
+        - ironic-tempest-ramdisk-bios-snmp-pxe
+        - ironic-tempest-ovn-uefi-ipmi-pxe
         # NOTE(TheJulia) Marking multinode non-voting on 20210311
         # Due to a high failure rate on limestone where the compute1
         # machine never appears to be able to communicate across the
@@ -28,16 +39,20 @@
         # understand it in mind for the upcoming release.
         - ironic-tempest-ipa-wholedisk-direct-tinyipa-multinode:
             voting: false
+        - ironic-tempest-ipa-wholedisk-direct-tinyipa-multinode-shard:
+            voting: false
         - ironic-tempest-bios-ipmi-direct-tinyipa
         - ironic-tempest-bfv
         - ironic-tempest-ipa-partition-uefi-pxe-grub2
-        - metalsmith-integration-glance-centos8-legacy
+        # NOTE(rpittau): Currently broken because of an issue with parted
+        - metalsmith-integration-glance-centos9-legacy:
+            voting: false
+        # NOTE(TheJulia): At present, metal3 doesn't leverage
+        # stable branches, and as far as we are aware these jobs
+        # can be removed once this branch is made stable.
+        # - metal3-integration
         # Non-voting jobs
-        - ironic-tox-bandit:
-            voting: false
         - ironic-inspector-tempest:
-            voting: false
-        - ironic-inspector-tempest-managed-non-standalone:
             voting: false
         - ironic-inspector-tempest-uefi-redfish-vmedia:
             voting: false
@@ -49,7 +64,7 @@
             voting: false
         - ironic-inspector-tempest-rbac-scope-enforced:
             voting: false
-        - bifrost-integration-tinyipa-ubuntu-focal:
+        - bifrost-integration-tinyipa-ubuntu-jammy:
             voting: false
         - bifrost-integration-redfish-vmedia-uefi-centos-9:
             voting: false
@@ -57,25 +72,38 @@
             voting: false
         - bifrost-benchmark-ironic:
             voting: false
+        - ironic-tox-codespell:
+            voting: false
     gate:
       jobs:
+        - ironic-tox-bandit
+        - ironic-tox-unit-mysql-migrations
         - ironic-tox-unit-with-driver-libs
         - ironic-tempest-functional-python3
-        - ironic-tempest-functional-rbac-scope-enforced
-        - ironic-grenade
-        - ironic-standalone
-        - ironic-standalone-redfish
+        # NOTE(rpittau) disabled until we fix the tests
+        # see also https://review.opendev.org/c/openstack/ironic-tempest-plugin/+/882312
+        # - ironic-tempest-functional-rbac-scope-enforced
+        # NOTE(TheJulia): Disabling until we get a dnsmasq handling fix backported.
+        # - ironic-grenade
+        # NOTE(JayF): Disabling standalone jobs on 20240228 from voting, there's a
+        # dnsmasq bug only exposed on these jobs.
+        #- ironic-standalone-redfish
         - ironic-tempest-bios-redfish-pxe
         - ironic-tempest-uefi-redfish-vmedia
-        - ironic-tempest-wholedisk-bios-snmp-pxe
-        - ironic-tempest-partition-uefi-ipmi-pxe
+        - ironic-tempest-ramdisk-bios-snmp-pxe
+        - ironic-tempest-ovn-uefi-ipmi-pxe
         # NOTE(TheJulia): Disabled multinode on 20210311 due to Limestone
-        # seeming to be 
+        # seeming to be
         # - ironic-tempest-ipa-wholedisk-direct-tinyipa-multinode
         - ironic-tempest-bios-ipmi-direct-tinyipa
         - ironic-tempest-bfv
         - ironic-tempest-ipa-partition-uefi-pxe-grub2
-        - metalsmith-integration-glance-centos8-legacy
+        # NOTE(rpittau): Currently broken because of an issue with parted
+        #- metalsmith-integration-glance-centos9-legacy
+        # NOTE(TheJulia): At present, metal3 doesn't leverage
+        # stable branches, and as far as we are aware these jobs
+        # can be removed once this branch is made stable.
+        # - metal3-integration
     experimental:
       jobs:
         # TODO(dtantsur): these jobs are useful but currently hopelessly

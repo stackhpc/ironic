@@ -94,7 +94,7 @@ BASE_VERSION = 1
 # v1.54: Add events support.
 # v1.55: Add deploy templates API.
 # v1.56: Add support for building configdrives.
-# v1.57: Add support for updating an exisiting allocation.
+# v1.57: Add support for updating an existing allocation.
 # v1.58: Add support for backfilling allocations.
 # v1.59: Add support vendor data in configdrives.
 # v1.60: Add owner to the allocation object.
@@ -119,6 +119,16 @@ BASE_VERSION = 1
 # v1.79: Change allocation behaviour to prefer node name match
 # v1.80: Marker to represent self service node creation/deletion
 # v1.81: Add node inventory
+# v1.82: Add node sharding capability
+# v1.83: Add child node modeling
+# v1.84: Add ramdisk callback to continue inspection.
+# v1.85: Add unhold verb
+# v1.86: Add firmware interface
+# v1.87: Add service verb
+# v1.88: Add name field to port.
+# v1.89: Add API for attaching/detaching virtual media
+# v1.90: Accept ovn vtep switch metadata schema to port.local_link_connection
+
 MINOR_0_JUNO = 0
 MINOR_1_INITIAL_VERSION = 1
 MINOR_2_AVAILABLE_STATE = 2
@@ -201,6 +211,15 @@ MINOR_78_NODE_HISTORY = 78
 MINOR_79_ALLOCATION_NODE_NAME = 79
 MINOR_80_PROJECT_CREATE_DELETE_NODE = 80
 MINOR_81_NODE_INVENTORY = 81
+MINOR_82_NODE_SHARD = 82
+MINOR_83_PARENT_CHILD_NODES = 83
+MINOR_84_CONTINUE_INSPECTION = 84
+MINOR_85_UNHOLD_VERB = 85
+MINOR_86_FIRMWARE_INTERFACE = 86
+MINOR_87_SERVICE = 87
+MINOR_88_PORT_NAME = 88
+MINOR_89_ATTACH_DETACH_VMEDIA = 89
+MINOR_90_OVN_VTEP = 90
 
 # When adding another version, update:
 # - MINOR_MAX_VERSION
@@ -208,7 +227,7 @@ MINOR_81_NODE_INVENTORY = 81
 #   explanation of what changed in the new version
 # - common/release_mappings.py, RELEASE_MAPPING['master']['api']
 
-MINOR_MAX_VERSION = MINOR_81_NODE_INVENTORY
+MINOR_MAX_VERSION = MINOR_90_OVN_VTEP
 
 # String representations of the minor and maximum versions
 _MIN_VERSION_STRING = '{}.{}'.format(BASE_VERSION, MINOR_1_INITIAL_VERSION)

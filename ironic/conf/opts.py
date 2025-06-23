@@ -27,6 +27,7 @@ _opts = [
     ('database', ironic.conf.database.opts),
     ('deploy', ironic.conf.deploy.opts),
     ('dhcp', ironic.conf.dhcp.opts),
+    ('disk_utils', ironic.conf.disk_utils.opts),
     ('drac', ironic.conf.drac.opts),
     ('glance', ironic.conf.glance.list_opts()),
     ('healthcheck', ironic.conf.healthcheck.opts),
@@ -43,6 +44,7 @@ _opts = [
     ('nova', ironic.conf.nova.list_opts()),
     ('pxe', ironic.conf.pxe.opts),
     ('redfish', ironic.conf.redfish.opts),
+    ('sensor_data', ironic.conf.sensor_data.opts),
     ('service_catalog', ironic.conf.service_catalog.list_opts()),
     ('snmp', ironic.conf.snmp.opts),
     ('swift', ironic.conf.swift.list_opts()),
@@ -77,7 +79,6 @@ def update_opt_defaults():
             # This comes in two flavors
             'oslo.messaging=INFO',
             'oslo_messaging=INFO',
-            'sqlalchemy=WARNING',
             'stevedore=INFO',
             'eventlet.wsgi.server=INFO',
             'iso8601=WARNING',
@@ -89,5 +90,8 @@ def update_opt_defaults():
             'openstack=WARNING',
             # Policy logging is not necessarily useless, but very verbose
             'oslo_policy=WARNING',
+            # Concurrency lock logging is not bad, but exceptionally noisy
+            # and typically not needed in debugging Ironic itself.
+            'oslo_concurrency.lockutils=WARNING',
         ]
     )

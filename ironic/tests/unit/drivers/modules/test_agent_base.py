@@ -25,6 +25,7 @@ from ironic.common import exception
 from ironic.common import image_service
 from ironic.common import states
 from ironic.conductor import cleaning
+from ironic.conductor import servicing
 from ironic.conductor import steps as conductor_steps
 from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
@@ -159,7 +160,8 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                        autospec=True)
     def test_heartbeat_in_maintenance(self, next_step_mock):
         # NOTE(pas-ha) checking only for states that are not noop
-        for state in (states.DEPLOYWAIT, states.CLEANWAIT):
+        for state in (states.DEPLOYWAIT, states.CLEANWAIT,
+                      states.SERVICEWAIT):
             next_step_mock.reset_mock()
             self.node.provision_state = state
             self.node.maintenance = True
@@ -186,7 +188,8 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                           group='conductor')
         for state, expected in [(states.DEPLOYWAIT, states.DEPLOYFAIL),
                                 (states.CLEANWAIT, states.CLEANFAIL),
-                                (states.RESCUEWAIT, states.RESCUEFAIL)]:
+                                (states.RESCUEWAIT, states.RESCUEFAIL),
+                                (states.SERVICEWAIT, states.SERVICEFAIL)]:
             next_step_mock.reset_mock()
             self.node.provision_state = state
             self.node.maintenance = True
@@ -211,7 +214,8 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                        autospec=True)
     def test_heartbeat_with_reservation(self, next_step_mock):
         # NOTE(pas-ha) checking only for states that are not noop
-        for state in (states.DEPLOYWAIT, states.CLEANWAIT):
+        for state in (states.DEPLOYWAIT, states.CLEANWAIT,
+                      states.SERVICEWAIT):
             next_step_mock.reset_mock()
             self.node.provision_state = state
             self.node.reservation = 'localhost'
@@ -231,7 +235,9 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                        autospec=True)
     def test_heartbeat_noops_in_wrong_state(self, next_step_mock, log_mock):
         allowed = {states.DEPLOYWAIT, states.CLEANWAIT, states.RESCUEWAIT,
-                   states.DEPLOYING, states.CLEANING, states.RESCUING}
+                   states.DEPLOYING, states.CLEANING, states.RESCUING,
+                   states.DEPLOYHOLD, states.CLEANHOLD, states.SERVICEHOLD,
+                   states.SERVICING, states.SERVICEWAIT}
         for state in set(states.machine.states) - allowed:
             for m in (next_step_mock, log_mock):
                 m.reset_mock()
@@ -252,7 +258,8 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
     def test_heartbeat_noops_in_wrong_state2(self, next_step_mock):
         CONF.set_override('allow_provisioning_in_maintenance', False,
                           group='conductor')
-        allowed = {states.DEPLOYWAIT, states.CLEANWAIT}
+        allowed = {states.DEPLOYWAIT, states.CLEANWAIT,
+                   states.SERVICEWAIT}
         for state in set(states.machine.states) - allowed:
             next_step_mock.reset_mock()
             with task_manager.acquire(self.context, self.node.uuid,
@@ -302,7 +309,7 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
             next_step_mock.side_effect = driver_failure
             self.deploy.heartbeat(task, 'http://127.0.0.1:8080', '1.0.0')
             # task.node.provision_state being set to DEPLOYFAIL
-            # within the driver_failue, hearbeat should not call
+            # within the driver_failue, heartbeat should not call
             # deploy_utils.set_failed_state anymore
             self.assertFalse(failed_mock.called)
             log_mock.assert_called_once_with(
@@ -463,8 +470,10 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
             task, 'Node failed to perform rescue operation: some failure')
 
     @mock.patch.object(agent_base.LOG, 'error', autospec=True)
-    def test_heartbeat_records_cleaning_deploying(self, log_mock):
-        for provision_state in (states.CLEANING, states.DEPLOYING):
+    def test_heartbeat_records_when_appropriate(self, log_mock):
+        for provision_state in (states.CLEANING, states.DEPLOYING,
+                                states.CLEANHOLD, states.DEPLOYHOLD,
+                                states.SERVICEHOLD, states.SERVICING):
             self.node.driver_internal_info = {}
             self.node.provision_state = provision_state
             self.node.save()
@@ -518,6 +527,68 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                 self.assertIsNotNone(
                     task.node.driver_internal_info['agent_last_heartbeat'])
                 self.assertEqual(provision_state, task.node.provision_state)
+
+    @mock.patch.object(objects.node.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(agent_base.HeartbeatMixin,
+                       'refresh_steps', autospec=True)
+    @mock.patch.object(conductor_steps, 'set_node_service_steps',
+                       autospec=True)
+    @mock.patch.object(servicing, 'continue_node_service', autospec=True)
+    def test_heartbeat_resume_service(self, mock_service, mock_set_steps,
+                                      mock_refresh, mock_touch):
+        self.node.clean_step = {}
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.save()
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            self.deploy.heartbeat(task, 'http://127.0.0.1:8080', '1.0.0')
+
+        mock_touch.assert_called_once_with(mock.ANY)
+        mock_refresh.assert_called_once_with(mock.ANY, task, 'service')
+        mock_service.assert_called_once_with(task)
+        mock_set_steps.assert_called_once_with(task)
+
+    @mock.patch.object(objects.node.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(agent_base.HeartbeatMixin,
+                       'continue_servicing', autospec=True)
+    def test_heartbeat_continue_servicing(self, mock_continue, mock_touch):
+        self.node.service_step = {
+            'priority': 10,
+            'interface': 'deploy',
+            'step': 'foo',
+            'reboot_requested': False
+        }
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.save()
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            self.deploy.heartbeat(task, 'http://127.0.0.1:8080', '1.0.0')
+
+        mock_touch.assert_called_once_with(mock.ANY)
+        mock_continue.assert_called_once_with(mock.ANY, task)
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler', autospec=True)
+    @mock.patch.object(agent_base.HeartbeatMixin,
+                       'continue_servicing', autospec=True)
+    def test_heartbeat_continue_servicing_fails(self, mock_continue,
+                                                mock_handler):
+        self.node.service_step = {
+            'priority': 10,
+            'interface': 'deploy',
+            'step': 'foo',
+            'reboot_requested': False
+        }
+
+        mock_continue.side_effect = Exception()
+
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.save()
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            self.deploy.heartbeat(task, 'http://127.0.0.1:8080', '1.0.0')
+
+        mock_continue.assert_called_once_with(mock.ANY, task)
+        mock_handler.assert_called_once_with(task, mock.ANY, mock.ANY)
 
 
 class AgentRescueTests(AgentDeployMixinBaseTest):
@@ -941,6 +1012,33 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
                 mock.ANY, task.node, root_uuid='some-root-uuid',
                 efi_system_part_uuid=None, prep_boot_part_uuid=None,
                 target_boot_mode='whatever', software_raid=False
+            )
+
+    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
+                       autospec=True)
+    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
+    @mock.patch.object(boot_mode_utils, 'get_boot_mode', autospec=True,
+                       return_value='uefi')
+    def test_configure_local_boot_lenovo(self, boot_mode_mock,
+                                         try_set_boot_device_mock,
+                                         install_bootloader_mock):
+        install_bootloader_mock.return_value = {
+            'command_status': 'SUCCESS', 'command_error': None}
+        props = self.node.properties
+        props['vendor'] = 'Lenovo'
+        props['capabilities'] = 'boot_mode:uefi'
+        self.node.properties = props
+        self.node.save()
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            task.node.driver_internal_info['is_whole_disk_image'] = False
+            self.deploy.configure_local_boot(task, root_uuid='some-root-uuid')
+            try_set_boot_device_mock.assert_not_called()
+            boot_mode_mock.assert_called_once_with(task.node)
+            install_bootloader_mock.assert_called_once_with(
+                mock.ANY, task.node, root_uuid='some-root-uuid',
+                efi_system_part_uuid=None, prep_boot_part_uuid=None,
+                target_boot_mode='uefi', software_raid=False
             )
 
     @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
@@ -1522,7 +1620,7 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
             agent_base._post_step_reboot(task, 'clean')
             self.assertTrue(mock_build_opt.called)
             self.assertTrue(mock_prepare.called)
-            mock_reboot.assert_called_once_with(task, states.REBOOT)
+            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
             self.assertTrue(task.node.driver_internal_info['cleaning_reboot'])
             self.assertNotIn('agent_secret_token',
                              task.node.driver_internal_info)
@@ -1541,7 +1639,7 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
             agent_base._post_step_reboot(task, 'deploy')
             self.assertTrue(mock_build_opt.called)
             self.assertTrue(mock_prepare.called)
-            mock_reboot.assert_called_once_with(task, states.REBOOT)
+            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
             self.assertTrue(
                 task.node.driver_internal_info['deployment_reboot'])
             self.assertNotIn('agent_secret_token',
@@ -1562,7 +1660,7 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
             agent_base._post_step_reboot(task, 'clean')
             self.assertTrue(mock_build_opt.called)
             self.assertTrue(mock_prepare.called)
-            mock_reboot.assert_called_once_with(task, states.REBOOT)
+            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
             self.assertIn('agent_secret_token',
                           task.node.driver_internal_info)
 
@@ -1578,7 +1676,7 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
         with task_manager.acquire(self.context, self.node['uuid'],
                                   shared=False) as task:
             agent_base._post_step_reboot(task, 'clean')
-            mock_reboot.assert_called_once_with(task, states.REBOOT)
+            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
             mock_handler.assert_called_once_with(task, mock.ANY,
                                                  traceback=True)
             self.assertNotIn('cleaning_reboot',
@@ -1596,10 +1694,29 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
         with task_manager.acquire(self.context, self.node['uuid'],
                                   shared=False) as task:
             agent_base._post_step_reboot(task, 'deploy')
-            mock_reboot.assert_called_once_with(task, states.REBOOT)
+            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
             mock_handler.assert_called_once_with(task, mock.ANY,
                                                  traceback=True)
             self.assertNotIn('deployment_reboot',
+                             task.node.driver_internal_info)
+
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(pxe.PXEBoot, 'prepare_ramdisk', spec_set=True,
+                       autospec=True)
+    @mock.patch.object(manager_utils, 'servicing_error_handler', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test__post_step_reboot_fail_servicing(self, mock_reboot, mock_handler,
+                                              mock_prepare, mock_build_opt):
+        mock_reboot.side_effect = RuntimeError("broken")
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.save()
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            agent_base._post_step_reboot(task, 'service')
+            mock_reboot.assert_called_once_with(task, states.REBOOT, None)
+            mock_handler.assert_called_once_with(task, mock.ANY,
+                                                 traceback=True)
+            self.assertNotIn('servicing_reboot',
                              task.node.driver_internal_info)
 
     def _test_clean_step_hook(self):
@@ -1739,7 +1856,7 @@ class ContinueCleaningTest(AgentDeployMixinBaseTest):
         with task_manager.acquire(self.context, self.node['uuid'],
                                   shared=False) as task:
             self.deploy.continue_cleaning(task)
-            reboot_mock.assert_called_once_with(task, states.REBOOT)
+            reboot_mock.assert_called_once_with(task, states.REBOOT, None)
 
     @mock.patch.object(cleaning, 'continue_node_clean', autospec=True)
     @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
@@ -1994,6 +2111,111 @@ class ContinueCleaningTest(AgentDeployMixinBaseTest):
                                   shared=False) as task:
             self.deploy.continue_cleaning(task)
             error_mock.assert_called_once_with(task, mock.ANY, traceback=False)
+
+
+class ContinueServiceTest(AgentDeployMixinBaseTest):
+
+    def setUp(self):
+        super().setUp()
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.target_provision_state = states.ACTIVE
+        self.node.save()
+
+    @mock.patch.object(servicing, 'continue_node_service', autospec=True)
+    @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
+                       autospec=True)
+    def test_continue_servicing(self, status_mock, service_mock):
+        # Test a successful execute clean step on the agent
+        self.node.service_step = {
+            'priority': 10,
+            'interface': 'deploy',
+            'step': 'erase_devices',
+            'reboot_requested': False
+        }
+        self.node.save()
+        status_mock.return_value = [{
+            'command_status': 'SUCCEEDED',
+            'command_name': 'execute_service_step',
+            'command_result': {
+                'service_step': self.node.service_step
+            }
+        }]
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            self.deploy.continue_servicing(task)
+            service_mock.assert_called_once_with(task)
+            self.assertEqual(states.SERVICING, task.node.provision_state)
+            self.assertEqual(states.ACTIVE,
+                             task.node.target_provision_state)
+
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(pxe.PXEBoot, 'prepare_ramdisk', spec_set=True,
+                       autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
+                       autospec=True)
+    def test_continue_servicing_reboot(
+            self, status_mock, reboot_mock, mock_prepare, mock_build_opt):
+        # Test a successful execute clean step on the agent, with reboot
+        self.node.service_step = {
+            'priority': 42,
+            'interface': 'deploy',
+            'step': 'reboot_me_afterwards',
+            'reboot_requested': True
+        }
+        self.node.save()
+        status_mock.return_value = [{
+            'command_status': 'SUCCEEDED',
+            'command_name': 'execute_service_step',
+            'command_result': {
+                'service_step': self.node.service_step
+            }
+        }]
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            self.deploy.continue_servicing(task)
+            reboot_mock.assert_called_once_with(task, states.REBOOT, None)
+
+    @mock.patch.object(servicing, 'continue_node_service', autospec=True)
+    @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
+                       autospec=True)
+    def test_continue_servicing_after_reboot(self, status_mock, service_mock):
+        # Test a successful execute clean step on the agent, with reboot
+        self.node.service_step = {
+            'priority': 42,
+            'interface': 'deploy',
+            'step': 'reboot_me_afterwards',
+            'reboot_requested': True
+        }
+        driver_internal_info = self.node.driver_internal_info
+        driver_internal_info['servicing_reboot'] = True
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+        # Represents a freshly booted agent with no commands
+        status_mock.return_value = []
+
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            self.deploy.continue_servicing(task)
+            service_mock.assert_called_once_with(task)
+            self.assertEqual(states.SERVICING, task.node.provision_state)
+            self.assertNotIn('servicing_reboot',
+                             task.node.driver_internal_info)
+
+    @mock.patch.object(servicing, 'continue_node_service', autospec=True)
+    @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
+                       autospec=True)
+    def test_continue_servicing_running(self, status_mock, service_mock):
+        # Test that no action is taken while a clean step is executing
+        status_mock.return_value = [{
+            'command_status': 'RUNNING',
+            'command_name': 'execute_service_step',
+            'command_result': None
+        }]
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            self.deploy.continue_servicing(task)
+            self.assertFalse(service_mock.called)
 
 
 class TestRefreshCleanSteps(AgentDeployMixinBaseTest):
@@ -2343,3 +2565,41 @@ class StepMethodsTestCase(db_base.DbTestCase):
             response = agent_base.execute_step(
                 task, self.clean_steps['deploy'][0], 'clean')
             self.assertEqual(states.CLEANWAIT, response)
+
+
+class FreshlyBootedTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super(FreshlyBootedTestCase, self).setUp()
+
+    def test__freshly_booted_empty_result(self):
+        commands = []
+        self.assertTrue(agent_base._freshly_booted(commands, 'deploy'))
+
+    def test__freshly_booted_single_command(self):
+        commands = [{'command_name': 'get_deploy_steps'}]
+        self.assertTrue(agent_base._freshly_booted(commands, 'deploy'))
+
+    def test__freshly_booted_single_command_mismatch(self):
+        commands = [{'command_name': 'get_service_steps'}]
+        self.assertFalse(agent_base._freshly_booted(commands, 'deploy'))
+
+    def test__freshly_booted_has_retries(self):
+        # NOTE(TheJulia): this is just an arbitrary number
+        # of retires to account for lossy/problematic networks
+        commands = [
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'}]
+        self.assertTrue(agent_base._freshly_booted(commands, 'deploy'))
+
+    def test__freshly_booted_multi_command(self):
+        commands = [
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_service_steps'}]
+        self.assertFalse(agent_base._freshly_booted(commands, 'deploy'))

@@ -44,7 +44,7 @@ class GenericHardware(hardware_type.AbstractHardwareType):
     @property
     def supported_boot_interfaces(self):
         """List of supported boot interfaces."""
-        return [ipxe.iPXEBoot, pxe.PXEBoot]
+        return [ipxe.iPXEBoot, pxe.PXEBoot, ipxe.iPXEHttpBoot, pxe.HttpBoot]
 
     @property
     def supported_deploy_interfaces(self):
@@ -58,7 +58,7 @@ class GenericHardware(hardware_type.AbstractHardwareType):
         """List of supported inspect interfaces."""
         # Inspector support should be the default if it's enabled by an
         # operator (implying that the service is installed).
-        return [inspector.Inspector, noop.NoInspect]
+        return [inspector.Inspector, inspector.AgentInspect, noop.NoInspect]
 
     @property
     def supported_network_interfaces(self):
@@ -85,6 +85,11 @@ class GenericHardware(hardware_type.AbstractHardwareType):
         """List of supported storage interfaces."""
         return [noop_storage.NoopStorage, cinder.CinderStorage,
                 external_storage.ExternalStorage]
+
+    @property
+    def supported_firmware_interfaces(self):
+        """List of supported firmware interfaces."""
+        return [noop.NoFirmware]
 
 
 class ManualManagementHardware(GenericHardware):

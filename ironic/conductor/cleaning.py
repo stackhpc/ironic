@@ -14,6 +14,7 @@
 
 from oslo_log import log
 
+from ironic.common import async_steps
 from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.common import states
@@ -22,6 +23,7 @@ from ironic.conductor import task_manager
 from ironic.conductor import utils
 from ironic.conf import CONF
 from ironic.drivers import utils as driver_utils
+from ironic import objects
 
 LOG = log.getLogger(__name__)
 
@@ -81,8 +83,7 @@ def do_node_clean(task, clean_steps=None, disable_ramdisk=False):
                                       disable_ramdisk)
     task.node.save()
 
-    # Retrieve BIOS config settings for this node
-    utils.node_cache_bios_settings(task, node)
+    utils.node_update_cache(task)
 
     # Allow the deploy driver to set up the ramdisk again (necessary for
     # IPA cleaning)
@@ -158,7 +159,6 @@ def do_next_clean_step(task, step_index, disable_ramdisk=None):
     LOG.info('Executing %(kind)s cleaning on node %(node)s, remaining steps: '
              '%(steps)s', {'node': node.uuid, 'steps': steps,
                            'kind': 'manual' if manual_clean else 'automated'})
-
     # Execute each step until we hit an async step or run out of steps
     for ind, step in enumerate(steps):
         # Save which step we're about to start so we can restart
@@ -166,20 +166,46 @@ def do_next_clean_step(task, step_index, disable_ramdisk=None):
         node.clean_step = step
         node.set_driver_internal_info('clean_step_index', step_index + ind)
         node.save()
-        interface = getattr(task.driver, step.get('interface'))
-        LOG.info('Executing %(step)s on node %(node)s',
-                 {'step': step, 'node': node.uuid})
+        eocn = step.get('execute_on_child_nodes', False)
+        result = None
         try:
-            result = interface.execute_clean_step(task, step)
+            if async_steps.CLEANING_POLLING in node.driver_internal_info:
+                # We're executing a new step, so a prior polling
+                # flag should be dictated by the new step, *not* a
+                # prior step.
+                node.del_driver_internal_info(async_steps.CLEANING_POLLING)
+            if not eocn:
+                LOG.info('Executing %(step)s on node %(node)s',
+                         {'step': step, 'node': node.uuid})
+                use_step_handler = conductor_steps.use_reserved_step_handler(
+                    task, step)
+                if use_step_handler:
+                    if use_step_handler == conductor_steps.EXIT_STEPS:
+                        # Exit the step, i.e. hold step
+                        return
+                    # if use_step_handler == conductor_steps.USED_HANDLER
+                    # Then we have completed the needful in the handler,
+                    # but since there is no other value to check now,
+                    # we know we just need to skip execute_deploy_step
+                else:
+                    interface = getattr(task.driver, step.get('interface'))
+                    result = interface.execute_clean_step(task, step)
+            else:
+                LOG.info('Executing %(step)s on child nodes for node '
+                         '%(node)s.',
+                         {'step': step, 'node': node.uuid})
+                result = execute_step_on_child_nodes(task, step)
+
         except Exception as e:
             if isinstance(e, exception.AgentConnectionFailed):
-                if task.node.driver_internal_info.get('cleaning_reboot'):
+                if task.node.driver_internal_info.get(
+                        async_steps.CLEANING_REBOOT):
                     LOG.info('Agent is not yet running on node %(node)s '
                              'after cleaning reboot, waiting for agent to '
                              'come up to run next clean step %(step)s.',
                              {'node': node.uuid, 'step': step})
-                    node.set_driver_internal_info('skip_current_clean_step',
-                                                  False)
+                    node.set_driver_internal_info(
+                        async_steps.SKIP_CURRENT_CLEAN_STEP, False)
                     target_state = (states.MANAGEABLE if manual_clean
                                     else None)
                     task.process_event('wait', target_state=target_state)
@@ -190,7 +216,8 @@ def do_next_clean_step(task, step_index, disable_ramdisk=None):
                          'executing a command. Error: %(error)s',
                          {'node': task.node.uuid,
                           'error': e})
-                node.set_driver_internal_info('skip_current_clean_step', False)
+                node.set_driver_internal_info(
+                    async_steps.SKIP_CURRENT_CLEAN_STEP, False)
                 target_state = states.MANAGEABLE if manual_clean else None
                 task.process_event('wait', target_state=target_state)
                 return
@@ -217,13 +244,16 @@ def do_next_clean_step(task, step_index, disable_ramdisk=None):
             task.process_event('wait', target_state=target_state)
             return
         elif result is not None:
+            # NOTE(TheJulia): If your here debugging a step which fails,
+            # part of the constraint is that a value *cannot* be returned.
+            # to the runner. The step has to either succeed and return
+            # None, or raise an exception.
             msg = (_('While executing step %(step)s on node '
                      '%(node)s, step returned invalid value: %(val)s')
                    % {'step': step, 'node': node.uuid, 'val': result})
             return utils.cleaning_error_handler(task, msg)
         LOG.info('Node %(node)s finished clean step %(step)s',
                  {'node': node.uuid, 'step': step})
-
     if CONF.agent.deploy_logs_collect == 'always' and not disable_ramdisk:
         driver_utils.collect_ramdisk_logs(task.node, label='cleaning')
 
@@ -241,19 +271,84 @@ def do_next_clean_step(task, step_index, disable_ramdisk=None):
             return utils.cleaning_error_handler(task, msg,
                                                 traceback=True,
                                                 tear_down_cleaning=False)
-
     LOG.info('Node %s cleaning complete', node.uuid)
     event = 'manage' if manual_clean or node.retired else 'done'
     # NOTE(rloo): No need to specify target prov. state; we're done
     task.process_event(event)
 
 
+def execute_step_on_child_nodes(task, step):
+    """Execute a requested step against a child node.
+
+    :param task: The TaskManager object for the parent node.
+    :param step: The requested step to be executed.
+    :returns: None on Success, the resulting error message if a
+              failure has occurred.
+    """
+    # NOTE(TheJulia): We could just use nodeinfo list calls against
+    # dbapi.
+    # NOTE(TheJulia): We validate the data in advance in the API
+    # with the original request context.
+    eocn = step.get('execute_on_child_nodes')
+    child_nodes = step.get('limit_child_node_execution', [])
+    filters = {'parent_node': task.node.uuid}
+    if eocn and len(child_nodes) >= 1:
+        filters['uuid_in'] = child_nodes
+    child_nodes = objects.Node.list(
+        task.context,
+        filters=filters,
+        fields=['uuid']
+    )
+    for child_node in child_nodes:
+        result = None
+        LOG.info('Executing step %(step)s on child node %(node)s for parent '
+                 'node %(parent_node)s',
+                 {'step': step,
+                  'node': child_node.uuid,
+                  'parent_node': task.node.uuid})
+        with task_manager.acquire(task.context,
+                                  child_node.uuid,
+                                  purpose='execute step') as child_task:
+            interface = getattr(child_task.driver, step.get('interface'))
+            LOG.info('Executing %(step)s on node %(node)s',
+                     {'step': step, 'node': child_task.node.uuid})
+            if not conductor_steps.use_reserved_step_handler(child_task, step):
+                result = interface.execute_clean_step(child_task, step)
+            if result is not None:
+                if (result == states.CLEANWAIT
+                    and CONF.conductor.permit_child_node_step_async_result):
+                    # Operator has chosen to permit this due to some reason
+                    # NOTE(TheJulia): This is where we would likely wire agent
+                    # error handling if we ever implicitly allowed child node
+                    # deploys to take place with the agent from a parent node
+                    # being deployed.
+                    continue
+                msg = (_('While executing step %(step)s on child node '
+                         '%(node)s, step returned invalid value: %(val)s')
+                       % {'step': step, 'node': child_task.node.uuid,
+                          'val': result})
+                LOG.error(msg)
+                # Only None or states.CLEANWAIT are possible paths forward
+                # in the parent step execution code, so returning the message
+                # means it will be logged.
+                return msg
+
+
+def get_last_error(node):
+    last_error = _('By request, the clean operation was aborted')
+    if node.clean_step:
+        last_error += (
+            _(' during or after the completion of step "%s"')
+            % conductor_steps.step_id(node.clean_step)
+        )
+    return last_error
+
+
 @task_manager.require_exclusive_lock
-def do_node_clean_abort(task, step_name=None):
+def do_node_clean_abort(task):
     """Internal method to abort an ongoing operation.
 
     :param task: a TaskManager instance with an exclusive lock
-    :param step_name: The name of the clean step.
     """
     node = task.node
     try:
@@ -271,12 +366,13 @@ def do_node_clean_abort(task, step_name=None):
                                      set_fail_state=False)
         return
 
+    last_error = get_last_error(node)
     info_message = _('Clean operation aborted for node %s') % node.uuid
-    last_error = _('By request, the clean operation was aborted')
-    if step_name:
-        msg = _(' after the completion of step "%s"') % step_name
-        last_error += msg
-        info_message += msg
+    if node.clean_step:
+        info_message += (
+            _(' during or after the completion of step "%s"')
+            % node.clean_step
+        )
 
     node.last_error = last_error
     node.clean_step = None
@@ -318,7 +414,7 @@ def continue_node_clean(task):
                 target_state = None
 
             task.process_event('fail', target_state=target_state)
-            do_node_clean_abort(task, step_name)
+            do_node_clean_abort(task)
             return
 
         LOG.debug('The cleaning operation for node %(node)s was '

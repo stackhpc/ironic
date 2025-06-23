@@ -29,7 +29,7 @@ from ironic.objects import base
 from ironic.objects import fields as object_fields
 from ironic.objects import notification
 
-REQUIRED_INT_PROPERTIES = ['local_gb', 'cpus', 'memory_mb']
+REQUIRED_INT_PROPERTIES = ['local_gb', 'memory_mb']
 
 CONF = cfg.CONF
 LOG = log.getLogger(__name__)
@@ -78,7 +78,11 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
     # Version 1.34: Add lessee field
     # Version 1.35: Add network_data field
     # Version 1.36: Add boot_mode and secure_boot fields
-    VERSION = '1.36'
+    # Version 1.37: Add shard field
+    # Version 1.38: Add parent_node field
+    # Version 1.39: Add firmware_interface field
+    # Version 1.40: Add service_step field
+    VERSION = '1.40'
 
     dbapi = db_api.get_instance()
 
@@ -103,6 +107,11 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         # being executed, or None, indicating deployment is not in progress
         # or has not yet started.
         'deploy_step': object_fields.FlexibleDictField(nullable=True),
+
+        # A service step dictionary, indicating the current step
+        # being executed, or None, indicating deployment is not in progress
+        # or has not yet started.
+        'service_step': object_fields.FlexibleDictField(nullable=True),
 
         'raid_config': object_fields.FlexibleDictField(nullable=True),
         'target_raid_config': object_fields.FlexibleDictField(nullable=True),
@@ -153,6 +162,7 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         'boot_interface': object_fields.StringField(nullable=True),
         'console_interface': object_fields.StringField(nullable=True),
         'deploy_interface': object_fields.StringField(nullable=True),
+        'firmware_interface': object_fields.StringField(nullable=True),
         'inspect_interface': object_fields.StringField(nullable=True),
         'management_interface': object_fields.StringField(nullable=True),
         'network_interface': object_fields.StringField(nullable=True),
@@ -170,6 +180,8 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         'network_data': object_fields.FlexibleDictField(nullable=True),
         'boot_mode': object_fields.StringField(nullable=True),
         'secure_boot': object_fields.BooleanField(nullable=True),
+        'shard': object_fields.StringField(nullable=True),
+        'parent_node': object_fields.StringField(nullable=True),
     }
 
     def as_dict(self, secure=False, mask_configdrive=True):
@@ -189,7 +201,7 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         return d
 
     def _validate_property_values(self, properties):
-        """Check if the input of local_gb, cpus and memory_mb are valid.
+        """Check if the input of local_gb and memory_mb are valid.
 
         :param properties: a dict contains the node's information.
         """
@@ -656,6 +668,11 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
             should be set to empty dict (or removed).
         Version 1.36: boot_mode, secure_boot were was added. Defaults are None.
             For versions prior to this, it should be set to None or removed.
+        Version 1.37: shard was added. Default is None. For versions prior to
+            this, it should be set to None or removed.
+        Version 1.39: firmware_interface field was added. Its default value is
+            None. For versions prior to this, it should be set to None (or
+            removed).
 
         :param target_version: the desired version of the object
         :param remove_unavailable_fields: True to remove fields that are
@@ -671,7 +688,8 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
                   ('automated_clean', 28), ('protected_reason', 29),
                   ('owner', 30), ('allocation_id', 31), ('description', 32),
                   ('retired_reason', 33), ('lessee', 34), ('boot_mode', 36),
-                  ('secure_boot', 36)]
+                  ('secure_boot', 36), ('shard', 37),
+                  ('firmware_interface', 39)]
 
         for name, minor in fields:
             self._adjust_field_to_version(name, None, target_version,
@@ -740,6 +758,18 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         """
         self.instance_info[key] = value
         self._changed_fields.add('instance_info')
+
+    def set_property(self, key, value):
+        """Set a `properties` value.
+
+        Setting a `properties` dict value via this method ensures that this
+        field will be flagged for saving.
+
+        :param key: Key of item to set
+        :param value: Value of item to set
+        """
+        self.properties[key] = value
+        self._changed_fields.add('properties')
 
 
 @base.IronicObjectRegistry.register
@@ -1072,7 +1102,7 @@ class NodeCRUDPayload(NodePayload):
         'driver_info': object_fields.FlexibleDictField(nullable=True)
     }
 
-    def __init__(self, node, chassis_uuid):
+    def __init__(self, node, chassis_uuid=None):
         super(NodeCRUDPayload, self).__init__(node, chassis_uuid=chassis_uuid)
 
 

@@ -19,15 +19,23 @@ from oslo_config import cfg
 from oslo_config import types
 
 from ironic.common.i18n import _
+from ironic.conf import types as ir_types
+
 
 opts = [
     cfg.IntOpt('workers_pool_size',
-               default=100, min=3,
+               default=300, min=3,
                help=_('The size of the workers greenthread pool. '
                       'Note that 2 threads will be reserved by the conductor '
                       'itself for handling heart beats and periodic tasks. '
                       'On top of that, `sync_power_state_workers` will take '
                       'up to 7 green threads with the default value of 8.')),
+    cfg.IntOpt('reserved_workers_pool_percentage',
+               default=5, min=0, max=50,
+               help=_('The percentage of the whole workers pool that will be '
+                      'kept for API requests and other important tasks. '
+                      'This part of the pool will not be used for periodic '
+                      'tasks or agent heartbeats. Set to 0 to disable.')),
     cfg.IntOpt('heartbeat_interval',
                default=10,
                help=_('Seconds between conductor heart beats.')),
@@ -97,41 +105,6 @@ opts = [
     cfg.IntOpt('node_locked_retry_interval',
                default=1,
                help=_('Seconds to sleep between node lock attempts.')),
-    cfg.BoolOpt('send_sensor_data',
-                default=False,
-                help=_('Enable sending sensor data message via the '
-                       'notification bus')),
-    cfg.IntOpt('send_sensor_data_interval',
-               default=600,
-               min=1,
-               help=_('Seconds between conductor sending sensor data message '
-                      'to ceilometer via the notification bus.')),
-    cfg.IntOpt('send_sensor_data_workers',
-               default=4, min=1,
-               help=_('The maximum number of workers that can be started '
-                      'simultaneously for send data from sensors periodic '
-                      'task.')),
-    cfg.IntOpt('send_sensor_data_wait_timeout',
-               default=300,
-               help=_('The time in seconds to wait for send sensors data '
-                      'periodic task to be finished before allowing periodic '
-                      'call to happen again. Should be less than '
-                      'send_sensor_data_interval value.')),
-    cfg.ListOpt('send_sensor_data_types',
-                default=['ALL'],
-                help=_('List of comma separated meter types which need to be'
-                       ' sent to Ceilometer. The default value, "ALL", is a '
-                       'special value meaning send all the sensor data.')),
-    cfg.BoolOpt('send_sensor_data_for_undeployed_nodes',
-                default=False,
-                help=_('The default for sensor data collection is to only '
-                       'collect data for machines that are deployed, however '
-                       'operators may desire to know if there are failures '
-                       'in hardware that is not presently in use. '
-                       'When set to true, the conductor will collect sensor '
-                       'information from all nodes when sensor data '
-                       'collection is enabled via the send_sensor_data '
-                       'setting.')),
     cfg.IntOpt('sync_local_state_interval',
                default=180,
                help=_('When conductors join or leave the cluster, existing '
@@ -240,20 +213,44 @@ opts = [
                        'endpoint via multicast DNS.')),
     cfg.StrOpt('deploy_kernel',
                mutable=True,
-               help=_('Glance ID, http:// or file:// URL of the kernel of '
-                      'the default deploy image.')),
+               help=_('Glance ID, http:// or file:// URL of the '
+                      'kernel of the default deploy image.')),
     cfg.StrOpt('deploy_ramdisk',
                mutable=True,
-               help=_('Glance ID, http:// or file:// URL of the initramfs of '
-                      'the default deploy image.')),
+               help=_('Glance ID, http:// or file:// URL of the '
+                      'initramfs of the default deploy image.')),
+    cfg.DictOpt('deploy_kernel_by_arch',
+                default={},
+                mutable=True,
+                help=_('A dictionary of key-value pairs of each architecture '
+                       'with the Glance ID, http:// or file:// URL of the '
+                       'kernel of the default deploy image.')),
+    cfg.DictOpt('deploy_ramdisk_by_arch',
+                default={},
+                mutable=True,
+                help=_('A dictionary of key-value pairs of each architecture '
+                       'with the Glance ID, http:// or file:// URL of the '
+                       'initramfs of the default deploy image.')),
     cfg.StrOpt('rescue_kernel',
                mutable=True,
-               help=_('Glance ID, http:// or file:// URL of the kernel of '
-                      'the default rescue image.')),
+               help=_('Glance ID, http:// or file:// URL of the '
+                      'kernel of the default rescue image.')),
     cfg.StrOpt('rescue_ramdisk',
                mutable=True,
-               help=_('Glance ID, http:// or file:// URL of the initramfs of '
-                      'the default rescue image.')),
+               help=_('Glance ID, http:// or file:// URL of the '
+                      'initramfs of the default rescue image.')),
+    cfg.DictOpt('rescue_kernel_by_arch',
+                default={},
+                mutable=True,
+                help=_('A dictionary of key-value pairs of each architecture '
+                       'with the Glance ID, http:// or file:// URL of the '
+                       'kernel of the default rescue image.')),
+    cfg.DictOpt('rescue_ramdisk_by_arch',
+                default={},
+                mutable=True,
+                help=_('A dictionary of key-value pairs of each architecture '
+                       'with the Glance ID, http:// or file:// URL of the '
+                       'initramfs of the default rescue image.')),
     cfg.StrOpt('rescue_password_hash_algorithm',
                default='sha256',
                choices=['sha256', 'sha512'],
@@ -384,6 +381,123 @@ opts = [
                       'is a global setting applying to all requests this '
                       'conductor receives, regardless of access rights. '
                       'The concurrent clean limit cannot be disabled.')),
+    cfg.BoolOpt('poweroff_in_cleanfail',
+                default=False,
+                help=_('If True power off nodes in the ``clean failed`` '
+                       'state. Default False. Option may be unsafe '
+                       'when using Cleaning to perform '
+                       'hardware-transformative actions such as '
+                       'firmware upgrade.')),
+    cfg.BoolOpt('poweroff_in_servicefail',
+                default=False,
+                help=_('If True power off nodes in the ``service failed`` '
+                       'state. Default False. Option may be unsafe '
+                       'when using service to perform '
+                       'hardware-transformative actions such as '
+                       'firmware upgrade.')),
+    cfg.BoolOpt('permit_child_node_step_async_result',
+                default=False,
+                mutable=True,
+                help=_('This option allows child node steps to not error if '
+                       'the resulting step execution returned a "wait" '
+                       'state. Under normal conditions, child nodes are not '
+                       'expected to request a wait state. This option exists '
+                       'for operators to use if needed to perform specific '
+                       'tasks where this is known acceptable. Use at your'
+                       'own risk!')),
+    cfg.IntOpt('max_conductor_wait_step_seconds',
+               default=30,
+               min=0,
+               max=1800,
+               mutable=True,
+               help=_('The maximum number of seconds which a step can '
+                      'be requested to explicitly sleep or wait. This '
+                      'value should be changed sparingly as it holds a '
+                      'conductor thread and if used across many nodes at '
+                      'once can exhaust a conductor\'s resources. This'
+                      'capability has a hard coded maximum wait of 1800 '
+                      'seconds, or 30 minutes. If you need to wait longer '
+                      'than the maximum value, we recommend exploring '
+                      'hold steps.')),
+    cfg.BoolOpt('disable_deep_image_inspection',
+                default=False,
+                # Normally such an option would be mutable, but this is,
+                # a security guard and operators should not expect to change
+                # this option under normal circumstances.
+                mutable=False,
+                help=_('Security Option to permit an operator to disable '
+                       'file content inspections. Under normal conditions, '
+                       'the conductor will inspect requested image contents '
+                       'which are transferred through the conductor. '
+                       'Disabling this option is not advisable and opens '
+                       'the risk of unsafe images being processed which may '
+                       'allow an attacker to leverage unsafe features in '
+                       'various disk image formats to perform a variety of '
+                       'unsafe and potentially compromising actions. '
+                       'This option is *not* mutable, and '
+                       'requires a service restart to change.')),
+    cfg.BoolOpt('conductor_always_validates_images',
+                default=False,
+                # Normally mutable, however from a security context we do want
+                # all logging to be generated from this option to be changed,
+                # and as such is set to False to force a conductor restart.
+                mutable=False,
+                help=_('Security Option to enable the conductor to *always* '
+                       'inspect the image content of any requested deploy, '
+                       'even if the deployment would have normally bypassed '
+                       'the conductor\'s cache. When this is set to False, '
+                       'the Ironic-Python-Agent is responsible '
+                       'for any necessary image checks. Setting this to '
+                       'True will result in a higher utilization of '
+                       'resources (disk space, network traffic) '
+                       'as the conductor will evaluate *all* images. '
+                       'This option is *not* mutable, and requires a '
+                       'service restart to change. This option requires '
+                       '[conductor]disable_deep_image_inspection to be set '
+                       'to False.')),
+    cfg.ListOpt('permitted_image_formats',
+                default=['raw', 'qcow2', 'iso'],
+                mutable=True,
+                help=_('The supported list of image formats which are '
+                       'permitted for deployment with Ironic. If an image '
+                       'format outside of this list is detected, the image '
+                       'validation logic will fail the deployment process.')),
+    cfg.BoolOpt('disable_file_checksum',
+                default=False,
+                mutable=False,
+                help=_('Deprecated Security option: In the default case, '
+                       'image files have their checksums verified before '
+                       'undergoing additional conductor side actions such '
+                       'as image conversion. '
+                       'Enabling this option opens the risk of files being '
+                       'replaced at the source without the user\'s '
+                       'knowledge.'),
+                deprecated_for_removal=True),
+    cfg.BoolOpt('disable_support_for_checksum_files',
+                default=False,
+                mutable=False,
+                help=_('Security option: By default Ironic will attempt to '
+                       'retrieve a remote checksum file via HTTP(S) URL in '
+                       'order to validate an image download. This is '
+                       'functionality aligning with ironic-python-agent '
+                       'support for standalone users. Disabling this '
+                       'functionality by setting this option to True will '
+                       'create a more secure environment, however it may '
+                       'break users in an unexpected fashion.')),
+    cfg.ListOpt('file_url_allowed_paths',
+                default=['/var/lib/ironic', '/shared/html', '/templates',
+                         '/opt/cache/files', '/vagrant'],
+                item_type=ir_types.ExplicitAbsolutePath(),
+                help=_(
+                    'List of paths that are allowed to be used as file:// '
+                    'URLs. Files in /boot, /dev, /etc, /proc, /sys and other'
+                    'system paths are always disallowed for security reasons. '
+                    'Any files in this path readable by ironic may be used as '
+                    'an image source when deploying. Setting this value to '
+                    '"" (empty) disables file:// URL support. Paths listed '
+                    'here are validated as absolute paths and will be rejected'
+                    'if they contain path traversal mechanisms, such as "..".'
+                )),
 ]
 
 

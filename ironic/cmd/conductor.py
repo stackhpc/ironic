@@ -25,8 +25,9 @@ from oslo_config import cfg
 from oslo_log import log
 from oslo_service import service
 
-from ironic.common import rpc_service
 from ironic.common import service as ironic_service
+from ironic.common import utils
+from ironic.conductor import rpc_service
 
 CONF = cfg.CONF
 
@@ -43,8 +44,43 @@ def warn_about_unsafe_shred_parameters(conf):
                     'Secure Erase. This is a possible SECURITY ISSUE!')
 
 
+def warn_about_sqlite():
+    # We are intentionally calling the helper here to ensure it caches
+    # for all future calls.
+    if utils.is_ironic_using_sqlite():
+        LOG.warning('Ironic has been configured to utilize SQLite. '
+                    'This has some restrictions and impacts. You must run '
+                    'as as a single combined ironic process, and some '
+                    'internal mechanisms do not execute such as the hash '
+                    'ring will remain static and the conductor\'s '
+                    '``last_updated`` field will also not update. This is '
+                    'in order to minimize database locking issues present '
+                    'as a result of SQLAlchemy 2.0 and the removal of '
+                    'autocommit support.')
+
+
+def warn_about_max_wait_parameters(conf):
+    max_wait = conf.conductor.max_conductor_wait_step_seconds
+    max_deploy_timeout = conf.conductor.deploy_callback_timeout
+    max_clean_timeout = conf.conductor.clean_callback_timeout
+    error_with = None
+    if max_wait >= max_deploy_timeout:
+        error_with = 'deploy_callback_timeout'
+    if max_wait >= max_clean_timeout:
+        error_with = 'clean_callback_timeout'
+    if error_with:
+        LOG.warning('The [conductor]max_conductor_wait_step_seconds '
+                    'configuration parameter exceeds the value of '
+                    '[conductor]%s, which could create a condition where '
+                    'tasks may timeout. Ironic recommends a low default '
+                    'value for [conductor]max_conductor_wait_step_seconds ',
+                    'please re-evaluate your configuration.', error_with)
+
+
 def issue_startup_warnings(conf):
     warn_about_unsafe_shred_parameters(conf)
+    warn_about_sqlite()
+    warn_about_max_wait_parameters(conf)
 
 
 def main():

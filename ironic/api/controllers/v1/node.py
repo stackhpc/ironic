@@ -17,6 +17,7 @@ import copy
 import datetime
 from http import client as http_client
 import json
+import urllib.parse
 
 from ironic_lib import metrics_utils
 import jsonschema
@@ -32,6 +33,7 @@ from ironic.api.controllers import link
 from ironic.api.controllers.v1 import allocation
 from ironic.api.controllers.v1 import bios
 from ironic.api.controllers.v1 import collection
+from ironic.api.controllers.v1 import firmware
 from ironic.api.controllers.v1 import notification_utils as notify
 from ironic.api.controllers.v1 import port
 from ironic.api.controllers.v1 import portgroup
@@ -40,6 +42,7 @@ from ironic.api.controllers.v1 import versions
 from ironic.api.controllers.v1 import volume
 from ironic.api import method
 from ironic.common import args
+from ironic.common import boot_devices
 from ironic.common import boot_modes
 from ironic.common import exception
 from ironic.common.i18n import _
@@ -55,9 +58,12 @@ from ironic import objects
 CONF = ironic.conf.CONF
 
 LOG = log.getLogger(__name__)
-_CLEAN_STEPS_SCHEMA = {
+
+
+# TODO(TheJulia): We *really* need to just have *one* schema.
+_STEPS_SCHEMA = {
     "$schema": "http://json-schema.org/schema#",
-    "title": "Clean steps schema",
+    "title": "Steps schema",
     "type": "array",
     # list of clean steps
     "items": {
@@ -80,6 +86,16 @@ _CLEAN_STEPS_SCHEMA = {
                 "type": "object",
                 "properties": {}
             },
+            "execute_on_child_nodes": {
+                "description": "Boolean if the step should be executed "
+                               "on child nodes.",
+                "type": "boolean",
+            },
+            "limit_child_node_execution": {
+                "description": "List of nodes upon which to execute child "
+                               "node steps on.",
+                "type": "array",
+            }
         },
         # interface, step and args are the only expected keys
         "additionalProperties": False
@@ -112,7 +128,9 @@ _DEFAULT_RETURN_FIELDS = ['instance_uuid', 'maintenance', 'power_state',
 PROVISION_ACTION_STATES = (ir_states.VERBS['manage'],
                            ir_states.VERBS['provide'],
                            ir_states.VERBS['abort'],
-                           ir_states.VERBS['adopt'])
+                           ir_states.VERBS['adopt'],
+                           ir_states.VERBS['unhold'],
+                           ir_states.VERBS['service'])
 
 _NODES_CONTROLLER_RESERVED_WORDS = None
 
@@ -158,6 +176,7 @@ def node_schema():
             'driver': {'type': 'string'},
             'driver_info': {'type': ['object', 'null']},
             'extra': {'type': ['object', 'null']},
+            'firmware_interface': {'type': ['string', 'null']},
             'inspect_interface': {'type': ['string', 'null']},
             'instance_info': {'type': ['object', 'null']},
             'instance_uuid': {'type': ['string', 'null']},
@@ -172,6 +191,7 @@ def node_schema():
             ]},
             'network_interface': {'type': ['string', 'null']},
             'owner': {'type': ['string', 'null']},
+            'parent_node': {'type': ['string', 'null'], 'maxLength': 36},
             'power_interface': {'type': ['string', 'null']},
             'properties': {'type': ['object', 'null']},
             'raid_interface': {'type': ['string', 'null']},
@@ -180,6 +200,7 @@ def node_schema():
             'retired': {'type': ['string', 'boolean', 'null']},
             'retired_reason': {'type': ['string', 'null']},
             'secure_boot': {'type': ['string', 'boolean', 'null']},
+            'shard': {'type': ['string', 'null']},
             'storage_interface': {'type': ['string', 'null']},
             'uuid': {'type': ['string', 'null']},
             'vendor_interface': {'type': ['string', 'null']},
@@ -267,8 +288,11 @@ PATCH_ALLOWED_FIELDS = [
     'resource_class',
     'retired',
     'retired_reason',
+    'shard',
     'storage_interface',
-    'vendor_interface'
+    'vendor_interface',
+    'parent_node',
+    'firmware_interface'
 ]
 
 TRAITS_SCHEMA = {
@@ -293,6 +317,28 @@ VIF_VALIDATOR = args.and_valid(
     }),
     args.dict_valid(id=args.uuid_or_name)
 )
+
+VMEDIA_ATTACH_VALIDATOR = args.schema({
+    'type': 'object',
+    'properties': {
+        'device_type': {
+            'type': 'string',
+            'enum': boot_devices.VMEDIA_DEVICES,
+        },
+        'image_url': {'type': 'string'},
+        'image_download_source': {
+            'type': 'string',
+            'enum': ['http', 'local', 'swift'],
+        },
+        # TODO(dtantsur): these are useful additions in the future, but the
+        # ISO image code does not support them.
+        # 'username': {'type': 'string'},
+        # 'password': {'type': 'string'},
+        # 'insecure': {'type': 'boolean'},
+    },
+    'required': ['device_type', 'image_url'],
+    'additionalProperties': False,
+})
 
 
 def get_nodes_controller_reserved_names():
@@ -376,6 +422,18 @@ def validate_network_data(network_data):
         # said in jsonschema documentation to use this still.
         msg = _("Invalid network_data: %s ") % e.message
         raise exception.Invalid(msg)
+
+
+class GetNodeAndTopicMixin:
+
+    def _get_node_and_topic(self, policy_name):
+        rpc_node = api_utils.check_node_policy_and_retrieve(
+            policy_name, self.node_ident)
+        try:
+            return rpc_node, api.request.rpcapi.get_topic_for(rpc_node)
+        except exception.NoValidHost as e:
+            e.code = http_client.BAD_REQUEST
+            raise
 
 
 class BootDeviceController(rest.RestController):
@@ -865,7 +923,7 @@ class NodeStatesController(rest.RestController):
                     'modes': ', '.join(ALLOWED_TARGET_BOOT_MODES)})
             raise exception.InvalidParameterValue(msg)
 
-        # NOTE(cenne): This currenly includes the ADOPTING state
+        # NOTE(cenne): This currently includes the ADOPTING state
         if rpc_node.provision_state in ir_states.UNSTABLE_STATES:
             msg = _("Node is in %(state)s state. Since node is transitioning, "
                     "the boot mode will not be set as this may interfere "
@@ -913,7 +971,7 @@ class NodeStatesController(rest.RestController):
                    {'state': target})
             raise exception.InvalidParameterValue(msg)
 
-        # NOTE(cenne): This currenly includes the ADOPTING state
+        # NOTE(cenne): This currently includes the ADOPTING state
         if rpc_node.provision_state in ir_states.UNSTABLE_STATES:
             msg = _("Node is in %(state)s state. Since node is transitioning, "
                     "the boot mode will not be set as this may interfere "
@@ -932,7 +990,8 @@ class NodeStatesController(rest.RestController):
 
     def _do_provision_action(self, rpc_node, target, configdrive=None,
                              clean_steps=None, deploy_steps=None,
-                             rescue_password=None, disable_ramdisk=None):
+                             rescue_password=None, disable_ramdisk=None,
+                             service_steps=None):
         topic = api.request.rpcapi.get_topic_for(rpc_node)
         # Note that there is a race condition. The node state(s) could change
         # by the time the RPC call is made and the TaskManager manager gets a
@@ -975,6 +1034,17 @@ class NodeStatesController(rest.RestController):
             api.request.rpcapi.do_node_clean(
                 api.request.context, rpc_node.uuid, clean_steps,
                 disable_ramdisk, topic=topic)
+        elif target == ir_states.VERBS['service']:
+            if not service_steps:
+                msg = (_('"service_steps" is required when setting '
+                         'target provision state to '
+                         '%s') % ir_states.VERBS['service'])
+                raise exception.ClientSideError(
+                    msg, status_code=http_client.BAD_REQUEST)
+            _check_service_steps(service_steps)
+            api.request.rpcapi.do_node_service(
+                api.request.context, rpc_node.uuid, service_steps,
+                disable_ramdisk, topic=topic)
         elif target in PROVISION_ACTION_STATES:
             api.request.rpcapi.do_provisioning_action(
                 api.request.context, rpc_node.uuid, target, topic)
@@ -990,10 +1060,12 @@ class NodeStatesController(rest.RestController):
                    clean_steps=args.types(type(None), list),
                    deploy_steps=args.types(type(None), list),
                    rescue_password=args.string,
-                   disable_ramdisk=args.boolean)
+                   disable_ramdisk=args.boolean,
+                   service_steps=args.types(type(None), list))
     def provision(self, node_ident, target, configdrive=None,
                   clean_steps=None, deploy_steps=None,
-                  rescue_password=None, disable_ramdisk=None):
+                  rescue_password=None, disable_ramdisk=None,
+                  service_steps=None):
         """Asynchronous trigger the provisioning of the node.
 
         This will set the target provision state of the node, and a
@@ -1051,11 +1123,31 @@ class NodeStatesController(rest.RestController):
             inside the rescue environment. This is required (and only valid),
             when target is "rescue".
         :param disable_ramdisk: Whether to skip booting ramdisk for cleaning.
+        :param service_steps: A list of service steps that will be performed on
+            the node. A service step is a dictionary with required keys
+            'interface', 'step', 'priority' and 'args'. If specified, the value
+            for 'args' is a keyword variable argument dictionary that is passed
+            to the service step method.::
+
+              { 'interface': <driver_interface>,
+                'step': <name_of_service_step>,
+                'args': {<arg1>: <value1>, ..., <argn>: <valuen>}
+                'priority': <integer>}
+
+            For example (this isn't a real example, this service step doesn't
+            exist)::
+
+              { 'interface': 'deploy',
+                'step': 'upgrade_firmware',
+                'args': {'force': True},
+                'priority': 90 }
+
         :raises: NodeLocked (HTTP 409) if the node is currently locked.
         :raises: ClientSideError (HTTP 409) if the node is already being
                  provisioned.
         :raises: InvalidParameterValue (HTTP 400), if validation of
-                 clean_steps, deploy_steps or power driver interface fails.
+                 clean_steps, deploy_steps, service_steps or power driver
+                 interface fails.
         :raises: InvalidStateRequested (HTTP 400) if the requested transition
                  is not possible from the current state.
         :raises: NodeInMaintenance (HTTP 400), if operation cannot be
@@ -1115,9 +1207,20 @@ class NodeStatesController(rest.RestController):
             if not api_utils.allow_inspect_abort():
                 raise exception.NotAcceptable()
 
+        if target == ir_states.VERBS['unhold']:
+            # NOTE(TheJulia): There is no solid reason to do state checks
+            # as well, other than add additional complexity as multiple
+            # states are involved.
+            if not api_utils.allow_unhold_verb():
+                raise exception.NotAcceptable()
+
+        if target == ir_states.VERBS['service']:
+            if not api_utils.allow_service_verb():
+                raise exception.NotAcceptable()
+
         self._do_provision_action(rpc_node, target, configdrive, clean_steps,
                                   deploy_steps, rescue_password,
-                                  disable_ramdisk)
+                                  disable_ramdisk, service_steps)
 
         # Set the HTTP Location Header
         url_args = '/'.join([node_ident, 'states'])
@@ -1131,7 +1234,7 @@ def _check_clean_steps(clean_steps):
         clean_steps parameter of :func:`NodeStatesController.provision`.
     :raises: InvalidParameterValue if validation of steps fails.
     """
-    _check_steps(clean_steps, 'clean', _CLEAN_STEPS_SCHEMA)
+    _check_steps(clean_steps, 'clean', _STEPS_SCHEMA)
 
 
 def _check_deploy_steps(deploy_steps):
@@ -1142,6 +1245,16 @@ def _check_deploy_steps(deploy_steps):
     :raises: InvalidParameterValue if validation of steps fails.
     """
     _check_steps(deploy_steps, 'deploy', _DEPLOY_STEPS_SCHEMA)
+
+
+def _check_service_steps(service_steps):
+    """Ensure all necessary keys are present and correct in steps for service
+
+    :param service_steps: a list of steps. For more details, see the
+        service_steps parameter of :func:`NodeStatesController.provision`.
+    :raises: InvalidParameterValue if validation of steps fails.
+    """
+    _check_steps(service_steps, 'service', _STEPS_SCHEMA)
 
 
 def _check_steps(steps, step_type, schema):
@@ -1162,6 +1275,25 @@ def _check_steps(steps, step_type, schema):
     except jsonschema.ValidationError as exc:
         raise exception.InvalidParameterValue(_('Invalid %s_steps: %s') %
                                               (step_type, exc))
+    for step in steps:
+        eocn = step.get('execute_on_child_nodes')
+        child_nodes = step.get('limit_child_node_execution')
+        if eocn and isinstance(child_nodes, list):
+            # Extract each element, validate permission to access node.
+            for entry in child_nodes:
+                if not uuidutils.is_uuid_like(entry):
+                    raise exception.InvalidParameterValue(_(
+                        'Invalid entry detected for execute_on_child_node '
+                        'parameter in step %s.' % entry.get('step')))
+                api_utils.check_node_policy_and_retrieve(
+                    'baremetal:node:set_provision_state', entry)
+        elif eocn:
+            # Validate looks like a bool, if not raise exception
+            if not strutils.is_valid_boolstr(eocn):
+                raise exception.InvalidParameterValue(_(
+                    'Invalid entry detected for execute_on_child_node '
+                    'parameter in step %s. A boolean or a UUID value is '
+                    'expected.' % step.get('step')))
 
 
 def _get_chassis_uuid(node):
@@ -1354,6 +1486,7 @@ def _get_fields_for_node_query(fields=None):
                     'driver_internal_info',
                     'extra',
                     'fault',
+                    'firmware_interface',
                     'inspection_finished_at',
                     'inspection_started_at',
                     'inspect_interface',
@@ -1368,6 +1501,7 @@ def _get_fields_for_node_query(fields=None):
                     'network_data',
                     'network_interface',
                     'owner',
+                    'parent_node',
                     'power_interface',
                     'power_state',
                     'properties',
@@ -1383,6 +1517,8 @@ def _get_fields_for_node_query(fields=None):
                     'retired',
                     'retired_reason',
                     'secure_boot',
+                    'service_step',
+                    'shard',
                     'storage_interface',
                     'target_power_state',
                     'target_provision_state',
@@ -1512,7 +1648,7 @@ def node_sanitize(node, fields, cdict=None,
     :type fields: list of str
     :param cdict: Context dictionary for policy values evaluation.
                   If not provided, it will be executed by the method,
-                  however for enumerating node lists, it is more efficent
+                  however for enumerating node lists, it is more efficient
                   to provide.
     :param show_driver_secrets: A boolean value to allow external single
                                 evaluation of policy instead of once per
@@ -1597,6 +1733,10 @@ def node_sanitize(node, fields, cdict=None,
             node['driver_info'] = strutils.mask_dict_password(
                 node['driver_info'], "******")
 
+            _mask_fields(node['driver_info'],
+                         ['snmp_auth_key', 'snmp_priv_key'],
+                         "******")
+
     if not show_instance_secrets and 'instance_info' in node_keys:
         node['instance_info'] = strutils.mask_dict_password(
             node['instance_info'], "******")
@@ -1641,7 +1781,7 @@ def _node_sanitize_extended(node, node_keys, target_dict, cdict):
         and not policy.check("baremetal:node:get:last_error",
                              target_dict, cdict)):
         # Guard the last error from being visible as it can contain
-        # hostnames revealing infrastucture internal details.
+        # hostnames revealing infrastructure internal details.
         node['last_error'] = ('** Value Redacted - Requires '
                               'baremetal:node:get:last_error '
                               'permission. **')
@@ -1658,6 +1798,12 @@ def _node_sanitize_extended(node, node_keys, target_dict, cdict):
         node['driver_internal_info'] = {
             'content': '** Redacted - Requires baremetal:node:get:'
                        'driver_internal_info permission. **'}
+
+
+def _mask_fields(dictionary, fields, secret):
+    for field in fields:
+        if dictionary.get(field):
+            dictionary[field] = secret
 
 
 def node_list_convert_with_links(nodes, limit, url, fields=None, **kwargs):
@@ -1794,19 +1940,10 @@ class NodeMaintenanceController(rest.RestController):
         self._set_maintenance(rpc_node, False)
 
 
-class NodeVIFController(rest.RestController):
+class NodeVIFController(rest.RestController, GetNodeAndTopicMixin):
 
     def __init__(self, node_ident):
         self.node_ident = node_ident
-
-    def _get_node_and_topic(self, policy_name):
-        rpc_node = api_utils.check_node_policy_and_retrieve(
-            policy_name, self.node_ident)
-        try:
-            return rpc_node, api.request.rpcapi.get_topic_for(rpc_node)
-        except exception.NoValidHost as e:
-            e.code = http_client.BAD_REQUEST
-            raise
 
     @METRICS.timer('NodeVIFController.get_all')
     @method.expose()
@@ -1961,7 +2098,107 @@ class NodeInventoryController(rest.RestController):
         """
         node = api_utils.check_node_policy_and_retrieve(
             'baremetal:node:inventory:get', self.node_ident)
-        return inspect_utils.get_introspection_data(node, api.request.context)
+        return inspect_utils.get_inspection_data(node, api.request.context)
+
+
+class NodeChildrenController(rest.RestController):
+
+    def __init__(self, node_ident):
+        if hasattr(self, 'parent'):
+            # Short circuit any attempt to access
+            # /v1/nodes/<node>/children/<child_node>/children
+            raise exception.HTTPNotFound()
+        if api.request.version.minor < versions.MINOR_83_PARENT_CHILD_NODES:
+            # Minimum Client version is required.
+            raise exception.HTTPNotFound()
+
+        super(NodeChildrenController).__init__()
+        self.parent_node = node_ident
+
+    @METRICS.timer('NodeHistoryController.get_all')
+    @method.expose()
+    def get_all(self):
+        try:
+            # retrieve the parent node and validate access is permitted.
+            rpc_node = api_utils.check_node_policy_and_retrieve(
+                'baremetal:node:get', self.parent_node)
+        except exception.HTTPForbidden:
+            # If access is forbidden, we cannot tell the user they don't
+            # have access.
+            raise exception.HTTPNotFound()
+
+        filters = {}
+        # Extract the project ID or get None if not applicable.
+        project = api_utils.check_list_policy('node', None)
+        url = api.request.public_url
+        if project:
+            filters['project'] = project
+        filters['parent_node'] = rpc_node.uuid
+        nodes = objects.Node.list(api.request.context,
+                                  filters=filters, fields=['uuid'])
+        node_list = []
+        for node in nodes:
+            node_list.append(node.uuid)
+        # todo, need to check the format for links
+        return {
+            'children': node_list,
+            'links': link.make_link('children', url, 'nodes',
+                                    '?parent_node={}'.format(rpc_node.uuid))}
+
+
+class NodeVmediaController(rest.RestController, GetNodeAndTopicMixin):
+
+    def __init__(self, node_ident):
+        self.node_ident = node_ident
+
+    @METRICS.timer('NodeVmediaController.post')
+    @method.expose(status_code=http_client.NO_CONTENT)
+    @method.body('vmedia')
+    @args.validate(vmedia=VMEDIA_ATTACH_VALIDATOR)
+    def post(self, vmedia):
+        """Attach a virtual media to this node
+
+        :param vmedia: a dictionary of information about the attachment.
+        """
+        parsed_url = urllib.parse.urlparse(vmedia['image_url'])
+        # NOTE(dtantsur): we may eventually support glance images, but for now
+        # let us reject everything that is not http/https.
+        if parsed_url.scheme not in ('http', 'https'):
+            raise exception.Invalid(_("Unsupported or missing URL scheme: %s")
+                                    % parsed_url.scheme)
+
+        rpc_node, topic = self._get_node_and_topic(
+            'baremetal:node:vmedia:attach')
+        api.request.rpcapi.attach_virtual_media(
+            api.request.context, rpc_node.uuid,
+            device_type=vmedia['device_type'],
+            image_url=vmedia['image_url'],
+            image_download_source=vmedia.get('image_download_source', 'local'),
+            topic=topic)
+
+    @METRICS.timer('NodeVmediaController.delete')
+    @method.expose(status_code=http_client.NO_CONTENT)
+    @args.validate(device_types=args.string_list)
+    def delete(self, device_types=None):
+        """Detach a virtual media from this node
+
+        :param device_types: A collection of device types.
+        """
+        if device_types:
+            invalid = [item for item in device_types
+                       if item not in boot_devices.VMEDIA_DEVICES]
+            if invalid:
+                raise exception.Invalid(
+                    _("Invalid device type(s) %(invalid)s "
+                      "(valid are %(valid)s)")
+                    % {'invalid': ', '.join(invalid),
+                       'valid': ', '.join(boot_devices.VMEDIA_DEVICES)})
+
+        rpc_node, topic = self._get_node_and_topic(
+            'baremetal:node:vmedia:detach')
+        api.request.rpcapi.detach_virtual_media(
+            api.request.context, rpc_node.uuid,
+            device_types=device_types, topic=topic)
 
 
 class NodesController(rest.RestController):
@@ -1990,6 +2227,10 @@ class NodesController(rest.RestController):
     """A flag to indicate if the requests to this controller are coming
     from the top-level resource Chassis"""
 
+    parent_node = None
+    """An indicator to signal if this resource is being accessed
+    by a sub-controller."""
+
     _custom_actions = {
         'detail': ['GET'],
         'validate': ['GET'],
@@ -1999,7 +2240,7 @@ class NodesController(rest.RestController):
                              'instance_info', 'driver_internal_info',
                              'clean_step', 'deploy_step',
                              'raid_config', 'target_raid_config',
-                             'traits', 'network_data']
+                             'traits', 'network_data', 'service_step']
 
     _subcontroller_map = {
         'ports': port.PortsController,
@@ -2011,6 +2252,9 @@ class NodesController(rest.RestController):
         'allocation': allocation.NodeAllocationController,
         'history': NodeHistoryController,
         'inventory': NodeInventoryController,
+        'children': NodeChildrenController,
+        'firmware': firmware.NodeFirmwareController,
+        'vmedia': NodeVmediaController,
     }
 
     @pecan.expose()
@@ -2036,13 +2280,18 @@ class NodesController(rest.RestController):
             or (remainder[0] == 'history'
                 and not api_utils.allow_node_history())
             or (remainder[0] == 'inventory'
-                and not api_utils.allow_node_inventory())):
+                and not api_utils.allow_node_inventory())
+            or (remainder[0] == 'firmware'
+                and not api_utils.allow_firmware_interface())
+            or (remainder[0] == 'vmedia'
+                and not api_utils.allow_attach_detach_vmedia())):
             pecan.abort(http_client.NOT_FOUND)
         if remainder[0] == 'traits' and not api_utils.allow_traits():
             # NOTE(mgoddard): Returning here will ensure we exhibit the
             # behaviour of previous releases for microversions without this
             # endpoint.
             return
+
         subcontroller = self._subcontroller_map.get(remainder[0])
         if subcontroller:
             return subcontroller(node_ident=ident), remainder[1:]
@@ -2068,7 +2317,9 @@ class NodesController(rest.RestController):
                               fields=None, fault=None, conductor_group=None,
                               detail=None, conductor=None, owner=None,
                               lessee=None, project=None,
-                              description_contains=None):
+                              description_contains=None, shard=None,
+                              sharded=None, include_children=None,
+                              parent_node=None):
         if self.from_chassis and not chassis_uuid:
             raise exception.MissingParameterValue(
                 _("Chassis id not specified."))
@@ -2088,6 +2339,12 @@ class NodesController(rest.RestController):
 
         # The query parameters for the 'next' URL
         parameters = {}
+
+        # note(JayF): This is where you resolve differences between the name
+        # of the filter in the API and the name of the filter in the DB API.
+        # In the case of lists (args.string_list), you need to append _in to
+        # the filter name in order to exercise the list-aware logic in the
+        # lower level.
         possible_filters = {
             'maintenance': maintenance,
             'chassis_uuid': chassis_uuid,
@@ -2099,10 +2356,14 @@ class NodesController(rest.RestController):
             'conductor_group': conductor_group,
             'owner': owner,
             'lessee': lessee,
+            'shard_in': shard,
             'project': project,
             'description_contains': description_contains,
             'retired': retired,
-            'instance_uuid': instance_uuid
+            'instance_uuid': instance_uuid,
+            'sharded': sharded,
+            'include_children': include_children,
+            'parent_node': parent_node,
         }
         filters = {}
         for key, value in possible_filters.items():
@@ -2121,7 +2382,8 @@ class NodesController(rest.RestController):
             # map the name for the call, as we did not pickup a specific
             # list of fields to return.
             obj_fields = fields
-        # NOTE(TheJulia): When a data set of the nodeds list is being
+
+        # NOTE(TheJulia): When a data set of the nodes list is being
         # requested, this method takes approximately 3-3.5% of the time
         # when requesting specific fields aligning with Nova's sync
         # process. (Local DB though)
@@ -2154,7 +2416,6 @@ class NodesController(rest.RestController):
             # and we cannot pass a limit of 0 to sqlalchemy
             # and expect a response.
             limit = 0
-
         return node_list_convert_with_links(nodes, limit,
                                             url=resource_url,
                                             fields=fields,
@@ -2246,14 +2507,17 @@ class NodesController(rest.RestController):
                    fault=args.string, conductor_group=args.string,
                    detail=args.boolean, conductor=args.string,
                    owner=args.string, description_contains=args.string,
-                   lessee=args.string, project=args.string)
+                   lessee=args.string, project=args.string,
+                   shard=args.string_list, sharded=args.boolean,
+                   include_children=args.boolean, parent_node=args.string)
     def get_all(self, chassis_uuid=None, instance_uuid=None, associated=None,
                 maintenance=None, retired=None, provision_state=None,
                 marker=None, limit=None, sort_key='id', sort_dir='asc',
                 driver=None, fields=None, resource_class=None, fault=None,
                 conductor_group=None, detail=None, conductor=None,
                 owner=None, description_contains=None, lessee=None,
-                project=None):
+                project=None, shard=None, sharded=None, include_children=None,
+                parent_node=None):
         """Retrieve a list of nodes.
 
         :param chassis_uuid: Optional UUID of a chassis, to get only nodes for
@@ -2288,15 +2552,20 @@ class NodesController(rest.RestController):
         :param owner: Optional string value that set the owner whose nodes
                       are to be retrurned.
         :param lessee: Optional string value that set the lessee whose nodes
-                      are to be returned.
+                       are to be returned.
         :param project: Optional string value that set the project - lessee or
                         owner - whose nodes are to be returned.
+        :param shard: Optional string value that set the shards whose nodes are
+                      to be returned.
         :param fields: Optional, a list with a specified set of fields
                        of the resource to be returned.
         :param fault: Optional string value to get only nodes with that fault.
         :param description_contains: Optional string value to get only nodes
                                      with description field contains matching
                                      value.
+        :param sharded: Optional boolean whether to return a list of
+                        nodes with or without a shard set. May be combined
+                        with other parameters.
         """
         project = api_utils.check_list_policy('node', project)
 
@@ -2311,6 +2580,12 @@ class NodesController(rest.RestController):
         api_utils.check_allow_filter_by_conductor(conductor)
         api_utils.check_allow_filter_by_owner(owner)
         api_utils.check_allow_filter_by_lessee(lessee)
+        api_utils.check_allow_filter_by_shard(shard)
+        # Sharded is guarded by the same API version as shard
+        api_utils.check_allow_filter_by_shard(sharded)
+        api_utils.check_allow_child_node_params(
+            include_children=include_children,
+            parent_node=parent_node)
 
         fields = api_utils.get_request_return_fields(fields, detail,
                                                      _DEFAULT_RETURN_FIELDS)
@@ -2327,7 +2602,10 @@ class NodesController(rest.RestController):
                                           detail=detail,
                                           conductor=conductor,
                                           owner=owner, lessee=lessee,
+                                          shard=shard, sharded=sharded,
                                           project=project,
+                                          include_children=include_children,
+                                          parent_node=parent_node,
                                           **extra_args)
 
     @METRICS.timer('NodesController.detail')
@@ -2340,13 +2618,16 @@ class NodesController(rest.RestController):
                    resource_class=args.string, fault=args.string,
                    conductor_group=args.string, conductor=args.string,
                    owner=args.string, description_contains=args.string,
-                   lessee=args.string, project=args.string)
+                   lessee=args.string, project=args.string,
+                   shard=args.string_list, sharded=args.boolean)
     def detail(self, chassis_uuid=None, instance_uuid=None, associated=None,
                maintenance=None, retired=None, provision_state=None,
                marker=None, limit=None, sort_key='id', sort_dir='asc',
                driver=None, resource_class=None, fault=None,
                conductor_group=None, conductor=None, owner=None,
-               description_contains=None, lessee=None, project=None):
+               description_contains=None, lessee=None, project=None,
+               shard=None, sharded=None, include_children=None,
+               parent_node=None):
         """Retrieve a list of nodes with detail.
 
         :param chassis_uuid: Optional UUID of a chassis, to get only nodes for
@@ -2383,9 +2664,13 @@ class NodesController(rest.RestController):
                       are to be returned.
         :param project: Optional string value that set the project - lessee or
                         owner - whose nodes are to be returned.
+        :param shard: Optional - set the shards whose nodes are to be returned.
         :param description_contains: Optional string value to get only nodes
                                      with description field contains matching
                                      value.
+        :param sharded: Optional boolean whether to return a list of
+                        nodes with or without a shard set. May be combined
+                        with other parameters.
         """
         project = api_utils.check_list_policy('node', project)
 
@@ -2403,6 +2688,9 @@ class NodesController(rest.RestController):
             raise exception.HTTPNotFound()
 
         api_utils.check_allow_filter_by_conductor(conductor)
+        api_utils.check_allow_filter_by_shard(shard)
+        # Sharded is guarded by the same API version as shard
+        api_utils.check_allow_filter_by_shard(sharded)
 
         extra_args = {'description_contains': description_contains}
         return self._get_nodes_collection(chassis_uuid, instance_uuid,
@@ -2416,7 +2704,10 @@ class NodesController(rest.RestController):
                                           conductor_group=conductor_group,
                                           conductor=conductor,
                                           owner=owner, lessee=lessee,
-                                          project=project,
+                                          project=project, shard=shard,
+                                          sharded=sharded,
+                                          include_children=include_children,
+                                          parent_node=parent_node,
                                           **extra_args)
 
     @METRICS.timer('NodesController.validate')
@@ -2507,7 +2798,7 @@ class NodesController(rest.RestController):
         # NOTE(jroll) this is special-cased to "" and not None,
         # because it is used in hash ring calculations
         if not node.get('conductor_group'):
-            node['conductor_group'] = ''
+            node['conductor_group'] = CONF.default_conductor_group
 
         if node.get('name') is not None:
             error_msg = _("Cannot create node with invalid name '%(name)s'")
@@ -2531,7 +2822,7 @@ class NodesController(rest.RestController):
 
             if requested_owner and requested_owner != project_id:
                 # Translation: If project scoped, and an owner has been
-                # requested, and that owner does not match the requestor's
+                # requested, and that owner does not match the requester's
                 # project ID value.
                 msg = _("Cannot create a node as a project scoped admin "
                         "with an owner other than your own project.")
@@ -2541,6 +2832,13 @@ class NodesController(rest.RestController):
 
         chassis = _replace_chassis_uuid_with_id(node)
         chassis_uuid = chassis and chassis.uuid or None
+
+        if ('parent_node' in node
+            and not uuidutils.is_uuid_like(node['parent_node'])):
+
+            parent_node = api_utils.check_node_policy_and_retrieve(
+                'baremetal:node:get', node['parent_node'])
+            node['parent_node'] = parent_node.uuid
 
         new_node = objects.Node(context, **node)
 
@@ -2568,6 +2866,7 @@ class NodesController(rest.RestController):
         return api_node
 
     def _validate_patch(self, patch, reset_interfaces):
+        corrected_values = {}
         if self.from_chassis:
             raise exception.OperationNotPermitted()
 
@@ -2598,56 +2897,82 @@ class NodesController(rest.RestController):
 
         for network_data in network_data_fields:
             validate_network_data(network_data)
+        parent_node = api_utils.get_patch_values(patch, '/parent_node')
+        if parent_node:
+            # At this point, if there *is* a parent_node, there is a value
+            # in the patch value list.
+            try:
+                # Verify we can see the parent node
+                req_parent_node = api_utils.check_node_policy_and_retrieve(
+                    'baremetal:node:get', parent_node[0])
+                # If we can't see the node, an exception gets raised.
+            except Exception:
+                msg = _("Unable to apply the requested parent_node. "
+                        "Requested value was invalid.")
+                raise exception.Invalid(msg)
+            corrected_values['parent_node'] = req_parent_node.uuid
+        return corrected_values
 
     def _authorize_patch_and_get_node(self, node_ident, patch):
         # deal with attribute-specific policy rules
         policy_checks = []
         generic_update = False
-        for p in patch:
-            if p['path'].startswith('/instance_info'):
-                policy_checks.append('baremetal:node:update_instance_info')
-            elif p['path'].startswith('/extra'):
-                policy_checks.append('baremetal:node:update_extra')
-            elif (p['path'].startswith('/automated_clean')
-                  and strutils.bool_from_string(p['value'], default=None)
-                  is False):
-                policy_checks.append('baremetal:node:disable_cleaning')
-            elif p['path'].startswith('/driver_info'):
-                policy_checks.append('baremetal:node:update:driver_info')
-            elif p['path'].startswith('/properties'):
-                policy_checks.append('baremetal:node:update:properties')
-            elif p['path'].startswith('/chassis_uuid'):
-                policy_checks.append('baremetal:node:update:chassis_uuid')
-            elif p['path'].startswith('/instance_uuid'):
-                policy_checks.append('baremetal:node:update:instance_uuid')
-            elif p['path'].startswith('/lessee'):
-                policy_checks.append('baremetal:node:update:lessee')
-            elif p['path'].startswith('/owner'):
-                policy_checks.append('baremetal:node:update:owner')
-            elif p['path'].startswith('/driver'):
-                policy_checks.append('baremetal:node:update:driver_interfaces')
-            elif ((p['path'].lstrip('/').rsplit(sep="_", maxsplit=1)[0]
-                   in driver_base.ALL_INTERFACES)
-                  and (p['path'].lstrip('/').rsplit(sep="_", maxsplit=1)[-1]
-                       == "interface")):
-                # TODO(TheJulia): Replace the above check with something like
-                # elif (p['path'].lstrip('/').removesuffix('_interface')
-                # when the minimum supported version is Python 3.9.
-                policy_checks.append('baremetal:node:update:driver_interfaces')
-            elif p['path'].startswith('/network_data'):
-                policy_checks.append('baremetal:node:update:network_data')
-            elif p['path'].startswith('/conductor_group'):
-                policy_checks.append('baremetal:node:update:conductor_group')
-            elif p['path'].startswith('/name'):
-                policy_checks.append('baremetal:node:update:name')
-            elif p['path'].startswith('/retired'):
-                policy_checks.append('baremetal:node:update:retired')
-            else:
-                generic_update = True
-        # always do at least one check
-        if generic_update or not policy_checks:
-            policy_checks.append('baremetal:node:update')
 
+        paths_to_policy = (
+            ('/instance_info', 'baremetal:node:update_instance_info'),
+            ('/extra', 'baremetal:node:update_extra'),
+            ('/driver_info', 'baremetal:node:update:driver_info'),
+            ('/properties', 'baremetal:node:update:properties'),
+            ('/chassis_uuid', 'baremetal:node:update:chassis_uuid'),
+            ('/instance_uuid', 'baremetal:node:update:instance_uuid'),
+            ('/lessee', 'baremetal:node:update:lessee'),
+            ('/owner', 'baremetal:node:update:owner'),
+            ('/driver', 'baremetal:node:update:driver_interfaces'),
+            ('/network_data', 'baremetal:node:update:network_data'),
+            ('/conductor_group', 'baremetal:node:update:conductor_group'),
+            ('/name', 'baremetal:node:update:name'),
+            ('/retired', 'baremetal:node:update:retired'),
+            ('/shard', 'baremetal:node:update:shard'),
+            ('/parent_node', 'baremetal:node:update:parent_node')
+        )
+        for p in patch:
+            # Process general direct path to policy map
+            rule_match_found = False
+            for check_path, policy_name in paths_to_policy:
+                if p['path'].startswith(check_path):
+                    policy_checks.append(policy_name)
+                    # Break from the loop as there is no reason to
+                    # continue iterating
+                    rule_match_found = True
+                    break
+
+            # Process more advanced checks and conditional behavior checks.
+            if not rule_match_found:
+                if ((p['path'].lstrip('/').rsplit(sep="_", maxsplit=1)[0]
+                     in driver_base.ALL_INTERFACES)
+                    and (p['path'].lstrip('/').rsplit(sep="_", maxsplit=1)[-1]
+                         == "interface")):
+                    # TODO(TheJulia): Replace the above check with something
+                    # like elif (p['path'].lstrip('/').removesuffix(
+                    # '_interface') when the minimum supported version is
+                    # Python 3.9.
+                    policy_checks.append(
+                        'baremetal:node:update:driver_interfaces')
+                    rule_match_found = True
+                elif (p['path'].startswith('/automated_clean')
+                      and strutils.bool_from_string(p['value'], default=None)
+                      is False):
+                    policy_checks.append('baremetal:node:disable_cleaning')
+                    rule_match_found = True
+            if not rule_match_found:
+                generic_update = True
+        # End of loop over patch to determine rules to apply.
+
+        if generic_update or not policy_checks:
+            # General policy check, either we no specific policy to apply
+            # on a node, or we fell through completely, regardless,
+            # we apply the update policy check.
+            policy_checks.append('baremetal:node:update')
         return api_utils.check_multiple_node_policies_and_retrieve(
             policy_checks, node_ident, with_suffix=True)
 
@@ -2668,7 +2993,7 @@ class NodesController(rest.RestController):
                 api_utils.allow_reset_interfaces()):
             raise exception.NotAcceptable()
 
-        self._validate_patch(patch, reset_interfaces)
+        corrected_values = self._validate_patch(patch, reset_interfaces)
 
         context = api.request.context
         rpc_node = self._authorize_patch_and_get_node(node_ident, patch)
@@ -2724,7 +3049,6 @@ class NodesController(rest.RestController):
                             msg, status_code=http_client.CONFLICT)
                 except exception.AllocationNotFound:
                     pass
-
         names = api_utils.get_patch_values(patch, '/name')
         if len(names):
             error_msg = (_("Node %s: Cannot change name to invalid name ")
@@ -2740,6 +3064,12 @@ class NodesController(rest.RestController):
         node_dict['chassis_uuid'] = _get_chassis_uuid(rpc_node)
 
         node_dict = api_utils.apply_jsonpatch(node_dict, patch)
+        if corrected_values:
+            # If we determined in our schema validation that someone
+            # provided non-fatal, but incorrect input, that we correct
+            # it here from the output returned from validation.
+            for key in corrected_values.keys():
+                node_dict[key] = corrected_values[key]
 
         api_utils.patched_validate_with_schema(
             node_dict, node_patch_schema(), node_patch_validator)
@@ -2767,7 +3097,6 @@ class NodesController(rest.RestController):
             new_node = api.request.rpcapi.update_node(context,
                                                       rpc_node, topic,
                                                       reset_interfaces)
-
         api_node = node_convert_with_links(new_node)
         chassis_uuid = api_node.get('chassis_uuid')
         notify.emit_end_notification(context, new_node, 'update',

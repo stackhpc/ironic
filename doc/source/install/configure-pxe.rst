@@ -1,10 +1,28 @@
-Configuring PXE and iPXE
+Configuring Network Boot
 ========================
+
+Ironic's primary means of booting hardware to perform actions or work on a
+baremetal node is to perform network booting. Traditionally, this has meant
+the use of Preboot Execution Environment, or PXE. This support and
+and functionality has evolve as time has gone on to include support for not
+just the ``pxe`` ``boot_interface`` in concert with hardware vendor specific
+variations, but also a distinct ``ipxe`` setting for ``boot_interface`` with
+default values to enable use of `iPXE <https://ipxe.org/>`_.
+
+As time passed, ``http`` and ``http-ipxe`` values were also added as valid
+``boot_interface`` options which may be used, which are functionally identical
+in behavior to ``pxe`` and ``ipxe``, except HTTP is used as the transport
+mechanism. Not all hardware supports HTTPBoot, as it is often referred.
+
+.. note::
+   Support for HTTPBoot interfaces was added during the 2024.1 development
+   cycle. Prior versions of Ironic does not contain the ``http`` and
+   ``http-ipxe`` boot interfaces.
 
 DHCP server setup
 -----------------
 
-A DHCP server is required by PXE/iPXE client. You need to follow steps below.
+A DHCP server is required for network boot clients. You need to follow steps below.
 
 #. Set the ``[dhcp]/dhcp_provider`` to ``neutron`` in the Bare Metal Service's
    configuration file (``/etc/ironic/ironic.conf``):
@@ -15,7 +33,8 @@ A DHCP server is required by PXE/iPXE client. You need to follow steps below.
     defaults, and when you create subnet, DHCP is also enabled if you do not add
     any dhcp options at "openstack subnet create" command.
 
-#. Enable DHCP in the subnet of PXE network.
+#. Enable DHCP in the subnet of provisioning network to be used for network
+   boot (PXE, iPXE, HTTPBoot) operations.
 
 #. Set the ip address range in the subnet for DHCP.
 
@@ -281,7 +300,7 @@ on the Bare Metal service node(s) where ``ironic-conductor`` is running.
       Setting the iPXE parameters noted in the code block above to no value,
       in other words setting a line to something like ``ipxe_bootfile_name=``
       will result in ironic falling back to the default values of the non-iPXE
-      PXE settings. This is for backwards compatability.
+      PXE settings. This is for backwards compatibility.
 
 #. Ensure iPXE is the default PXE, if applicable.
 
@@ -469,3 +488,166 @@ those paths will be created using configuration parameter
 the configuration parameter ``[pxe]file_permission``. Absolute destination
 paths are not supported and will result in ironic failing to start up as
 it is a misconfiguration of the deployment.
+
+.. _configure-unmanaged-inspection:
+
+Configuring unmanaged in-band inspection
+----------------------------------------
+
+This section must be followed if you intend to use :ref:`unmanaged-inspection`
+without ironic-inspector. For ironic-inspector support, check `its installation
+guide
+<https://docs.openstack.org/ironic-inspector/latest/install/index.html#configuration>`_.
+
+With PXE
+~~~~~~~~
+
+After you followed `TFTP Server Setup`_, you need to create the default PXE
+configuration. Populate ``/tftpboot/pxelinux.cfg/default`` with the following
+contents::
+
+    default introspect
+
+    label introspect
+    kernel ironic-python-agent.kernel
+    append initrd=ironic-python-agent.initramfs ipa-inspection-callback-url=http://{IP}:6385/v1/continue_inspection systemd.journald.forward_to_console=yes
+
+    ipappend 3
+
+Instead of ``http://{IP}:6385/v1/continue_inspection``, insert the correct Bare
+Metal API endpoint, keeping the mandatory ``/v1/continue_inspection`` suffix.
+You may also populate other IPA options (e.g. ``ipa-debug=1`` for detailed
+logging, ``ipa-inspection-collectors`` to customize the inspection process,
+or ``ipa-api-url`` to enable :doc:`/admin/fast-track`).
+
+Second, you need to configure DHCP for unknown hosts since the OpenStack
+Networking service won't be able to handle them. For instance, you can install
+**dnsmasq** and use the following ``/etc/dnsmasq.conf``:
+
+.. code-block:: ini
+
+    port=0
+    interface={INTERFACE}
+    bind-interfaces
+    dhcp-range={DHCP IP RANGE, e.g. 192.168.0.50,192.168.0.150}
+    enable-tftp
+    tftp-root=/tftpboot
+    dhcp-boot=pxelinux.0
+    dhcp-sequential-ip
+
+If you need this dnsmasq instance to co-exist with the OpenStack Networking
+service, some measures must be taken to prevent them from clashing over DHCP
+requests. One way to do it is to physically separate the inspection network.
+Another - to configure the :doc:`/admin/inspection/pxe_filter`.
+
+Finally, build or download IPA images into
+``/tftpboot/ironic-python-agent.kernel`` and
+``/tftpboot/ironic-python-agent.initramfs``. These can be the same images that
+you use for deployment and cleaning.
+
+With iPXE
+~~~~~~~~~
+
+iPXE configuration is pretty similar to PXE above, but differs in details.
+Start with `iPXE Setup`_, then create a new file ``/httpboot/inspection.ipxe``
+with the following contents::
+
+    #!ipxe
+
+    :retry_dhcp
+    dhcp || goto retry_dhcp
+
+    :retry_boot
+    imgfree
+    kernel --timeout 30000 http://{IP}:8080/ironic-python-agent.kernel ipa-inspection-callback-url=http://{IP}:6385/v1/continue_inspection systemd.journald.forward_to_console=yes BOOTIF=${mac} initrd=ironic-python-agent.initramfs || goto retry_boot
+    initrd --timeout 30000 http://{IP}:8080/ironic-python-agent.initramfs || goto retry_boot
+    boot
+
+Just as `with PXE`_, adjust ``ipa-inspection-callback-url`` to match your
+deployment and add any required IPA options. You also need to fix ``{IP}:8080``
+to match the iPXE server you configured previously.
+
+The DHCP configuration is much more complex. Since most hardware does not have
+an up-to-date iPXE firmware, you need to bootstrap it from TFTP. The
+**dnsmasq** configuration may look roughly like this:
+
+.. code-block:: ini
+
+    port=0
+    interface={INTERFACE}
+    bind-interfaces
+    dhcp-range={DHCP IP RANGE, e.g. 192.168.0.50,192.168.0.150}
+    enable-tftp
+    tftp-root=/tftpboot
+    dhcp-sequential-ip
+    dhcp-match=ipxe,175
+    dhcp-match=set:efi,option:client-arch,7
+    dhcp-match=set:efi,option:client-arch,9
+    dhcp-match=set:efi,option:client-arch,11
+    # dhcpv6.option: Client System Architecture Type (61)
+    dhcp-match=set:efi6,option6:61,0007
+    dhcp-match=set:efi6,option6:61,0009
+    dhcp-match=set:efi6,option6:61,0011
+    dhcp-userclass=set:ipxe6,iPXE
+    # Client is already running iPXE; move to next stage of chainloading
+    dhcp-boot=tag:ipxe,http://{IP}:8080/inspection.ipxe
+    # Client is PXE booting over EFI without iPXE ROM,
+    # send EFI version of iPXE chainloader
+    dhcp-boot=tag:efi,tag:!ipxe,ipxe.efi
+    dhcp-option=tag:efi6,tag:!ipxe6,option6:bootfile-url,tftp://{IP}/ipxe.efi
+    # Client is running PXE over BIOS; send BIOS version of iPXE chainloader
+    dhcp-boot=undionly.kpxe,localhost.localdomain,{IP}
+
+.. note::
+   It's not trivial to write such a configuration from scratch. In addition to
+   this document, you may take some inspiration from `Bifrost
+   <https://opendev.org/openstack/bifrost/src/branch/master/playbooks/roles/bifrost-ironic-install/templates/dnsmasq.conf.j2>`_
+   and `Metal3
+   <https://github.com/metal3-io/ironic-image/blob/main/ironic-config/dnsmasq.conf.j2>`_.
+
+Finally, put ``ironic-python-agent.kernel`` and
+``ironic-python-agent.initramfs`` to ``/httpboot``.
+
+HTTPBoot
+--------
+
+HTTPBoot interfaces in Ironic are built upon the underlying network boot
+substrate. This means much of the configuration in the ``[pxe]`` and
+``[deploy]`` impacts the use of HTTPBoot, except when Ironic is setting
+DHCP parameters, it populates a HTTP(S) URL to the DHCP server, which is
+then transmitted to the client attempting to Network Boot. In large part,
+this is because HTTPBoot is an evolution of PXE Boot technique and
+technology.
+
+This means a TFTP server is *not* required, but the HTTP server is
+required as if you are utilizing iPXE. This is largely because iPXE
+has traditionally been leveraged by Operators to limit the TFTP
+packets being transmitted via UDP across a network.
+
+One aspect to keep in mind, is HTTPBoot is relatively new when compared
+to PXE boot, and not all bootloaders may support HTTPBoot, as the underlying
+UEFI standard upon which it was largely based, UEFI v2.5, was published in
+2015.
+
+Ironic contains two distinct flavors of HTTPBoot, largely based
+upon what configuration defaults are used in terms of boot loader, templates,
+and overall mechanism style.
+
+* ``http`` is the boot interface based upon the ``pxe`` boot interface.
+  This is the interface you would want to use if you had, for example, a
+  signed GRUB2 bootloader chain to utilize. In this case it is up to the
+  boot loader to understand how to extract and run with the URL, and then
+  retrieves any additional configuration loader files and configuration
+  templates created on disk.
+* ``http-ipxe`` is the boot interface based upon the ``ipxe`` boot interface.
+  This interface signals to the client to utilize the configured iPXE loader
+  binary over HTTP, and then the boot sequence proceeds with the pattern and
+  capabilities of iPXE.
+
+To enable the boot interfaces, you will need to add them to your
+``[DEFAULT]enabled_boot_interfaces`` configuration entry.
+
+.. code-block:: ini
+
+   [DEFAULT]
+   enabled_boot_interfaces=ipxe,http-ipxe,pxe,http

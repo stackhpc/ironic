@@ -25,11 +25,12 @@ from ironic.common.i18n import _
 from ironic.common import image_service
 from ironic.common import swift
 from ironic.conf import CONF
+from ironic.drivers.modules.redfish import utils as redfish_utils
 
 LOG = log.getLogger(__name__)
 
 _UPDATE_FIRMWARE_SCHEMA = {
-    "$schema": "http://json-schema.org/schema#",
+    "$schema": "http://json-schema.org/draft-04/schema#",
     "title": "update_firmware clean step schema",
     "type": "array",
     # list of firmware update images
@@ -63,6 +64,37 @@ _UPDATE_FIRMWARE_SCHEMA = {
         "additionalProperties": False
     }
 }
+
+_FIRMWARE_INTERFACE_UPDATE_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "title": "update_firmware clean step schema",
+    "type": "array",
+    "minItems": 1,
+    # list of firmware update images
+    "items": {
+        "type": "object",
+        "required": ["component", "url"],
+        "properties": {
+            "component": {
+                "description": "name of the firmware component to be updated",
+                "type": "string",
+                "enum": redfish_utils.FIRMWARE_COMPONENTS
+            },
+            "url": {
+                "description": "URL for firmware file",
+                "type": "string",
+                "minLength": 1
+            },
+            "wait": {
+                "description": "optional wait time for firmware update",
+                "type": "integer",
+                "minimum": 1
+            }
+        },
+        "additionalProperties": False
+    }
+}
+
 _FIRMWARE_SUBDIR = 'firmware'
 
 
@@ -78,6 +110,20 @@ def validate_update_firmware_args(firmware_images):
         raise exception.InvalidParameterValue(
             _('Invalid firmware update %(firmware_images)s. Errors: %(err)s')
             % {'firmware_images': firmware_images, 'err': err})
+
+
+def validate_firmware_interface_update_args(settings):
+    """Validate ``update`` step input argument
+
+    :param settings: args to validate.
+    :raises: InvalidParameterValue When argument is not valid
+    """
+    try:
+        jsonschema.validate(settings, _FIRMWARE_INTERFACE_UPDATE_SCHEMA)
+    except jsonschema.ValidationError as err:
+        raise exception.InvalidParameterValue(
+            _('Invalid firmware update %(settings)s. Errors: %(err)s')
+            % {'settings': settings, 'err': err})
 
 
 def get_swift_temp_url(parsed_url):
@@ -137,8 +183,22 @@ def verify_checksum(node, checksum, file_path):
     :param file_path: File path for which to verify checksum
     :raises RedfishError: When checksum does not match
     """
-    calculated_checksum = fileutils.compute_file_checksum(
-        file_path, algorithm='sha1')
+    if len(checksum) <= 41:
+        # SHA1: 40 bytes long
+        calculated_checksum = fileutils.compute_file_checksum(
+            file_path, algorithm='sha1')
+    elif len(checksum) <= 64:
+        calculated_checksum = fileutils.compute_file_checksum(
+            file_path, algorithm='sha256')
+    elif len(checksum) <= 128:
+        calculated_checksum = fileutils.compute_file_checksum(
+            file_path, algorithm='sha512')
+    else:
+        raise exception.RedfishError(
+            _('Unable to identify checksum to perform firmware file checksum '
+              'calculation. Please validate your input in and try again. '
+              'Received: %(checksum)s')
+            % {'checksum': checksum})
     if checksum != calculated_checksum:
         raise exception.RedfishError(
             _('For node %(node)s firmware file %(temp_file)s checksums do not '
@@ -244,14 +304,13 @@ def cleanup(node):
         LOG.debug('For node %(node)s cleaning up files from Swift container '
                   '%(container)s.',
                   {'node': node.uuid, 'container': container})
-        _, objects = swift_api.connection.get_container(container)
+        objects = swift_api.connection.list_objects(container)
         for o in objects:
-            name = o.get('name')
-            if name and name.startswith(node.uuid):
+            if o.name and o.name.startswith(node.uuid):
                 try:
-                    swift_api.delete_object(container, name)
+                    swift_api.delete_object(container, o.name)
                 except exception.SwiftOperationError as error:
                     LOG.warning('For node %(node)s failed to clean up '
                                 '%(object)s. Error: %(error)s',
-                                {'node': node.uuid, 'object': name,
+                                {'node': node.uuid, 'object': o.name,
                                  'error': error})

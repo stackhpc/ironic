@@ -21,16 +21,15 @@ from urllib import parse as urlparse
 
 from oslo_log import log
 from oslo_utils import excutils
-from oslo_utils import importutils
 from oslo_utils import strutils
 import rfc3986
+import sushy
 import tenacity
 
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import utils
 from ironic.conf import CONF
-
-sushy = importutils.try_import('sushy')
 
 LOG = log.getLogger(__name__)
 
@@ -79,6 +78,17 @@ COMMON_PROPERTIES = REQUIRED_PROPERTIES.copy()
 COMMON_PROPERTIES.update(OPTIONAL_PROPERTIES)
 
 
+# All available FIRMWARE COMPONENTS
+BIOS = 'bios'
+"BIOS Firmware Component"
+
+BMC = 'bmc'
+"BMC Firmware Component"
+
+FIRMWARE_COMPONENTS = [BIOS, BMC]
+"""Firmware Components available to update"""
+
+
 def parse_driver_info(node):
     """Parse the information required for Ironic to connect to Redfish.
 
@@ -97,7 +107,7 @@ def parse_driver_info(node):
                                                  'info': missing_info})
 
     # Validate the Redfish address
-    address = driver_info['redfish_address']
+    address = utils.wrap_ipv6(driver_info['redfish_address'])
     try:
         parsed = rfc3986.uri_reference(address)
     except TypeError:
@@ -188,13 +198,12 @@ def parse_driver_info(node):
 
 class SessionCache(object):
     """Cache of HTTP sessions credentials"""
-    AUTH_CLASSES = {}
-    if sushy:
-        AUTH_CLASSES.update(
-            basic=sushy.auth.BasicAuth,
-            session=sushy.auth.SessionAuth,
-            auto=sushy.auth.SessionOrBasicAuth
-        )
+
+    AUTH_CLASSES = dict(
+        basic=sushy.auth.BasicAuth,
+        session=sushy.auth.SessionAuth,
+        auto=sushy.auth.SessionOrBasicAuth
+    )
 
     _sessions = collections.OrderedDict()
 
@@ -203,9 +212,13 @@ class SessionCache(object):
         # include it in the session key.
         # NOTE(TheJulia): Multiplying the address by 4, to ensure
         # we meet a minimum of 16 bytes for salt.
+        # NOTE(frickler): password may be None, make sure we have a str
+        password = driver_info.get('password')
+        if not password:
+            password = ''
         pw_hash = hashlib.pbkdf2_hmac(
             'sha512',
-            driver_info.get('password').encode('utf-8'),
+            password.encode('utf-8'),
             str(driver_info.get('address') * 4).encode('utf-8'), 40)
         self._driver_info = driver_info
         # Assemble the session key and append the hashed password to it,
@@ -474,3 +487,39 @@ def wait_until_get_system_ready(node):
     driver_info = parse_driver_info(node)
     system_id = driver_info['system_id']
     return _get_system(driver_info, system_id)
+
+
+def get_manager(node, system, manager_id=None):
+    """Get a node's manager.
+
+    :param system: a Sushy system object
+    :param manager_id: the id of the manager
+    :return: a sushy Manager
+    :raises: RedfishError when the System doesn't have Managers associated
+    """
+
+    try:
+        sushy_manager = None
+        available_managers = system.managers
+        if available_managers:
+            if manager_id is None:
+                sushy_manager = available_managers[0]
+            else:
+                for manager in available_managers:
+                    if manager.identity == manager_id:
+                        sushy_manager = manager
+        if sushy_manager is None:
+            raise Exception("Couldn't find any Sushy Manager")
+        return sushy_manager
+    except sushy.exceptions.MissingAttributeError as e:
+        LOG.error('Redfish Managers for node %(node)s are not associated '
+                  'with system %(system)s. Error %(error)s',
+                  {'system': system.identity,
+                   'node': node.uuid, 'error': e})
+        raise exception.RedfishError(error=e)
+    except Exception as exc:
+        LOG.error('Redfish Manager was not found for '
+                  'node %(node)s under system %(system)s. Error %(error)s',
+                  {'system': system.identity,
+                   'node': node.uuid, 'error': exc})
+        raise exception.RedfishError(error=exc)

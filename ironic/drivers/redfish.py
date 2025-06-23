@@ -15,13 +15,13 @@
 
 from ironic.drivers import generic
 from ironic.drivers.modules import agent
-from ironic.drivers.modules import inspector
 from ironic.drivers.modules import ipxe
 from ironic.drivers.modules import noop
 from ironic.drivers.modules import noop_mgmt
 from ironic.drivers.modules import pxe
 from ironic.drivers.modules.redfish import bios as redfish_bios
 from ironic.drivers.modules.redfish import boot as redfish_boot
+from ironic.drivers.modules.redfish import firmware as redfish_firmware
 from ironic.drivers.modules.redfish import inspect as redfish_inspect
 from ironic.drivers.modules.redfish import management as redfish_mgmt
 from ironic.drivers.modules.redfish import power as redfish_power
@@ -50,8 +50,8 @@ class RedfishHardware(generic.GenericHardware):
     @property
     def supported_inspect_interfaces(self):
         """List of supported power interfaces."""
-        return [redfish_inspect.RedfishInspect, inspector.Inspector,
-                noop.NoInspect]
+        return ([redfish_inspect.RedfishInspect]
+                + super().supported_inspect_interfaces)
 
     @property
     def supported_boot_interfaces(self):
@@ -59,7 +59,8 @@ class RedfishHardware(generic.GenericHardware):
         # NOTE(dtantsur): virtual media goes last because of limited hardware
         # vendors support.
         return [ipxe.iPXEBoot, pxe.PXEBoot,
-                redfish_boot.RedfishVirtualMediaBoot]
+                redfish_boot.RedfishVirtualMediaBoot,
+                redfish_boot.RedfishHttpsBoot]
 
     @property
     def supported_vendor_interfaces(self):
@@ -70,3 +71,7 @@ class RedfishHardware(generic.GenericHardware):
     def supported_raid_interfaces(self):
         """List of supported raid interfaces."""
         return [redfish_raid.RedfishRAID, noop.NoRAID, agent.AgentRAID]
+
+    @property
+    def supported_firmware_interfaces(self):
+        return [redfish_firmware.RedfishFirmware, noop.NoFirmware]

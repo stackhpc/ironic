@@ -44,7 +44,7 @@ NUMERIC_RELEASES = sorted(
     map(versionutils.convert_version_to_tuple,
         set(release_mappings.RELEASE_MAPPING)
         # Update the exceptions whenever needed
-        - {'master', 'zed', 'yoga'}),
+        - {'master', '2024.1', '2023.1', '2023.2', 'antelope', 'zed', 'yoga'}),
     reverse=True)
 
 

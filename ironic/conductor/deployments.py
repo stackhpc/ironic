@@ -19,6 +19,7 @@ from oslo_db import exception as db_exception
 from oslo_log import log
 from oslo_utils import excutils
 
+from ironic.common import async_steps
 from ironic.common import exception
 from ironic.common.glance_service import service_utils as glance_utils
 from ironic.common.i18n import _
@@ -30,6 +31,7 @@ from ironic.conductor import task_manager
 from ironic.conductor import utils
 from ironic.conf import CONF
 from ironic.objects import fields
+from ironic.objects import Node
 
 LOG = log.getLogger(__name__)
 
@@ -269,30 +271,56 @@ def do_next_deploy_step(task, step_index):
         node.deploy_step = step
         node.set_driver_internal_info('deploy_step_index', idx)
         node.save()
-        interface = getattr(task.driver, step.get('interface'))
-        LOG.info('Executing %(step)s on node %(node)s',
-                 {'step': step, 'node': node.uuid})
+
+        child_node_execution = step.get('execute_on_child_nodes', False)
+        result = None
         try:
-            result = interface.execute_deploy_step(task, step)
+            if async_steps.DEPLOYMENT_POLLING in node.driver_internal_info:
+                # We're going to execute a new step, we should delete any
+                # older/out of date option.
+                node.del_driver_internal_info(async_steps.DEPLOYMENT_POLLING)
+            if not child_node_execution:
+                interface = getattr(task.driver, step.get('interface'))
+                LOG.info('Executing %(step)s on node %(node)s',
+                         {'step': step, 'node': node.uuid})
+                use_step_handler = conductor_steps.use_reserved_step_handler(
+                    task, step)
+                if use_step_handler:
+                    if use_step_handler == conductor_steps.EXIT_STEPS:
+                        # Exit the step, i.e. hold step
+                        return
+                    # if use_step_handler == conductor_steps.USED_HANDLER
+                    # Then we have completed the needful in the handler,
+                    # but since there is no other value to check now,
+                    # we know we just need to skip execute_deploy_step
+                else:
+                    interface = getattr(task.driver, step.get('interface'))
+                    result = interface.execute_deploy_step(task, step)
+            else:
+                LOG.info('Executing %(step)s on child nodes for node '
+                         '%(node)s',
+                         {'step': step, 'node': node.uuid})
+                result = execute_step_on_child_nodes(task, step)
         except exception.AgentInProgress as e:
             LOG.info('Conductor attempted to process deploy step for '
                      'node %(node)s. Agent indicated it is presently '
                      'executing a command. Error: %(error)s',
                      {'node': task.node.uuid,
                       'error': e})
-            node.set_driver_internal_info('skip_current_deploy_step',
-                                          False)
+            node.set_driver_internal_info(
+                async_steps.SKIP_CURRENT_DEPLOY_STEP, False)
             task.process_event('wait')
             return
         except exception.IronicException as e:
             if isinstance(e, exception.AgentConnectionFailed):
-                if task.node.driver_internal_info.get('deployment_reboot'):
+                if task.node.driver_internal_info.get(
+                        async_steps.DEPLOYMENT_REBOOT):
                     LOG.info('Agent is not yet running on node %(node)s after '
                              'deployment reboot, waiting for agent to come up '
                              'to run next deploy step %(step)s.',
                              {'node': node.uuid, 'step': step})
-                    node.set_driver_internal_info('skip_current_deploy_step',
-                                                  False)
+                    node.set_driver_internal_info(
+                        async_steps.SKIP_CURRENT_DEPLOY_STEP, False)
                     task.process_event('wait')
                     return
 
@@ -490,3 +518,65 @@ def _start_console_in_deploy(task):
     else:
         notify_utils.emit_console_notification(
             task, 'console_restore', fields.NotificationStatus.END)
+
+
+def execute_step_on_child_nodes(task, step):
+    """Execute a requested step against a child node.
+
+    :param task: The TaskManager object for the parent node.
+    :param step: The requested step to be executed.
+    :returns: None on Success, the resulting error message if a
+              failure has occurred.
+    """
+    # NOTE(TheJulia): We could just use nodeinfo list calls against
+    # dbapi.
+    # NOTE(TheJulia): We validate the data in advance in the API
+    # with the original request context.
+    eocn = step.get('execute_on_child_nodes')
+    child_nodes = step.get('limit_child_node_execution', [])
+    filters = {'parent_node': task.node.uuid}
+    if eocn and len(child_nodes) >= 1:
+        filters['uuid_in'] = child_nodes
+
+    child_nodes = Node.list(
+        task.context,
+        filters=filters,
+        fields=['uuid']
+    )
+    for child_node in child_nodes:
+        result = None
+        LOG.info('Executing step %(step)s on child node %(node)s for parent '
+                 'node %(parent_node)s',
+                 {'step': step,
+                  'node': child_node.uuid,
+                  'parent_node': task.node.uuid})
+        with task_manager.acquire(task.context,
+                                  child_node.uuid,
+                                  purpose='execute step') as child_task:
+            interface = getattr(child_task.driver, step.get('interface'))
+            LOG.info('Executing %(step)s on node %(node)s',
+                     {'step': step, 'node': child_task.node.uuid})
+            if not conductor_steps.use_reserved_step_handler(child_task, step):
+                result = interface.execute_clean_step(child_task, step)
+            if result is not None:
+                if (result == states.DEPLOYWAIT
+                    and CONF.conductor.permit_child_node_step_async_result):
+                    # Operator has chosen to permit this due to some reason
+                    # NOTE(TheJulia): This is where we would likely wire agent
+                    # error handling if we ever implicitly allowed child node
+                    # deploys to take place with the agent from a parent node
+                    # being deployed.
+                    continue
+                # NOTE(TheJulia): If your here debugging a step which fails,
+                # part of the constraint is that a value *cannot* be returned.
+                # to the runner. The step has to either succeed and return
+                # None, or raise an exception.
+                msg = (_('While executing step %(step)s on child node '
+                         '%(node)s, step returned invalid value: %(val)s')
+                       % {'step': step, 'node': child_task.node.uuid,
+                          'val': result})
+                LOG.error(msg)
+                # Only None or states.DEPLOYWAIT are possible paths forward
+                # in the parent step execution code, so returning the message
+                # means it will be logged.
+                return msg

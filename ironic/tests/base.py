@@ -26,7 +26,6 @@ import os
 import subprocess
 import sys
 import tempfile
-from unittest import mock
 import warnings
 
 import eventlet
@@ -57,19 +56,10 @@ logging.register_options(CONF)
 logging.setup(CONF, 'ironic')
 
 
-# NOTE(rpittau) this function allows autospec for classmethods and
-# staticmethods in Python 3.6, while no issue occurs in Python 3.7.4
-# and later.
-# For more info please see: http://bugs.python.org/issue23078
-def _patch_mock_callable(obj):
-    if isinstance(obj, type):
-        return True
-    if getattr(obj, '__call__', None) is not None:
-        return True
-    if (isinstance(obj, (staticmethod, classmethod))
-            and mock._callable(obj.__func__)):
-        return True
-    return False
+BASE_TEST_TIMEOUT = os.environ.get('BASE_TEST_TIMEOUT', 60)
+
+
+BASE_TEST_TIMEOUT = os.environ.get('BASE_TEST_TIMEOUT', 60)
 
 
 class WarningsFixture(fixtures.Fixture):
@@ -102,6 +92,11 @@ class WarningsFixture(fixtures.Fixture):
             category=UserWarning,
         )
 
+        # NOTE(gibi): The UUIDFields emits a warning if the value is not a
+        # valid UUID. Let's escalate that to an exception in the test to
+        # prevent adding violations.
+        warnings.filterwarnings('error', message='.* is an invalid UUID.')
+
         # Enable deprecation warnings to capture upcoming SQLAlchemy changes
 
         warnings.filterwarnings(
@@ -122,16 +117,6 @@ class WarningsFixture(fixtures.Fixture):
         warnings.filterwarnings(
             'error',
             module='ironic',
-            category=sqla_exc.SAWarning,
-        )
-
-        # ...but filter everything out until we get around to fixing them
-        # TODO(stephenfin): Fix all of these
-
-        warnings.filterwarnings(
-            'ignore',
-            module='ironic',
-            message='SELECT statement has a cartesian product ',
             category=sqla_exc.SAWarning,
         )
 
@@ -194,6 +179,9 @@ class TestCase(oslo_test_base.BaseTestCase):
         self.useFixture(fixtures.EnvironmentVariable('http_proxy'))
         self.policy = self.useFixture(policy_fixture.PolicyFixture())
         self.useFixture(WarningsFixture())
+
+        self.useFixture(fixtures.Timeout(int(BASE_TEST_TIMEOUT),
+                                         gentle=False))
 
         driver_factory.HardwareTypesFactory._extension_manager = None
         for factory in driver_factory._INTERFACE_LOADERS.values():

@@ -81,15 +81,9 @@ affected, since the initial provision state is still ``available``.
 However, using API version 1.11 or above may break existing automation tooling
 with respect to node creation.
 
-The default API version used by (the most recent) python-ironicclient is 1.9,
-but it may change in the future and should not be relied on.
-
-In the examples below we will use version 1.11 of the Bare metal API.
-This gives us the following advantages:
-
-* Explicit power credentials validation before leaving the ``enroll`` state.
-* Running node cleaning before entering the ``available`` state.
-* Not exposing half-configured nodes to the scheduler.
+The ``openstack baremetal`` command line tool tries to negotiate the most
+recent supported version, which in virtually all cases will be newer than
+1.11.
 
 To set the API version for all commands, you can set the environment variable
 ``IRONIC_API_VERSION``. For the OpenStackClient baremetal plugin, set
@@ -118,7 +112,6 @@ and may be combined if desired.
 
    .. code-block:: console
 
-    $ export OS_BAREMETAL_API_VERSION=1.11
     $ baremetal node create --driver ipmi
     +--------------+--------------------------------------+
     | Property     | Value                                |
@@ -292,12 +285,13 @@ Adding scheduling information
       This is not required for standalone deployments, only for those using
       the Compute service for provisioning bare metal instances.
 
-#. Update the node's properties to match the actual hardware of the node:
+#. Update the node's properties to match the actual hardware of the node.
+   These are optional. When provided, ``memory_mb`` can be used for checking
+   if the instance image fits into the node's memory:
 
    .. code-block:: console
 
     $ baremetal node set $NODE_UUID \
-        --property cpus=$CPU_COUNT \
         --property memory_mb=$RAM_MB \
         --property local_gb=$DISK_GB
 
@@ -310,14 +304,13 @@ Adding scheduling information
          --driver-info ipmi_username=$USER \
          --driver-info ipmi_password=$PASS \
          --driver-info ipmi_address=$ADDRESS \
-         --property cpus=$CPU_COUNT \
          --property memory_mb=$RAM_MB \
          --property local_gb=$DISK_GB
 
    These values can also be discovered during `Hardware Inspection`_.
 
-   .. warning::
-      The value provided for the ``local_gb`` property must match the size of
+   .. note::
+      The value provided for the ``local_gb`` property should match the size of
       the root device you're going to deploy on. By default
       **ironic-python-agent** picks the smallest disk which is not smaller
       than 4 GiB.
@@ -423,12 +416,13 @@ Validating node information
 Making node available for deployment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-In order for nodes to be available for deploying workloads on them, nodes
-must be in the ``available`` provision state. To do this, nodes
-created with API version 1.11 and above must be moved from the ``enroll`` state
-to the ``manageable`` state and then to the ``available`` state.
-This section can be safely skipped, if API version 1.10 or earlier is used
-(which is the case by default).
+In order for nodes to be available for deploying workloads on them, nodes must
+be in the ``available`` provision state. To do this, nodes must be moved from
+the ``enroll`` state to the ``manageable`` state and then to the ``available``
+state.
+
+.. note::
+   This section can be skipped, if API version 1.10 or earlier is used.
 
 After creating a node and before moving it from its initial provision state of
 ``enroll``, basic power and port information needs to be configured on the node.

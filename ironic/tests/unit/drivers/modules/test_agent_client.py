@@ -523,7 +523,8 @@ class TestAgentClient(base.TestCase):
         self.assertRaises(exception.InvalidParameterValue,
                           self.client._command, self.node, method, params)
 
-    def test__command_poll(self):
+    @mock.patch('time.sleep', autospec=True)
+    def test__command_poll(self, mock_sleep):
         response_data = {'status': 'ok'}
         final_status = MockCommandStatus('SUCCEEDED', name='run_image')
         self.client.session.post.return_value = MockResponse(response_data)
@@ -551,8 +552,9 @@ class TestAgentClient(base.TestCase):
             params={'wait': 'false'},
             timeout=60,
             verify=True)
-        self.client.session.get.assert_called_with(url, timeout=60,
+        self.client.session.get.assert_called_with(url, params={}, timeout=60,
                                                    verify=True)
+        mock_sleep.assert_called_with(CONF.agent.command_wait_interval)
 
     def test_get_commands_status(self):
         if not mock._is_instance_mock(self.client.session):
@@ -569,7 +571,7 @@ class TestAgentClient(base.TestCase):
             '%(agent_url)s/%(api_version)s/commands/' % {
                 'agent_url': agent_url,
                 'api_version': CONF.agent.agent_api_version},
-            verify=True, timeout=CONF.agent.command_timeout)
+            params={}, verify=True, timeout=CONF.agent.command_timeout)
 
     def test_get_commands_status_retries(self):
         res = mock.MagicMock(spec_set=['json'])
@@ -606,7 +608,7 @@ class TestAgentClient(base.TestCase):
             '%(agent_url)s/%(api_version)s/commands/' % {
                 'agent_url': agent_url,
                 'api_version': CONF.agent.agent_api_version},
-            verify='/path/to/agent.crt',
+            params={}, verify='/path/to/agent.crt',
             timeout=CONF.agent.command_timeout)
 
     def _test_install_bootloader(self, root_uuid, efi_system_part_uuid=None,
@@ -663,6 +665,53 @@ class TestAgentClient(base.TestCase):
                                        ports)
         self.client._command.assert_called_once_with(
             node=self.node, method='clean.execute_clean_step',
+            params=expected_params)
+
+    def test_get_service_steps(self):
+        self.client._command = mock.MagicMock(spec_set=[])
+        ports = []
+        expected_params = {
+            'node': self.node.as_dict(secure=True),
+            'ports': []
+        }
+
+        self.client.get_service_steps(self.node,
+                                      ports)
+        self.client._command.assert_called_once_with(
+            node=self.node, method='service.get_service_steps',
+            params=expected_params, wait=True)
+
+    def test_get_service_steps_older_client(self):
+        self.client._command = mock.MagicMock(spec_set=[])
+        self.client._command.side_effect = exception.AgentAPIError('meow')
+        ports = []
+        expected_params = {
+            'node': self.node.as_dict(secure=True),
+            'ports': []
+        }
+
+        self.client.get_service_steps(self.node,
+                                      ports)
+        self.client._command.assert_called_once_with(
+            node=self.node, method='service.get_service_steps',
+            params=expected_params, wait=True)
+
+    def test_execute_service_step(self):
+        self.client._command = mock.MagicMock(spec_set=[])
+        ports = []
+        step = {'priority': 10, 'step': 'erase_devices', 'interface': 'deploy'}
+        expected_params = {
+            'step': step,
+            'node': self.node.as_dict(secure=True),
+            'ports': [],
+            'service_version':
+                self.node.driver_internal_info['hardware_manager_version']
+        }
+        self.client.execute_service_step(step,
+                                         self.node,
+                                         ports)
+        self.client._command.assert_called_once_with(
+            node=self.node, method='service.execute_service_step',
             params=expected_params)
 
     def test_power_off(self):

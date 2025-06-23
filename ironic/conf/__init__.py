@@ -27,8 +27,10 @@ from ironic.conf import database
 from ironic.conf import default
 from ironic.conf import deploy
 from ironic.conf import dhcp
+from ironic.conf import disk_utils
 from ironic.conf import dnsmasq
 from ironic.conf import drac
+from ironic.conf import fake
 from ironic.conf import glance
 from ironic.conf import healthcheck
 from ironic.conf import ibmc
@@ -44,6 +46,7 @@ from ironic.conf import neutron
 from ironic.conf import nova
 from ironic.conf import pxe
 from ironic.conf import redfish
+from ironic.conf import sensor_data
 from ironic.conf import service_catalog
 from ironic.conf import snmp
 from ironic.conf import swift
@@ -64,7 +67,9 @@ default.register_opts(CONF)
 deploy.register_opts(CONF)
 drac.register_opts(CONF)
 dhcp.register_opts(CONF)
+disk_utils.register_opts(CONF)
 dnsmasq.register_opts(CONF)
+fake.register_opts(CONF)
 glance.register_opts(CONF)
 healthcheck.register_opts(CONF)
 ibmc.register_opts(CONF)
@@ -80,6 +85,7 @@ neutron.register_opts(CONF)
 nova.register_opts(CONF)
 pxe.register_opts(CONF)
 redfish.register_opts(CONF)
+sensor_data.register_opts(CONF)
 service_catalog.register_opts(CONF)
 snmp.register_opts(CONF)
 swift.register_opts(CONF)

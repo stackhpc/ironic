@@ -23,6 +23,27 @@ scheduling of instances, but will still allow for other operations,
 such as cleaning, to happen (this marks an important difference to
 nodes which have the ``maintenance`` flag set).
 
+Requirements
+============
+
+The use of the retirement feature requires that automated cleaning
+be enabled. The default ``[conductor]automated_clean`` setting must
+not be disabled as the retirement feature is only engaged upon
+the completion of cleaning as it sets forth the expectation of removing
+sensitive data from a node.
+
+If you're uncomfortable with full cleaning, but want to make use of the
+the retirement feature, a compromise may be to explore use of metadata
+erasure, however this will leave additional data on disk which you may
+wish to erase completely. Please consult the configuration for the
+``[deploy]erase_devices_metadata_priority`` and
+``[deploy]erase_devices_priority`` settings, and do note that
+clean steps can be manually invoked through manual cleaning should you
+wish to trigger the ``erase_devices`` clean step to completely wipe
+all data from storage devices. Alternatively, automated cleaning can
+also be enabled on an individual node level using the
+``baremetal node set --automated-clean <node_id>`` command.
+
 How to use
 ==========
 
@@ -51,7 +72,7 @@ will hence not be eligible for scheduling of new instances.
 
 Equally, nodes with ``retired`` set to True cannot move from ``manageable``
 to ``available``: the ``provide`` verb is blocked. This is to prevent
-accidental re-use of nodes tagged for removal from the fleet. In order
+accidental reuse of nodes tagged for removal from the fleet. In order
 to move these nodes to ``available`` none the less, the ``retired`` field
 needs to be removed first. This can be done via::
 

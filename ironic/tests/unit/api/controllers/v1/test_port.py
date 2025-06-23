@@ -15,7 +15,6 @@ Tests for the API /ports/ methods.
 
 import datetime
 from http import client as http_client
-import types
 from unittest import mock
 from urllib import parse as urlparse
 
@@ -194,7 +193,7 @@ class TestPortsController__GetPortsCollection(base.TestCase):
         mock_request.context = 'fake-context'
         mock_list.return_value = []
         self.controller._get_ports_collection(None, None, None, None, None,
-                                              None, 'asc',
+                                              None, None, 'asc',
                                               resource_url='ports')
         mock_list.assert_called_once_with('fake-context', 1000, None,
                                           project=None, sort_dir='asc',
@@ -235,24 +234,6 @@ class TestListPorts(test_api_base.BaseApiTest):
         self.assertNotIn('node_uuid', data['ports'][0])
         # never expose the node_id
         self.assertNotIn('node_id', data['ports'][0])
-
-    # NOTE(jlvillal): autospec=True doesn't work on staticmethods:
-    # https://bugs.python.org/issue23078
-    @mock.patch.object(objects.Portgroup, 'get', spec_set=types.FunctionType)
-    def test_list_with_deleted_port_group(self, mock_get_pg):
-        # check that we don't end up with HTTP 400 when port group deletion
-        # races with listing ports - see https://launchpad.net/bugs/1748893
-        portgroup = obj_utils.create_test_portgroup(self.context,
-                                                    node_id=self.node.id)
-        port = obj_utils.create_test_port(self.context, node_id=self.node.id,
-                                          portgroup_id=portgroup.id)
-        mock_get_pg.side_effect = exception.PortgroupNotFound('boom')
-        data = self.get_json(
-            '/ports/detail',
-            headers={api_base.Version.string: str(api_v1.max_version())}
-        )
-        self.assertEqual(port.uuid, data['ports'][0]["uuid"])
-        self.assertIsNone(data['ports'][0]["portgroup_uuid"])
 
     @mock.patch.object(policy, 'authorize', spec=True)
     def test_list_non_admin_forbidden(self, mock_authorize):
@@ -402,6 +383,34 @@ class TestListPorts(test_api_base.BaseApiTest):
         data = self.get_json('/ports/%s' % port.uuid,
                              headers={api_base.Version.string: "1.53"})
         self.assertTrue(data['is_smartnic'])
+
+    def test_hide_fields_in_newer_versions_ovn_vtep(self):
+        llc = {'port_id': '42',
+               'vtep-logical-switch': 'lswitch',
+               'vtep-physical-switch': 'jswitch'}
+        port = obj_utils.create_test_port(self.context, node_id=self.node.id,
+                                          local_link_connection=llc)
+
+        # note(JayF): Version older than 1.19, older than 1.90,
+        # this means port.llc key does not exist at all.
+        data = self.get_json(
+            '/ports/%s' % port.uuid,
+            headers={api_base.Version.string: "1.18"})
+        self.assertNotIn('local_link_connection', data)
+
+        # note(JayF): Version newer than 1.19, older than 1.90,
+        # this means port.llc key must exist, value is empty dict
+        data = self.get_json(
+            '/ports/%s' % port.uuid,
+            headers={api_base.Version.string: "1.89"})
+        self.assertIn('local_link_connection', data)
+        self.assertEqual({}, data['local_link_connection'])
+
+        # note(JayF): Version 1.90+, key exists, value is passed
+        data = self.get_json('/ports/%s' % port.uuid,
+                             headers={api_base.Version.string: "1.90"})
+        self.assertIn('local_link_connection', data)
+        self.assertEqual(llc, data['local_link_connection'])
 
     def test_get_collection_custom_fields(self):
         fields = 'uuid,extra'
@@ -1098,6 +1107,43 @@ class TestListPorts(test_api_base.BaseApiTest):
         self.assertEqual(http_client.BAD_REQUEST, response.status_int)
         self.assertIn('Expected UUID or name for portgroup',
                       response.json['error_message'])
+
+
+class TestListPortsByShard(test_api_base.BaseApiTest):
+    def setUp(self):
+        super(TestListPortsByShard, self).setUp()
+        self.headers = {
+            api_base.Version.string: '1.%s' % versions.MINOR_82_NODE_SHARD
+        }
+
+    def _create_port_with_shard(self, shard, address):
+        node = obj_utils.create_test_node(self.context, owner='12345',
+                                          shard=shard,
+                                          uuid=uuidutils.generate_uuid())
+        return obj_utils.create_test_port(self.context, name='port_%s' % shard,
+                                          node_id=node.id, address=address,
+                                          uuid=uuidutils.generate_uuid())
+
+    def test_get_by_shard_single_fail_api_version(self):
+        self._create_port_with_shard('test_shard', 'aa:bb:cc:dd:ee:ff')
+        data = self.get_json('/ports?shard=test_shard', expect_errors=True)
+        self.assertEqual(406, data.status_int)
+
+    def test_get_by_shard_single(self):
+        port = self._create_port_with_shard('test_shard', 'aa:bb:cc:dd:ee:ff')
+        data = self.get_json('/ports?shard=test_shard', headers=self.headers)
+        self.assertEqual(port.uuid, data['ports'][0]["uuid"])
+
+    def test_get_by_shard_multi(self):
+        bad_shard_address = 'ee:ee:ee:ee:ee:ee'
+        self._create_port_with_shard('shard1', 'aa:bb:cc:dd:ee:ff')
+        self._create_port_with_shard('shard2', 'ab:bb:cc:dd:ee:ff')
+        self._create_port_with_shard('shard3', bad_shard_address)
+
+        res = self.get_json('/ports?shard=shard1,shard2', headers=self.headers)
+        self.assertEqual(2, len(res['ports']))
+        self.assertNotEqual(res['ports'][0]['address'], bad_shard_address)
+        self.assertNotEqual(res['ports'][1]['address'], bad_shard_address)
 
 
 @mock.patch.object(rpcapi.ConductorAPI, 'update_port', autospec=True,
@@ -1873,6 +1919,7 @@ class TestPost(test_api_base.BaseApiTest):
         pdict.pop('physical_network')
         pdict.pop('is_smartnic')
         pdict.pop('portgroup_uuid')
+        pdict.pop('name')
         headers = {api_base.Version.string: str(api_v1.min_version())}
         response = self.post_json('/ports', pdict, headers=headers)
         self.assertEqual('application/json', response.content_type)

@@ -22,6 +22,7 @@ from ironic_lib import metrics_utils
 from oslo_log import log as logging
 from oslo_utils import importutils
 from oslo_utils import units
+import sushy
 import tenacity
 
 from ironic.common import exception
@@ -41,7 +42,6 @@ from ironic.drivers.modules.redfish import utils as redfish_utils
 
 drac_exceptions = importutils.try_import('dracclient.exceptions')
 drac_constants = importutils.try_import('dracclient.constants')
-sushy = importutils.try_import('sushy')
 sushy_oem_idrac = importutils.try_import('sushy_oem_idrac')
 
 LOG = logging.getLogger(__name__)
@@ -1022,7 +1022,7 @@ def _commit_to_controllers(node, controllers, substep="completed"):
     # all realtime controllers
     all_realtime = all(
         (cntlr['is_reboot_required'] == optional)
-        and not(cntlr.get('is_ehba_mode'))
+        and not (cntlr.get('is_ehba_mode'))
         for cntlr in controllers)
 
     # check any controller with ehba mode
@@ -1644,6 +1644,10 @@ class DracRedfishRAID(redfish_raid.RedfishRAID):
 
 
 class DracWSManRAID(base.RAIDInterface):
+
+    # NOTE(TheJulia): Deprecating November 2023 in favor of Redfish
+    # and due to a lack of active driver maintenance.
+    supported = False
 
     def get_properties(self):
         """Return the properties of the interface."""

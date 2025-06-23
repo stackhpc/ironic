@@ -15,17 +15,30 @@
 
 """Tests for manipulating Nodes via the DB API"""
 
+import copy
 import datetime
 from unittest import mock
 
+from oslo_config import cfg
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
-from sqlalchemy.orm import exc as sa_exc
+from sqlalchemy import exc as sa_exc
+# NOTE(TheJulia): At some point, we should drop the line below,
+# as I understand the ORM exceptions are going to move completely
+# after SQLAlchemy 2.0 to just the base exception class.
+from sqlalchemy.orm import exc as sa_orm_exc
 
 from ironic.common import exception
 from ironic.common import states
+from ironic.common import utils as common_utils
+from ironic.db.sqlalchemy import api as dbapi
+from ironic.db.sqlalchemy.api import Connection as db_conn
+from ironic.db.sqlalchemy.models import NodeInventory
 from ironic.tests.unit.db import base
 from ironic.tests.unit.db import utils
+
+
+CONF = cfg.CONF
 
 
 class DbNodeTestCase(base.DbTestCase):
@@ -173,24 +186,24 @@ class DbNodeTestCase(base.DbTestCase):
         self.assertEqual([node2.id], [r[0] for r in res])
 
         res = self.dbapi.get_nodeinfo_list(filters={'maintenance': True})
-        self.assertEqual([node2.id], [r.id for r in res])
+        self.assertEqual([node2.id], [r[0] for r in res])
 
         res = self.dbapi.get_nodeinfo_list(filters={'maintenance': False})
         self.assertEqual(sorted([node1.id, node3.id]),
-                         sorted([r.id for r in res]))
+                         sorted([r[0] for r in res]))
 
         res = self.dbapi.get_nodeinfo_list(filters={'fault': 'boom'})
-        self.assertEqual([node2.id], [r.id for r in res])
+        self.assertEqual([node2.id], [r[0] for r in res])
 
         res = self.dbapi.get_nodeinfo_list(filters={'fault': 'moob'})
         self.assertEqual([], [r.id for r in res])
 
         res = self.dbapi.get_nodeinfo_list(filters={'resource_class': 'foo'})
-        self.assertEqual([node2.id], [r.id for r in res])
+        self.assertEqual([node2.id], [r[0] for r in res])
 
         res = self.dbapi.get_nodeinfo_list(
             filters={'conductor_group': 'group1'})
-        self.assertEqual([node2.id], [r.id for r in res])
+        self.assertEqual([node2.id], [r[0] for r in res])
 
         res = self.dbapi.get_nodeinfo_list(
             filters={'conductor_group': 'group2'})
@@ -200,13 +213,13 @@ class DbNodeTestCase(base.DbTestCase):
             filters={'reserved_by_any_of': ['fake-host',
                                             'another-fake-host']})
         self.assertEqual(sorted([node1.id, node3.id]),
-                         sorted([r.id for r in res]))
+                         sorted([r[0] for r in res]))
 
         res = self.dbapi.get_nodeinfo_list(filters={'id': node1.id})
-        self.assertEqual([node1.id], [r.id for r in res])
+        self.assertEqual([node1.id], [r[0] for r in res])
 
         res = self.dbapi.get_nodeinfo_list(filters={'uuid': node1.uuid})
-        self.assertEqual([node1.id], [r.id for r in res])
+        self.assertEqual([node1.id], [r[0] for r in res])
 
         # ensure unknown filters explode
         filters = {'bad_filter': 'foo'}
@@ -483,7 +496,7 @@ class DbNodeTestCase(base.DbTestCase):
                                           owner='fred',
                                           lessee='marsha',
                                           # Fields that should not be
-                                          # present in the obejct.
+                                          # present in the object.
                                           driver_internal_info={
                                               'cat': 'meow'},
                                           internal_info={'corgi': 'rocks'},
@@ -534,7 +547,7 @@ class DbNodeTestCase(base.DbTestCase):
                           'deploy_interface', 'boot_interface',
                           'driver', 'extra']:
                 try:
-                    self.assertRaises(sa_exc.DetachedInstanceError,
+                    self.assertRaises(sa_orm_exc.DetachedInstanceError,
                                       _attempt_field_access, r, field)
                 except AttributeError:
                     pass
@@ -591,7 +604,7 @@ class DbNodeTestCase(base.DbTestCase):
                           'driver', 'extra', 'power_state',
                           'traits']:
                 try:
-                    self.assertRaises(sa_exc.DetachedInstanceError,
+                    self.assertRaises(sa_orm_exc.DetachedInstanceError,
                                       _attempt_field_access, r, field)
                 except AttributeError:
                     # We expect an AttributeError, in addition to
@@ -763,14 +776,48 @@ class DbNodeTestCase(base.DbTestCase):
         self.assertRaises(exception.NodeHistoryNotFound,
                           self.dbapi.get_node_history_by_id, history.id)
 
+    def test_inventory_updated_for_node(self):
+        node = utils.create_test_node()
+
+        first_timestamp = datetime.datetime(2000, 1, 1, 0, 0)
+        second_timestamp = first_timestamp + datetime.timedelta(minutes=8)
+        utils.create_test_inventory(node_id=node.id,
+                                    id=1,
+                                    created_at=first_timestamp)
+        utils.create_test_inventory(node_id=node.id,
+                                    id=2,
+                                    inventory={"inventory": "test2"},
+                                    created_at=second_timestamp)
+
+        node_inventory = self.dbapi.get_node_inventory_by_node_id(
+            node_id=node.id)
+        expected_inventory = NodeInventory(node_id=node.id,
+                                           id=2,
+                                           inventory_data={"inventory":
+                                                           "test2"},
+                                           created_at=second_timestamp,
+                                           plugin_data={"pdata":
+                                                        {"plugin": "data"}},
+                                           version='1.0')
+        self.assertJsonEqual(expected_inventory, node_inventory)
+
     def test_inventory_get_destroyed_after_destroying_a_node_by_uuid(self):
         node = utils.create_test_node()
 
-        inventory = utils.create_test_inventory(node_id=node.id)
+        utils.create_test_inventory(node_id=node.id)
 
         self.dbapi.destroy_node(node.uuid)
         self.assertRaises(exception.NodeInventoryNotFound,
-                          self.dbapi.get_node_inventory_by_id, inventory.id)
+                          self.dbapi.get_node_inventory_by_node_id, node.id)
+
+    def test_firmware_component_list_after_destroying_a_node_by_uuid(self):
+        node = utils.create_test_node()
+
+        utils.create_test_firmware_component(node_id=node.id)
+
+        self.dbapi.destroy_node(node.uuid)
+        self.assertRaises(exception.NodeNotFound,
+                          self.dbapi.get_firmware_component_list, node.id)
 
     def test_update_node(self):
         node = utils.create_test_node()
@@ -811,6 +858,48 @@ class DbNodeTestCase(base.DbTestCase):
         new_extra = {'foo': 'bar'}
         self.assertRaises(exception.NodeNotFound, self.dbapi.update_node,
                           node_uuid, {'extra': new_extra})
+
+    @mock.patch.object(dbapi, 'LOG', autospec=True)
+    def test_update_node_retries(self, log_mock):
+        """Test retry logic to ensure it works."""
+        node = utils.create_test_node()
+        CONF.set_override('sqlite_retries', True, group='database')
+        # NOTE(TheJulia): Update is an ideal place to test retries
+        # as the underlying work is done by _do_update_node.
+        with mock.patch.object(db_conn, '_do_update_node',
+                               autospec=True) as mock_update:
+            sa_err = sa_exc.OperationalError(
+                statement=None,
+                params=None,
+                orig=Exception('database is locked'))
+            mock_update.side_effect = [
+                sa_err,
+                sa_err,
+                node
+            ]
+            self.dbapi.update_node(node.id, {'extra': {'foo': 'bar'}})
+            self.assertEqual(3, mock_update.call_count)
+            self.assertEqual(2, log_mock.log.call_count)
+
+    def test_update_node_retries_without_log_mock(self):
+        """Test retry logic to ensure it works."""
+        node = utils.create_test_node()
+        CONF.set_override('sqlite_retries', True, group='database')
+        # NOTE(TheJulia): Update is an ideal place to test retries
+        # as the underlying work is done by _do_update_node.
+        with mock.patch.object(db_conn, '_do_update_node',
+                               autospec=True) as mock_update:
+            sa_err = sa_exc.OperationalError(
+                statement=None,
+                params=None,
+                orig=Exception('database is locked'))
+            mock_update.side_effect = [
+                sa_err,
+                sa_err,
+                node
+            ]
+            self.dbapi.update_node(node.id, {'extra': {'foo': 'bar'}})
+            self.assertEqual(3, mock_update.call_count)
 
     def test_update_node_uuid(self):
         node = utils.create_test_node()
@@ -884,6 +973,53 @@ class DbNodeTestCase(base.DbTestCase):
                          timeutils.normalize_time(result))
         self.assertIsNone(res['inspection_started_at'])
 
+    @mock.patch.object(timeutils, 'utcnow', autospec=True)
+    def test_update_node_inspection_finished_at_inspecting(self, mock_utcnow):
+        mocked_time = datetime.datetime(2000, 1, 1, 0, 0)
+        mock_utcnow.return_value = mocked_time
+        node = utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                                      inspection_finished_at=mocked_time,
+                                      provision_state=states.INSPECTING)
+        res = self.dbapi.update_node(node.id,
+                                     {'provision_state': states.MANAGEABLE})
+        result = res['inspection_finished_at']
+        self.assertEqual(mocked_time,
+                         timeutils.normalize_time(result))
+        self.assertIsNone(res['inspection_started_at'])
+
+    @mock.patch.object(timeutils, 'utcnow', autospec=True)
+    def test_update_node_inspection_finished_at_inspectwait(self,
+                                                            mock_utcnow):
+        mocked_time = datetime.datetime(2000, 1, 1, 0, 0)
+        mock_utcnow.return_value = mocked_time
+        node = utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                                      inspection_finished_at=mocked_time,
+                                      provision_state=states.INSPECTWAIT)
+        res = self.dbapi.update_node(node.id,
+                                     {'provision_state': states.MANAGEABLE})
+        result = res['inspection_finished_at']
+        self.assertEqual(mocked_time,
+                         timeutils.normalize_time(result))
+        self.assertIsNone(res['inspection_started_at'])
+
+    def test_update_node_inspection_started_at_inspecting(self):
+        mocked_time = datetime.datetime(2000, 1, 1, 0, 0)
+        node = utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                                      inspection_started_at=mocked_time,
+                                      provision_state=states.INSPECTING)
+        res = self.dbapi.update_node(node.id,
+                                     {'provision_state': states.INSPECTFAIL})
+        self.assertIsNone(res['inspection_started_at'])
+
+    def test_update_node_inspection_started_at_inspectwait(self):
+        mocked_time = datetime.datetime(2000, 1, 1, 0, 0)
+        node = utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                                      inspection_started_at=mocked_time,
+                                      provision_state=states.INSPECTWAIT)
+        res = self.dbapi.update_node(node.id,
+                                     {'provision_state': states.INSPECTFAIL})
+        self.assertIsNone(res['inspection_started_at'])
+
     def test_reserve_node(self):
         node = utils.create_test_node()
         self.dbapi.set_node_tags(node.id, ['tag1', 'tag2'])
@@ -902,6 +1038,39 @@ class DbNodeTestCase(base.DbTestCase):
         # check reservation
         res = self.dbapi.get_node_by_uuid(uuid)
         self.assertEqual(r1, res.reservation)
+
+    def test_reserve_node_reads_reservation_once_sqlite(self):
+        node = utils.create_test_node()
+        uuid = node.uuid
+
+        r1 = 'fake-reservation'
+
+        with mock.patch.object(db_conn, '_get_node_reservation',
+                               autospec=True) as mock_get_res:
+            mock_get_res.return_value = node
+            self.dbapi.reserve_node(r1, uuid)
+            mock_get_res.assert_called_once_with(mock.ANY, node.uuid)
+
+    @mock.patch.object(common_utils, 'is_ironic_using_sqlite', autospec=True)
+    def test_reserve_node_reads_reservation_twice(self, is_sqlite_mock):
+        # Ensure we re-query for who holds the reservation *when* lock fails
+        # to trigger.
+        node = utils.create_test_node()
+        uuid = node.uuid
+        is_sqlite_mock.return_value = False
+        r1 = 'fake-reservation'
+        self.dbapi.update_node(node.id, {'reservation': r1})
+        locked_node = copy.copy(node)
+        locked_node.reservation = r1
+        with mock.patch.object(db_conn, '_get_node_reservation',
+                               autospec=True) as mock_get_res:
+            mock_get_res.side_effect = [node, locked_node]
+            self.assertRaisesRegex(exception.NodeLocked,
+                                   'locked by host fake-reservation',
+                                   self.dbapi.reserve_node, r1, uuid)
+            mock_get_res.assert_has_calls([
+                mock.call(mock.ANY, node.uuid),
+                mock.call(mock.ANY, node.id)])
 
     def test_release_reservation(self):
         node = utils.create_test_node()

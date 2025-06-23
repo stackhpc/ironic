@@ -51,6 +51,7 @@ PORT_SCHEMA = {
         'portgroup_uuid': {'type': ['string', 'null']},
         'pxe_enabled': {'type': ['string', 'boolean', 'null']},
         'uuid': {'type': ['string', 'null']},
+        'name': {'type': ['string', 'null']},
     },
     'required': ['address', 'node_uuid'],
     'additionalProperties': False,
@@ -67,7 +68,8 @@ PATCH_ALLOWED_FIELDS = [
     'node_uuid',
     'physical_network',
     'portgroup_uuid',
-    'pxe_enabled'
+    'pxe_enabled',
+    'name',
 ]
 
 PORT_VALIDATOR_EXTRA = args.dict_valid(
@@ -109,6 +111,23 @@ def hide_fields_in_newer_versions(port):
     # if requested version is < 1.53, hide is_smartnic field.
     if not api_utils.allow_port_is_smartnic():
         port.pop('is_smartnic', None)
+    # if requested version is < 1.88, hide name field.
+    if not api_utils.allow_port_name():
+        port.pop('name', None)
+    # note(JayF): if requested version is < 1.90, hide new
+    # local_link_connection schema but only check it if we allow advanced
+    # net fields, since otherwise we removed local_link_connection above
+    # and don't want to re-add it here
+    if (not api_utils.allow_ovn_vtep_version()
+            and api_utils.allow_port_advanced_net_fields):
+        local_link_connection = port.get('local_link_connection', {})
+        if any(key for key in local_link_connection.keys()
+               if key in api_utils.LOCAL_LINK_OVN_90_FIELDS):
+            # note(JayF): In this case, the field *should* exist but should be
+            # set to empty. This is because api version clients in this branch
+            # expect the key port.local_link_connection to exist even if we
+            # cannot set a valid value
+            port['local_link_connection'] = {}
 
 
 def convert_with_links(rpc_port, fields=None, sanitize=True):
@@ -124,6 +143,7 @@ def convert_with_links(rpc_port, fields=None, sanitize=True):
             'physical_network',
             'pxe_enabled',
             'node_uuid',
+            'name',
         )
     )
     if rpc_port.portgroup_id:
@@ -163,22 +183,13 @@ def port_sanitize(port, fields=None):
 def list_convert_with_links(rpc_ports, limit, url, fields=None, **kwargs):
     ports = []
     for rpc_port in rpc_ports:
-        try:
-            port = convert_with_links(rpc_port, fields=fields,
-                                      sanitize=False)
-            # NOTE(dtantsur): node was deleted after we fetched the port
-            # list, meaning that the port was also deleted. Skip it.
-            if port['node_uuid'] is None:
-                continue
-        except exception.PortgroupNotFound:
-            # NOTE(dtantsur): port group was deleted after we fetched the
-            # port list, it may mean that the port was deleted too, but
-            # we don't know it. Pretend that the port group was removed.
-            LOG.debug('Removing port group UUID from port %s as the port '
-                      'group was deleted', rpc_port.uuid)
-            rpc_port.portgroup_id = None
-            port = convert_with_links(rpc_port, fields=fields,
-                                      sanitize=False)
+        port = convert_with_links(rpc_port, fields=fields,
+                                  sanitize=False)
+        # NOTE(dtantsur): node was deleted after we fetched the port
+        # list, meaning that the port was also deleted. Skip it.
+        if port['node_uuid'] is None:
+            continue
+
         ports.append(port)
     return collection.list_convert_with_links(
         items=ports,
@@ -208,7 +219,7 @@ class PortsController(rest.RestController):
         self.parent_portgroup_ident = portgroup_ident
 
     def _get_ports_collection(self, node_ident, address, portgroup_ident,
-                              marker, limit, sort_key, sort_dir,
+                              shard, marker, limit, sort_key, sort_dir,
                               resource_url=None, fields=None, detail=None,
                               project=None):
         """Retrieve a collection of ports.
@@ -219,6 +230,8 @@ class PortsController(rest.RestController):
                         this MAC address.
         :param portgroup_ident: UUID or name of a portgroup, to get only ports
                                 for that portgroup.
+        :param shard: A comma-separated shard list, to get only ports for those
+                       shards
         :param marker: pagination marker for large data sets.
         :param limit: maximum number of resources to return in a single result.
                       This value cannot be larger than the value of max_limit
@@ -251,8 +264,12 @@ class PortsController(rest.RestController):
         node_ident = self.parent_node_ident or node_ident
         portgroup_ident = self.parent_portgroup_ident or portgroup_ident
 
-        if node_ident and portgroup_ident:
-            raise exception.OperationNotPermitted()
+        exclusive_filters = 0
+        for i in [node_ident, portgroup_ident, shard]:
+            if i:
+                exclusive_filters += 1
+            if exclusive_filters > 1:
+                raise exception.OperationNotPermitted()
 
         if portgroup_ident:
             # FIXME: Since all we need is the portgroup ID, we can
@@ -279,6 +296,11 @@ class PortsController(rest.RestController):
                                                  project=project)
         elif address:
             ports = self._get_ports_by_address(address, project=project)
+        elif shard:
+            ports = objects.Port.list_by_node_shards(api.request.context,
+                                                     shard, limit,
+                                                     marker_obj, sort_key,
+                                                     sort_dir, project=project)
         else:
             ports = objects.Port.list(api.request.context, limit,
                                       marker_obj, sort_key=sort_key,
@@ -342,6 +364,13 @@ class PortsController(rest.RestController):
             if (not api_utils.allow_local_link_connection_network_type()
                     and 'network_type' in fields['local_link_connection']):
                 raise exception.NotAcceptable()
+            if (not api_utils.allow_ovn_vtep_version()
+                    and 'vtep-logical-switch'
+                    in fields['local_link_connection']):
+                raise exception.NotAcceptable()
+        if ('name' in fields
+                and not api_utils.allow_port_name()):
+            raise exception.NotAcceptable()
 
     @METRICS.timer('PortsController.get_all')
     @method.expose()
@@ -349,10 +378,11 @@ class PortsController(rest.RestController):
                    address=args.mac_address, marker=args.uuid,
                    limit=args.integer, sort_key=args.string,
                    sort_dir=args.string, fields=args.string_list,
-                   portgroup=args.uuid_or_name, detail=args.boolean)
+                   portgroup=args.uuid_or_name, detail=args.boolean,
+                   shard=args.string_list)
     def get_all(self, node=None, node_uuid=None, address=None, marker=None,
                 limit=None, sort_key='id', sort_dir='asc', fields=None,
-                portgroup=None, detail=None):
+                portgroup=None, detail=None, shard=None):
         """Retrieve a list of ports.
 
         Note that the 'node_uuid' interface is deprecated in favour
@@ -375,6 +405,8 @@ class PortsController(rest.RestController):
             of the resource to be returned.
         :param portgroup: UUID or name of a portgroup, to get only ports
                                    for that portgroup.
+        :param shard: Optional, a list of shard ids to filter by, only ports
+                      associated with nodes in these shards will be returned.
         :raises: NotAcceptable, HTTPNotFound
         """
         project = api_utils.check_port_list_policy(
@@ -394,6 +426,8 @@ class PortsController(rest.RestController):
         if portgroup and not api_utils.allow_portgroups_subcontrollers():
             raise exception.NotAcceptable()
 
+        api_utils.check_allow_filter_by_shard(shard)
+
         fields = api_utils.get_request_return_fields(fields, detail,
                                                      _DEFAULT_RETURN_FIELDS)
 
@@ -406,8 +440,9 @@ class PortsController(rest.RestController):
                 raise exception.NotAcceptable()
 
         return self._get_ports_collection(node_uuid or node, address,
-                                          portgroup, marker, limit, sort_key,
-                                          sort_dir, resource_url='ports',
+                                          portgroup, shard, marker, limit,
+                                          sort_key, sort_dir,
+                                          resource_url='ports',
                                           fields=fields, detail=detail,
                                           project=project)
 
@@ -416,10 +451,11 @@ class PortsController(rest.RestController):
     @args.validate(node=args.uuid_or_name, node_uuid=args.uuid,
                    address=args.mac_address, marker=args.uuid,
                    limit=args.integer, sort_key=args.string,
-                   sort_dir=args.string,
-                   portgroup=args.uuid_or_name)
+                   sort_dir=args.string, portgroup=args.uuid_or_name,
+                   shard=args.string_list)
     def detail(self, node=None, node_uuid=None, address=None, marker=None,
-               limit=None, sort_key='id', sort_dir='asc', portgroup=None):
+               limit=None, sort_key='id', sort_dir='asc', portgroup=None,
+               shard=None):
         """Retrieve a list of ports with detail.
 
         Note that the 'node_uuid' interface is deprecated in favour
@@ -433,6 +469,8 @@ class PortsController(rest.RestController):
                         this MAC address.
         :param portgroup: UUID or name of a portgroup, to get only ports
                            for that portgroup.
+        :param shard: comma separated list of shards, to only get ports
+                      associated with nodes in those shards.
         :param marker: pagination marker for large data sets.
         :param limit: maximum number of resources to return in a single result.
                       This value cannot be larger than the value of max_limit
@@ -450,6 +488,8 @@ class PortsController(rest.RestController):
         if portgroup and not api_utils.allow_portgroups_subcontrollers():
             raise exception.NotAcceptable()
 
+        api_utils.check_allow_filter_by_shard(shard)
+
         if not node_uuid and node:
             # We're invoking this interface using positional notation, or
             # explicitly using 'node'.  Try and determine which one.
@@ -464,18 +504,18 @@ class PortsController(rest.RestController):
             raise exception.HTTPNotFound()
 
         return self._get_ports_collection(node_uuid or node, address,
-                                          portgroup, marker, limit, sort_key,
-                                          sort_dir,
+                                          portgroup, shard, marker, limit,
+                                          sort_key, sort_dir,
                                           resource_url='ports/detail',
                                           project=project)
 
     @METRICS.timer('PortsController.get_one')
     @method.expose()
-    @args.validate(port_uuid=args.uuid, fields=args.string_list)
-    def get_one(self, port_uuid, fields=None):
+    @args.validate(port_ident=args.uuid_or_name, fields=args.string_list)
+    def get_one(self, port_ident, fields=None):
         """Retrieve information about the given port.
 
-        :param port_uuid: UUID of a port.
+        :param port_ident: UUID or name of a port.
         :param fields: Optional, a list with a specified set of fields
             of the resource to be returned.
         :raises: NotAcceptable, HTTPNotFound
@@ -484,7 +524,7 @@ class PortsController(rest.RestController):
             raise exception.OperationNotPermitted()
 
         rpc_port, rpc_node = api_utils.check_port_policy_and_retrieve(
-            'baremetal:port:get', port_uuid)
+            'baremetal:port:get', port_ident)
 
         api_utils.check_allow_specify_fields(fields)
         self._check_allowed_port_fields(fields)
@@ -606,11 +646,11 @@ class PortsController(rest.RestController):
     @METRICS.timer('PortsController.patch')
     @method.expose()
     @method.body('patch')
-    @args.validate(port_uuid=args.uuid, patch=args.patch)
-    def patch(self, port_uuid, patch):
+    @args.validate(port_ident=args.uuid_or_name, patch=args.patch)
+    def patch(self, port_ident, patch):
         """Update an existing port.
 
-        :param port_uuid: UUID of a port.
+        :param port_ident: UUID or name of a port.
         :param patch: a json PATCH document to apply to this port.
         :raises: NotAcceptable, HTTPNotFound
         """
@@ -631,7 +671,7 @@ class PortsController(rest.RestController):
         self._check_allowed_port_fields(fields_to_check)
 
         rpc_port, rpc_node = api_utils.check_port_policy_and_retrieve(
-            'baremetal:port:update', port_uuid)
+            'baremetal:port:update', port_ident)
 
         port_dict = rpc_port.as_dict()
         # NOTE(lucasagomes):
@@ -659,7 +699,7 @@ class PortsController(rest.RestController):
                         context, port_dict['portgroup_uuid'])
                 else:
                     portgroup = None
-        except exception.PortGroupNotFound as e:
+        except exception.PortgroupNotFound as e:
             # Change error code because 404 (NotFound) is inappropriate
             # response for a PATCH request to change a Port
             e.code = http_client.BAD_REQUEST  # BadRequest

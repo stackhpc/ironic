@@ -24,7 +24,7 @@
 # they can determine that something is special, something is different,
 # and from there try to determine *what* it is. The key in their case
 # is the ID values, but they don't know that from the outside.
-# This is also why thid party admins should get 200s and empty lists,
+# This is also why third party admins should get 200s and empty lists,
 # again the database query should be filtered. Third party admin,
 # in essence serves as the primary negative test.
 #
@@ -84,9 +84,8 @@ values:
     X-Roles: service
   owner_project_id: &owner_project_id 70e5e25a-2ca2-4cb1-8ae8-7d8739cee205
   lessee_project_id: &lessee_project_id f11853c7-fa9c-4db3-a477-c9d8e0dbbf13
-  owned_node_ident: &owned_node_ident f11853c7-fa9c-4db3-a477-c9d8e0dbbf13
+  owned_node_ident: &owned_node_ident 1ab63b9e-66d7-4cd7-8618-dddd0f9f7881
   lessee_node_ident: &lessee_node_ident 38d5abed-c585-4fce-a57e-a2ffc2a2ec6f
-
 # Nodes - https://docs.openstack.org/api-ref/baremetal/?expanded=#nodes-nodes
 
 # Based on nodes_post_admin test.
@@ -582,7 +581,7 @@ owner_manager_cannot_change_owner:
 # This is not an explicitly restricted item, it falls
 # to generalized update capability, which oddly makes
 # a lot of sense in this case. It is a flag to prevent
-# accidential erasure/removal of the node.
+# accidental erasure/removal of the node.
 
 lessee_member_can_set_protected:
   path: '/v1/nodes/{lessee_node_ident}'
@@ -3384,19 +3383,19 @@ owner_reader_cannot_get_conductors:
   path: '/v1/conductors'
   method: get
   headers: *owner_reader_headers
-  assert_status: 500
+  assert_status: 403
 
 lessee_reader_cannot_get_conductors:
   path: '/v1/conductors'
   method: get
   headers: *lessee_reader_headers
-  assert_status: 500
+  assert_status: 403
 
 third_party_admin_cannot_get_conductors:
   path: '/v1/conductors'
   method: get
   headers: *third_party_admin_headers
-  assert_status: 500
+  assert_status: 403
 
 # Allocations - https://docs.openstack.org/api-ref/baremetal/#allocations-allocations
 
@@ -3532,7 +3531,7 @@ third_party_admin_cannot_create_allocation_with_candidates_not_owned:
   assert_status: 400
 
 owner_admin_can_create_allocation_with_their_uuid:
-  # NOTE(TheJulia): Owner/Lessee are equivelent in
+  # NOTE(TheJulia): Owner/Lessee are equivalent in
   # this context, so testing only one is fine.
   path: '/v1/allocations'
   method: post
@@ -3632,19 +3631,19 @@ owner_reader_cannot_get_deploy_templates:
   path: '/v1/deploy_templates'
   method: get
   headers: *owner_reader_headers
-  assert_status: 500
+  assert_status: 403
 
 lessee_reader_cannot_get_deploy_templates:
   path: '/v1/deploy_templates'
   method: get
   headers: *lessee_reader_headers
-  assert_status: 500
+  assert_status: 403
 
 third_party_admin_cannot_get_deploy_templates:
   path: '/v1/deploy_templates'
   method: get
   headers: *third_party_admin_headers
-  assert_status: 500
+  assert_status: 403
 
 third_party_admin_cannot_post_deploy_template:
   path: '/v1/deploy_templates'
@@ -3657,20 +3656,20 @@ third_party_admin_cannot_post_deploy_template:
         args: {}
         priority: 0
   headers: *third_party_admin_headers
-  assert_status: 500
+  assert_status: 403
 
 service_cannot_get_deploy_templates:
   path: '/v1/deploy_templates'
   method: get
   headers: *service_headers
-  assert_status: 500
+  assert_status: 403
 
 service_cannot_post_deploy_template:
   path: '/v1/deploy_templates'
   method: post
   body: *deploy_template
   headers: *service_headers
-  assert_status: 500
+  assert_status: 403
 
 # Chassis endpoints - https://docs.openstack.org/api-ref/baremetal/#chassis-chassis
 
@@ -3870,4 +3869,112 @@ lessee_node_inventory_get_reader:
   path: '/v1/nodes/{node_ident}/inventory'
   method: get
   headers: *lessee_reader_headers
+  assert_status: 404
+
+# Shard support - system scoped req'd to set on a node or view via /v1/shards
+shard_get_shards_disallowed:
+  path: '/v1/shards'
+  method: get
+  headers: *owner_reader_headers
+  assert_status: 403
+
+shard_patch_set_node_shard_disallowed:
+  path: '/v1/nodes/{owner_node_ident}'
+  method: patch
+  headers: *owner_admin_headers
+  body:
+    - op: replace
+      path: /shard
+      value: 'TestShard'
+  assert_status: 403
+
+# Update node parent_node field - baremetal:node:update:parent_node
+
+parent_node_patch_by_admin:
+  path: '/v1/nodes/{lessee_node_ident}'
+  method: patch
+  headers: *owner_admin_headers
+  body: &patch_parent_node
+    - op: replace
+      path: /parent_node
+      value: *owned_node_ident
+  assert_status: 403
+
+parent_node_patch_by_member:
+  path: '/v1/nodes/{lessee_node_ident}'
+  method: patch
+  headers: *owner_member_headers
+  body: *patch_parent_node
+  assert_status: 403
+
+parent_node_patch_by_reader:
+  path: '/v1/nodes/{lessee_node_ident}'
+  method: patch
+  headers: *owner_reader_headers
+  body: *patch_parent_node
+  assert_status: 403
+
+parent_node_patch_by_manager:
+  path: '/v1/nodes/{lessee_node_ident}'
+  method: patch
+  headers: *owner_manager_headers
+  body: *patch_parent_node
+  assert_status: 403
+
+parent_node_patch_by_cannot_see_node:
+  # This node cannot be seen, and also just doesn't exist.
+  # Just to verify we return a 400 on a node we can change.
+  path: '/v1/nodes/{lessee_node_ident}'
+  method: patch
+  headers: *owner_admin_headers
+  body:
+    - op: replace
+      path: /parent_node
+      value: 'f11853c7-fa9c-4db3-a477-c9d8e0dbbf13'
+  assert_status: 400
+
+parent_node_children_can_get_list_of_children:
+  path: '/v1/nodes/{owner_node_ident}/children'
+  method: get
+  headers: *owner_reader_headers
+  assert_status: 200
+  assert_list_length:
+    children: 1
+
+lessee_cannot_get_a_nodes_children:
+  path: '/v1/nodes/{owner_node_ident}/children'
+  method: get
+  headers: *lessee_reader_headers
+  assert_status: 404
+
+# Node Firmware
+
+owner_reader_can_get_firmware_components:
+  path: '/v1/nodes/{owner_node_ident}/firmware'
+  method: get
+  headers: *owner_reader_headers
+  assert_status: 200
+
+lessee_reader_can_get_firmware_components:
+  path: '/v1/nodes/{lessee_node_ident}/firmware'
+  method: get
+  headers: *lessee_reader_headers
+  assert_status: 200
+
+third_party_admin_cannot_get_firmware_components:
+  path: '/v1/nodes/{owner_node_ident}/firmware'
+  method: get
+  headers: *third_party_admin_headers
+  assert_status: 404
+
+service_can_get_firmware_components_owner_project:
+  path: '/v1/nodes/{owner_node_ident}/firmware'
+  method: get
+  headers: *service_headers_owner_project
+  assert_status: 200
+
+service_cannot_get_firmware_components:
+  path: '/v1/nodes/{owner_node_ident}/firmware'
+  method: get
+  headers: *service_headers
   assert_status: 404

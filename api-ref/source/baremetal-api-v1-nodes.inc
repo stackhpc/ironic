@@ -104,6 +104,12 @@ supplied when the Node is created, or the resource may be updated later.
 .. versionadded:: 1.65
   Introduced the ``lessee`` field.
 
+.. versionadded:: 1.82
+  Introduced the ``shard`` field.
+
+.. versionadded: 1.83
+  Introduced the ``parent_node`` field.
+
 Normal response codes: 201
 
 Error codes: 400,403,406
@@ -135,6 +141,7 @@ Request
     - owner: owner
     - description: req_n_description
     - lessee: lessee
+    - shard: shard
     - automated_clean: req_automated_clean
     - bios_interface: req_bios_interface
     - chassis_uuid: req_chassis_uuid
@@ -143,6 +150,7 @@ Request
     - maintenance: req_maintenance
     - maintenance_reason: maintenance_reason
     - network_data: network_data
+    - parent_node: parent_node
     - protected: protected
     - protected_reason: protected_reason
     - retired: retired
@@ -161,7 +169,7 @@ and any defaults added for non-specified fields. Most fields default to "null"
 or "".
 
 The list and example below are representative of the response as of API
-microversion 1.48.
+microversion 1.81.
 
 .. rest_parameters:: parameters.yaml
 
@@ -208,11 +216,13 @@ microversion 1.48.
     - vendor_interface: vendor_interface
     - volume: n_volume
     - conductor_group: conductor_group
+    - parent_node: parent_node
     - protected: protected
     - protected_reason: protected_reason
     - conductor: conductor
     - owner: owner
     - lessee: lessee
+    - shard: shard
     - description: n_description
     - allocation_uuid: allocation_uuid
     - automated_clean: automated_clean
@@ -280,6 +290,16 @@ provision state, and maintenance setting for each Node.
 .. versionadded:: 1.65
   Introduced the ``lessee`` field.
 
+.. versionadded:: 1.82
+  Introduced the ``shard`` field. Introduced the ``sharded`` request parameter.
+
+.. versionadded:: 1.83
+  Introduced the ``parent_node`` field and query parameter to identify
+  matching nodes.
+  Introduced the ``include_children`` parameter which allows for all child
+  nodes to be enumerated, which are normally hidden as child nodes are not
+  normally intended for direct consumption by end users.
+
 Normal response codes: 200
 
 Error codes: 400,403,406
@@ -300,6 +320,8 @@ Request
    - fault: r_fault
    - owner: owner
    - lessee: lessee
+   - shard: req_shard
+   - sharded: req_sharded
    - description_contains: r_description_contains
    - fields: fields
    - limit: limit
@@ -307,6 +329,8 @@ Request
    - sort_dir: sort_dir
    - sort_key: sort_key
    - detail: detail
+   - parent_node: parent_node
+   - include_children: include_children
 
 Response
 --------
@@ -371,6 +395,9 @@ Nova instance, eg. with a request to ``v1/nodes/detail?instance_uuid={NOVA INSTA
 .. versionadded:: 1.65
   Introduced the ``lessee`` field.
 
+.. versionadded:: 1.82
+  Introduced the ``shard`` field. Introduced the ``sharded`` request parameter.
+
 Normal response codes: 200
 
 Error codes: 400,403,406
@@ -391,6 +418,8 @@ Request
    - conductor: r_conductor
    - owner: owner
    - lessee: lessee
+   - shard: req_shard
+   - sharded: req_sharded
    - description_contains: r_description_contains
    - limit: limit
    - marker: marker
@@ -446,10 +475,12 @@ Response
     - vendor_interface: vendor_interface
     - volume: n_volume
     - conductor_group: conductor_group
+    - parent_node: parent_node
     - protected: protected
     - protected_reason: protected_reason
     - owner: owner
     - lessee: lessee
+    - shard: shard
     - description: n_description
     - conductor: conductor
     - allocation_uuid: allocation_uuid
@@ -507,6 +538,12 @@ only the specified set.
 
 .. versionadded:: 1.66
   Introduced the ``network_data`` field.
+
+.. versionadded:: 1.82
+  Introduced the ``shard`` field.
+
+.. versionadded:: 1.83
+  Introduced the ``parent_node`` field.
 
 Normal response codes: 200
 
@@ -573,6 +610,7 @@ Response
     - protected_reason: protected_reason
     - owner: owner
     - lessee: lessee
+    - shard: shard
     - description: n_description
     - conductor: conductor
     - allocation_uuid: allocation_uuid
@@ -599,6 +637,9 @@ managed through sub-resources.
 
 .. versionadded:: 1.51
   Introduced the ability to set/unset a node's description.
+
+.. versionadded:: 1.82
+  Introduced the ability to set/unset a node's shard.
 
 Normal response codes: 200
 
@@ -670,6 +711,7 @@ Response
     - protected_reason: protected_reason
     - owner: owner
     - lessee: lessee
+    - shard: shard
     - description: n_description
     - conductor: conductor
     - allocation_uuid: allocation_uuid

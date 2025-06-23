@@ -19,6 +19,7 @@ from ironic.common import exception
 from ironic.common import states
 from ironic.conductor import steps as conductor_steps
 from ironic.conductor import task_manager
+from ironic.conductor import utils as conductor_utils
 from ironic.conductor import verify as verify_steps
 from ironic import objects
 from ironic.tests.unit.db import base as db_base
@@ -580,15 +581,27 @@ class NodeCleaningStepsTestCase(db_base.DbTestCase):
         self.deploy_erase = {
             'step': 'erase_disks', 'priority': 20, 'interface': 'deploy',
             'abortable': True}
+        self.vendor_action = {
+            'abortable': False, 'argsinfo': None, 'interface': 'vendor',
+            'priority': 1, 'requires_ramdisk': True,
+            'step': 'log_passthrough'}
+        self.firmware_step = {
+            'abortable': False, 'argsinfo': {}, 'interface': 'firmware',
+            'priority': 0, 'requires_ramdisk': True,
+            'step': 'update'
+        }
+
         # Automated cleaning should be executed in this order
         self.clean_steps = [self.deploy_erase, self.power_update,
-                            self.deploy_update]
+                            self.deploy_update, self.vendor_action]
         # Manual clean step
         self.deploy_raid = {
             'step': 'build_raid', 'priority': 0, 'interface': 'deploy',
             'argsinfo': {'arg1': {'description': 'desc1', 'required': True},
                          'arg2': {'description': 'desc2'}}}
 
+    @mock.patch('ironic.drivers.modules.fake.FakeFirmware.get_clean_steps',
+                lambda self, taks: [])
     @mock.patch('ironic.drivers.modules.fake.FakeBIOS.get_clean_steps',
                 lambda self, task: [])
     @mock.patch('ironic.drivers.modules.fake.FakeDeploy.get_clean_steps',
@@ -613,6 +626,10 @@ class NodeCleaningStepsTestCase(db_base.DbTestCase):
 
         self.assertEqual(self.clean_steps, steps)
 
+    @mock.patch('ironic.drivers.modules.fake.FakeFirmware.get_clean_steps',
+                lambda self, task: [])
+    @mock.patch('ironic.drivers.modules.fake.FakeVendorB.get_clean_steps',
+                lambda self, task: [])
     @mock.patch('ironic.drivers.modules.fake.FakeBIOS.get_clean_steps',
                 lambda self, task: [])
     @mock.patch('ironic.drivers.modules.fake.FakeDeploy.get_clean_steps',
@@ -660,6 +677,8 @@ class NodeCleaningStepsTestCase(db_base.DbTestCase):
 
         self.assertEqual(self.clean_steps, steps)
 
+    @mock.patch('ironic.drivers.modules.fake.FakeVendorB.get_clean_steps',
+                lambda self, task: [])
     @mock.patch('ironic.drivers.modules.fake.FakeDeploy.get_clean_steps',
                 autospec=True)
     @mock.patch('ironic.drivers.modules.fake.FakePower.get_clean_steps',
@@ -765,7 +784,13 @@ class NodeCleaningStepsTestCase(db_base.DbTestCase):
                                     {'interface': 'power', 'priority': 10,
                                      'step': 'update_firmware'},
                                     {'interface': 'deploy', 'priority': 10,
-                                     'step': 'update_firmware'}]
+                                     'step': 'update_firmware'},
+                                    {'abortable': False,
+                                     'argsinfo': None,
+                                     'interface': 'vendor',
+                                     'priority': 1,
+                                     'requires_ramdisk': True,
+                                     'step': 'log_passthrough'}]
 
         self.assertEqual(expected_step_priorities, steps)
 
@@ -780,7 +805,8 @@ class NodeCleaningStepsTestCase(db_base.DbTestCase):
         cfg.CONF.set_override('clean_step_priority_override',
                               ["deploy.erase_disks:0",
                                "power.update_firmware:0",
-                               "deploy.update_firmware:0", ],
+                               "deploy.update_firmware:0",
+                               "vendor.log_passthrough:0", ],
                               'conductor')
 
         node = obj_utils.create_test_node(
@@ -971,6 +997,19 @@ class NodeCleaningStepsTestCase(db_base.DbTestCase):
                      'priority': 20, 'abortable': True}]
         self.assertEqual(expected, result)
 
+    @mock.patch.object(conductor_steps, '_validate_user_step',
+                       autospec=True)
+    def test__validate_user_clean_steps_reserved_options(self, mock_steps):
+        node = obj_utils.create_test_node(self.context)
+        user_steps = [{'step': 'magic', 'execute_on_child_nodes': True},
+                      {'step': 'power_on', 'interface': 'power'},
+                      {'step': 'power_off', 'interface': 'power'},
+                      {'step': 'reboot', 'interface': 'power'}]
+        with task_manager.acquire(self.context, node.uuid) as task:
+            conductor_steps._validate_user_clean_steps(
+                task, user_steps, disable_ramdisk=True)
+            mock_steps.assert_not_called()
+
 
 @mock.patch.object(conductor_steps, '_get_deployment_templates',
                    autospec=True)
@@ -1029,8 +1068,8 @@ class GetValidatedStepsFromTemplatesTestCase(db_base.DbTestCase):
                                      mock_templates):
         mock_templates.return_value = [self.template]
         mock_validate.side_effect = exception.InstanceDeployFailure('foo')
-        with task_manager.acquire(
-                self.context, self.node.uuid, shared=False) as task:
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
             self.assertRaises(
                 exception.InstanceDeployFailure,
                 conductor_steps._get_validated_steps_from_templates, task)
@@ -1299,3 +1338,157 @@ class NodeVerifyStepsTestCase(db_base.DbTestCase):
             verify_steps.do_node_verify(task)
             node.refresh()
             self.assertTrue(mock_execute.called)
+
+
+class ReservedStepsHandlerTestCase(db_base.DbTestCase):
+    def setUp(self):
+        super(ReservedStepsHandlerTestCase, self).setUp()
+
+    @mock.patch.object(conductor_utils, 'node_power_action',
+                       autospec=True)
+    def _test_reserved_step(self, step, mock_power_action):
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANING,
+            target_provision_state=states.MANAGEABLE,
+            last_error=None,
+            clean_step=None)
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            res = conductor_steps.use_reserved_step_handler(task, step)
+            self.assertTrue(res)
+
+    def test_reserved_step_power_on(self):
+        self._test_reserved_step({'step': 'power_on'})
+
+    def test_reserved_step_power_off(self):
+        self._test_reserved_step({'step': 'power_off'})
+
+    def test_reserved_step_power_reboot(self):
+        self._test_reserved_step({'step': 'reboot'})
+
+
+class ReservedStepHandlerByNameTestCase(db_base.DbTestCase):
+    def setUp(self):
+        super(ReservedStepHandlerByNameTestCase, self).setUp()
+
+    @mock.patch.object(conductor_steps, '_sleep_wrapper', autospec=True)
+    def _test_reserved_step(self, step, mock_sleep):
+        CONF.set_override('max_conductor_wait_step_seconds', 2,
+                          group='conductor')
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANING,
+            target_provision_state=states.MANAGEABLE,
+            last_error=None,
+            clean_step=None)
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            res = conductor_steps.use_reserved_step_handler(task, step)
+            self.assertTrue(res)
+            if step.get('step') == 'wait':
+                if 'args' in step:
+                    self.assertEqual(task.node.provision_state,
+                                     states.CLEANING)
+                    if step['args']['seconds'] == 3:
+                        mock_sleep.assert_called_once_with(2)
+                    else:
+                        mock_sleep.assert_called_once_with(
+                            step['args']['seconds'])
+                else:
+                    self.assertEqual(task.node.provision_state,
+                                     states.CLEANWAIT)
+                    mock_sleep.assert_not_called()
+
+    def test_reserved_step_wait(self):
+        self._test_reserved_step({'step': 'wait'})
+
+    def test_reserved_step_wait_time_to_long(self):
+        self._test_reserved_step({'step': 'wait', 'args': {'seconds': 3}})
+
+    def test_reserved_step_wait_time(self):
+        self._test_reserved_step({'step': 'wait', 'args': {'seconds': 1}})
+
+
+class NodeServiceStepsTestCase(db_base.DbTestCase):
+    def setUp(self):
+        super(NodeServiceStepsTestCase, self).setUp()
+
+        self.deploy_start = {
+            'step': 'deploy_start', 'interface': 'deploy'}
+        self.power_one = {
+            'step': 'power_one', 'priority': 0, 'interface': 'power'}
+        self.deploy_middle = {
+            'step': 'deploy_middle', 'interface': 'deploy'}
+        self.deploy_end = {
+            'step': 'deploy_end', 'interface': 'deploy'}
+        self.power_disable = {
+            'step': 'power_disable', 'priority': 0, 'interface': 'power'}
+        self.deploy_core = {
+            'step': 'deploy', 'interface': 'deploy'}
+        # enabled steps
+        self.service_steps = [self.deploy_start, self.power_one,
+                              self.deploy_middle, self.deploy_end]
+        # Deploy step with argsinfo.
+        self.deploy_raid = {
+            'step': 'build_raid', 'priority': 0, 'interface': 'deploy',
+            'argsinfo': {'arg1': {'description': 'desc1', 'required': True},
+                         'arg2': {'description': 'desc2'}}}
+        self.node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware')
+
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.get_service_steps',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.get_service_steps',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeManagement.get_service_steps',
+                autospec=True)
+    def test__get_service_steps(self, mock_mgt_steps, mock_power_steps,
+                                mock_deploy_steps):
+        # Test getting deploy steps, with one driver returning None, two
+        # conflicting priorities, and asserting they are ordered properly.
+
+        mock_power_steps.return_value = [self.power_disable, self.power_one]
+        mock_deploy_steps.return_value = [
+            self.deploy_start, self.deploy_middle, self.deploy_end]
+        # These next steps are actually present on the FakeVendorB interface,
+        # and instead of just mock everything, we're actually exercising the
+        # rest of the way down including the decorator to get here.
+        fake_log_passthrough = {
+            'abortable': False, 'argsinfo': None, 'interface': 'vendor',
+            'priority': 0, 'requires_ramdisk': False,
+            'step': 'log_passthrough'
+        }
+        fake_trigger_servicewait = {
+            'abortable': False, 'argsinfo': None, 'interface': 'vendor',
+            'priority': 0, 'requires_ramdisk': True,
+            'step': 'trigger_servicewait'
+        }
+
+        expected = self.service_steps + [fake_log_passthrough,
+                                         fake_trigger_servicewait,
+                                         self.power_disable]
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            steps = conductor_steps._get_service_steps(task, enabled=False)
+
+            self.assertCountEqual(expected, steps)
+            mock_mgt_steps.assert_called_once_with(mock.ANY, task)
+            mock_power_steps.assert_called_once_with(mock.ANY, task)
+            mock_deploy_steps.assert_called_once_with(mock.ANY, task)
+
+    @mock.patch.object(conductor_steps, '_validate_user_service_steps',
+                       autospec=True)
+    def test_set_node_service_steps(self, mock_steps):
+        mock_steps.return_value = self.service_steps
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            conductor_steps.set_node_service_steps(task)
+            self.node.refresh()
+            self.assertEqual(self.service_steps,
+                             self.node.driver_internal_info['service_steps'])
+            self.assertEqual({}, self.node.service_step)
+            self.assertIsNone(
+                self.node.driver_internal_info['service_step_index'])
+            mock_steps.assert_called_once_with(task, [], disable_ramdisk=False)

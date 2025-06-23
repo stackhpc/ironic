@@ -20,16 +20,14 @@ import time
 from unittest import mock
 
 from oslo_config import cfg
-from oslo_utils import importutils
 import requests
+import sushy
 
 from ironic.common import exception
 from ironic.drivers.modules.redfish import utils as redfish_utils
 from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.db import utils as db_utils
 from ironic.tests.unit.objects import utils as obj_utils
-
-sushy = importutils.try_import('sushy')
 
 INFO_DICT = db_utils.get_test_redfish_info()
 
@@ -166,6 +164,14 @@ class RedfishUtilsTestCase(db_base.DbTestCase):
         self.node.driver_info['redfish_address'] = test_redfish_address
         self.parsed_driver_info['root_prefix'] = '/test/redfish/v0/'
         response = redfish_utils.parse_driver_info(self.node)
+        self.assertEqual(self.parsed_driver_info, response)
+
+    def test_parse_driver_info_default_scheme_ipv6_brackets_added(self):
+        test_redfish_address = '2001:DB8::1'
+        self.node.driver_info['redfish_address'] = test_redfish_address
+        response = redfish_utils.parse_driver_info(self.node)
+        self.parsed_driver_info['address'] = ("https://[%s]"
+                                              % test_redfish_address)
         self.assertEqual(self.parsed_driver_info, response)
 
     def test_get_task_monitor(self):

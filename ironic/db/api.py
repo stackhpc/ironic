@@ -72,6 +72,7 @@ class Connection(object, metaclass=abc.ABCMeta):
                         :reserved_by_any_of: [conductor1, conductor2]
                         :resource_class: resource class name
                         :retired: True | False
+                        :shard_in: shard (multiple possibilities)
                         :provision_state: provision state of node
                         :provision_state_in:
                             provision state of node (multiple possibilities)
@@ -106,6 +107,7 @@ class Connection(object, metaclass=abc.ABCMeta):
                         :provisioned_before:
                             nodes with provision_updated_at field before this
                             interval in seconds
+                        :shard: nodes with the given shard
         :param limit: Maximum number of nodes to return.
         :param marker: the last item of the previous page; we return the next
                        result set.
@@ -292,6 +294,14 @@ class Connection(object, metaclass=abc.ABCMeta):
         :param sort_key: Attribute by which results should be sorted.
         :param sort_dir: direction in which results should be sorted.
                          (asc, desc)
+        """
+
+    @abc.abstractmethod
+    def get_ports_by_shards(self, shards, limit=None, marker=None,
+                            sort_key=None, sort_dir=None):
+        """Return a list of ports contained in the provided shards.
+
+        :param shard_ids: A list of shards to filter ports by.
         """
 
     @abc.abstractmethod
@@ -575,10 +585,16 @@ class Connection(object, metaclass=abc.ABCMeta):
         """
 
     @abc.abstractmethod
-    def touch_conductor(self, hostname):
+    def touch_conductor(self, hostname, online=True):
         """Mark a conductor as active by updating its 'updated_at' property.
 
+        Calling periodically with ``online=False`` will result in the conductor
+        appearing unregistered, but recently enough to prevent other conductors
+        failing orphan nodes. This improves the behaviour of graceful and drain
+        shutdown.
+
         :param hostname: The hostname of this conductor service.
+        :param online: Whether the conductor is online.
         :raises: ConductorNotFound
         """
 
@@ -955,16 +971,6 @@ class Connection(object, metaclass=abc.ABCMeta):
         :param ident: The UUID or integer ID of a volume target.
         :raises: VolumeTargetNotFound if a volume target with the specified
                  ident does not exist.
-        """
-
-    @abc.abstractmethod
-    def get_not_versions(self, model_name, versions):
-        """Returns objects with versions that are not the specified versions.
-
-        :param model_name: the name of the model (class) of desired objects
-        :param versions: list of versions of objects not to be returned
-        :returns: list of the DB objects
-        :raises: IronicException if there is no class associated with the name
         """
 
     @abc.abstractmethod
@@ -1413,7 +1419,7 @@ class Connection(object, metaclass=abc.ABCMeta):
     def bulk_delete_node_history_records(self, node_id, limit):
         """Utility method to bulk delete node history entries.
 
-        :param entires: A list of node history entriy id's to be
+        :param entries: A list of node history entry id's to be
                         queried for deletion.
         """
 
@@ -1441,17 +1447,77 @@ class Connection(object, metaclass=abc.ABCMeta):
         """
 
     @abc.abstractmethod
-    def get_node_inventory_by_id(self, inventory_id):
-        """Return a node inventory representation.
-
-        :param inventory_id: The id of a inventory record.
-        :returns: An inventory of a node.
-        """
-
-    @abc.abstractmethod
     def get_node_inventory_by_node_id(self, node_id):
         """Get the node inventory for a given node.
 
         :param node_id: The integer node ID.
         :returns: An inventory of a node.
+        """
+
+    @abc.abstractmethod
+    def get_shard_list(self):
+        """Retrieve a list of shards.
+
+        :returns: list of dicts containing shard names and count
+        """
+
+    @abc.abstractclassmethod
+    def create_firmware_component(self, values):
+        """Create a FirmwareComponent record for a given node.
+
+        :param values: a dictionary with the necessary information to create
+            a FirmwareComponent.
+
+                     ::
+
+                      {
+                        'component': String,
+                        'initial_version': String,
+                        'current_version': String,
+                        'last_version_flashed': String
+                      }
+        :returns: A FirmwareComponent object.
+        :raises: FirmwareComponentAlreadyExists if any  of the component
+            records already exists.
+        """
+
+    @abc.abstractclassmethod
+    def update_firmware_component(self, node_id, component, values):
+        """Update a FirmwareComponent record.
+
+        :param node_id: The node id.
+        :param component: The component of the node to update.
+        :param values: A dictionary with the new information about the
+            FirmwareComponent.
+
+                     ::
+
+                      {
+                        'current_version': String,
+                        'last_version_flashed': String
+                      }
+        :returns: A FirmwareComponent object.
+        :raises: FirmwareComponentNotFound the component
+            is not found.
+        """
+
+    @abc.abstractmethod
+    def get_firmware_component(self, node_id, name):
+        """Retrieve Firmware Component.
+
+        :param node_id: The node id.
+        :param name: name of Firmware component.
+        :returns: The FirmwareComponent object.
+        :raises: NodeNotFound if the node is not found.
+        :raises: FirmwareComponentNotFound if the Firmware component
+            is not found.
+        """
+
+    @abc.abstractclassmethod
+    def get_firmware_component_list(self, node_id):
+        """Retrieve a list Firmware Components of a given node.
+
+        :param node_id: The node id.
+        :returns: A list of FirmwareComponent objects.
+        :raises: NodeNotFound if the node is not found.
         """

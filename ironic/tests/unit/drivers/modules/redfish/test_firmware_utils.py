@@ -256,6 +256,30 @@ class FirmwareUtilsTestCase(base.TestCase):
         mock_compute_file_checksum.assert_called_with(
             file_path, algorithm='sha1')
 
+    @mock.patch.object(fileutils, 'compute_file_checksum', autospec=True)
+    def test_verify_checksum_sha256(self, mock_compute_file_checksum):
+        checksum = 'a' * 64
+        file_path = '/tmp/bios.exe'
+        mock_compute_file_checksum.return_value = checksum
+        node = mock.Mock(uuid='9f0f6795-f74e-4b5a-850e-72f586a92435')
+
+        firmware_utils.verify_checksum(node, checksum, file_path)
+
+        mock_compute_file_checksum.assert_called_with(
+            file_path, algorithm='sha256')
+
+    @mock.patch.object(fileutils, 'compute_file_checksum', autospec=True)
+    def test_verify_checksum_sha512(self, mock_compute_file_checksum):
+        checksum = 'a' * 128
+        file_path = '/tmp/bios.exe'
+        mock_compute_file_checksum.return_value = checksum
+        node = mock.Mock(uuid='9f0f6795-f74e-4b5a-850e-72f586a92435')
+
+        firmware_utils.verify_checksum(node, checksum, file_path)
+
+        mock_compute_file_checksum.assert_called_with(
+            file_path, algorithm='sha512')
+
     @mock.patch.object(os, 'makedirs', autospec=True)
     @mock.patch.object(shutil, 'copyfile', autospec=True)
     @mock.patch.object(os, 'link', autospec=True)
@@ -407,8 +431,12 @@ class FirmwareUtilsTestCase(base.TestCase):
             uuid='55cdaba0-1123-4622-8b37-bb52dd6285d3',
             driver_internal_info={'firmware_cleanup': ['http', 'swift']})
         object_name = '55cdaba0-1123-4622-8b37-bb52dd6285d3/file.exe'
-        get_container = mock_swift_api.return_value.connection.get_container
-        get_container.return_value = (mock.Mock(), [{'name': object_name}])
+        obj = mock.Mock()
+        obj.name = object_name
+
+        connection = mock.MagicMock()
+        mock_swift_api.return_value.connection = connection
+        connection.list_objects.return_value = [obj]
 
         firmware_utils.cleanup(node)
 
@@ -446,8 +474,12 @@ class FirmwareUtilsTestCase(base.TestCase):
             uuid='55cdaba0-1123-4622-8b37-bb52dd6285d3',
             driver_internal_info={'firmware_cleanup': ['swift']})
         object_name = '55cdaba0-1123-4622-8b37-bb52dd6285d3/file.exe'
-        get_container = mock_swift_api.return_value.connection.get_container
-        get_container.return_value = (mock.Mock(), [{'name': object_name}])
+        obj = mock.Mock()
+        obj.name = object_name
+
+        connection = mock.MagicMock()
+        mock_swift_api.return_value.connection = connection
+        connection.list_objects.return_value = [obj]
         mock_swift_api.return_value.delete_object.side_effect =\
             exception.SwiftOperationError
 

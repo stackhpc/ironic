@@ -105,6 +105,12 @@ class BareDriver(object):
     A reference to an instance of :class:DeployInterface.
     """
 
+    firmware = None
+    """`Standard` attribute for inspection related features.
+
+    A reference to an instance of :class:FirmwareInterface.
+    """
+
     inspect = None
     """`Standard` attribute for inspection related features.
 
@@ -161,7 +167,8 @@ class BareDriver(object):
     @property
     def optional_interfaces(self):
         """Interfaces that can be no-op."""
-        return ['bios', 'console', 'inspect', 'raid', 'rescue', 'storage']
+        return ['bios', 'console', 'firmware', 'inspect', 'raid', 'rescue',
+                'storage']
 
     @property
     def all_interfaces(self):
@@ -240,6 +247,7 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
         instance.clean_steps = []
         instance.deploy_steps = []
         instance.verify_steps = []
+        instance.service_steps = []
         for n, method in inspect.getmembers(instance, inspect.ismethod):
             if getattr(method, '_is_clean_step', False):
                 # Create a CleanStep to represent this method
@@ -264,6 +272,15 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
                         'priority': method._verify_step_priority,
                         'interface': instance.interface_type}
                 instance.verify_steps.append(step)
+            if getattr(method, '_is_service_step', False):
+                step = {'step': method.__name__,
+                        'priority': method._service_step_priority,
+                        'abortable': method._service_step_abortable,
+                        'argsinfo': method._service_step_argsinfo,
+                        'interface': instance.interface_type,
+                        'requires_ramdisk':
+                            method._service_step_requires_ramdisk}
+                instance.service_steps.append(step)
 
         if instance.clean_steps:
             LOG.debug('Found clean steps %(steps)s for interface '
@@ -279,6 +296,11 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
             LOG.debug('Found verify steps %(steps)s for interface '
                       '%(interface)s',
                       {'steps': instance.deploy_steps,
+                       'interface': instance.interface_type})
+        if instance.service_steps:
+            LOG.debug('Found service steps %(steps)s for interface '
+                      '%(interface)s',
+                      {'steps': instance.service_steps,
                        'interface': instance.interface_type})
 
         return instance
@@ -393,6 +415,35 @@ class BaseInterface(object, metaclass=abc.ABCMeta):
 
     def execute_verify_step(self, task, step):
         """Execute the verify step on task.node.
+
+        A verify step must take a single positional argument: a TaskManager
+        object. It does not take keyword variable arguments.
+
+        :param task: A TaskManager object
+        :param step: The deploy step dictionary representing the step to
+            execute
+        :returns: None if this method has completed synchronously
+        """
+        return self._execute_step(task, step)
+
+    def get_service_steps(self, task):
+        """Get a list of service steps for the interface.
+
+        This function will return all service steps (both enabled and disabled)
+        for the interface, in an unordered list.
+
+        :param task: A TaskManager object, useful for interfaces overriding
+            this function
+        :raises NodeServiceFailure: if there is a problem getting the steps
+            from the driver. For example, when a node (using an agent driver)
+            has just been enrolled and the agent isn't alive yet to be queried
+            for the available clean steps.
+        :returns: A list of clean step dictionaries
+        """
+        return self.service_steps
+
+    def execute_service_step(self, task, step):
+        """Execute the service step on task.node.
 
         A verify step must take a single positional argument: a TaskManager
         object. It does not take keyword variable arguments.
@@ -537,6 +588,38 @@ class DeployInterface(BaseInterface):
         LOG.warning('Got heartbeat message from node %(node)s, but '
                     'the driver %(driver)s does not support heartbeating',
                     {'node': task.node.uuid, 'driver': task.node.driver})
+
+    def tear_down_service(self, task):
+        """Tear down after servicing is completed.
+
+        Given that servicing is complete, do all cleanup and tear
+        down necessary to allow the node to be returned to an active
+        state.
+
+        :param task: A TaskManager instance containing the node to act on.
+        """
+        pass
+
+    def prepare_service(self, task):
+        """Prepare the node for servicing tasks.
+
+        For example, nodes that use the Ironic Python Agent will need to
+        boot the ramdisk in order to do in-band service tasks.
+
+        If the function is asynchronous, the driver will need to handle
+        settings node.driver_internal_info['service_steps'] and
+        node.service_step, as they would be set in
+        ironic.conductor.manager._do_node_service, but cannot be set when
+        this is asynchronous. After, the interface should make an RPC call
+        to continue_node_servicing to start cleaning.
+
+        :param task: A TaskManager instance containing the node to act on.
+        :returns: If this function is going to be asynchronous, should return
+            `states.SERVICEWAIT`. Otherwise, should return `None`.
+            The interface will need to call _get_cleaning_steps and then RPC
+            to continue_node_service.
+        """
+        pass
 
 
 class BootInterface(BaseInterface):
@@ -1219,12 +1302,38 @@ class ManagementInterface(BaseInterface):
         raise exception.UnsupportedDriverExtension(
             driver=task.node.driver, extension='get_mac_addresses')
 
+    def attach_virtual_media(self, task, device_type, image_url):
+        """Attach a virtual media device to the node.
+
+        :param task: A TaskManager instance containing the node to act on.
+        :param device_type: Device type, one of
+            :data:`ironic.common.boot_devices.VMEDIA_DEVICES`.
+        :param image_url: URL of the image to attach, HTTP or HTTPS.
+        :raises: UnsupportedDriverExtension
+
+        """
+        raise exception.UnsupportedDriverExtension(
+            driver=task.node.driver, extension='attach_virtual_media')
+
+    def detach_virtual_media(self, task, device_types=None):
+        """Detach some or all virtual media devices from the node.
+
+        :param task: A TaskManager instance containing the node to act on.
+        :param device_types: A collection of device type, ones from
+            :data:`ironic.common.boot_devices.VMEDIA_DEVICES`.
+            If not provided, all devices are detached.
+        :raises: UnsupportedDriverExtension
+
+        """
+        raise exception.UnsupportedDriverExtension(
+            driver=task.node.driver, extension='detach_virtual_media')
+
 
 class InspectInterface(BaseInterface):
     """Interface for inspection-related actions."""
     interface_type = 'inspect'
 
-    ESSENTIAL_PROPERTIES = {'memory_mb', 'local_gb', 'cpus', 'cpu_arch'}
+    ESSENTIAL_PROPERTIES = {'memory_mb', 'local_gb', 'cpu_arch'}
     """The properties required by scheduler/deploy."""
 
     @abc.abstractmethod
@@ -1251,6 +1360,20 @@ class InspectInterface(BaseInterface):
         interface implementation is expected to be a quick processing.
 
         :param task: a task from TaskManager.
+        :raises: UnsupportedDriverExtension, if the method is not implemented
+                 by specific inspect interface.
+        """
+        raise exception.UnsupportedDriverExtension(
+            driver=task.node.driver, extension='abort')
+
+    def continue_inspection(self, task, inventory, plugin_data=None):
+        """Continue in-band hardware inspection.
+
+        Should not be implemented for purely out-of-band implementations.
+
+        :param task: a task from TaskManager.
+        :param inventory: hardware inventory from the node.
+        :param plugin_data: optional plugin-specific data.
         :raises: UnsupportedDriverExtension, if the method is not implemented
                  by specific inspect interface.
         """
@@ -1288,7 +1411,7 @@ class BIOSInterface(BaseInterface):
         table with the BIOS configuration applied on the node.
 
         :param task: a TaskManager instance.
-        :param settings: Dictonary containing the BIOS configuration.
+        :param settings: Dictionary containing the BIOS configuration.
         :raises: UnsupportedDriverExtension, if the node's driver doesn't
             support BIOS configuration.
         :raises: InvalidParameterValue, if validation of settings fails.
@@ -1662,7 +1785,7 @@ class NetworkInterface(BaseInterface):
         """
 
     def need_power_on(self, task):
-        """Check if ironic node must be powered on before applying network changes
+        """Check if node must be powered on before applying network changes
 
         :param task: A TaskManager instance.
         :returns: Boolean.
@@ -1684,10 +1807,32 @@ class NetworkInterface(BaseInterface):
         :raises: InvalidParameterValue, if the network interface configuration
             is invalid.
         :raises: MissingParameterValue, if some parameters are missing.
-        :returns: a dict holding network configuration information adhearing
+        :returns: a dict holding network configuration information adhering
             Nova network metadata layout (`network_data.json`).
         """
         return task.node.network_data or {}
+
+    def add_servicing_network(self, task):
+        """Add the servicing network to the node.
+
+        :param task: A TaskManager instance.
+        :returns: a dictionary in the form {port.uuid: neutron_port['id']}
+        :raises: NetworkError
+        :raises: InvalidParameterValue, if the network interface configuration
+            is invalid.
+        """
+        return {}
+
+    def remove_servicing_network(self, task):
+        """Removes the servicing network from a node.
+
+        :param task: A TaskManager instance.
+        :raises: NetworkError
+        :raises: InvalidParameterValue, if the network interface configuration
+            is invalid.
+        :raises: MissingParameterValue, if some parameters are missing.
+        """
+        pass
 
 
 class StorageInterface(BaseInterface, metaclass=abc.ABCMeta):
@@ -1719,6 +1864,55 @@ class StorageInterface(BaseInterface, metaclass=abc.ABCMeta):
         :returns: Boolean value to indicate if the interface expects
                   the image to be written by Ironic.
         :raises: UnsupportedDriverExtension
+        """
+
+
+def cache_firmware_components(func):
+    """A decorator to cache firmware components after running the function.
+
+    :param func: Function or method to wrap.
+    """
+    @functools.wraps(func)
+    def wrapped(self, task, *args, **kwargs):
+        result = func(self, task, *args, **kwargs)
+        self.cache_firmware_components(task)
+        return result
+    return wrapped
+
+
+class FirmwareInterface(BaseInterface):
+    """Base class for firmware interface"""
+
+    interface_type = 'firmware'
+
+    @abc.abstractmethod
+    def update(self, task, settings):
+        """Update the Firmware on the given using the settings for components.
+
+        :param task: a TaskManager instance.
+        :param settings: a list of dictionaries, each dictionary contains the
+            component name and the url that will be used to update the
+            firmware.
+        :raises: UnsupportedDriverExtension, if the node's driver doesn't
+            support update via the interface.
+        :raises: InvalidParameterValue, if validation of the settings fails.
+        :raises: MissingParamterValue, if some required parameters are
+            missing.
+        :returns: states.CLEANWAIT if Firmware update with the settings is in
+            progress asynchronously of None if it is complete.
+        """
+
+    @abc.abstractmethod
+    def cache_firmware_components(self, task):
+        """Store or update Firmware Components on the given node.
+
+        This method stores Firmware Components to the firmware_information
+        table during 'cleaning' operation. It will also update the timestamp
+        of each Firmware Component.
+
+        :param task: a TaskManager instance.
+        :raises: UnsupportedDriverExtension, if the node's driver doesn't
+            support getting Firmware Components from bare metal.
         """
 
 
@@ -1951,5 +2145,84 @@ def verify_step(priority):
                 _('"priority" must be an integer value >= 0, instead of "%s"')
                 % priority)
 
+        return func
+    return decorator
+
+
+def service_step(priority=None, abortable=False, argsinfo=None,
+                 requires_ramdisk=True):
+    """Decorator for service steps.
+
+    Service steps may be used in performing service upon a node.
+
+    For service, the steps will be executed in a similar fashion
+    to cleaning, but the steps and order of execution must be
+    explicitly specified by the user when invoking the servicing API.
+
+    Decorated service steps must take as the only a single positional
+    argument, a TaskManager object, in addition to a keyword arguments
+    variable (as described in argsinfo).
+
+    Service steps can be either synchronous or asynchronous.  If the step is
+    synchronous, it should return `None` when finished, and the conductor
+    will continue on to the next step. While the clean step is executing, the
+    node will be in `states.SERVICING` provision state. If the step is
+    asynchronous, the step should return `states.SERVICEWAIT` to the
+    conductor before it starts the asynchronous work.  When the step is
+    complete, the step should make an RPC call to `continue_node_service` to
+    move to the next step in servicing. The node will be in
+    `states.SERVICEWAIT` provision state during the asynchronous work.
+
+    Examples::
+
+        class MyInterface(base.BaseInterface):
+            @base.service_step()
+            def example_service(self, task):
+                # do some service actions
+
+            @base.service_step(priority=0, abortable=True, argsinfo=
+                               {'size': {'description': 'size of widget (MB)',
+                                         'required': True}})
+            def advanced_service(self, task, **kwargs):
+                # do some advanced magical service
+
+    :param priority: an integer priority, defaults to None which maps to 0.
+                     Priorities are not considered, by default but exists
+                     should this functionality be adopted later on to align
+                     with the steps framework.
+    :param abortable: Boolean value. Whether the clean step is abortable
+        or not; defaults to False.
+    :param argsinfo: a dictionary of keyword arguments where key is the name of
+        the argument and value is a dictionary as follows::
+
+            'description': <description>. Required. This should include
+                           possible values.
+            'required': Boolean. Optional; default is False. True if this
+                        argument is required.  If so, it must be specified in
+                        the service request; false if it is optional.
+    :param requires_ramdisk: Whether this step requires the ramdisk
+        to be running. Should be set to False for purely out-of-band steps.
+    :raises InvalidParameterValue: if any of the arguments are invalid
+    """
+    def decorator(func):
+        func._is_service_step = True
+        if isinstance(priority, int):
+            func._service_step_priority = priority
+        else:
+            # Service steps are only invoked by operators in a model
+            # like manual cleaning, so there is no need to explicitly
+            # require it on the decorator.
+            func._service_step_priority = 0
+
+        if isinstance(abortable, bool):
+            func._service_step_abortable = abortable
+        else:
+            raise exception.InvalidParameterValue(
+                _('"abortable" must be a Boolean value instead of "%s"')
+                % abortable)
+
+        _validate_argsinfo(argsinfo)
+        func._service_step_argsinfo = argsinfo
+        func._service_step_requires_ramdisk = requires_ramdisk
         return func
     return decorator

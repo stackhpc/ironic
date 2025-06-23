@@ -29,6 +29,9 @@ LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 
 
+# NOTE(TheJulia): Deprecated after the 2024.1 PTG in favor of
+# a future step templating interface.
+
 def save_configuration(task, url, data):
     """Store configuration mold to indicated location.
 
@@ -49,12 +52,16 @@ def save_configuration(task, url, data):
     )
     def _request(url, data, auth_header):
         return requests.put(
-            url, data=json.dumps(data, indent=2), headers=auth_header)
+            url, data=json.dumps(data, indent=2), headers=auth_header,
+            timeout=CONF.webserver_connection_timeout)
 
     auth_header = _get_auth_header(task)
     response = _request(url, data, auth_header)
     response.raise_for_status()
 
+
+# NOTE(TheJulia): Deprecated after the 2024.1 PTG in favor of
+# a future step templating interface.
 
 def get_configuration(task, url):
     """Gets configuration mold from indicated location.
@@ -76,7 +83,8 @@ def get_configuration(task, url):
         reraise=True
     )
     def _request(url, auth_header):
-        return requests.get(url, headers=auth_header)
+        return requests.get(url, headers=auth_header,
+                            timeout=CONF.webserver_connection_timeout)
 
     auth_header = _get_auth_header(task)
     response = _request(url, auth_header)
@@ -95,6 +103,9 @@ def get_configuration(task, url):
 
     response.raise_for_status()
 
+
+# NOTE(TheJulia): Deprecated after the 2024.1 PTG in favor of
+# a future step templating interface.
 
 def _get_auth_header(task):
     """Based on setup of configuration mold storage gets authentication header

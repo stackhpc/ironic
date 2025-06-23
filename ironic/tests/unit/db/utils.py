@@ -26,6 +26,7 @@ from ironic.objects import bios
 from ironic.objects import chassis
 from ironic.objects import conductor
 from ironic.objects import deploy_template
+from ironic.objects import firmware
 from ironic.objects import node
 from ironic.objects import node_history
 from ironic.objects import node_inventory
@@ -165,7 +166,6 @@ def get_test_snmp_info(**kw):
 def get_test_node(**kw):
     properties = {
         "cpu_arch": "x86_64",
-        "cpus": "8",
         "local_gb": "10",
         "memory_mb": "4096",
     }
@@ -237,6 +237,9 @@ def get_test_node(**kw):
         'network_data': kw.get('network_data'),
         'boot_mode': kw.get('boot_mode', None),
         'secure_boot': kw.get('secure_boot', None),
+        'shard': kw.get('shard', None),
+        'parent_node': kw.get('parent_node', None),
+        'service_step': kw.get('service_step'),
     }
 
     for iface in drivers_base.ALL_INTERFACES:
@@ -448,6 +451,8 @@ def get_test_portgroup(**kw):
         'uuid': kw.get('uuid', '6eb02b44-18a3-4659-8c0b-8d2802581ae4'),
         'name': kw.get('name', 'fooname'),
         'node_id': kw.get('node_id', 123),
+        'node_uuid': kw.get('node_uuid',
+                            '40481b96-306b-4a33-901f-795a3dc2f397'),
         'address': kw.get('address', '52:54:00:cf:2d:31'),
         'extra': kw.get('extra', {}),
         'created_at': kw.get('created_at'),
@@ -506,7 +511,6 @@ def create_test_node_tag(**kw):
 def get_test_xclarity_properties():
     return {
         "cpu_arch": "x86_64",
-        "cpus": "8",
         "local_gb": "10",
         "memory_mb": "4096",
     }
@@ -741,7 +745,7 @@ def get_test_inventory(**kw):
 def create_test_inventory(**kw):
     """Create test inventory entry in DB and return NodeInventory DB object.
 
-    :param kw: kwargs with overriding values for port's attributes.
+    :param kw: kwargs with overriding values for inventory attributes.
     :returns: Test NodeInventory DB object.
     """
     inventory = get_test_inventory(**kw)
@@ -750,3 +754,43 @@ def create_test_inventory(**kw):
         del inventory['id']
     dbapi = db_api.get_instance()
     return dbapi.create_node_inventory(inventory)
+
+
+def create_test_firmware_component(**kw):
+    """Create test Firmware Component entry in DB and return object.
+
+    Function to be used to create test FirmwareComponent object in the DB.
+
+    :param kw: kwargs with overriding values for firmware component
+    :returns: Test FirmwareComponent DB object
+    """
+    fw_cmp_values = get_test_firmware_component(**kw)
+    if 'id' not in kw:
+        del fw_cmp_values['id']
+    dbapi = db_api.get_instance()
+    return dbapi.create_firmware_component(fw_cmp_values)
+
+
+def get_test_firmware_component(**kw):
+    # NOTE(iurygregory): update version to get from the object in the object
+    # patch.
+    return {
+        'id': kw.get('id', 256),
+        'node_id': kw.get('node_id', 123),
+        'component': kw.get('component', 'bmc'),
+        'initial_version': kw.get('initial_version', 'v1.0.0'),
+        'current_version': kw.get('current_version', 'v1.0.0'),
+        'last_version_flashed': kw.get('last_version_flashed', None),
+        'version': kw.get('version', firmware.FirmwareComponent.VERSION),
+        'created_at': kw.get('created_at'),
+        'updated_at': kw.get('updated_at'),
+    }
+
+
+def get_test_firmware_component_list():
+    return [
+        {'component': 'bmc', 'initial_version': 'v1.0.0',
+         'current_version': 'v1.0.0', 'last_version_flashed': None},
+        {'component': 'BIOS', 'initial_version': 'v1.5.0',
+         'current_version': 'v1.5.0', 'last_version_flashed': None},
+    ]

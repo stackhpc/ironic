@@ -14,22 +14,19 @@
 
 from unittest import mock
 
-from oslo_utils import importutils
+import sushy
 
 from ironic.common import exception
 from ironic.common import states
 from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
 from ironic.drivers.modules import deploy_utils
-from ironic.drivers.modules.redfish import bios as redfish_bios
 from ironic.drivers.modules.redfish import boot as redfish_boot
 from ironic.drivers.modules.redfish import utils as redfish_utils
 from ironic import objects
 from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.db import utils as db_utils
 from ironic.tests.unit.objects import utils as obj_utils
-
-sushy = importutils.try_import('sushy')
 
 INFO_DICT = db_utils.get_test_redfish_info()
 
@@ -56,13 +53,6 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                     enabled_management_interfaces=['redfish'])
         self.node = obj_utils.create_test_node(
             self.context, driver='redfish', driver_info=INFO_DICT)
-
-    @mock.patch.object(redfish_bios, 'sushy', None)
-    def test_loading_error(self):
-        self.assertRaisesRegex(
-            exception.DriverLoadError,
-            'Unable to import the sushy library',
-            redfish_bios.RedfishBIOS)
 
     def test_get_properties(self):
         with task_manager.acquire(self.context, self.node.uuid,
@@ -203,10 +193,11 @@ class RedfishBiosTestCase(db_base.DbTestCase):
             if fast_track:
                 mock_power_action.assert_has_calls([
                     mock.call(task, states.POWER_OFF),
-                    mock.call(task, states.REBOOT),
+                    mock.call(task, states.REBOOT, None),
                 ])
             else:
-                mock_power_action.assert_called_once_with(task, states.REBOOT)
+                mock_power_action.assert_called_once_with(
+                    task, states.REBOOT, None)
             if step == 'factory_reset':
                 bios.reset_bios.assert_called_once()
             if step == 'apply_configuration':
@@ -530,6 +521,27 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                                   shared=False) as task:
             bios = mock_get_system(task.node).bios
             bios.supported_apply_times = None
+
+            task.driver.bios.apply_configuration(task, settings)
+
+            bios.set_attributes.assert_called_once_with(
+                {s['name']: s['value'] for s in settings},
+                apply_time=None)
+
+    @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
+                       spec_set=True, autospec=True)
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_configuration_no_apply_time_attr(
+            self, mock_power_action, mock_get_system, mock_build_agent_options,
+            mock_prepare):
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'},
+                    {'name': 'NicBoot1', 'value': 'NetworkBoot'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            bios = mock_get_system(task.node).bios
+            del bios.supported_apply_times
 
             task.driver.bios.apply_configuration(task, settings)
 

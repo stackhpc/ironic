@@ -106,7 +106,7 @@ node_ident:
   type: string
 port_ident:
   description: |
-    The UUID of the port.
+    The UUID or Name of the port.
   in: path
   required: true
   type: string
@@ -207,6 +207,12 @@ fields_for_conductor:
   in: query
   required: false
   type: array
+include_children:
+  description: |
+    Whether to show child nodes in the node list, which are normally hidden.
+  in: query
+  required: false
+  type: boolean
 limit:
   description: |
     Requests a page size of items. Returns a number of items up to a limit
@@ -286,7 +292,7 @@ r_description_contains:
     Filter the list of returned nodes, and only return those containing
     substring specified by ``description_contains``.
   in: query
-  requred: false
+  required: false
   type: string
 r_driver:
   description: |
@@ -343,13 +349,17 @@ r_port_node_ident:
   description: |
     Filter the list of returned Ports, and only return the ones associated
     with this specific node (name or UUID), or an empty set if not found.
+    This filter takes precedence over all other filters, and cannot be set at
+    the same time as node_uuid or portgroup.
   in: query
   required: false
   type: string
 r_port_node_uuid:
   description: |
     Filter the list of returned Ports, and only return the ones associated
-    with this specific node UUID, or an empty set if not found.
+    with this specific node UUID, or an empty set if not found. This filter
+    takes precedence over all other filters, and cannot be set at the same
+    time as node or portgroup.
   in: query
   required: false
   type: string
@@ -357,9 +367,18 @@ r_port_portgroup_ident:
   description: |
     Filter the list of returned Ports, and only return the ones associated
     with this specific Portgroup (name or UUID), or an empty set if not found.
+    This filter takes precedence over all other filters, and cannot be set at
+    the same time as node_uuid or node.
   in: query
   required: false
   type: string
+r_port_shard:
+  description: |
+    Filter the list of returned Ports, and only return the ones associated
+    with nodes in this specific shard(s), or an empty set if not found.
+  in: query
+  required: false
+  type: array
 r_portgroup_address:
   description: |
     Filter the list of returned Portgroups, and only return the ones with the
@@ -562,7 +581,7 @@ bios_setting_name:
   type: string
 bios_setting_read_only:
   description: |
-    This Bios seting is read only and can't be changed.
+    This Bios setting is read only and can't be changed.
     May be None.
   in: body
   required: true
@@ -738,6 +757,13 @@ default_deploy_interface:
   description: |
     The default deploy interface used for a node with a dynamic driver, if no
     deploy interface is specified for the node.
+  in: body
+  required: true
+  type: string
+default_firmware_interface:
+  description: |
+    The default firmware interface used for a node with a dynamic driver, if no
+    firmware interface is specified for the node.
   in: body
   required: true
   type: string
@@ -925,6 +951,12 @@ enabled_deploy_interfaces:
   in: body
   required: true
   type: list
+enabled_firmware_interfaces:
+  description: |
+    The enabled firmware interfaces for this driver.
+  in: body
+  required: true
+  type: list
 enabled_inspect_interfaces:
   description: |
     The enabled inspection interfaces for this driver.
@@ -990,6 +1022,38 @@ fault:
   in: body
   required: false
   type: string
+firmware_component:
+  description: |
+    The Firmware Component of a Node, eg. "bios".
+  in: body
+  required: true
+  type: string
+firmware_component_current_version:
+  description: |
+    The current version of a Firmware Component.
+  in: body
+  required: true
+  type: string
+firmware_component_initial_version:
+  description: |
+    The initial version of a Firmware Component.
+  in: body
+  required: true
+  type: string
+firmware_component_last_version_flashed:
+  description: |
+    The last version flashed of a Firmware Component.
+  in: body
+  required: true
+  type: string
+firmware_components:
+  description: |
+    List of Firmware Components of the node. It includes following fields
+    "created_at", "updated_at", "component", "initial_version",
+    "current_version", "last_version_flashed"
+  in: body
+  required: true
+  type: array
 history_event:
   description: |
     The event message body which has been logged related to the node for
@@ -1308,6 +1372,13 @@ owner:
   in: body
   required: false
   type: string
+parent_node:
+  description: |
+    An optional UUID which can be used to denote the "parent" baremetal
+    node.
+  in: body
+  required: false
+  type: string
 passthru_async:
   description: |
     If True the passthru function is invoked asynchronously; if False,
@@ -1360,6 +1431,12 @@ port_address:
     MAC address.
   in: body
   required: true
+  type: string
+port_name:
+  description: |
+    The name assigned to the network Port.
+  in: body
+  required: false
   type: string
 portgroup_address:
   description: |
@@ -1728,6 +1805,12 @@ req_port_address:
   in: body
   required: true
   type: string
+req_port_name:
+  description: |
+    The name assigned to the network Port.
+  in: body
+  required: false
+  type: string
 req_portgroup_address:
   description: |
     Physical hardware address of this Portgroup, typically the hardware
@@ -1807,6 +1890,20 @@ req_resource_class_create:
   in: body
   required: false
   type: string
+req_shard:
+  description: |
+    Filter the list of returned Nodes, and only return the ones associated
+    with nodes in this specific shard(s), or an empty set if not found.
+  in: body
+  required: false
+  type: array
+req_sharded:
+  description: |
+    When true, filter the list of returned Nodes, and only return the ones with
+    a non-null ``shard`` value. When false, the inverse filter is performed.
+  in: body
+  required: false
+  type: boolean
 req_standalone_ports_supported:
   description: |
     Indicates whether ports that are members of this portgroup can be
@@ -1932,6 +2029,22 @@ secure_boot:
     Indicates whether node is currently booted with secure_boot turned on.
   in: body
   type: boolean
+shard:
+  description: |
+    A string indicating the shard this node belongs to.
+  in: body
+  type: string
+shard_count:
+  description: |
+    The number of nodes with this current string as their assigned shard value.
+  in: body
+  type: integer
+shard_name:
+  description: |
+    The name of the shard. A value of "None" indicates the count of nodes with
+    an empty shard value.
+  in: body
+  type: string
 standalone_ports_supported:
   description: |
     Indicates whether ports that are members of this portgroup can be
@@ -2077,7 +2190,25 @@ versions:
   in: body
   required: true
   type: array
-
+vmedia_device_type:
+  description: |
+    The type of the virtual media device used, e.g. CDROM
+  in: body
+  required: true
+  type: string
+vmedia_image_download_source:
+  description: |
+    How the image is served to the BMC, "http" for a remote location or
+    "local" to use the local web server.
+  in: body
+  required: false
+  type: string
+vmedia_image_url:
+  description: |
+    The url of the image to attach to a virtual media device.
+  in: body
+  required: true
+  type: string
 # variables returned from volume-connector
 volume_connector_connector_id:
   description: |

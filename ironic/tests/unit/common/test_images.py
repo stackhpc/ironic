@@ -21,14 +21,16 @@ import os
 import shutil
 from unittest import mock
 
-from ironic_lib import disk_utils
 from oslo_concurrency import processutils
 from oslo_config import cfg
+from oslo_utils import fileutils
 
 from ironic.common import exception
 from ironic.common.glance_service import service_utils as glance_utils
+from ironic.common import image_format_inspector
 from ironic.common import image_service
 from ironic.common import images
+from ironic.common import qemu_img
 from ironic.common import utils
 from ironic.tests import base
 
@@ -72,87 +74,279 @@ class IronicImagesTestCase(base.TestCase):
         image_to_raw_mock.assert_called_once_with(
             'image_href', 'path', 'path.part')
 
-    @mock.patch.object(disk_utils, 'qemu_img_info', autospec=True)
-    def test_image_to_raw_no_file_format(self, qemu_img_info_mock):
-        info = self.FakeImgInfo()
-        info.file_format = None
-        qemu_img_info_mock.return_value = info
+    @mock.patch.object(fileutils, 'compute_file_checksum',
+                       autospec=True)
+    @mock.patch.object(image_service, 'get_image_service', autospec=True)
+    @mock.patch.object(images, 'image_to_raw', autospec=True)
+    @mock.patch.object(builtins, 'open', autospec=True)
+    def test_fetch_image_service_force_raw_with_checksum(
+            self, open_mock, image_to_raw_mock,
+            image_service_mock, mock_checksum):
+        mock_file_handle = mock.MagicMock(spec=io.BytesIO)
+        mock_file_handle.__enter__.return_value = 'file'
+        open_mock.return_value = mock_file_handle
+        mock_checksum.return_value = 'f00'
+
+        images.fetch('context', 'image_href', 'path', force_raw=True,
+                     checksum='f00', checksum_algo='sha256')
+
+        mock_checksum.assert_called_once_with('path', algorithm='sha256')
+        open_mock.assert_called_once_with('path', 'wb')
+        image_service_mock.return_value.download.assert_called_once_with(
+            'image_href', 'file')
+        image_to_raw_mock.assert_called_once_with(
+            'image_href', 'path', 'path.part')
+
+    @mock.patch.object(fileutils, 'compute_file_checksum',
+                       autospec=True)
+    @mock.patch.object(image_service, 'get_image_service', autospec=True)
+    @mock.patch.object(images, 'image_to_raw', autospec=True)
+    @mock.patch.object(builtins, 'open', autospec=True)
+    def test_fetch_image_service_with_checksum_mismatch(
+            self, open_mock, image_to_raw_mock,
+            image_service_mock, mock_checksum):
+        mock_file_handle = mock.MagicMock(spec=io.BytesIO)
+        mock_file_handle.__enter__.return_value = 'file'
+        open_mock.return_value = mock_file_handle
+        mock_checksum.return_value = 'a00'
+
+        self.assertRaises(exception.ImageChecksumError,
+                          images.fetch, 'context', 'image_href',
+                          'path', force_raw=True,
+                          checksum='f00', checksum_algo='sha256')
+
+        mock_checksum.assert_called_once_with('path', algorithm='sha256')
+        open_mock.assert_called_once_with('path', 'wb')
+        image_service_mock.return_value.download.assert_called_once_with(
+            'image_href', 'file')
+        # If the checksum fails, then we don't attempt to convert the image.
+        image_to_raw_mock.assert_not_called()
+
+    @mock.patch.object(fileutils, 'compute_file_checksum',
+                       autospec=True)
+    @mock.patch.object(image_service, 'get_image_service', autospec=True)
+    @mock.patch.object(images, 'image_to_raw', autospec=True)
+    @mock.patch.object(builtins, 'open', autospec=True)
+    def test_fetch_image_service_force_raw_no_checksum_algo(
+            self, open_mock, image_to_raw_mock,
+            image_service_mock, mock_checksum):
+        mock_file_handle = mock.MagicMock(spec=io.BytesIO)
+        mock_file_handle.__enter__.return_value = 'file'
+        open_mock.return_value = mock_file_handle
+        mock_checksum.return_value = 'f00'
+
+        images.fetch('context', 'image_href', 'path', force_raw=True,
+                     checksum='f00')
+
+        mock_checksum.assert_called_once_with('path', algorithm='md5')
+        open_mock.assert_called_once_with('path', 'wb')
+        image_service_mock.return_value.download.assert_called_once_with(
+            'image_href', 'file')
+        image_to_raw_mock.assert_called_once_with(
+            'image_href', 'path', 'path.part')
+
+    @mock.patch.object(fileutils, 'compute_file_checksum',
+                       autospec=True)
+    @mock.patch.object(image_service, 'get_image_service', autospec=True)
+    @mock.patch.object(images, 'image_to_raw', autospec=True)
+    @mock.patch.object(builtins, 'open', autospec=True)
+    def test_fetch_image_service_force_raw_combined_algo(
+            self, open_mock, image_to_raw_mock,
+            image_service_mock, mock_checksum):
+        mock_file_handle = mock.MagicMock(spec=io.BytesIO)
+        mock_file_handle.__enter__.return_value = 'file'
+        open_mock.return_value = mock_file_handle
+        mock_checksum.return_value = 'f00'
+
+        images.fetch('context', 'image_href', 'path', force_raw=True,
+                     checksum='sha512:f00')
+
+        mock_checksum.assert_called_once_with('path', algorithm='sha512')
+        open_mock.assert_called_once_with('path', 'wb')
+        image_service_mock.return_value.download.assert_called_once_with(
+            'image_href', 'file')
+        image_to_raw_mock.assert_called_once_with(
+            'image_href', 'path', 'path.part')
+
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_image_to_raw_not_permitted_format(self, detect_format_mock):
+        info = mock.MagicMock()
+        # In the case the image looks okay, but it is not in our permitted
+        # format list, we need to ensure we still fail appropriately.
+        info.safety_check.return_value = True
+        info.__str__.return_value = 'vhd'
+        detect_format_mock.return_value = info
 
         e = self.assertRaises(exception.ImageUnacceptable, images.image_to_raw,
                               'image_href', 'path', 'path_tmp')
-        qemu_img_info_mock.assert_called_once_with('path_tmp')
-        self.assertIn("'qemu-img info' parsing failed.", str(e))
+        info.safety_check.assert_called_once()
+        detect_format_mock.assert_called_once_with('path_tmp')
+        self.assertIn("The requested image is not valid for use.", str(e))
 
-    @mock.patch.object(disk_utils, 'qemu_img_info', autospec=True)
-    def test_image_to_raw_backing_file_present(self, qemu_img_info_mock):
-        info = self.FakeImgInfo()
-        info.file_format = 'raw'
-        info.backing_file = 'backing_file'
-        qemu_img_info_mock.return_value = info
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_image_to_raw_fails_safety_check(self, detect_format_mock):
+        info = mock.MagicMock()
+        info.__str__.return_value = 'qcow2'
+        info.safety_check.return_value = False
+        detect_format_mock.return_value = info
 
         e = self.assertRaises(exception.ImageUnacceptable, images.image_to_raw,
                               'image_href', 'path', 'path_tmp')
-        qemu_img_info_mock.assert_called_once_with('path_tmp')
-        self.assertIn("fmt=raw backed by: backing_file", str(e))
+        info.safety_check.assert_called_once()
+        detect_format_mock.assert_called_once_with('path_tmp')
+        self.assertIn("The requested image is not valid for use.", str(e))
 
     @mock.patch.object(os, 'rename', autospec=True)
     @mock.patch.object(os, 'unlink', autospec=True)
-    @mock.patch.object(disk_utils, 'convert_image', autospec=True)
-    @mock.patch.object(disk_utils, 'qemu_img_info', autospec=True)
-    def test_image_to_raw(self, qemu_img_info_mock, convert_image_mock,
+    @mock.patch.object(qemu_img, 'convert_image', autospec=True)
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_image_to_raw(self, detect_format_mock, convert_image_mock,
                           unlink_mock, rename_mock):
         CONF.set_override('force_raw_images', True)
-        info = self.FakeImgInfo()
-        info.file_format = 'fmt'
+        info = mock.MagicMock()
+        info.__str__.side_effect = iter(['qcow2', 'raw'])
         info.backing_file = None
-        qemu_img_info_mock.return_value = info
+        info.saftey_check.return_value = True
+        detect_format_mock.return_value = info
 
-        def convert_side_effect(source, dest, out_format):
+        def convert_side_effect(source, dest, out_format, source_format):
             info.file_format = 'raw'
         convert_image_mock.side_effect = convert_side_effect
 
         images.image_to_raw('image_href', 'path', 'path_tmp')
-
-        qemu_img_info_mock.assert_has_calls([mock.call('path_tmp'),
-                                             mock.call('path.converted')])
+        info.safety_check.assert_called_once()
+        self.assertEqual(2, info.__str__.call_count)
+        detect_format_mock.assert_has_calls([
+            mock.call('path_tmp'),
+            mock.call('path.converted')])
         convert_image_mock.assert_called_once_with('path_tmp',
-                                                   'path.converted', 'raw')
+                                                   'path.converted', 'raw',
+                                                   source_format='qcow2')
         unlink_mock.assert_called_once_with('path_tmp')
         rename_mock.assert_called_once_with('path.converted', 'path')
 
+    @mock.patch.object(os, 'rename', autospec=True)
     @mock.patch.object(os, 'unlink', autospec=True)
-    @mock.patch.object(disk_utils, 'convert_image', autospec=True)
-    @mock.patch.object(disk_utils, 'qemu_img_info', autospec=True)
-    def test_image_to_raw_not_raw_after_conversion(self, qemu_img_info_mock,
+    @mock.patch.object(qemu_img, 'convert_image', autospec=True)
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_image_to_raw_safety_check_disabled(
+            self, detect_format_mock, convert_image_mock,
+            unlink_mock, rename_mock):
+        CONF.set_override('force_raw_images', True)
+        CONF.set_override('disable_deep_image_inspection', True,
+                          group='conductor')
+        info = mock.MagicMock()
+        info.__str__.side_effect = iter(['vmdk', 'raw'])
+        info.backing_file = None
+        info.saftey_check.return_value = None
+        detect_format_mock.return_value = info
+
+        def convert_side_effect(source, dest, out_format, source_format):
+            info.file_format = 'raw'
+        convert_image_mock.side_effect = convert_side_effect
+
+        images.image_to_raw('image_href', 'path', 'path_tmp')
+        info.safety_check.assert_not_called()
+        detect_format_mock.assert_has_calls([
+            mock.call('path')])
+        self.assertEqual(2, info.__str__.call_count)
+        convert_image_mock.assert_called_once_with('path_tmp',
+                                                   'path.converted', 'raw',
+                                                   source_format='vmdk')
+        unlink_mock.assert_called_once_with('path_tmp')
+        rename_mock.assert_called_once_with('path.converted', 'path')
+
+    @mock.patch.object(os, 'rename', autospec=True)
+    @mock.patch.object(os, 'unlink', autospec=True)
+    @mock.patch.object(qemu_img, 'convert_image', autospec=True)
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_image_to_raw_safety_check_disabled_fails_to_convert(
+            self, detect_format_mock, convert_image_mock,
+            unlink_mock, rename_mock):
+        CONF.set_override('force_raw_images', True)
+        CONF.set_override('disable_deep_image_inspection', True,
+                          group='conductor')
+        info = mock.MagicMock()
+        info.__str__.return_value = 'vmdk'
+        info.backing_file = None
+        info.saftey_check.return_value = None
+        detect_format_mock.return_value = info
+
+        self.assertRaises(exception.ImageConvertFailed,
+                          images.image_to_raw,
+                          'image_href', 'path', 'path_tmp')
+        info.safety_check.assert_not_called()
+        self.assertEqual(2, info.__str__.call_count)
+        detect_format_mock.assert_has_calls([
+            mock.call('path')])
+        convert_image_mock.assert_called_once_with('path_tmp',
+                                                   'path.converted', 'raw',
+                                                   source_format='vmdk')
+        unlink_mock.assert_called_once_with('path_tmp')
+        rename_mock.assert_not_called()
+
+    @mock.patch.object(os, 'unlink', autospec=True)
+    @mock.patch.object(qemu_img, 'convert_image', autospec=True)
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_image_to_raw_not_raw_after_conversion(self, detect_format_mock,
                                                    convert_image_mock,
                                                    unlink_mock):
         CONF.set_override('force_raw_images', True)
-        info = self.FakeImgInfo()
-        info.file_format = 'fmt'
-        info.backing_file = None
-        qemu_img_info_mock.return_value = info
+        info = mock.MagicMock()
+        info.__str__.return_value = 'qcow2'
+        detect_format_mock.return_value = info
 
         self.assertRaises(exception.ImageConvertFailed, images.image_to_raw,
                           'image_href', 'path', 'path_tmp')
-        qemu_img_info_mock.assert_has_calls([mock.call('path_tmp'),
-                                             mock.call('path.converted')])
         convert_image_mock.assert_called_once_with('path_tmp',
-                                                   'path.converted', 'raw')
+                                                   'path.converted', 'raw',
+                                                   source_format='qcow2')
         unlink_mock.assert_called_once_with('path_tmp')
+        info.safety_check.assert_called_once()
+        info.safety_check.assert_called_once()
+        self.assertEqual(2, info.__str__.call_count)
+        detect_format_mock.assert_has_calls([
+            mock.call('path_tmp'),
+            mock.call('path.converted')])
 
     @mock.patch.object(os, 'rename', autospec=True)
-    @mock.patch.object(disk_utils, 'qemu_img_info', autospec=True)
-    def test_image_to_raw_already_raw_format(self, qemu_img_info_mock,
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_image_to_raw_already_raw_format(self, detect_format_mock,
                                              rename_mock):
-        info = self.FakeImgInfo()
-        info.file_format = 'raw'
-        info.backing_file = None
-        qemu_img_info_mock.return_value = info
+        info = mock.MagicMock()
+        info.__str__.return_value = 'raw'
+        detect_format_mock.return_value = info
 
         images.image_to_raw('image_href', 'path', 'path_tmp')
 
-        qemu_img_info_mock.assert_called_once_with('path_tmp')
         rename_mock.assert_called_once_with('path_tmp', 'path')
+        info.safety_check.assert_called_once()
+        info.safety_check.assert_called_once()
+        self.assertEqual(1, info.__str__.call_count)
+        detect_format_mock.assert_called_once_with('path_tmp')
+
+    @mock.patch.object(os, 'rename', autospec=True)
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_image_to_raw_already_iso(self, detect_format_mock,
+                                      rename_mock):
+        info = mock.MagicMock()
+        info.__str__.return_value = 'iso'
+        detect_format_mock.return_value = info
+
+        images.image_to_raw('image_href', 'path', 'path_tmp')
+
+        rename_mock.assert_called_once_with('path_tmp', 'path')
+        info.safety_check.assert_called_once()
+        self.assertEqual(1, info.__str__.call_count)
+        detect_format_mock.assert_called_once_with('path_tmp')
 
     @mock.patch.object(image_service, 'get_image_service', autospec=True)
     def test_image_show_no_image_service(self, image_service_mock):
@@ -175,36 +369,39 @@ class IronicImagesTestCase(base.TestCase):
         show_mock.assert_called_once_with('context', 'image_href',
                                           'image_service')
 
-    @mock.patch.object(disk_utils, 'qemu_img_info', autospec=True)
-    def test_converted_size_estimate_default(self, qemu_img_info_mock):
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_converted_size_estimate_default(self, image_info_mock):
         info = self.FakeImgInfo()
-        info.disk_size = 2
+        info.actual_size = 2
         info.virtual_size = 10 ** 10
-        qemu_img_info_mock.return_value = info
+        image_info_mock.return_value = info
         size = images.converted_size('path', estimate=True)
-        qemu_img_info_mock.assert_called_once_with('path')
+        image_info_mock.assert_called_once_with('path')
         self.assertEqual(4, size)
 
-    @mock.patch.object(disk_utils, 'qemu_img_info', autospec=True)
-    def test_converted_size_estimate_custom(self, qemu_img_info_mock):
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_converted_size_estimate_custom(self, image_info_mock):
         CONF.set_override('raw_image_growth_factor', 3)
         info = self.FakeImgInfo()
-        info.disk_size = 2
+        info.actual_size = 2
         info.virtual_size = 10 ** 10
-        qemu_img_info_mock.return_value = info
+        image_info_mock.return_value = info
         size = images.converted_size('path', estimate=True)
-        qemu_img_info_mock.assert_called_once_with('path')
+        image_info_mock.assert_called_once_with('path')
         self.assertEqual(6, size)
 
-    @mock.patch.object(disk_utils, 'qemu_img_info', autospec=True)
-    def test_converted_size_estimate_raw_smaller(self, qemu_img_info_mock):
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    def test_converted_size_estimate_raw_smaller(self, image_info_mock):
         CONF.set_override('raw_image_growth_factor', 3)
         info = self.FakeImgInfo()
-        info.disk_size = 2
+        info.actual_size = 2
         info.virtual_size = 5
-        qemu_img_info_mock.return_value = info
+        image_info_mock.return_value = info
         size = images.converted_size('path', estimate=True)
-        qemu_img_info_mock.assert_called_once_with('path')
+        image_info_mock.assert_called_once_with('path')
         self.assertEqual(5, size)
 
     @mock.patch.object(images, 'get_image_properties', autospec=True)
@@ -519,13 +716,11 @@ class FsImageTestCase(base.TestCase):
         walk_mock.assert_called_once_with('tmpdir1')
         rmtree_mock.assert_called_once_with('tmpdir1')
 
-    @mock.patch.object(utils, 'mount', autospec=True)
-    def test__get_deploy_iso_files_fail_with_ExecutionError(
-            self, get_iso_files_mock):
-        get_iso_files_mock.side_effect = processutils.ProcessExecutionError
-        self.assertRaises(exception.ImageCreationFailed,
-                          images._get_deploy_iso_files,
-                          'path/to/deployiso', 'tmpdir1')
+    def test__get_deploy_iso_files_fail_with_ExecutionError(self):
+        self.assertRaisesRegex(exception.ImageCreationFailed,
+                               'No such file or directory',
+                               images._get_deploy_iso_files,
+                               'path/to/deployiso', 'tmpdir1')
 
     @mock.patch.object(shutil, 'rmtree', autospec=True)
     @mock.patch.object(images, '_create_root_fs', autospec=True)
@@ -570,7 +765,8 @@ class FsImageTestCase(base.TestCase):
                                          'path/to/kernel',
                                          'path/to/ramdisk',
                                          deploy_iso='path/to/deploy_iso',
-                                         kernel_params=params)
+                                         kernel_params=params,
+                                         publisher_id='1-23-4')
         get_iso_files_mock.assert_called_once_with('path/to/deploy_iso',
                                                    'mountdir')
         create_root_fs_mock.assert_called_once_with('tmpdir', files_info)
@@ -578,7 +774,8 @@ class FsImageTestCase(base.TestCase):
                                      grub_options)
         write_to_file_mock.assert_any_call(grub_file, grubcfg)
         execute_mock.assert_called_once_with(
-            'mkisofs', '-r', '-V', 'VMEDIA_BOOT_ISO', '-l', '-e',
+            'mkisofs', '-r', '-V', 'VMEDIA_BOOT_ISO', '-l',
+            '-publisher', '1-23-4', '-e',
             'path/to/efiboot.img', '-no-emul-boot', '-o', 'tgt_file', 'tmpdir')
         rmtree_mock.assert_called_once_with('mountdir')
 
@@ -653,7 +850,8 @@ class FsImageTestCase(base.TestCase):
                                               'path/to/kernel',
                                               'path/to/ramdisk',
                                               kernel_params=params,
-                                              inject_files=inject_files)
+                                              inject_files=inject_files,
+                                              publisher_id='1-23-4')
 
         files_info = {
             'path/to/kernel': 'vmlinuz',
@@ -672,6 +870,7 @@ class FsImageTestCase(base.TestCase):
         execute_mock.assert_called_once_with(
             'mkisofs', '-r', '-V',
             "VMEDIA_BOOT_ISO", '-J', '-l',
+            '-publisher', '1-23-4',
             '-no-emul-boot', '-boot-load-size',
             '4', '-boot-info-table', '-b', 'isolinux/isolinux.bin',
             '-o', 'tgt_file', 'tmpdir')
@@ -811,7 +1010,8 @@ class FsImageTestCase(base.TestCase):
         create_isolinux_mock.assert_called_once_with(
             'output_file', 'tmpdir/kernel', 'tmpdir/ramdisk',
             deploy_iso='tmpdir/iso',
-            esp_image=None, kernel_params=params, inject_files=None)
+            esp_image=None, kernel_params=params, inject_files=None,
+            publisher_id=None)
 
     @mock.patch.object(images, 'create_esp_image_for_uefi', autospec=True)
     @mock.patch.object(images, 'fetch', autospec=True)
@@ -839,7 +1039,8 @@ class FsImageTestCase(base.TestCase):
         create_isolinux_mock.assert_called_once_with(
             'output_file', 'tmpdir/kernel', 'tmpdir/ramdisk',
             deploy_iso=None, esp_image='tmpdir/esp',
-            kernel_params=params, inject_files=None)
+            kernel_params=params, inject_files=None,
+            publisher_id=None)
 
     @mock.patch.object(images, 'create_esp_image_for_uefi', autospec=True)
     @mock.patch.object(images, 'fetch', autospec=True)
@@ -867,7 +1068,8 @@ class FsImageTestCase(base.TestCase):
         create_isolinux_mock.assert_called_once_with(
             'output_file', 'tmpdir/kernel', 'tmpdir/ramdisk',
             deploy_iso='tmpdir/iso',
-            esp_image=None, kernel_params=params, inject_files=None)
+            esp_image=None, kernel_params=params, inject_files=None,
+            publisher_id=None)
 
     @mock.patch.object(images, 'create_esp_image_for_uefi', autospec=True)
     @mock.patch.object(images, 'fetch', autospec=True)
@@ -882,7 +1084,7 @@ class FsImageTestCase(base.TestCase):
             'ctx', 'output_file', 'http://kernel-href', 'http://ramdisk-href',
             esp_image_href='http://efiboot-href',
             root_uuid='root-uuid', kernel_params='kernel-params',
-            boot_mode='uefi')
+            boot_mode='uefi', publisher_id='1-23-4')
 
         expected_calls = [mock.call('ctx', 'http://kernel-href',
                                     'tmpdir/kernel'),
@@ -895,7 +1097,8 @@ class FsImageTestCase(base.TestCase):
         create_isolinux_mock.assert_called_once_with(
             'output_file', 'tmpdir/kernel', 'tmpdir/ramdisk',
             deploy_iso=None, esp_image='tmpdir/esp',
-            kernel_params=params, inject_files=None)
+            kernel_params=params, inject_files=None,
+            publisher_id='1-23-4')
 
     @mock.patch.object(images, 'create_isolinux_image_for_bios', autospec=True)
     @mock.patch.object(images, 'fetch', autospec=True)
@@ -909,7 +1112,8 @@ class FsImageTestCase(base.TestCase):
         images.create_boot_iso('ctx', 'output_file', 'kernel-uuid',
                                'ramdisk-uuid', 'deploy_iso-uuid',
                                'efiboot-uuid', 'root-uuid',
-                               'kernel-params', 'bios')
+                               'kernel-params', 'bios',
+                               publisher_id='1-23-4')
 
         fetch_images_mock.assert_any_call(
             'ctx', 'kernel-uuid', 'tmpdir/kernel')
@@ -926,7 +1130,8 @@ class FsImageTestCase(base.TestCase):
         params = ['root=UUID=root-uuid', 'kernel-params']
         create_isolinux_mock.assert_called_once_with(
             'output_file', 'tmpdir/kernel', 'tmpdir/ramdisk',
-            kernel_params=params, inject_files=None)
+            kernel_params=params, inject_files=None,
+            publisher_id='1-23-4')
 
     @mock.patch.object(images, 'create_isolinux_image_for_bios', autospec=True)
     @mock.patch.object(images, 'fetch', autospec=True)
@@ -951,7 +1156,8 @@ class FsImageTestCase(base.TestCase):
         params = ['root=UUID=root-uuid', 'kernel-params']
         create_isolinux_mock.assert_called_once_with(
             'output_file', 'tmpdir/kernel', 'tmpdir/ramdisk',
-            kernel_params=params, inject_files=None)
+            kernel_params=params, inject_files=None,
+            publisher_id=None)
 
     @mock.patch.object(image_service, 'get_image_service', autospec=True)
     def test_get_glance_image_properties_no_such_prop(self,

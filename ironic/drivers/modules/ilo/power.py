@@ -79,12 +79,21 @@ def _get_power_state(node):
     # Check the current power state.
     try:
         power_status = ilo_object.get_host_power_status()
-
     except ilo_error.IloError as ilo_exception:
         LOG.error("iLO get_power_state failed for node %(node_id)s with "
                   "error: %(error)s.",
                   {'node_id': node.uuid, 'error': ilo_exception})
         operation = _('iLO get_power_status')
+        if 'RIBCLI is disabled' in str(ilo_exception):
+            warn_msg = ("Node %s appears to have a disabled API "
+                        "required for the \'%s\' hardware type to function. "
+                        "Please consider using the \'redfish\' hardware "
+                        "type." % (node.uuid, node.driver))
+            manager_utils.node_history_record(node, event=warn_msg,
+                                              event_type=node.provision_state,
+                                              error=True)
+            raise exception.IloOperationError(operation=operation,
+                                              error=warn_msg)
         raise exception.IloOperationError(operation=operation,
                                           error=ilo_exception)
 
@@ -174,9 +183,12 @@ def _wait_for_state_change(node, target_state, requested_state,
     else:
         timeout = int(max_retry * interval)
         LOG.error("iLO failed to change state to %(tstate)s "
-                  "within %(timeout)s sec for node %(node)s",
+                  "within %(timeout)s sec for node %(node)s. Reported "
+                  "state from iLO is %(state)s, expected state from iLO "
+                  "is %(expected)s.",
                   {'tstate': target_state, 'node': node.uuid,
-                   'timeout': int(max_retry * interval)})
+                   'timeout': int(max_retry * interval), 'state': state[0],
+                   'expected': state_to_check})
         raise exception.PowerStateFailure(pstate=target_state)
 
 
@@ -272,7 +284,7 @@ def _can_get_server_post_state(node):
     Returns True if the POST state of the server can be retrieved.
     It cannot be retrieved for older ProLiant models.
     :param node: The node.
-    :returns: True if POST state can be retrieved, else Flase.
+    :returns: True if POST state can be retrieved, else False.
     :raises: IloOperationError on an error from IloClient library.
     """
     try:

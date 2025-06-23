@@ -70,7 +70,11 @@ def get_client(token=None, context=None, auth_from_config=False):
 
     user_auth = None
     if (not auth_from_config and CONF.neutron.auth_type != 'none'
-            and context.auth_token):
+            and context.auth_token and not context.system_scope):
+        # If we have a token, we *should* use the user's auth, however we
+        # can only do so *if* it is a project scoped request. If it is
+        # system scoped, we cannot leverage user auth data to make the next
+        # request.
         user_auth = keystone.get_service_auth(context, endpoint, service_auth)
 
     sess = keystone.get_session('neutron', timeout=CONF.neutron.timeout,
@@ -311,8 +315,20 @@ def add_ports_to_network(task, network_uuid, security_groups=None):
             continue
 
         update_port_attrs['mac_address'] = ironic_port.address
+
+        # Stores local link information for the port
         binding_profile = {'local_link_information':
                            [portmap[ironic_port.uuid]]}
+
+        # Determine if network type is OVN
+        if is_ovn_vtep_port(ironic_port):
+            vtep_logical_switch = \
+                portmap[ironic_port.uuid]['vtep_logical_switch']
+            vtep_physical_switch = \
+                portmap[ironic_port.uuid]['vtep_physical_switch']
+            binding_profile['vtep_logical_switch'] = vtep_logical_switch
+            binding_profile['vtep_physical_switch'] = vtep_physical_switch
+
         update_port_attrs['binding:profile'] = binding_profile
 
         if not ironic_port.pxe_enabled:
@@ -378,6 +394,28 @@ def add_ports_to_network(task, network_uuid, security_groups=None):
                  {'node_uuid': node.uuid, 'net': network_uuid, 'ports': ports})
 
     return ports
+
+
+def is_ovn_vtep_port(port_info):
+    """Check if the current port is an OVN VTEP port
+
+    :param port_info: an instance of ironic.objects.port.Port
+        or port data as a port like object
+    :returns: Boolean indicating if the port is an OVN VTEP port
+    """
+
+    local_link_connection = {}
+
+    if isinstance(port_info, objects.Port):
+        local_link_connection = port_info.local_link_connection
+    elif isinstance(port_info, dict):
+        local_link_connection = port_info['local_link_connection']
+
+    if all(k in local_link_connection.keys()
+           for k in ['vtep-logical-switch', 'vtep-physical-switch']):
+        return True
+
+    return False
 
 
 def remove_ports_from_network(task, network_uuid):
@@ -688,7 +726,8 @@ def validate_network(uuid_or_name, net_type=_('network'), context=None):
     """
     if not uuid_or_name:
         raise exception.MissingParameterValue(
-            _('UUID or name of %s is not set in configuration') % net_type)
+            _('UUID or name of %s is not set in configuration or '
+              'in node driver_info.') % net_type)
 
     client = get_client(context=context)
     network = _get_network_by_uuid_or_name(client, uuid_or_name,
@@ -943,7 +982,7 @@ class NeutronNetworkInterfaceMixin(object):
             or CONF.neutron.cleaning_network
         )
         return validate_network(
-            cleaning_network, _('cleaning network'),
+            cleaning_network, 'cleaning_network',
             context=task.context)
 
     def get_provisioning_network_uuid(self, task):
@@ -952,7 +991,7 @@ class NeutronNetworkInterfaceMixin(object):
             or CONF.neutron.provisioning_network
         )
         return validate_network(
-            provisioning_network, _('provisioning network'),
+            provisioning_network, 'provisioning_network',
             context=task.context)
 
     # TODO(stendulker): FlatNetwork should not use this method.
@@ -963,7 +1002,7 @@ class NeutronNetworkInterfaceMixin(object):
             or CONF.neutron.rescuing_network
         )
         return validate_network(
-            rescuing_network, _('rescuing network'),
+            rescuing_network, 'rescuing_network',
             context=task.context)
 
     def get_inspection_network_uuid(self, task):
@@ -972,7 +1011,7 @@ class NeutronNetworkInterfaceMixin(object):
             or CONF.neutron.inspection_network
         )
         return validate_network(
-            inspection_network, _('inspection network'),
+            inspection_network, 'inspection_network',
             context=task.context)
 
     def validate_inspection(self, task):
@@ -989,3 +1028,12 @@ class NeutronNetworkInterfaceMixin(object):
             # Fall back to non-managed in-band inspection
             raise exception.UnsupportedDriverExtension(
                 driver=task.node.driver, extension='inspection')
+
+    def get_servicing_network_uuid(self, task):
+        servicing_network = (
+            task.node.driver_info.get('servicing_network')
+            or CONF.neutron.servicing_network
+        )
+        return validate_network(
+            servicing_network, _('servicing network'),
+            context=task.context)

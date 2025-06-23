@@ -197,7 +197,8 @@ def _inspect_hardware(node, existing_traits=None, **kwargs):
         props = irmc.scci.get_essential_properties(
             report, IRMCInspect.ESSENTIAL_PROPERTIES)
         d_info = irmc_common.parse_driver_info(node)
-        if node.driver_internal_info.get('irmc_ipmi_succeed'):
+        if (getattr(node, 'power_interface') == 'ipmitool'
+            or node.driver_internal_info.get('irmc_ipmi_succeed')):
             capabilities = irmc.scci.get_capabilities_properties(
                 d_info,
                 capabilities_props,
@@ -236,7 +237,7 @@ def _inspect_hardware(node, existing_traits=None, **kwargs):
                       "with the server, please check if you have set them "
                       "correctly.")
         error = (_("Inspection failed for node %(node_id)s "
-                   "with the following error: %(error)s. (advice)s") %
+                   "with the following error: %(error)s. %(advice)s") %
                  {'node_id': node.uuid, 'error': e, 'advice': advice})
         raise exception.HardwareInspectionFailure(error=error)
 

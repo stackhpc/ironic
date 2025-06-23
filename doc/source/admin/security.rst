@@ -19,6 +19,40 @@ OpenStack deployment.
 
 .. TODO: add "Multi-tenancy Considerations" section
 
+Image Checksums
+===============
+
+Ironic has long provided a capacity to supply and check a checksum for disk
+images being deployed. However, one aspect which Ironic has not asserted is
+"Why?" in terms of "Is it for security?" or "Is it for data integrity?".
+
+The answer is both to ensure a higher level of security with remote
+image files, *and* provide faster feedback should a image being transferred
+happens to be corrupted.
+
+Normally checksums are verified by the ``ironic-python-agent`` **OR** the
+deployment interface responsible for overall deployment operation. That being
+said, not *every* deployment interface relies on disk images which have
+checksums, and those deployment interfaces are for specific use cases which
+Ironic users leverage, outside of the "general" use case capabilities provided
+by the ``direct`` deployment interface.
+
+.. NOTE::
+   Use of the node ``instance_info/image_checksum`` field is discouraged
+   for integrated OpenStack Users as usage of the matching Glance Image
+   Service field is also deprecated. That being said, Ironic retains this
+   feature by popular demand while also enabling also retain simplified
+   operator interaction.
+   The newer field values supported by Glance are also specifically
+   supported by Ironic as ``instance_info/image_os_hash_value`` for
+   checksum values and ``instance_info/image_os_hash_algo`` field for
+   the checksum algorithm.
+
+.. WARNING::
+   Setting a checksum value to a URL is supported, *however* doing this is
+   making a "tradeoff" with security as the remote checksum *can* change.
+   Conductor support this functionality can be disabled using the
+   :oslo.config:option:`conductor.disable_support_for_checksum_files` setting.
 
 REST API: user roles and policy settings
 ========================================
@@ -275,3 +309,70 @@ An easy way to do this is to:
 
     # Access IPA ramdisk functions
     "baremetal:driver:ipa_lookup": "rule:is_admin"
+
+Disk Images
+===========
+
+Ironic relies upon the ``qemu-img`` tool to convert images from a supplied
+disk image format, to a ``raw`` format in order to write the contents of a
+disk image to the remote device.
+
+By default, only ``qcow2`` format is supported for this operation, however there
+have been reports other formats work when so enabled using the
+``[conductor]permitted_image_formats`` configuration option.
+
+
+Ironic takes several steps by default.
+
+#. Ironic checks and compares supplied metadata with a remote authoritative
+   source, such as the Glance Image Service, if available.
+#. Ironic attempts to "fingerprint" the file type based upon available
+   metadata and file structure. A file format which is not known to the image
+   format inspection code may be evaluated as "raw", which means the image
+   would not be passed through ``qemu-img``. When in doubt, use a ``raw``
+   image which you can verify is in the desirable and expected state.
+#. The image then has a set of safety and sanity checks executed which look
+   for unknown or unsafe feature usage in the base format which could permit
+   an attacker to potentially leverage functionality in ``qemu-img`` which
+   should not be utilized. This check, by default, occurs only through images
+   which transverse *through* the conductor.
+#. Ironic then checks if the fingerprint values and metadata values match.
+   If they do not match, the requested image is rejected and the operation
+   fails.
+#. The image is then provided to the ``ironic-python-agent``.
+
+Images which are considered "pass-through", as in they are supplied by an
+API user as a URL, or are translated to a temporary URL via available
+service configuration, are supplied as a URL to the
+``ironic-python-agent``.
+
+Ironic can be configured to intercept this interaction and have the conductor
+download and inspect these items before the ``ironic-python-agent`` will do so,
+however this can increase the temporary disk utilization of the Conductor
+along with network traffic to facilitate the transfer. This check is disabled
+by default, but can be enabled using the
+``[conductor]conductor_always_validates_images`` configuration option.
+
+An option exists which forces all files to be served from the conductor, and
+thus force image inspection before involvement of the ``ironic-python-agent``
+is the use of the ``[agent]image_download_source`` configuration parameter
+when set to ``local`` which proxies all disk images through the conductor.
+This setting is also available in the node ``driver_info`` and
+``instance_info`` fields.
+
+Mitigating Factors to disk images
+---------------------------------
+
+In a fully integrated OpenStack context, Ironic requires images to be set to
+"public" in the Image Service.
+
+A direct API user with sufficient elevated access rights *can* submit a URL
+for the baremetal node ``instance_info`` dictionary field with an
+``image_source`` key value set to a URL. To do so explicitly requires
+elevated (trusted) access rights of a System scoped Member,
+or Project scoped Owner-Member, or a Project scoped Lessee-Admin via
+the ``baremetal:node:update_instance_info`` policy permission rule.
+Before the Wallaby release of OpenStack, this was restricted to
+``admin`` and ``baremetal_admin`` roles and remains similarly restrictive
+in the newer "Secure RBAC" model.
+

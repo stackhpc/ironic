@@ -14,7 +14,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import signal
 import sys
 import time
 
@@ -33,19 +32,18 @@ LOG = log.getLogger(__name__)
 CONF = cfg.CONF
 
 
-class RPCService(service.Service):
+class BaseRPCService(service.Service):
 
     def __init__(self, host, manager_module, manager_class):
-        super(RPCService, self).__init__()
+        super().__init__()
         self.host = host
         manager_module = importutils.try_import(manager_module)
         manager_class = getattr(manager_module, manager_class)
-        self.manager = manager_class(host, rpc.MANAGER_TOPIC)
+        self.manager = manager_class(host)
         self.topic = self.manager.topic
         self.rpcserver = None
-        self.deregister = True
-        self._failure = None
         self._started = False
+        self._failure = None
 
     def wait_for_start(self):
         while not self._started and not self._failure:
@@ -57,7 +55,7 @@ class RPCService(service.Service):
     def start(self):
         self._failure = None
         self._started = False
-        super(RPCService, self).start()
+        super().start()
         try:
             self._real_start()
         except Exception as exc:
@@ -65,6 +63,9 @@ class RPCService(service.Service):
             raise
         else:
             self._started = True
+
+    def handle_signal(self):
+        pass
 
     def _real_start(self):
         admin_context = context.get_admin_context()
@@ -85,43 +86,8 @@ class RPCService(service.Service):
 
         self.handle_signal()
         self.manager.init_host(admin_context)
-        rpc.set_global_manager(self.manager)
 
         LOG.info('Created RPC server with %(transport)s transport for service '
                  '%(service)s on host %(host)s.',
                  {'service': self.topic, 'host': self.host,
                   'transport': CONF.rpc_transport})
-
-    def stop(self):
-        try:
-            if self.rpcserver is not None:
-                self.rpcserver.stop()
-                self.rpcserver.wait()
-        except Exception as e:
-            LOG.exception('Service error occurred when stopping the '
-                          'RPC server. Error: %s', e)
-        try:
-            self.manager.del_host(deregister=self.deregister)
-        except Exception as e:
-            LOG.exception('Service error occurred when cleaning up '
-                          'the RPC manager. Error: %s', e)
-
-        super(RPCService, self).stop(graceful=True)
-        LOG.info('Stopped RPC server for service %(service)s on host '
-                 '%(host)s.',
-                 {'service': self.topic, 'host': self.host})
-        rpc.set_global_manager(None)
-
-    def _handle_signal(self, signo, frame):
-        LOG.info('Got signal SIGUSR1. Not deregistering on next shutdown '
-                 'of service %(service)s on host %(host)s.',
-                 {'service': self.topic, 'host': self.host})
-        self.deregister = False
-
-    def handle_signal(self):
-        """Add a signal handler for SIGUSR1.
-
-        The handler ensures that the manager is not deregistered when it is
-        shutdown.
-        """
-        signal.signal(signal.SIGUSR1, self._handle_signal)

@@ -23,9 +23,11 @@ import time
 from unittest import mock
 import uuid
 
+from oslo_config import cfg
 from oslo_utils import uuidutils
 
 from ironic.common import exception
+from ironic.common import image_format_inspector
 from ironic.common import image_service
 from ironic.common import images
 from ironic.common import utils
@@ -63,7 +65,8 @@ class TestImageCacheFetch(BaseTest):
         self.cache.fetch_image(self.uuid, self.dest_path)
         self.assertFalse(mock_download.called)
         mock_fetch.assert_called_once_with(
-            None, self.uuid, self.dest_path, True)
+            None, self.uuid, self.dest_path, True,
+            None, None, None)
         self.assertFalse(mock_clean_up.called)
         mock_image_service.assert_not_called()
 
@@ -80,7 +83,8 @@ class TestImageCacheFetch(BaseTest):
                           self.uuid, self.dest_path)
         self.assertFalse(mock_download.called)
         mock_fetch.assert_called_once_with(
-            None, self.uuid, self.dest_path, True)
+            None, self.uuid, self.dest_path, True,
+            None, None, None)
         self.assertFalse(mock_clean_up.called)
         mock_image_service.assert_not_called()
 
@@ -155,7 +159,8 @@ class TestImageCacheFetch(BaseTest):
         mock_download.assert_called_once_with(
             self.cache, self.uuid, self.master_path, self.dest_path,
             mock_image_service.return_value.show.return_value,
-            ctx=None, force_raw=True)
+            ctx=None, force_raw=True, expected_format=None,
+            expected_checksum=None, expected_checksum_algo=None)
         mock_clean_up.assert_called_once_with(self.cache)
         mock_image_service.assert_called_once_with(self.uuid, context=None)
         mock_image_service.return_value.show.assert_called_once_with(self.uuid)
@@ -177,7 +182,8 @@ class TestImageCacheFetch(BaseTest):
         mock_download.assert_called_once_with(
             self.cache, self.uuid, self.master_path, self.dest_path,
             mock_image_service.return_value.show.return_value,
-            ctx=None, force_raw=True)
+            ctx=None, force_raw=True, expected_format=None,
+            expected_checksum=None, expected_checksum_algo=None)
         mock_clean_up.assert_called_once_with(self.cache)
 
     def test_fetch_image_not_uuid(self, mock_download, mock_clean_up,
@@ -190,7 +196,8 @@ class TestImageCacheFetch(BaseTest):
         mock_download.assert_called_once_with(
             self.cache, href, master_path, self.dest_path,
             mock_image_service.return_value.show.return_value,
-            ctx=None, force_raw=True)
+            ctx=None, force_raw=True, expected_format=None,
+            expected_checksum=None, expected_checksum_algo=None)
         self.assertTrue(mock_clean_up.called)
 
     def test_fetch_image_not_uuid_no_force_raw(self, mock_download,
@@ -199,11 +206,14 @@ class TestImageCacheFetch(BaseTest):
         href = u'http://abc.com/ubuntu.qcow2'
         href_converted = str(uuid.uuid5(uuid.NAMESPACE_URL, href))
         master_path = os.path.join(self.master_dir, href_converted)
-        self.cache.fetch_image(href, self.dest_path, force_raw=False)
+        self.cache.fetch_image(href, self.dest_path, force_raw=False,
+                               expected_checksum='f00',
+                               expected_checksum_algo='sha256')
         mock_download.assert_called_once_with(
             self.cache, href, master_path, self.dest_path,
             mock_image_service.return_value.show.return_value,
-            ctx=None, force_raw=False)
+            ctx=None, force_raw=False, expected_format=None,
+            expected_checksum='f00', expected_checksum_algo='sha256')
         self.assertTrue(mock_clean_up.called)
 
 
@@ -211,7 +221,8 @@ class TestImageCacheFetch(BaseTest):
 class TestImageCacheDownload(BaseTest):
 
     def test__download_image(self, mock_fetch):
-        def _fake_fetch(ctx, uuid, tmp_path, *args):
+        def _fake_fetch(ctx, uuid, tmp_path, force_raw, expected_format,
+                        expected_checksum, expected_checksum_algo):
             self.assertEqual(self.uuid, uuid)
             self.assertNotEqual(self.dest_path, tmp_path)
             self.assertNotEqual(os.path.dirname(tmp_path), self.master_dir)
@@ -233,7 +244,8 @@ class TestImageCacheDownload(BaseTest):
         # Make sure we don't use any parts of the URL anywhere.
         url = "http://example.com/image.iso?secret=%s" % ("x" * 1000)
 
-        def _fake_fetch(ctx, href, tmp_path, *args):
+        def _fake_fetch(ctx, href, tmp_path, force_raw, expected_format,
+                        expected_checksum, expected_checksum_algo):
             self.assertEqual(url, href)
             self.assertNotEqual(self.dest_path, tmp_path)
             self.assertNotEqual(os.path.dirname(tmp_path), self.master_dir)
@@ -517,7 +529,8 @@ class TestImageCacheCleanUp(base.TestCase):
     @mock.patch.object(utils, 'rmtree_without_raise', autospec=True)
     @mock.patch.object(image_cache, '_fetch', autospec=True)
     def test_temp_images_not_cleaned(self, mock_fetch, mock_rmtree):
-        def _fake_fetch(ctx, uuid, tmp_path, *args):
+        def _fake_fetch(ctx, uuid, tmp_path, force_raw, expected_format,
+                        expected_checksum, expected_checksum_algo):
             with open(tmp_path, 'w') as fp:
                 fp.write("TEST" * 10)
 
@@ -572,7 +585,7 @@ class TestImageCacheCleanUp(base.TestCase):
 
         self.assertEqual(image_cache._cache_cleanup_list[0][1], Cache2)
 
-        # The order of caches with same prioirty is not deterministic.
+        # The order of caches with same priority is not deterministic.
         item_possibilities = [Cache1, Cache3]
         second_item_actual = image_cache._cache_cleanup_list[1][1]
         self.assertIn(second_item_actual, item_possibilities)
@@ -754,57 +767,228 @@ class CleanupImageCacheTestCase(base.TestCase):
 
 class TestFetchCleanup(base.TestCase):
 
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    @mock.patch.object(images, 'image_show', autospec=True)
+    @mock.patch.object(os, 'remove', autospec=True)
     @mock.patch.object(images, 'converted_size', autospec=True)
     @mock.patch.object(images, 'fetch', autospec=True)
     @mock.patch.object(images, 'image_to_raw', autospec=True)
-    @mock.patch.object(images, 'force_raw_will_convert', autospec=True,
-                       return_value=True)
     @mock.patch.object(image_cache, '_clean_up_caches', autospec=True)
     def test__fetch(
-            self, mock_clean, mock_will_convert, mock_raw, mock_fetch,
-            mock_size):
+            self, mock_clean, mock_raw, mock_fetch,
+            mock_size, mock_remove, mock_show, mock_format_inspector):
+        image_check = mock.MagicMock()
+        image_check.__str__.side_effect = iter(['qcow2', 'raw'])
+        image_check.safety_check.return_value = True
+        mock_format_inspector.return_value = image_check
+        mock_show.return_value = {}
         mock_size.return_value = 100
-        image_cache._fetch('fake', 'fake-uuid', '/foo/bar', force_raw=True)
+        image_cache._fetch('fake', 'fake-uuid', '/foo/bar', force_raw=True,
+                           expected_checksum='1234',
+                           expected_checksum_algo='md5')
         mock_fetch.assert_called_once_with('fake', 'fake-uuid',
-                                           '/foo/bar.part', force_raw=False)
+                                           '/foo/bar.part', force_raw=False,
+                                           checksum='1234',
+                                           checksum_algo='md5')
         mock_clean.assert_called_once_with('/foo', 100)
         mock_raw.assert_called_once_with('fake-uuid', '/foo/bar',
                                          '/foo/bar.part')
-        mock_will_convert.assert_called_once_with('fake-uuid', '/foo/bar.part')
+        mock_remove.assert_not_called()
+        mock_show.assert_called_once_with('fake', 'fake-uuid')
+        mock_format_inspector.assert_called_once_with('/foo/bar.part')
+        image_check.safety_check.assert_called_once()
+        self.assertEqual(1, image_check.__str__.call_count)
 
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    @mock.patch.object(images, 'image_show', autospec=True)
+    @mock.patch.object(os, 'remove', autospec=True)
     @mock.patch.object(images, 'converted_size', autospec=True)
     @mock.patch.object(images, 'fetch', autospec=True)
     @mock.patch.object(images, 'image_to_raw', autospec=True)
-    @mock.patch.object(images, 'force_raw_will_convert', autospec=True,
-                       return_value=False)
     @mock.patch.object(image_cache, '_clean_up_caches', autospec=True)
-    def test__fetch_already_raw(
-            self, mock_clean, mock_will_convert, mock_raw, mock_fetch,
-            mock_size):
+    def test__fetch_deep_inspection_disabled(
+            self, mock_clean, mock_raw, mock_fetch,
+            mock_size, mock_remove, mock_show, mock_format_inspector):
+        cfg.CONF.set_override(
+            'disable_deep_image_inspection', True,
+            group='conductor')
+        image_check = mock.MagicMock()
+        image_check.__str__.return_value = 'qcow2'
+        image_check.safety_check.return_value = True
+        mock_format_inspector.return_value = image_check
+        mock_show.return_value = {}
+        mock_size.return_value = 100
         image_cache._fetch('fake', 'fake-uuid', '/foo/bar', force_raw=True)
         mock_fetch.assert_called_once_with('fake', 'fake-uuid',
-                                           '/foo/bar.part', force_raw=False)
-        mock_clean.assert_not_called()
-        mock_size.assert_not_called()
+                                           '/foo/bar.part', force_raw=False,
+                                           checksum=None, checksum_algo=None)
+        mock_clean.assert_called_once_with('/foo', 100)
         mock_raw.assert_called_once_with('fake-uuid', '/foo/bar',
                                          '/foo/bar.part')
-        mock_will_convert.assert_called_once_with('fake-uuid', '/foo/bar.part')
+        mock_remove.assert_not_called()
+        mock_show.assert_not_called()
+        mock_format_inspector.assert_called_once_with('/foo/bar.part')
+        image_check.safety_check.assert_not_called()
+        self.assertEqual(1, image_check.__str__.call_count)
 
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    @mock.patch.object(images, 'image_show', autospec=True)
+    @mock.patch.object(os, 'remove', autospec=True)
+    @mock.patch.object(os.path, 'exists', autospec=True)
     @mock.patch.object(images, 'converted_size', autospec=True)
     @mock.patch.object(images, 'fetch', autospec=True)
     @mock.patch.object(images, 'image_to_raw', autospec=True)
-    @mock.patch.object(images, 'force_raw_will_convert', autospec=True,
-                       return_value=True)
+    @mock.patch.object(image_cache, '_clean_up_caches', autospec=True)
+    def test__fetch_part_already_exists(
+            self, mock_clean, mock_raw, mock_fetch,
+            mock_size, mock_exists, mock_remove, mock_image_show,
+            mock_format_inspector):
+        image_check = mock.MagicMock()
+        image_check.__str__.side_effect = iter(['qcow2', 'raw'])
+        image_check.safety_check.return_value = True
+        mock_format_inspector.return_value = image_check
+        mock_exists.return_value = True
+        mock_size.return_value = 100
+        mock_image_show.return_value = {}
+        image_cache._fetch('fake', 'fake-uuid', '/foo/bar', force_raw=True,
+                           expected_format=None, expected_checksum='f00',
+                           expected_checksum_algo='sha256')
+        mock_fetch.assert_called_once_with('fake', 'fake-uuid',
+                                           '/foo/bar.part', force_raw=False,
+                                           checksum='f00',
+                                           checksum_algo='sha256')
+        mock_clean.assert_called_once_with('/foo', 100)
+        mock_raw.assert_called_once_with('fake-uuid', '/foo/bar',
+                                         '/foo/bar.part')
+        self.assertEqual(1, mock_exists.call_count)
+        self.assertEqual(1, mock_remove.call_count)
+        mock_image_show.assert_called_once_with('fake', 'fake-uuid')
+        mock_format_inspector.assert_called_once_with('/foo/bar.part')
+        image_check.safety_check.assert_called_once()
+        self.assertEqual(1, image_check.__str__.call_count)
+
+    @mock.patch.object(os, 'rename', autospec=True)
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    @mock.patch.object(images, 'image_show', autospec=True)
+    @mock.patch.object(images, 'converted_size', autospec=True)
+    @mock.patch.object(images, 'fetch', autospec=True)
+    @mock.patch.object(images, 'image_to_raw', autospec=True)
+    @mock.patch.object(image_cache, '_clean_up_caches', autospec=True)
+    def test__fetch_already_raw(
+            self, mock_clean, mock_raw, mock_fetch,
+            mock_size, mock_show, mock_format_inspector,
+            mock_rename):
+        mock_show.return_value = {'disk_format': 'raw'}
+        image_check = mock.MagicMock()
+        image_check.__str__.return_value = 'raw'
+        image_check.safety_check.return_value = True
+        mock_format_inspector.return_value = image_check
+        image_cache._fetch('fake', 'fake-uuid', '/foo/bar', force_raw=True,
+                           expected_checksum='e00',
+                           expected_checksum_algo='sha256')
+        mock_fetch.assert_called_once_with('fake', 'fake-uuid',
+                                           '/foo/bar.part', force_raw=False,
+                                           checksum='e00',
+                                           checksum_algo='sha256')
+        mock_clean.assert_not_called()
+        mock_size.assert_not_called()
+        mock_raw.assert_not_called()
+        mock_show.assert_called_once_with('fake', 'fake-uuid')
+        mock_format_inspector.assert_called_once_with('/foo/bar.part')
+        image_check.safety_check.assert_called_once()
+        self.assertEqual(1, image_check.__str__.call_count)
+        mock_rename.assert_called_once_with('/foo/bar.part', '/foo/bar')
+
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    @mock.patch.object(images, 'image_show', autospec=True)
+    @mock.patch.object(images, 'converted_size', autospec=True)
+    @mock.patch.object(images, 'fetch', autospec=True)
+    @mock.patch.object(images, 'image_to_raw', autospec=True)
+    @mock.patch.object(image_cache, '_clean_up_caches', autospec=True)
+    def test__fetch_format_does_not_match_glance(
+            self, mock_clean, mock_raw, mock_fetch,
+            mock_size, mock_show, mock_format_inspector):
+        mock_show.return_value = {'disk_format': 'raw'}
+        image_check = mock.MagicMock()
+        image_check.__str__.return_value = 'qcow2'
+        image_check.safety_check.return_value = True
+        mock_format_inspector.return_value = image_check
+        self.assertRaises(exception.InvalidImage,
+                          image_cache._fetch,
+                          'fake', 'fake-uuid',
+                          '/foo/bar', force_raw=True,
+                          expected_format=None,
+                          expected_checksum='a00',
+                          expected_checksum_algo='sha512')
+        mock_fetch.assert_called_once_with('fake', 'fake-uuid',
+                                           '/foo/bar.part', force_raw=False,
+                                           checksum='a00',
+                                           checksum_algo='sha512')
+        mock_clean.assert_not_called()
+        mock_size.assert_not_called()
+        mock_raw.assert_not_called()
+        mock_show.assert_called_once_with('fake', 'fake-uuid')
+        mock_format_inspector.assert_called_once_with('/foo/bar.part')
+        image_check.safety_check.assert_called_once()
+        self.assertEqual(1, image_check.__str__.call_count)
+
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    @mock.patch.object(images, 'image_show', autospec=True)
+    @mock.patch.object(images, 'converted_size', autospec=True)
+    @mock.patch.object(images, 'fetch', autospec=True)
+    @mock.patch.object(images, 'image_to_raw', autospec=True)
+    @mock.patch.object(image_cache, '_clean_up_caches', autospec=True)
+    def test__fetch_not_safe_image(
+            self, mock_clean, mock_raw, mock_fetch,
+            mock_size, mock_show, mock_format_inspector):
+        mock_show.return_value = {'disk_format': 'qcow2'}
+        image_check = mock.MagicMock()
+        image_check.__str__.return_value = 'qcow2'
+        image_check.safety_check.return_value = False
+        mock_format_inspector.return_value = image_check
+        self.assertRaises(exception.InvalidImage,
+                          image_cache._fetch,
+                          'fake', 'fake-uuid',
+                          '/foo/bar', force_raw=True)
+        mock_fetch.assert_called_once_with('fake', 'fake-uuid',
+                                           '/foo/bar.part', force_raw=False,
+                                           checksum=None, checksum_algo=None)
+        mock_clean.assert_not_called()
+        mock_size.assert_not_called()
+        mock_raw.assert_not_called()
+        mock_show.assert_called_once_with('fake', 'fake-uuid')
+        mock_format_inspector.assert_called_once_with('/foo/bar.part')
+        image_check.safety_check.assert_called_once()
+        self.assertEqual(0, image_check.__str__.call_count)
+
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    @mock.patch.object(images, 'image_show', autospec=True)
+    @mock.patch.object(images, 'converted_size', autospec=True)
+    @mock.patch.object(images, 'fetch', autospec=True)
+    @mock.patch.object(images, 'image_to_raw', autospec=True)
     @mock.patch.object(image_cache, '_clean_up_caches', autospec=True)
     def test__fetch_estimate_fallback(
-            self, mock_clean, mock_will_convert, mock_raw, mock_fetch,
-            mock_size):
+            self, mock_clean, mock_raw, mock_fetch,
+            mock_size, mock_show, mock_format_inspector):
+        mock_show.return_value = {'disk_format': 'qcow2'}
+        image_check = mock.MagicMock()
+        image_check.__str__.side_effect = iter(['qcow2', 'raw'])
+        image_check.safety_check.return_value = True
+        mock_format_inspector.return_value = image_check
         mock_size.side_effect = [100, 10]
         mock_clean.side_effect = [exception.InsufficientDiskSpace(), None]
 
         image_cache._fetch('fake', 'fake-uuid', '/foo/bar', force_raw=True)
         mock_fetch.assert_called_once_with('fake', 'fake-uuid',
-                                           '/foo/bar.part', force_raw=False)
+                                           '/foo/bar.part', force_raw=False,
+                                           checksum=None, checksum_algo=None)
         mock_size.assert_has_calls([
             mock.call('/foo/bar.part', estimate=False),
             mock.call('/foo/bar.part', estimate=True),
@@ -815,4 +999,71 @@ class TestFetchCleanup(base.TestCase):
         ])
         mock_raw.assert_called_once_with('fake-uuid', '/foo/bar',
                                          '/foo/bar.part')
-        mock_will_convert.assert_called_once_with('fake-uuid', '/foo/bar.part')
+        mock_show.assert_called_once_with('fake', 'fake-uuid')
+        mock_format_inspector.assert_called_once_with('/foo/bar.part')
+        image_check.safety_check.assert_called_once()
+        self.assertEqual(1, image_check.__str__.call_count)
+
+    @mock.patch.object(os, 'rename', autospec=True)
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    @mock.patch.object(images, 'image_show', autospec=True)
+    @mock.patch.object(os, 'remove', autospec=True)
+    @mock.patch.object(images, 'converted_size', autospec=True)
+    @mock.patch.object(images, 'fetch', autospec=True)
+    @mock.patch.object(images, 'image_to_raw', autospec=True)
+    @mock.patch.object(image_cache, '_clean_up_caches', autospec=True)
+    def test__fetch_ramdisk_kernel(
+            self, mock_clean, mock_raw, mock_fetch,
+            mock_size, mock_remove, mock_show, mock_format_inspector,
+            mock_rename):
+        image_check = mock.MagicMock()
+        image_check.__str__.return_value = 'raw'
+        image_check.safety_check.return_value = True
+        mock_format_inspector.return_value = image_check
+        mock_show.return_value = {'disk_format': 'aki'}
+        mock_size.return_value = 100
+        image_cache._fetch('fake', 'fake-uuid', '/foo/bar', force_raw=True)
+        mock_fetch.assert_called_once_with('fake', 'fake-uuid',
+                                           '/foo/bar.part', force_raw=False,
+                                           checksum=None, checksum_algo=None)
+        mock_clean.assert_not_called()
+        mock_raw.assert_not_called()
+        mock_remove.assert_not_called()
+        mock_show.assert_called_once_with('fake', 'fake-uuid')
+        mock_format_inspector.assert_called_once_with('/foo/bar.part')
+        image_check.safety_check.assert_called_once()
+        self.assertEqual(1, image_check.__str__.call_count)
+        mock_rename.assert_called_once_with('/foo/bar.part', '/foo/bar')
+
+    @mock.patch.object(os, 'rename', autospec=True)
+    @mock.patch.object(image_format_inspector, 'detect_file_format',
+                       autospec=True)
+    @mock.patch.object(images, 'image_show', autospec=True)
+    @mock.patch.object(os, 'remove', autospec=True)
+    @mock.patch.object(images, 'converted_size', autospec=True)
+    @mock.patch.object(images, 'fetch', autospec=True)
+    @mock.patch.object(images, 'image_to_raw', autospec=True)
+    @mock.patch.object(image_cache, '_clean_up_caches', autospec=True)
+    def test__fetch_ramdisk_image(
+            self, mock_clean, mock_raw, mock_fetch,
+            mock_size, mock_remove, mock_show, mock_format_inspector,
+            mock_rename):
+        image_check = mock.MagicMock()
+        image_check.__str__.return_value = 'raw'
+        image_check.safety_check.return_value = True
+        mock_format_inspector.return_value = image_check
+        mock_show.return_value = {'disk_format': 'ari'}
+        mock_size.return_value = 100
+        image_cache._fetch('fake', 'fake-uuid', '/foo/bar', force_raw=True)
+        mock_fetch.assert_called_once_with('fake', 'fake-uuid',
+                                           '/foo/bar.part', force_raw=False,
+                                           checksum=None, checksum_algo=None)
+        mock_clean.assert_not_called()
+        mock_raw.assert_not_called()
+        mock_remove.assert_not_called()
+        mock_show.assert_called_once_with('fake', 'fake-uuid')
+        mock_format_inspector.assert_called_once_with('/foo/bar.part')
+        image_check.safety_check.assert_called_once()
+        self.assertEqual(1, image_check.__str__.call_count)
+        mock_rename.assert_called_once_with('/foo/bar.part', '/foo/bar')

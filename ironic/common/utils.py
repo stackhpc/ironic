@@ -26,6 +26,7 @@ import hashlib
 import ipaddress
 import os
 import re
+import shlex
 import shutil
 import tempfile
 import time
@@ -39,7 +40,6 @@ from oslo_utils import netutils
 from oslo_utils import strutils
 from oslo_utils import timeutils
 import psutil
-import pytz
 
 from ironic.common import exception
 from ironic.common.i18n import _
@@ -56,12 +56,7 @@ TZ_RE = r'((?P<tz_sign>[+-])(?P<tz_hour>\d{2}):(?P<tz_min>\d{2}))' + \
 DATETIME_RE = re.compile(
     '%sT%s(%s)?' % (DATE_RE, TIME_RE, TZ_RE))
 
-
-def _get_root_helper():
-    # NOTE(jlvillal): This function has been moved to ironic-lib. And is
-    # planned to be deleted here. If need to modify this function, please
-    # also do the same modification in ironic-lib
-    return 'sudo ironic-rootwrap %s' % CONF.rootwrap_config
+USING_SQLITE = None
 
 
 def execute(*cmd, **kwargs):
@@ -81,8 +76,6 @@ def execute(*cmd, **kwargs):
         env = kwargs.pop('env_variables', os.environ.copy())
         env['LC_ALL'] = 'C'
         kwargs['env_variables'] = env
-    if kwargs.get('run_as_root') and 'root_helper' not in kwargs:
-        kwargs['root_helper'] = _get_root_helper()
     result = processutils.execute(*cmd, **kwargs)
     LOG.debug('Execution completed, command line is "%s"',
               ' '.join(map(str, cmd)))
@@ -121,7 +114,7 @@ def is_valid_logical_name(hostname):
     """Determine if a logical name is valid.
 
     The logical name may only consist of RFC3986 unreserved
-    characters, to wit:
+    characters:
 
         ALPHA / DIGIT / "-" / "." / "_" / "~"
     """
@@ -315,33 +308,6 @@ def safe_rstrip(value, chars=None):
     return value.rstrip(chars) or value
 
 
-def mount(src, dest, *args):
-    """Mounts a device/image file on specified location.
-
-    :param src: the path to the source file for mounting
-    :param dest: the path where it needs to be mounted.
-    :param args: a tuple containing the arguments to be
-        passed to mount command.
-    :raises: processutils.ProcessExecutionError if it failed
-        to run the process.
-    """
-    args = ('mount', ) + args + (src, dest)
-    execute(*args, run_as_root=True)
-
-
-def umount(loc, *args):
-    """Umounts a mounted location.
-
-    :param loc: the path to be unmounted.
-    :param args: a tuple containing the arguments to be
-        passed to the umount command.
-    :raises: processutils.ProcessExecutionError if it failed
-        to run the process.
-    """
-    args = ('umount', ) + args + (loc, )
-    execute(*args, run_as_root=True)
-
-
 def check_dir(directory_to_check=None, required_space=1):
     """Check a directory is usable.
 
@@ -450,7 +416,7 @@ def unix_file_modification_datetime(file_name):
         # normalize time to be UTC without timezone
         datetime.datetime.fromtimestamp(
             # fromtimestamp will return local time by default, make it UTC
-            os.path.getmtime(file_name), tz=pytz.utc
+            os.path.getmtime(file_name), tz=datetime.timezone.utc
         )
     )
 
@@ -575,8 +541,12 @@ def pop_node_nested_field(node, collection, field, default=None):
 
 def wrap_ipv6(ip):
     """Wrap the address in square brackets if it's an IPv6 address."""
-    if ipaddress.ip_address(ip).version == 6:
-        return "[%s]" % ip
+    try:
+        if ipaddress.ip_address(ip).version == 6:
+            return "[%s]" % ip
+    except ValueError:
+        pass
+
     return ip
 
 
@@ -696,3 +666,42 @@ def stop_after_retries(option, group=None):
         return retry_state.attempt_number >= num_retries + 1
 
     return should_stop
+
+
+def is_loopback(hostname_or_ip):
+    """Check if the provided hostname or IP address is a loopback."""
+    try:
+        return ipaddress.ip_address(hostname_or_ip).is_loopback
+    except ValueError:  # host name
+        return hostname_or_ip in ('localhost', 'localhost.localdomain')
+
+
+def parse_kernel_params(params):
+    """Parse kernel parameters into a dictionary.
+
+    ``None`` is used as a value for parameters that are not in
+    the ``key=value`` format.
+
+    :param params: kernel parameters as a space-delimited string.
+    """
+    result = {}
+    for s in shlex.split(params):
+        try:
+            key, value = s.split('=', 1)
+        except ValueError:
+            result[s] = None
+        else:
+            result[key] = value
+    return result
+
+
+def is_ironic_using_sqlite():
+    """Return True if Ironic is configured to use SQLite"""
+    global USING_SQLITE
+    if USING_SQLITE is not None:
+        return USING_SQLITE
+
+    # We're being called for the first time, lets cache and
+    # return the value.
+    USING_SQLITE = 'sqlite' in CONF.database.connection.lower()
+    return USING_SQLITE

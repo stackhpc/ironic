@@ -64,7 +64,7 @@ opts = [
                       'auto-expire. Applies only when `use_swift` is '
                       'enabled.')),
     cfg.StrOpt('kernel_append_params',
-               default='nofb nomodeset vga=normal',
+               default='nofb vga=normal',
                mutable=True,
                help=_('Additional kernel parameters to pass down to the '
                       'instance kernel. These parameters can be consumed by '
@@ -115,6 +115,12 @@ opts = [
                default=60,
                help=_('Number of seconds to wait between checking for '
                       'failed raid config tasks')),
+    cfg.IntOpt('boot_mode_config_timeout',
+               min=0,
+               default=900,
+               help=_('Number of seconds to wait for boot mode or secure '
+                      'boot status change to take effect after a reboot. '
+                      'Set to 0 to disable waiting.')),
 ]
 
 

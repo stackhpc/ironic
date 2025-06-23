@@ -471,6 +471,25 @@ class PXEBootTestCase(db_base.DbTestCase):
                                                          persistent=True)
             secure_boot_mock.assert_called_once_with(task)
 
+    @mock.patch.object(boot_mode_utils, 'configure_secure_boot_if_needed',
+                       autospec=True)
+    @mock.patch.object(manager_utils, 'node_set_boot_device', autospec=True)
+    @mock.patch.object(pxe_utils, 'clean_up_pxe_config', autospec=True)
+    def test_prepare_instance_lenovo(self, clean_up_pxe_config_mock,
+                                     set_boot_device_mock, secure_boot_mock):
+        props = self.node.properties
+        props['vendor'] = 'Lenovo'
+        props['capabilities'] = 'boot_mode:uefi'
+        self.node.properties = props
+        self.node.provision_state = states.DEPLOYING
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            task.driver.boot.prepare_instance(task)
+            clean_up_pxe_config_mock.assert_called_once_with(
+                task, ipxe_enabled=False)
+            set_boot_device_mock.assert_not_called()
+            secure_boot_mock.assert_called_once_with(task)
+
     @mock.patch.object(manager_utils, 'node_set_boot_device', autospec=True)
     @mock.patch.object(pxe_utils, 'clean_up_pxe_config', autospec=True)
     def test_prepare_instance_active(self, clean_up_pxe_config_mock,
@@ -550,6 +569,9 @@ class PXEBootTestCase(db_base.DbTestCase):
     def test_prepare_instance_ramdisk_pxe_conf_exists(self):
         self._test_prepare_instance_ramdisk(config_file_exits=False)
 
+    @mock.patch.object(os.path, 'isfile', autospec=True)
+    @mock.patch.object(boot_mode_utils, 'configure_secure_boot_if_needed',
+                       autospec=True)
     @mock.patch.object(manager_utils, 'node_set_boot_device', autospec=True)
     @mock.patch.object(deploy_utils, 'switch_pxe_config', autospec=True)
     @mock.patch.object(pxe_utils, 'create_pxe_config', autospec=True)
@@ -567,7 +589,7 @@ class PXEBootTestCase(db_base.DbTestCase):
             self, exec_mock, write_file_mock, render_mock, api_url_mock,
             boot_opt_mock, get_image_info_mock, cache_mock, dhcp_factory_mock,
             create_pxe_config_mock, switch_pxe_config_mock,
-            set_boot_device_mock):
+            set_boot_device_mock, mock_conf_sec_boot, mock_isfile):
         image_info = {'kernel': ['ins_kernel_id', '/path/to/kernel'],
                       'ramdisk': ['ins_ramdisk_id', '/path/to/ramdisk'],
                       'stage2': ['ins_stage2_id', '/path/to/stage2'],
@@ -578,6 +600,7 @@ class PXEBootTestCase(db_base.DbTestCase):
         dhcp_factory_mock.return_value = provider_mock
         self.node.provision_state = states.DEPLOYING
         self.config(http_url='http://fake_url', group='deploy')
+        mock_isfile.return_value = False
         with task_manager.acquire(self.context, self.node.uuid) as task:
             dhcp_opts = pxe_utils.dhcp_options_for_instance(
                 task, ipxe_enabled=False)
@@ -587,15 +610,11 @@ class PXEBootTestCase(db_base.DbTestCase):
                 task.node.uuid)
 
             task.driver.boot.prepare_instance(task)
-
+            self.assertEqual(2, mock_isfile.call_count)
             get_image_info_mock.assert_called_once_with(task,
                                                         ipxe_enabled=False)
             cache_mock.assert_called_once_with(
                 task, image_info, False)
-            if os.path.isfile('/usr/bin/ksvalidator'):
-                exec_mock.assert_called_once_with(
-                    'ksvalidator', mock.ANY, check_on_exit=[0], attempts=1
-                )
             provider_mock.update_dhcp.assert_called_once_with(task, dhcp_opts)
             render_mock.assert_called()
             write_file_mock.assert_called_with(
@@ -611,7 +630,10 @@ class PXEBootTestCase(db_base.DbTestCase):
             set_boot_device_mock.assert_called_once_with(task,
                                                          boot_devices.PXE,
                                                          persistent=True)
+            self.assertFalse(mock_conf_sec_boot.called)
+            self.assertEqual(2, mock_isfile.call_count)
 
+    @mock.patch.object(os.path, 'isfile', autospec=True)
     @mock.patch.object(manager_utils, 'node_set_boot_device', autospec=True)
     @mock.patch.object(deploy_utils, 'switch_pxe_config', autospec=True)
     @mock.patch.object(pxe_utils, 'create_pxe_config', autospec=True)
@@ -629,7 +651,7 @@ class PXEBootTestCase(db_base.DbTestCase):
             self, exec_mock, write_file_mock, render_mock, api_url_mock,
             boot_opt_mock, get_image_info_mock, cache_mock, dhcp_factory_mock,
             create_pxe_config_mock, switch_pxe_config_mock,
-            set_boot_device_mock):
+            set_boot_device_mock, isfile_mock):
         image_info = {'kernel': ['ins_kernel_id', '/path/to/kernel'],
                       'ramdisk': ['ins_ramdisk_id', '/path/to/ramdisk'],
                       'stage2': ['ins_stage2_id', '/path/to/stage2'],
@@ -641,6 +663,7 @@ class PXEBootTestCase(db_base.DbTestCase):
         self.node.provision_state = states.DEPLOYING
         self.config(http_url='http://fake_url', group='deploy')
         self.config(default_boot_mode='bios', group='deploy')
+        isfile_mock.return_value = False
 
         with task_manager.acquire(self.context, self.node.uuid) as task:
             dhcp_opts = pxe_utils.dhcp_options_for_instance(
@@ -656,10 +679,6 @@ class PXEBootTestCase(db_base.DbTestCase):
                                                         ipxe_enabled=False)
             cache_mock.assert_called_once_with(
                 task, image_info, False)
-            if os.path.isfile('/usr/bin/ksvalidator'):
-                exec_mock.assert_called_once_with(
-                    'ksvalidator', mock.ANY, check_on_exit=[0], attempts=1
-                )
             provider_mock.update_dhcp.assert_called_once_with(task, dhcp_opts)
             render_mock.assert_called()
             write_file_mock.assert_called_with(
@@ -675,6 +694,7 @@ class PXEBootTestCase(db_base.DbTestCase):
             set_boot_device_mock.assert_called_once_with(task,
                                                          boot_devices.PXE,
                                                          persistent=True)
+            self.assertEqual(2, isfile_mock.call_count)
 
     @mock.patch.object(boot_mode_utils, 'deconfigure_secure_boot_if_needed',
                        autospec=True)
@@ -786,11 +806,15 @@ class PXEAnacondaDeployTestCase(db_base.DbTestCase):
             task.driver.deploy.prepare(task)
             mock_prepare_instance.assert_called_once_with(mock.ANY, task)
 
+    @mock.patch.object(dhcp_factory.DHCPFactory, 'clean_dhcp', autospec=True)
+    @mock.patch.object(boot_mode_utils, 'configure_secure_boot_if_needed',
+                       autospec=True)
     @mock.patch.object(pxe_utils, 'clean_up_pxe_env', autospec=True)
     @mock.patch.object(pxe_utils, 'get_instance_image_info', autospec=True)
     @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
     def test_reboot_to_instance(self, mock_set_boot_dev, mock_image_info,
-                                mock_cleanup_pxe_env):
+                                mock_cleanup_pxe_env, mock_conf_sec_boot,
+                                mock_dhcp):
         image_info = {'kernel': ('', '/path/to/kernel'),
                       'ramdisk': ('', '/path/to/ramdisk'),
                       'stage2': ('', '/path/to/stage2'),
@@ -802,8 +826,11 @@ class PXEAnacondaDeployTestCase(db_base.DbTestCase):
         with task_manager.acquire(self.context, self.node.uuid) as task:
             task.driver.deploy.reboot_to_instance(task)
             mock_set_boot_dev.assert_called_once_with(task, boot_devices.DISK)
+            mock_conf_sec_boot.assert_called_once_with(task)
             mock_cleanup_pxe_env.assert_called_once_with(task, image_info,
                                                          ipxe_enabled=False)
+            mock_dhcp.assert_has_calls([
+                mock.call(mock.ANY, task)])
 
     @mock.patch.object(objects.node.Node, 'touch_provisioning', autospec=True)
     def test_heartbeat_deploy_start(self, mock_touch):
@@ -926,6 +953,11 @@ class PXEValidateRescueTestCase(db_base.DbTestCase):
                                    'Missing.*rescue_kernel',
                                    task.driver.boot.validate_rescue, task)
 
+    def test_http_boot_not_enabled(self):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            self.assertFalse(task.driver.boot.http_boot_enabled)
+
 
 @mock.patch.object(ipxe.iPXEBoot, '__init__', lambda self: None)
 @mock.patch.object(pxe.PXEBoot, '__init__', lambda self: None)
@@ -1031,3 +1063,156 @@ class iPXEBootRetryTestCase(PXEBootRetryTestCase):
 
     boot_interface = 'ipxe'
     boot_interface_class = ipxe.iPXEBoot
+
+
+@mock.patch.object(pxe.HttpBoot, '__init__', lambda self: None)
+class HttpBootTestCase(db_base.DbTestCase):
+    driver = 'fake-hardware'
+    boot_interface = 'http'
+    driver_info = DRV_INFO_DICT
+    driver_internal_info = DRV_INTERNAL_INFO_DICT
+
+    def setUp(self):
+        super(HttpBootTestCase, self).setUp()
+        self.context.auth_token = 'fake'
+        self.config_temp_dir('tftp_root', group='pxe')
+        self.config_temp_dir('images_path', group='pxe')
+        self.config_temp_dir('http_root', group='deploy')
+        self.config(group='deploy', http_url='http://myserver')
+        instance_info = INST_INFO_DICT
+        self.config(enabled_boot_interfaces=[self.boot_interface,
+                                             'http', 'fake'])
+        self.node = obj_utils.create_test_node(
+            self.context,
+            driver=self.driver,
+            boot_interface=self.boot_interface,
+            # Avoid fake properties in get_properties() output
+            vendor_interface='no-vendor',
+            instance_info=instance_info,
+            driver_info=self.driver_info,
+            driver_internal_info=self.driver_internal_info)
+        self.port = obj_utils.create_test_port(self.context,
+                                               node_id=self.node.id)
+
+    def test_http_boot_enabled(self):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            self.assertTrue(task.driver.boot.http_boot_enabled)
+
+    # TODO(TheJulia): Many of the interfaces mocked below are private PXE
+    # interface methods. As time progresses, these will need to be migrated
+    # and refactored as we begin to separate PXE and iPXE interfaces.
+    @mock.patch.object(manager_utils, 'node_get_boot_mode', autospec=True)
+    @mock.patch.object(manager_utils, 'node_set_boot_device', autospec=True)
+    @mock.patch.object(dhcp_factory, 'DHCPFactory', autospec=True)
+    @mock.patch.object(pxe_utils, 'get_instance_image_info', autospec=True)
+    @mock.patch.object(pxe_utils, 'get_image_info', autospec=True)
+    @mock.patch.object(pxe_utils, 'cache_ramdisk_kernel', autospec=True)
+    @mock.patch.object(pxe_utils, 'build_pxe_config_options', autospec=True)
+    @mock.patch.object(pxe_utils, 'create_pxe_config', autospec=True)
+    def _test_prepare_ramdisk(self, mock_pxe_config,
+                              mock_build_pxe, mock_cache_r_k,
+                              mock_deploy_img_info,
+                              mock_instance_img_info,
+                              dhcp_factory_mock,
+                              set_boot_device_mock,
+                              get_boot_mode_mock,
+                              uefi=False,
+                              cleaning=False,
+                              ipxe_use_swift=False,
+                              whole_disk_image=False,
+                              mode='deploy',
+                              node_boot_mode=None,
+                              persistent=False):
+        mock_build_pxe.return_value = {}
+        kernel_label = '%s_kernel' % mode
+        ramdisk_label = '%s_ramdisk' % mode
+        mock_deploy_img_info.return_value = {kernel_label: 'a',
+                                             ramdisk_label: 'r'}
+        if whole_disk_image:
+            mock_instance_img_info.return_value = {}
+        else:
+            mock_instance_img_info.return_value = {'kernel': 'b'}
+        mock_pxe_config.return_value = None
+        mock_cache_r_k.return_value = None
+        provider_mock = mock.MagicMock()
+        dhcp_factory_mock.return_value = provider_mock
+        get_boot_mode_mock.return_value = node_boot_mode
+        driver_internal_info = self.node.driver_internal_info
+        driver_internal_info['is_whole_disk_image'] = whole_disk_image
+        self.node.driver_internal_info = driver_internal_info
+        if mode == 'rescue':
+            mock_deploy_img_info.return_value = {
+                'rescue_kernel': 'a',
+                'rescue_ramdisk': 'r'}
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            dhcp_opts = pxe_utils.dhcp_options_for_instance(
+                task, ipxe_enabled=False, ip_version=4, http_boot_enabled=True)
+            dhcp_opts += pxe_utils.dhcp_options_for_instance(
+                task, ipxe_enabled=False, ip_version=6, http_boot_enabled=True)
+            task.driver.boot.prepare_ramdisk(task, {'foo': 'bar'})
+            if task.driver.boot.http_boot_enabled:
+                # FIXME(TheJulia): We need to change the parameter
+                # name on some of the pxe internal calls because
+                # they boil down to "use the http folder" or
+                # "use the tftp folder"
+                use_http_folder = True
+            else:
+                use_http_folder = False
+            mock_deploy_img_info.assert_called_once_with(
+                task.node, mode=mode, ipxe_enabled=use_http_folder)
+            provider_mock.update_dhcp.assert_called_once_with(
+                task, dhcp_opts)
+            if self.node.provision_state == states.DEPLOYING:
+                get_boot_mode_mock.assert_called_once_with(task)
+            set_boot_device_mock.assert_called_once_with(task,
+                                                         boot_devices.UEFIHTTP,
+                                                         persistent=persistent)
+            if ipxe_use_swift:
+                if whole_disk_image:
+                    self.assertFalse(mock_cache_r_k.called)
+                else:
+                    mock_cache_r_k.assert_called_once_with(
+                        task, {'kernel': 'b'},
+                        ipxe_enabled=use_http_folder)
+                mock_instance_img_info.assert_called_once_with(
+                    task, ipxe_enabled=False)
+            elif not cleaning and mode == 'deploy':
+                mock_cache_r_k.assert_called_once_with(
+                    task,
+                    {'deploy_kernel': 'a', 'deploy_ramdisk': 'r',
+                     'kernel': 'b'},
+                    ipxe_enabled=use_http_folder)
+                mock_instance_img_info.assert_called_once_with(
+                    task, ipxe_enabled=False)
+            elif mode == 'deploy':
+                mock_cache_r_k.assert_called_once_with(
+                    task, {'deploy_kernel': 'a', 'deploy_ramdisk': 'r'},
+                    ipxe_enabled=use_http_folder)
+            elif mode == 'rescue':
+                mock_cache_r_k.assert_called_once_with(
+                    task, {'rescue_kernel': 'a', 'rescue_ramdisk': 'r'},
+                    ipxe_enabled=use_http_folder)
+            mock_pxe_config.assert_called_once_with(
+                task, {}, CONF.pxe.uefi_pxe_config_template,
+                ipxe_enabled=False)
+
+    def test_prepare_ramdisk(self):
+        self.node.provision_state = states.DEPLOYING
+        self.node.save()
+        self._test_prepare_ramdisk()
+
+    def test_prepare_ramdisk_rescue(self):
+        self.node.provision_state = states.RESCUING
+        self.node.save()
+        self._test_prepare_ramdisk(mode='rescue')
+
+    def test_prepare_ramdisk_uefi(self):
+        self.node.provision_state = states.DEPLOYING
+        self.node.save()
+        properties = self.node.properties
+        properties['capabilities'] = 'boot_mode:uefi'
+        self.node.properties = properties
+        self.node.save()
+        self._test_prepare_ramdisk(uefi=True)

@@ -60,11 +60,13 @@ postgresql-client [platform:dpkg]
 # postgresql-devel [platform:rpm]
 postgresql-server [platform:rpm]
 mariadb [platform:rpm]
-mariadb-server [platform:rpm]
+mariadb-server [platform:rpm platform:debian-bookworm]
 # mariadb-devel [platform:rpm]
 dev-db/mariadb [platform:gentoo]
-mysql-client [platform:dpkg]
-mysql-server [platform:dpkg]
+mysql-client [platform:dpkg !platform:debian-bookworm]
+mysql-server [platform:dpkg !platform:debian-bookworm]
+mariadb-client [platform:debian-bookworm]
+
 # libmysqlclient-dev [platform:dpkg]
 # gettext and graphviz are needed by doc builds only. For transition,
 # have them in both doc and test.
@@ -79,9 +81,6 @@ librsvg2-bin [doc platform:dpkg]
 
 # these are needed to build images
 
-# NOTE apparmor is an undeclared dependency for docker on ubuntu,
-# see https://github.com/docker/docker/issues/9745
-apparmor [platform:dpkg imagebuild]
 gnupg [imagebuild]
 squashfs-tools [platform:dpkg platform:redhat imagebuild]
 squashfs [platform:suse imagebuild]

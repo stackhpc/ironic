@@ -103,8 +103,14 @@ LOCAL_LINK_BASE_SCHEMA = {
         'switch_info': {'type': 'string'},
         'network_type': {'type': 'string',
                          'enum': ['managed', 'unmanaged']},
+        'vtep-logical-switch': {'type': 'string'},
+        'vtep-physical-switch': {'type': 'string'},
     },
-    'additionalProperties': False
+    'additionalProperties': False,
+    'dependentRequired': {
+        'vtep-logical-switch': ['vtep-physical-switch'],
+        'vtep-physical-switch': ['vtep-logical-switch']
+    }
 }
 
 LOCAL_LINK_SCHEMA = copy.deepcopy(LOCAL_LINK_BASE_SCHEMA)
@@ -114,6 +120,11 @@ LOCAL_LINK_SCHEMA['required'] = ['port_id', 'switch_id']
 LOCAL_LINK_SMART_NIC_SCHEMA = copy.deepcopy(LOCAL_LINK_BASE_SCHEMA)
 # set mandatory fields for a smart nic
 LOCAL_LINK_SMART_NIC_SCHEMA['required'] = ['port_id', 'hostname']
+
+LOCAL_LINK_OVN_SCHEMA = copy.deepcopy(LOCAL_LINK_BASE_SCHEMA)
+LOCAL_LINK_OVN_SCHEMA['required'] = ['port_id', 'vtep-logical-switch',
+                                     'vtep-physical-switch']
+LOCAL_LINK_OVN_90_FIELDS = ['vtep-logical-switch', 'vtep-physical-switch']
 
 # no other mandatory fields for a network_type=unmanaged link
 LOCAL_LINK_UNMANAGED_SCHEMA = copy.deepcopy(LOCAL_LINK_BASE_SCHEMA)
@@ -125,6 +136,7 @@ LOCAL_LINK_CONN_SCHEMA = {'anyOf': [
     LOCAL_LINK_SCHEMA,
     LOCAL_LINK_SMART_NIC_SCHEMA,
     LOCAL_LINK_UNMANAGED_SCHEMA,
+    LOCAL_LINK_OVN_SCHEMA,
     {'type': 'object', 'additionalProperties': False},
 ]}
 
@@ -163,7 +175,7 @@ def local_link_normalize(name, value):
         except exception.InvalidDatapathID:
             raise exception.InvalidSwitchID(switch_id=value['switch_id'])
     except KeyError:
-        # In Smart NIC case 'switch_id' is optional.
+        # In Smart NIC or OVN VTEP case 'switch_id' is optional.
         pass
 
     return value
@@ -354,7 +366,7 @@ def patched_validate_with_schema(patched_dict, schema, validator=None):
         updates applied
     :param schema: Any dict key not in the schema will be deleted from the
         dict. If no validator is specified then the resulting ``patched_dict``
-        will be validated agains the schema
+        will be validated against the schema
     :param validator: Optional validator to use if there is extra validation
         required beyond the schema
     :raises: exception.Invalid if validation fails
@@ -531,7 +543,6 @@ def get_rpc_node(node_ident):
     # as a UUID.
     if uuidutils.is_uuid_like(node_ident):
         return objects.Node.get_by_uuid(api.request.context, node_ident)
-
     # We can refer to nodes by their name, if the client supports it
     if allow_node_logical_names():
         if is_valid_logical_name(node_ident):
@@ -807,6 +818,10 @@ VERSIONED_FIELDS = {
     'network_data': versions.MINOR_66_NODE_NETWORK_DATA,
     'boot_mode': versions.MINOR_75_NODE_BOOT_MODE,
     'secure_boot': versions.MINOR_75_NODE_BOOT_MODE,
+    'shard': versions.MINOR_82_NODE_SHARD,
+    'parent_node': versions.MINOR_83_PARENT_CHILD_NODES,
+    'firmware_interface': versions.MINOR_86_FIRMWARE_INTERFACE,
+    'service_step': versions.MINOR_87_SERVICE
 }
 
 for field in V31_FIELDS:
@@ -1063,6 +1078,33 @@ def check_allow_filter_by_lessee(lessee):
             "should be %(base)s.%(opr)s") %
             {'base': versions.BASE_VERSION,
              'opr': versions.MINOR_65_NODE_LESSEE})
+
+
+def check_allow_filter_by_shard(shard):
+    """Check if filtering nodes by shard is allowed.
+
+    Version 1.82 of the API allows filtering nodes by shard.
+    """
+    if (shard is not None and api.request.version.minor
+            < versions.MINOR_82_NODE_SHARD):
+        raise exception.NotAcceptable(_(
+            "Request not acceptable. The minimal required API version "
+            "should be %(base)s.%(opr)s") %
+            {'base': versions.BASE_VERSION,
+             'opr': versions.MINOR_82_NODE_SHARD})
+
+
+def check_allow_child_node_params(include_children=None,
+                                  parent_node=None):
+    if ((include_children is not None
+         or parent_node is not None)
+            and api.request.version.minor
+            < versions.MINOR_83_PARENT_CHILD_NODES):
+        raise exception.NotAcceptable(_(
+            "Request not acceptable. The minimal required API version "
+            "should be %(base)s.%(opr)s") %
+            {'base': versions.BASE_VERSION,
+             'opr': versions.MINOR_83_PARENT_CHILD_NODES})
 
 
 def initial_node_provision_state():
@@ -1626,7 +1668,8 @@ def check_port_policy_and_retrieve(policy_name, port_ident, portgroup=False):
                         a port or portgroup by.
 
     :raises: HTTPForbidden if the policy forbids access.
-    :raises: NodeNotFound if the node is not found.
+    :raises: PortNotFound if the port is not found.
+    :raises: PortgroupNotFound if the portgroup is not found.
     :return: RPC port identified by port_ident associated node
     """
     context = api.request.context
@@ -1856,6 +1899,15 @@ def check_volume_policy_and_retrieve(policy_name, vol_ident, target=False):
     return rpc_vol, rpc_node
 
 
+def allow_ovn_vtep_version():
+    """Check if ovn vtep version is allowed.
+
+    Version 1.90 of the API added support for ovn
+    vtep switches in port.local_link_connection.
+    """
+    return api.request.version.minor >= versions.MINOR_90_OVN_VTEP
+
+
 def allow_build_configdrive():
     """Check if building configdrive is allowed.
 
@@ -1923,6 +1975,16 @@ def allow_status_in_heartbeat():
     return api.request.version.minor >= versions.MINOR_72_HEARTBEAT_STATUS
 
 
+def allow_unhold_verb():
+    """Check if the unhold verb may be passed to the API"""
+    return api.request.version.minor >= versions.MINOR_85_UNHOLD_VERB
+
+
+def allow_service_verb():
+    """Check if the service verb may be passed to the API."""
+    return api.request.version.minor >= versions.MINOR_87_SERVICE
+
+
 def check_allow_deploy_steps(target, deploy_steps):
     """Check if deploy steps are allowed"""
 
@@ -1953,3 +2015,44 @@ def check_allow_clean_disable_ramdisk(target, disable_ramdisk):
     elif target != "clean":
         raise exception.BadRequest(
             _("disable_ramdisk is supported only with manual cleaning"))
+
+
+def allow_shards_endpoint():
+    """Check if shards endpoint is available."""
+    return api.request.version.minor >= versions.MINOR_82_NODE_SHARD
+
+
+def new_continue_inspection_endpoint():
+    """Check if /v1/continue_inspection endpoint is explicitly requested."""
+    return api.request.version.minor >= versions.MINOR_84_CONTINUE_INSPECTION
+
+
+def allow_continue_inspection_endpoint():
+    """Check if /v1/continue_inspection endpoint is available.
+
+    As a special exception, we allow it in the base version so that the API
+    can be used as a drop-in replacement for the Inspector's API.
+    """
+    return (new_continue_inspection_endpoint()
+            or api.request.version.minor == versions.MINOR_1_INITIAL_VERSION)
+
+
+def allow_firmware_interface():
+    """Check if we should support firmware interface and endpoints.
+
+    Version 1.86 of the API added support for firmware interface.
+    """
+    return api.request.version.minor >= versions.MINOR_86_FIRMWARE_INTERFACE
+
+
+def allow_port_name():
+    """Check if name is allowed for ports.
+
+    Version 1.88 of the API added name field to the port object.
+    """
+    return api.request.version.minor >= versions.MINOR_88_PORT_NAME
+
+
+def allow_attach_detach_vmedia():
+    """Check if we should support virtual media actions."""
+    return api.request.version.minor >= versions.MINOR_89_ATTACH_DETACH_VMEDIA

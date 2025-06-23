@@ -313,6 +313,14 @@ def _make_password_file(password):
             f.close()
 
 
+def is_bridging_enabled(node):
+    """Check if IPMI bridging is enabled.
+
+    This call is used in the inspector lookup.
+    """
+    return node.driver_info.get("ipmi_bridging", "no") != "no"
+
+
 def _parse_driver_info(node):
     """Gets the parameters required for ipmitool to access the node.
 
@@ -516,7 +524,7 @@ def _ipmitool_timing_args():
 
 
 def choose_cipher_suite(actual_cipher_suite):
-    """Gives the possible next avaible cipher suite version.
+    """Gives the possible next available cipher suite version.
 
     Based on CONF.ipmi.cipher_suite_versions and the last cipher suite version
     used that failed. This function is only called if the node doesn't have
@@ -552,9 +560,11 @@ def check_cipher_suite_errors(cmd_stderr):
     :returns: True if the cmd_stderr contains a cipher suite error,
         False otherwise.
     """
-    cs_errors = ["Unsupported cipher suite ID",
-                 "Error in open session response message :"
-                 " no matching cipher suite"]
+    cs_errors = [
+        "Unsupported cipher suite ID",
+        "Error in open session response message : no matching cipher suite",
+        "Error in open session response message : invalid role",
+    ]
     for cs_err in cs_errors:
         if cmd_stderr is not None and cs_err in cmd_stderr:
             return True
@@ -1201,8 +1211,8 @@ class IPMIManagement(base.ManagementInterface):
         boot_mode = boot_mode_utils.get_boot_mode(task.node)
         if boot_mode == 'uefi':
             # Long story short: UEFI was added to IPMI after the final spec
-            # release occured. This means BMCs may actually NEED to be
-            # explicitly told if the boot is persistant because the
+            # release occurred. This means BMCs may actually NEED to be
+            # explicitly told if the boot is persistent because the
             # BMC may return a value which is explicitly parsed as
             # no change, BUT the BMC may treat that as operational default.
             efi_persistence = '0xe0' if persistent else '0xa0'
@@ -1332,7 +1342,7 @@ class IPMIManagement(base.ManagementInterface):
         """
         driver_info = _parse_driver_info(task.node)
         # with '-v' option, we can get the entire sensor data including the
-        # extended sensor informations
+        # extended sensor information
         cmd = "sdr -v"
         try:
             out, err = _exec_ipmitool(
@@ -1371,23 +1381,44 @@ class VendorPassthru(base.VendorInterface):
     def __init__(self):
         _constructor_checks(driver=self.__class__.__name__)
 
+    _send_raw_step_args = {
+        'raw_bytes': {
+            'description': (
+                'A string of raw bytes to convey the request to transmit '
+                'to the remote BMC.'
+            ),
+            'required': True
+        }
+    }
+
     @METRICS.timer('VendorPassthru.send_raw')
+    @base.service_step(priority=0,
+                       argsinfo=_send_raw_step_args)
+    @base.deploy_step(priority=0,
+                      argsinfo=_send_raw_step_args)
+    @base.clean_step(priority=0, abortable=False,
+                     argsinfo=_send_raw_step_args,
+                     requires_ramdisk=False)
     @base.passthru(['POST'],
                    description=_("Send raw bytes to the BMC. Required "
                                  "argument: 'raw_bytes' - a string of raw "
                                  "bytes (e.g. '0x00 0x01')."))
     @task_manager.require_exclusive_lock
-    def send_raw(self, task, http_method, raw_bytes):
+    def send_raw(self, task, **kwargs):
         """Send raw bytes to the BMC. Bytes should be a string of bytes.
 
         :param task: a TaskManager instance.
-        :param http_method: the HTTP method used on the request.
         :param raw_bytes: a string of raw bytes to send, e.g. '0x00 0x01'
+                          supplied as a kwargument.
         :raises: IPMIFailure on an error from ipmitool.
         :raises: MissingParameterValue if a required parameter is missing.
         :raises:  InvalidParameterValue when an invalid value is specified.
 
         """
+        raw_bytes = kwargs.get('raw_bytes')
+        if not raw_bytes:
+            raise exception.MissingParameterValue(
+                'Argument raw_bytes is missing.')
         send_raw(task, raw_bytes)
 
     @METRICS.timer('VendorPassthru.bmc_reset')
@@ -1556,6 +1587,9 @@ class IPMIShellinaboxConsole(IPMIConsole):
                  created
         :raises: ConsoleSubprocessFailed when invoking the subprocess failed
         """
+        # Dealloc allocated port if any, so the same host can never has
+        # duplicated port.
+        _release_allocated_port(task)
         driver_info = _parse_driver_info(task.node)
         if not driver_info['port']:
             driver_info['port'] = _allocate_port(task)
@@ -1611,6 +1645,9 @@ class IPMISocatConsole(IPMIConsole):
                  created
         :raises: ConsoleSubprocessFailed when invoking the subprocess failed
         """
+        # Dealloc allocated port if any, so the same host can never has
+        # duplicated port.
+        _release_allocated_port(task)
         driver_info = _parse_driver_info(task.node)
         if not driver_info['port']:
             driver_info['port'] = _allocate_port(

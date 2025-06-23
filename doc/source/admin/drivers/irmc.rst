@@ -177,7 +177,7 @@ Configuration via ``driver_info``
   - string representing filesystem path to directory which contains
     certification file:  In this case, iRMC driver uses certification file
     stored at specified directory. Ironic conductor must be able to access
-    that directory. For iRMC to recongnize certification file, Ironic user
+    that directory. For iRMC to recognize certification file, Ironic user
     must run ``openssl rehash <path_to_dir>``.
 
   - string representing filesystem path to certification file: In this case,
@@ -465,12 +465,9 @@ configuration:
 Supported properties
 ~~~~~~~~~~~~~~~~~~~~
 
-The inspection process will discover the following essential properties
-(properties required for scheduling deployment):
+The inspection process will discover the following properties:
 
 * ``memory_mb``: memory size
-
-* ``cpus``: number of cpus
 
 * ``cpu_arch``: cpu architecture
 

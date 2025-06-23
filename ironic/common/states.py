@@ -52,6 +52,8 @@ VERBS = {
     'adopt': 'adopt',
     'rescue': 'rescue',
     'unrescue': 'unrescue',
+    'unhold': 'unhold',
+    'service': 'service',
 }
 """ Mapping of state-changing events that are PUT to the REST API
 
@@ -129,6 +131,9 @@ This is mainly a target provision state used during deployment. A successfully
 deployed node should go to ACTIVE status.
 """
 
+DEPLOYHOLD = 'deploy hold'
+""" Node is being held by a deploy step. """
+
 DELETING = 'deleting'
 """ Node is actively being torn down. """
 
@@ -158,6 +163,9 @@ the driver to finish a cleaning step.
 
 CLEANFAIL = 'clean failed'
 """ Node failed cleaning. This requires operator intervention to resolve. """
+
+CLEANHOLD = 'clean hold'
+""" Node is a holding state due to a clean step. """
 
 ERROR = 'error'
 """ An error occurred during node processing.
@@ -228,11 +236,32 @@ UNRESCUEFAIL = 'unrescue failed'
 UNRESCUING = 'unrescuing'
 """ Node is being restored from rescue mode (to active state). """
 
+SERVICE = 'service'
+""" Node is being requested to be modified through a service step. """
+
+SERVICING = 'servicing'
+""" Node is actively being changed by a service step. """
+
+SERVICEWAIT = 'service wait'
+""" Node is waiting for an operation to complete. """
+
+SERVICEFAIL = 'service failed'
+""" Node has failed in a service step execution. """
+
+SERVICEHOLD = 'service hold'
+""" Node is being held for direct intervention from a service step. """
+
+
+"""All Node states related to servicing."""
+SERVICING_STATES = frozenset((SERVICING, SERVICEWAIT,
+                              SERVICEFAIL, SERVICEHOLD))
+
+
 # NOTE(kaifeng): INSPECTING is allowed to keep backwards compatibility,
 # starting from API 1.39 node update is disallowed in this state.
 UPDATE_ALLOWED_STATES = (DEPLOYFAIL, INSPECTING, INSPECTFAIL, INSPECTWAIT,
                          CLEANFAIL, ERROR, VERIFYING, ADOPTFAIL, RESCUEFAIL,
-                         UNRESCUEFAIL)
+                         UNRESCUEFAIL, SERVICE, SERVICEHOLD, SERVICEFAIL)
 """Transitional states in which we allow updating a node."""
 
 DELETE_ALLOWED_STATES = (MANAGEABLE, ENROLL, ADOPTFAIL)
@@ -243,7 +272,7 @@ STABLE_STATES = (ENROLL, MANAGEABLE, AVAILABLE, ACTIVE, ERROR, RESCUE)
 
 UNSTABLE_STATES = (DEPLOYING, DEPLOYWAIT, CLEANING, CLEANWAIT, VERIFYING,
                    DELETING, INSPECTING, INSPECTWAIT, ADOPTING, RESCUING,
-                   RESCUEWAIT, UNRESCUING)
+                   RESCUEWAIT, UNRESCUING, SERVICING, SERVICEWAIT)
 """States that can be changed without external request."""
 
 STUCK_STATES_TREATED_AS_FAIL = (DEPLOYING, CLEANING, VERIFYING, INSPECTING,
@@ -265,9 +294,15 @@ _FASTTRACK_LOOKUP_ALLOWED_STATES = (ENROLL, MANAGEABLE, AVAILABLE,
                                     DEPLOYING, DEPLOYWAIT,
                                     CLEANING, CLEANWAIT,
                                     INSPECTING, INSPECTWAIT,
-                                    RESCUING, RESCUEWAIT)
+                                    RESCUING, RESCUEWAIT,
+                                    SERVICING, SERVICEWAIT,
+                                    SERVICEHOLD)
 FASTTRACK_LOOKUP_ALLOWED_STATES = frozenset(_FASTTRACK_LOOKUP_ALLOWED_STATES)
 """States where API lookups are permitted with fast track enabled."""
+
+FAILURE_STATES = frozenset((DEPLOYFAIL, CLEANFAIL, INSPECTFAIL,
+                            RESCUEFAIL, UNRESCUEFAIL, ADOPTFAIL,
+                            SERVICEFAIL))
 
 
 ##############
@@ -351,11 +386,13 @@ machine.add_state(VERIFYING, target=MANAGEABLE, **watchers)
 machine.add_state(DEPLOYING, target=ACTIVE, **watchers)
 machine.add_state(DEPLOYWAIT, target=ACTIVE, **watchers)
 machine.add_state(DEPLOYFAIL, target=ACTIVE, **watchers)
+machine.add_state(DEPLOYHOLD, target=ACTIVE, **watchers)
 
 # Add clean* states
 machine.add_state(CLEANING, target=AVAILABLE, **watchers)
 machine.add_state(CLEANWAIT, target=AVAILABLE, **watchers)
 machine.add_state(CLEANFAIL, target=AVAILABLE, **watchers)
+machine.add_state(CLEANHOLD, target=AVAILABLE, **watchers)
 
 # Add delete* states
 machine.add_state(DELETING, target=AVAILABLE, **watchers)
@@ -390,10 +427,18 @@ machine.add_transition(DEPLOYFAIL, DEPLOYING, 'deploy')
 
 # A deployment may also wait on external callbacks
 machine.add_transition(DEPLOYING, DEPLOYWAIT, 'wait')
+machine.add_transition(DEPLOYING, DEPLOYHOLD, 'hold')
+machine.add_transition(DEPLOYWAIT, DEPLOYHOLD, 'hold')
 machine.add_transition(DEPLOYWAIT, DEPLOYING, 'resume')
 
 # A deployment waiting on callback may time out
 machine.add_transition(DEPLOYWAIT, DEPLOYFAIL, 'fail')
+
+# Return the node into a deploying state from holding
+machine.add_transition(DEPLOYHOLD, DEPLOYWAIT, 'unhold')
+
+# A node in deploy hold may also be aborted
+machine.add_transition(DEPLOYHOLD, DEPLOYFAIL, 'abort')
 
 # A deployment may complete
 machine.add_transition(DEPLOYING, ACTIVE, 'done')
@@ -432,7 +477,15 @@ machine.add_transition(CLEANWAIT, CLEANFAIL, 'abort')
 
 # Cleaning may also wait on external callbacks
 machine.add_transition(CLEANING, CLEANWAIT, 'wait')
+machine.add_transition(CLEANING, CLEANHOLD, 'hold')
+machine.add_transition(CLEANWAIT, CLEANHOLD, 'hold')
 machine.add_transition(CLEANWAIT, CLEANING, 'resume')
+
+# A node in a clean hold step may also be aborted
+machine.add_transition(CLEANHOLD, CLEANFAIL, 'abort')
+
+# Return the node back to cleaning
+machine.add_transition(CLEANHOLD, CLEANWAIT, 'unhold')
 
 # An operator may want to move a CLEANFAIL node to MANAGEABLE, to perform
 # other actions like cleaning
@@ -478,6 +531,9 @@ machine.add_transition(INSPECTWAIT, INSPECTFAIL, 'fail')
 
 # Inspection is aborted.
 machine.add_transition(INSPECTWAIT, INSPECTFAIL, 'abort')
+
+# Inspection is continued.
+machine.add_transition(INSPECTWAIT, INSPECTING, 'resume')
 
 # Move the node to manageable state for any other
 # action.
@@ -563,3 +619,49 @@ machine.add_transition(ADOPTFAIL, ADOPTING, 'adopt')
 
 # A node that failed adoption can be moved back to manageable
 machine.add_transition(ADOPTFAIL, MANAGEABLE, 'manage')
+
+# Add service* states
+machine.add_state(SERVICING, target=ACTIVE, **watchers)
+machine.add_state(SERVICEWAIT, target=ACTIVE, **watchers)
+machine.add_state(SERVICEFAIL, target=ACTIVE, **watchers)
+machine.add_state(SERVICEHOLD, target=ACTIVE, **watchers)
+
+# A node in service an be returned to active
+machine.add_transition(SERVICING, ACTIVE, 'done')
+
+# A node in active can be serviced
+machine.add_transition(ACTIVE, SERVICING, 'service')
+
+# A node in servicing can be failed
+machine.add_transition(SERVICING, SERVICEFAIL, 'fail')
+
+# A node in service can enter a wait state
+machine.add_transition(SERVICING, SERVICEWAIT, 'wait')
+
+# A node in service can be held
+machine.add_transition(SERVICING, SERVICEHOLD, 'hold')
+machine.add_transition(SERVICEWAIT, SERVICEHOLD, 'hold')
+
+# A held node in service can get more service steps to start over
+machine.add_transition(SERVICEHOLD, SERVICING, 'service')
+
+# A held node in service can be removed from service
+machine.add_transition(SERVICEHOLD, SERVICEWAIT, 'unhold')
+
+# A node in service wait can resume
+machine.add_transition(SERVICEWAIT, SERVICING, 'resume')
+
+# A node in service wait can failed
+machine.add_transition(SERVICEWAIT, SERVICEFAIL, 'fail')
+
+# A node in service wait can be aborted
+machine.add_transition(SERVICEWAIT, SERVICEFAIL, 'abort')
+
+# A node in service hold can be aborted
+machine.add_transition(SERVICEHOLD, SERVICEFAIL, 'abort')
+
+# A node in service fail can re-enter service
+machine.add_transition(SERVICEFAIL, SERVICING, 'service')
+
+# A node in service fail can be rescued
+machine.add_transition(SERVICEFAIL, RESCUING, 'rescue')

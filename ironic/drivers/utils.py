@@ -298,6 +298,11 @@ def store_ramdisk_logs(node, logs, label=None):
     :raises: SwiftOperationError, if any operation with Swift fails.
 
     """
+    if CONF.agent.deploy_logs_collect == 'never':
+        LOG.info('Ramdisk logs will not be stored as the configuration '
+                 'option `agent.deploy_logs_collect` is set to `never`.')
+        return
+
     logs_file_name = get_ramdisk_logs_file_name(node, label=label)
     data = base64.decode_as_bytes(logs)
 
@@ -309,6 +314,8 @@ def store_ramdisk_logs(node, logs, label=None):
                                 logs_file_name)
         with open(log_path, 'wb') as f:
             f.write(data)
+        LOG.info('Ramdisk logs were stored in local storage for node %(node)s',
+                 {'node': node.uuid})
 
     elif CONF.agent.deploy_logs_storage_backend == 'swift':
         with tempfile.NamedTemporaryFile(dir=CONF.tempdir) as f:
@@ -322,6 +329,8 @@ def store_ramdisk_logs(node, logs, label=None):
             swift_api.create_object(
                 CONF.agent.deploy_logs_swift_container, logs_file_name,
                 f.name, object_headers=object_headers)
+        LOG.info('Ramdisk logs were stored in swift for node %(node)s',
+                 {'node': node.uuid})
 
 
 def collect_ramdisk_logs(node, label=None):
@@ -447,9 +456,21 @@ def get_agent_kernel_ramdisk(node, mode='deploy', deprecated_prefix=None):
     # from driver_info but deploy_ramdisk comes from configuration,
     # since it's a sign of a potential operator's mistake.
     if not kernel or not ramdisk:
+        # NOTE(kubajj): If kernel and/or ramdisk are specified by architecture,
+        # prioritise them, otherwise use the default.
+        kernel_dict_param_name = f'{mode}_kernel_by_arch'
+        ramdisk_dict_param_name = f'{mode}_ramdisk_by_arch'
+        kernel_dict = getattr(CONF.conductor, kernel_dict_param_name)
+        ramdisk_dict = getattr(CONF.conductor, ramdisk_dict_param_name)
+        cpu_arch = node.properties.get('cpu_arch')
+        kernel = kernel_dict.get(cpu_arch) if cpu_arch else None
+        ramdisk = ramdisk_dict.get(cpu_arch) if cpu_arch else None
+        if not kernel or not ramdisk:
+            kernel = getattr(CONF.conductor, kernel_name)
+            ramdisk = getattr(CONF.conductor, ramdisk_name)
         return {
-            kernel_name: getattr(CONF.conductor, kernel_name),
-            ramdisk_name: getattr(CONF.conductor, ramdisk_name),
+            kernel_name: kernel,
+            ramdisk_name: ramdisk,
         }
     else:
         return {
@@ -480,4 +501,6 @@ def need_prepare_ramdisk(node):
                                     states.RESCUING,
                                     states.RESCUEWAIT,
                                     states.INSPECTING,
-                                    states.INSPECTWAIT)
+                                    states.INSPECTWAIT,
+                                    states.SERVICING,
+                                    states.SERVICEWAIT)

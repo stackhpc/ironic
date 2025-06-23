@@ -36,6 +36,8 @@ from ironic.objects import base as objects_base
 
 LOG = log.getLogger(__name__)
 
+DBAPI = dbapi.get_instance()
+
 
 class LocalContext:
     """Context to make calls to a local conductor."""
@@ -152,12 +154,16 @@ class ConductorAPI(object):
     |    1.54 - Added optional agent_status and agent_status_message to
                 heartbeat
     |    1.55 - Added change_node_boot_mode
+    |    1.56 - Added continue_inspection
+    |    1.57 - Added do_node_service
+    |    1.58 - Added support for json-rpc port usage
+    |    1.59 - Added support for attaching/detaching virtual media
     """
 
     # NOTE(rloo): This must be in sync with manager.ConductorManager's.
     # NOTE(pas-ha): This also must be in sync with
     #               ironic.common.release_mappings.RELEASE_MAPPING['master']
-    RPC_API_VERSION = '1.55'
+    RPC_API_VERSION = '1.59'
 
     def __init__(self, topic=None):
         super(ConductorAPI, self).__init__()
@@ -230,7 +236,8 @@ class ConductorAPI(object):
             return dest.pop()
         except exception.DriverNotFound:
             reason = (_('No conductor service registered which supports '
-                        'driver %(driver)s for conductor group "%(group)s".') %
+                        'driver %(driver)s for conductor group "%(group)s". '
+                        'Ensure the driver is valid and enabled.') %
                       {'driver': node.driver, 'group': node.conductor_group})
             raise exception.NoValidHost(reason=reason)
 
@@ -247,7 +254,7 @@ class ConductorAPI(object):
 
     def get_random_topic(self):
         """Get an RPC topic for a random conductor service."""
-        conductors = dbapi.get_instance().get_online_conductors()
+        conductors = DBAPI.get_online_conductors()
         try:
             hostname = random.choice(conductors)
         except IndexError:
@@ -1393,3 +1400,94 @@ class ConductorAPI(object):
         """
         cctxt = self._prepare_call(topic=topic, version='1.49')
         return cctxt.call(context, 'get_node_with_token', node_id=node_id)
+
+    def continue_inspection(self, context, node_id, inventory,
+                            plugin_data=None, topic=None):
+        """Continue in-band inspection.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param inventory: hardware inventory from the node.
+        :param plugin_data: optional plugin-specific data.
+        :param topic: RPC topic. Defaults to self.topic.
+        :raises: NodeLocked if node is locked by another conductor.
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.56')
+        return cctxt.call(context, 'continue_inspection', node_id=node_id,
+                          inventory=inventory, plugin_data=plugin_data)
+
+    def do_node_service(self, context, node_id, service_steps,
+                        disable_ramdisk=None, topic=None):
+        """Signal to conductor service to perform manual cleaning on a node.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param service_steps: a list of service step dictionaries.
+        :param disable_ramdisk: Whether to skip booting ramdisk for service.
+        :param topic: RPC topic. Defaults to self.topic.
+        :raises: InvalidParameterValue if validation of power driver interface
+                 failed.
+        :raises: InvalidStateRequested if cleaning can not be performed.
+        :raises: NodeInMaintenance if node is in maintenance mode.
+        :raises: NodeLocked if node is locked by another conductor.
+        :raises: NoFreeConductorWorker when there is no free worker to start
+                 async task.
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.57')
+        return cctxt.call(
+            context, 'do_node_service',
+            node_id=node_id,
+            service_steps=service_steps,
+            disable_ramdisk=disable_ramdisk)
+
+    def attach_virtual_media(self, context, node_id, device_type, image_url,
+                             image_download_source=None, topic=None):
+        """Attach a virtual media device to the node.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param image_url: URL of the image to attach, HTTP or HTTPS.
+        :param image_download_source: Which way to serve the image to the BMC:
+            "http" to serve it from the provided location, "local" to serve
+            it from the local web server.
+        :param topic: RPC topic. Defaults to self.topic.
+        :raises: UnsupportedDriverExtension if the driver does not support
+                 this call.
+        :raises: InvalidParameterValue if validation of management driver
+                 interface failed.
+        :raises: NodeLocked if node is locked by another conductor.
+        :raises: NoFreeConductorWorker when there is no free worker to start
+                 async task.
+
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.59')
+        return cctxt.call(
+            context, 'attach_virtual_media',
+            node_id=node_id,
+            device_type=device_type,
+            image_url=image_url)
+
+    def detach_virtual_media(self, context, node_id, device_types=None,
+                             topic=None):
+        """Detach some or all virtual media devices from the node.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param device_types: A collection of device type, ones from
+            :data:`ironic.common.boot_devices.VMEDIA_DEVICES`.
+            If not provided, all devices are detached.
+        :param topic: RPC topic. Defaults to self.topic.
+        :raises: UnsupportedDriverExtension if the driver does not support
+                 this call.
+        :raises: InvalidParameterValue if validation of management driver
+                 interface failed.
+        :raises: NodeLocked if node is locked by another conductor.
+        :raises: NoFreeConductorWorker when there is no free worker to start
+                 async task.
+
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.59')
+        return cctxt.call(
+            context, 'detach_virtual_media',
+            node_id=node_id,
+            device_types=device_types)

@@ -18,8 +18,8 @@ Test class for DRAC inspection interface
 from unittest import mock
 
 from dracclient import exceptions as drac_exceptions
-from oslo_utils import importutils
 from oslo_utils import units
+import sushy
 
 from ironic.common import exception
 from ironic.common import states
@@ -32,8 +32,6 @@ from ironic.drivers.modules.redfish import utils as redfish_utils
 from ironic import objects
 from ironic.tests.unit.drivers.modules.drac import utils as test_utils
 from ironic.tests.unit.objects import utils as obj_utils
-
-sushy = importutils.try_import('sushy')
 
 INFO_DICT = test_utils.INFO_DICT
 
@@ -185,7 +183,6 @@ class DracInspectionTestCase(test_utils.BaseDracTest):
         expected_node_properties = {
             'memory_mb': 32768,
             'local_gb': 1116,
-            'cpus': 18,
             'cpu_arch': 'x86_64',
             'capabilities': 'boot_mode:uefi,pci_gpu_devices:1'}
         mock_client = mock.Mock()
@@ -235,7 +232,6 @@ class DracInspectionTestCase(test_utils.BaseDracTest):
         expected_node_properties = {
             'memory_mb': 32768,
             'local_gb': 279,
-            'cpus': 18,
             'cpu_arch': 'x86_64',
             'capabilities': 'boot_mode:uefi,pci_gpu_devices:1'}
         mock_client = mock.Mock()
@@ -305,7 +301,6 @@ class DracInspectionTestCase(test_utils.BaseDracTest):
         expected_node_properties = {
             'memory_mb': 32768,
             'local_gb': 279,
-            'cpus': 18,
             'cpu_arch': 'x86_64',
             'capabilities': 'boot_mode:uefi,pci_gpu_devices:0'}
         mock_client = mock.Mock()
@@ -355,7 +350,6 @@ class DracInspectionTestCase(test_utils.BaseDracTest):
         expected_node_properties = {
             'memory_mb': 32768,
             'local_gb': 279,
-            'cpus': 18,
             'cpu_arch': 'x86_64',
             'capabilities': 'boot_mode:uefi,pci_gpu_devices:2'}
         mock_client = mock.Mock()
@@ -387,7 +381,6 @@ class DracInspectionTestCase(test_utils.BaseDracTest):
         expected_node_properties = {
             'memory_mb': 32768,
             'local_gb': 279,
-            'cpus': 18,
             'cpu_arch': 'x86_64',
             'capabilities': 'boot_mode:uefi,pci_gpu_devices:0'}
         mock_client = mock.Mock()
@@ -417,7 +410,6 @@ class DracInspectionTestCase(test_utils.BaseDracTest):
         expected_node_properties = {
             'memory_mb': 32768,
             'local_gb': 1116,
-            'cpus': 18,
             'cpu_arch': 'x86_64',
             'capabilities': 'boot_mode:uefi,pci_gpu_devices:1'}
         mock_client = mock.Mock()
@@ -448,22 +440,6 @@ class DracInspectionTestCase(test_utils.BaseDracTest):
                 self.physical_disks)
 
             self.assertEqual(285888, root_disk.size_mb)
-
-    def test__calculate_cpus(self):
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=True) as task:
-            cpu = task.driver.inspect._calculate_cpus(
-                self.cpus[0])
-
-            self.assertEqual(12, cpu)
-
-    def test__calculate_cpus_without_ht_enabled(self):
-        with task_manager.acquire(self.context, self.node.uuid,
-                                  shared=True) as task:
-            cpu = task.driver.inspect._calculate_cpus(
-                self.cpus[1])
-
-            self.assertEqual(6, cpu)
 
     @mock.patch.object(drac_common, 'get_drac_client', spec_set=True,
                        autospec=True)

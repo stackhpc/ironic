@@ -18,6 +18,7 @@ from ironic_lib import metrics_utils
 from oslo_log import log
 from oslo_utils import units
 
+from ironic.common import async_steps
 from ironic.common import exception
 from ironic.common.glance_service import service_utils
 from ironic.common.i18n import _
@@ -195,7 +196,7 @@ def validate_http_provisioning_configuration(node):
         '[deploy]http_root': CONF.deploy.http_root,
         '[deploy]http_image_subdir': CONF.deploy.http_image_subdir
     }
-    error_msg = _('Node %s failed to validate http provisoning. Some '
+    error_msg = _('Node %s failed to validate http provisioning. Some '
                   'configuration options were missing') % node.uuid
     deploy_utils.check_for_missing_params(params, error_msg)
 
@@ -266,10 +267,11 @@ class CustomAgentDeploy(agent_base.AgentBaseMixin, agent_base.AgentDeployMixin,
         elif task.driver.storage.should_write_image(task):
             # Check if the driver has already performed a reboot in a previous
             # deploy step.
-            if not task.node.driver_internal_info.get('deployment_reboot'):
-                manager_utils.node_power_action(task, states.REBOOT)
-            task.node.del_driver_internal_info('deployment_reboot')
+            already_rebooted = task.node.del_driver_internal_info(
+                async_steps.DEPLOYMENT_REBOOT)
             task.node.save()
+            if not already_rebooted:
+                manager_utils.node_power_action(task, states.REBOOT)
             return states.DEPLOYWAIT
 
     @METRICS.timer('CustomAgentDeployMixin.prepare_instance_boot')
@@ -364,10 +366,11 @@ class CustomAgentDeploy(agent_base.AgentBaseMixin, agent_base.AgentDeployMixin,
                 # Alternatively, we could be in a fast track deployment
                 # and again, we should have nothing to do here.
                 return
-        if node.provision_state in (states.ACTIVE, states.UNRESCUING):
+        if node.provision_state in (states.ACTIVE, states.UNRESCUING,
+                                    states.ADOPTING):
             # Call is due to conductor takeover
             task.driver.boot.prepare_instance(task)
-        elif node.provision_state != states.ADOPTING:
+        else:
             if node.provision_state not in (states.RESCUING, states.RESCUEWAIT,
                                             states.RESCUE, states.RESCUEFAIL):
                 self._update_instance_info(task)
@@ -507,6 +510,13 @@ class AgentDeploy(CustomAgentDeploy):
             'stream_raw_images': CONF.agent.stream_raw_images,
         }
 
+        if (CONF.deploy.image_server_auth_strategy != 'noauth'):
+            image_info['image_server_auth_strategy'] = \
+                CONF.deploy.image_server_auth_strategy
+            image_info['image_server_user'] = CONF.deploy.image_server_user
+            image_info['image_server_password'] =\
+                CONF.deploy.image_server_password
+
         if node.instance_info.get('image_checksum'):
             image_info['checksum'] = node.instance_info['image_checksum']
 
@@ -615,8 +625,8 @@ class AgentDeploy(CustomAgentDeploy):
         else:
             manager_utils.node_set_boot_device(task, 'disk', persistent=True)
 
-        # Remove symbolic link when deploy is done.
-        deploy_utils.remove_http_instance_symlink(task.node.uuid)
+        # Remove symbolic link and image when deploy is done.
+        deploy_utils.destroy_http_instance_images(task.node)
 
 
 class AgentRAID(base.RAIDInterface):
@@ -657,6 +667,8 @@ class AgentRAID(base.RAIDInterface):
         return agent_base.get_steps(task, 'deploy', interface='raid')
 
     @METRICS.timer('AgentRAID.apply_configuration')
+    @base.service_step(priority=0,
+                       argsinfo=_RAID_APPLY_CONFIGURATION_ARGSINFO)
     @base.deploy_step(priority=0,
                       argsinfo=_RAID_APPLY_CONFIGURATION_ARGSINFO)
     def apply_configuration(self, task, raid_config,
@@ -853,7 +865,7 @@ class AgentRescue(base.RescueInterface):
 
         # NOTE(TheJulia): Revealing that the power is off at any time can
         # cause external power sync to decide that the node must be off.
-        # This may result in a post-rescued insance being turned off
+        # This may result in a post-rescued instance being turned off
         # unexpectedly after unrescue.
         # TODO(TheJulia): Once we have power/state callbacks to nova,
         # the reset of the power_state can be removed.

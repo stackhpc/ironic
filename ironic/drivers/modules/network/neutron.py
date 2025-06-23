@@ -33,22 +33,6 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
                      base.NetworkInterface):
     """Neutron v2 network interface"""
 
-    def __init__(self):
-        failures = []
-        cleaning_net = CONF.neutron.cleaning_network
-        if not cleaning_net:
-            failures.append('cleaning_network')
-
-        provisioning_net = CONF.neutron.provisioning_network
-        if not provisioning_net:
-            failures.append('provisioning_network')
-
-        if failures:
-            raise exception.DriverLoadError(
-                driver=self.__class__.__name__,
-                reason=(_('The following [neutron] group configuration '
-                          'options are missing: %s') % ', '.join(failures)))
-
     def validate(self, task):
         """Validates the network interface.
 
@@ -57,6 +41,8 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
             is invalid.
         :raises: MissingParameterValue, if some parameters are missing.
         """
+        # NOTE(TheJulia): These are the minimal networks needed for
+        # the neutron network interface to function.
         self.get_cleaning_network_uuid(task)
         self.get_provisioning_network_uuid(task)
 
@@ -265,3 +251,33 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         """
         return self._remove_network(
             task, self.get_inspection_network_uuid(task), 'inspection')
+
+    def validate_servicing(self, task):
+        """Validates the network interface for servicing operation.
+
+        :param task: a TaskManager instance.
+        :raises: InvalidParameterValue, if the network interface configuration
+            is invalid.
+        :raises: MissingParameterValue, if some parameters are missing.
+        """
+        self.get_servicing_network_uuid(task)
+
+    def add_servicing_network(self, task):
+        """Create neutron ports for each port to boot the servicing ramdisk.
+
+        :param task: a TaskManager instance.
+        :returns: a dictionary in the form {port.uuid: neutron_port['id']}
+        """
+        return self._add_network(
+            task, self.get_servicing_network_uuid(task),
+            CONF.neutron.servicing_network_security_groups,
+            'servicing')
+
+    def remove_servicing_network(self, task):
+        """Deletes neutron port created for booting the servicing ramdisk.
+
+        :param task: a TaskManager instance.
+        :raises: NetworkError
+        """
+        return self._remove_network(
+            task, self.get_servicing_network_uuid(task), 'servicing')

@@ -279,7 +279,7 @@ synchronization process, and record this value if not already set.
 While similar issues may exist when setting the boot mode and target
 boot device in other vendors' BMCs, we are not aware of them at present.
 Should you encounter such an issue, please feel free to report this via
-`Storyboard <https://storyboard.openstack.org>`_, and be sure to include
+`Launchpad <https://bugs.launchpad.net/ironic/+bugs>`_, and be sure to include
 the ``chassis bootparam get 5`` output value along with the ``mc info``
 output from your BMC.
 
@@ -289,6 +289,27 @@ Example::
         mc info
     ipmitool -I lanplus -H <BMC ADDRESS> -U <Username> -P <Password> \
         chassis bootparam get 5
+
+send_raw clean/deploy step
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``send_raw`` vendor passthru method is available to be invoked as a
+clean or deployment step should raw bytes need to be transmitted to the
+remote BMC in order to facilitate some sort of action or specific state.
+In this case, the raw bytes to be set are conveyed with a ``raw_bytes``
+argument on the requested clean or deploy step.
+
+Example::
+
+  {
+    "interface": "vendor",
+    "step": "send_raw",
+    "args": {
+      "raw_bytes": "0x00 0x00 0x00 0x00"
+    }
+  }
+
+
 
 .. _IPMItool: https://sourceforge.net/projects/ipmitool/
 .. _IPMI: https://en.wikipedia.org/wiki/Intelligent_Platform_Management_Interface

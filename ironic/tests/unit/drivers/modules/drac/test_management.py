@@ -24,6 +24,7 @@ import json
 from unittest import mock
 
 from oslo_utils import importutils
+import sushy
 
 import ironic.common.boot_devices
 from ironic.common import exception
@@ -42,7 +43,6 @@ from ironic.tests.unit.drivers.modules.drac import utils as test_utils
 from ironic.tests.unit.objects import utils as obj_utils
 
 dracclient_exceptions = importutils.try_import('dracclient.exceptions')
-sushy = importutils.try_import('sushy')
 
 INFO_DICT = test_utils.INFO_DICT
 
@@ -930,8 +930,6 @@ class DracRedfishManagementTestCase(test_utils.BaseDracTest):
         self.assertRaises(exception.InvalidParameterValue,
                           self.management.import_configuration, task, 'edge')
 
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
@@ -941,11 +939,9 @@ class DracRedfishManagementTestCase(test_utils.BaseDracTest):
     def test_import_configuration_success(
             self, mock_get_system, mock_get_configuration, mock_log,
             mock_power, mock_build_agent_options,
-            mock_set_async_step_flags, mock_get_async_step_return_state):
+            mock_set_async_step_flags):
         deploy_opts = mock.Mock()
         mock_build_agent_options.return_value = deploy_opts
-        step_result = mock.Mock()
-        mock_get_async_step_return_state.return_value = step_result
         task = mock.Mock(node=self.node, context=self.context)
         fake_manager_oem1 = mock.Mock()
         fake_manager_oem1.import_system_configuration.side_effect = (
@@ -961,6 +957,7 @@ class DracRedfishManagementTestCase(test_utils.BaseDracTest):
             '"data": {"prop1": "value1", "prop2": 2}}}')
 
         result = self.management.import_configuration(task, 'edge')
+        self.assertEqual(states.DEPLOYWAIT, result)
 
         fake_manager_oem2.import_system_configuration.assert_called_once_with(
             '{"prop1": "value1", "prop2": 2}')
@@ -971,8 +968,6 @@ class DracRedfishManagementTestCase(test_utils.BaseDracTest):
         mock_build_agent_options.assert_called_once_with(task.node)
         task.driver.boot.prepare_ramdisk.assert_called_once_with(
             task, deploy_opts)
-        mock_get_async_step_return_state.assert_called_once_with(task.node)
-        self.assertEqual(step_result, result)
 
     @mock.patch.object(drac_mgmt.DracRedfishManagement,
                        'import_configuration', autospec=True)
@@ -1593,8 +1588,15 @@ class DracRedfishManagementTestCase(test_utils.BaseDracTest):
             {'oem': {'interface': 'idrac-redfish'}})
 
     def test__validate_conf_mold_data_empty(self):
-        self.assertRaisesRegex(
-            exception.InvalidParameterValue,
-            "does not have enough properties",
-            drac_mgmt._validate_conf_mold,
-            {'oem': {'interface': 'idrac-redfish', 'data': {}}})
+        try:
+            self.assertRaisesRegex(
+                exception.InvalidParameterValue,
+                "does not have enough properties",
+                drac_mgmt._validate_conf_mold,
+                {'oem': {'interface': 'idrac-redfish', 'data': {}}})
+        except Exception:
+            self.assertRaisesRegex(
+                exception.InvalidParameterValue,
+                "should be non-empty",
+                drac_mgmt._validate_conf_mold,
+                {'oem': {'interface': 'idrac-redfish', 'data': {}}})

@@ -23,13 +23,14 @@ Enabling the Redfish driver
 #. Add ``redfish`` to the list of ``enabled_hardware_types``,
    ``enabled_power_interfaces``, ``enabled_management_interfaces`` and
    ``enabled_inspect_interfaces`` as well as ``redfish-virtual-media``
-   to ``enabled_boot_interfaces`` in ``/etc/ironic/ironic.conf``.
+   and ``redfish-https`` to ``enabled_boot_interfaces`` in
+   ``/etc/ironic/ironic.conf``.
    For example::
 
     [DEFAULT]
     ...
     enabled_hardware_types = ipmi,redfish
-    enabled_boot_interfaces = ipxe,redfish-virtual-media
+    enabled_boot_interfaces = ipxe,redfish-virtual-media,redfish-https
     enabled_power_interfaces = ipmitool,redfish
     enabled_management_interfaces = ipmitool,redfish
     enabled_inspect_interfaces = inspector,redfish
@@ -96,7 +97,7 @@ field:
 .. note::
    The ``redfish_address``, ``redfish_username``, ``redfish_password``,
    and ``redfish_verify_ca`` fields, if changed, will trigger a new session
-   to be establsihed and cached with the BMC. The ``redfish_auth_type`` field
+   to be established and cached with the BMC. The ``redfish_auth_type`` field
    will only be used for the creation of a new cached session, or should
    one be rejected by the BMC.
 
@@ -139,6 +140,22 @@ Two clean and deploy steps are provided for key management:
     resets secure boot keys to their manufacturing defaults.
 ``management.clear_secure_boot_keys``
     removes all secure boot keys from the node.
+
+Rebooting on boot mode changes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+While some hardware is able to change the boot mode or the `UEFI secure boot`_
+state immediately, other models may require a reboot for such a change to be
+applied. Furthermore, some hardware models cannot change the boot mode and the
+secure boot state simultaneously, requiring several reboots.
+
+The Bare Metal service refreshes the System resource after issuing a PATCH
+request against it. If the expected change is not observed, the node is
+rebooted, and the Bare Metal service waits until the change is applied. In the
+end, the previous power state is restored.
+
+This logic makes changing boot configuration more robust at the expense of
+several reboots in the worst case.
 
 Out-Of-Band inspection
 ======================
@@ -214,7 +231,7 @@ user-specified kernel command line parameters.
 .. code-block:: bash
 
   baremetal node set node-0 \
-    --driver-info kernel_append_params="nofb nomodeset vga=normal"
+    --driver-info kernel_append_params="nofb vga=normal"
 
 .. note::
    The ``driver_info`` field is supported starting with the Xena release.
@@ -271,20 +288,27 @@ Then the following script can be used to build an ESP image:
    DEST=/path/to/esp.img
    GRUB2=/path/to/grub.efi
    SHIM=/path/to/shim.efi
-   TEMP_MOUNT=$(mktemp -d)
 
    dd if=/dev/zero of=$DEST bs=4096 count=1024
-   mkfs.fat -s 4 -r 512 -S 4096 $DEST
+   mkfs.msdos -F 12 -n ESP_IMAGE $DEST
 
-   sudo mount $DEST $TEMP_MOUNT
-   sudo mkdir -p $DEST/EFI/BOOT
-   sudo cp "$SHIM" $DEST/EFI/BOOT/BOOTX64.efi
-   sudo cp "$GRUB2" $DEST/EFI/BOOT/GRUBX64.efi
-   sudo umount $TEMP_MOUNT
+   # The following commands require mtools to be installed
+   mmd -i $DEST EFI EFI/BOOT
+   mcopy -i $DEST -v $SHIM ::EFI/BOOT/BOOTX64.efi
+   mcopy -i $DEST -v $GRUB2 ::EFI/BOOT/GRUBX64.efi
+   mdir -i $DEST ::EFI/BOOT
 
 .. note::
    If you use an architecture other than x86-64, you'll need to adjust the
    destination paths.
+
+.. warning::
+   If you are using secure boot, you *must* utilize the same SHIM and GRUB
+   binaries matching your distribution's kernel and ramdisk, otherwise the
+   Secure Boot "chain of trust" will be broken.
+   Additionally, if you encounter odd issues UEFI booting with virtual media
+   which point to the bootloader, verify the appropriate distribution matching
+   binaries are in use.
 
 The resulting image should be provided via the ``driver_info/bootloader``
 ironic node property in form of an image UUID or a URL:
@@ -370,6 +394,41 @@ Layer 3 or DHCP-less ramdisk booting
 DHCP-less deploy is supported by the Redfish virtual media boot. See
 :doc:`/admin/dhcp-less` for more information.
 
+Redfish HTTP(s) Boot
+====================
+
+The ``redfish-https`` boot interface is very similar to the
+``redfish-virtual-media`` boot interface. In this driver, we compose an ISO
+image, and request the BMC to inform the UEFI firmware to boot the Ironic
+ramdisk, or a other ramdisk image. This approach is intended to allow a
+pattern of engagement where we have minimal reliance on addressing and
+discovery of the Ironic deployment through autoconfiguration like DHCP,
+and somewhat mirrors vendor examples of booting from an HTTP URL.
+
+This interface has some basic constraints.
+
+* There is no configuration drive functionality, while Virtual Media did
+  help provide such functionality.
+* This interface *is* dependent upon BMC, EFI Firmware, and Bootloader,
+  which means we may not see additional embedded files an contents in
+  an ISO image. This is the same basic constraint over the ``ramdisk``
+  deploy interface when using Network Booting.
+* This is a UEFI-Only boot interface. No legacy boot is possible with
+  this interface.
+
+A good starting point for this interface, is to think of it as
+higher security network boot, as we are explicitly telling the BMC
+where the node should boot from.
+
+Like the ``redfish-virtual-media`` boot interface, you will need
+to create an EFI System Partition image (ESP_), see
+`Configuring an ESP image`_ for details on how to do this.
+
+Additionally, if you would like to use the ``ramdisk`` deployment
+interface, the same basic instructions covered in `Virtual Media Ramdisk`_
+apply, just use ``redfish-https`` as the boot_interface, and keep in mind,
+no configuration drives exist with the ``redfish-https`` boot interface.
+
 Firmware update using manual cleaning
 =====================================
 
@@ -387,7 +446,7 @@ of the remaining updates will pause.  When the node is taken out of maintenance
 mode, processing of the remaining updates will continue.
 
 When updating the BMC firmware, the BMC may become unavailable for a period of
-time as it resets. In this case, it may be desireable to have the cleaning step
+time as it resets. In this case, it may be desirable to have the cleaning step
 wait after the update has been applied before indicating that the
 update was successful. This allows the BMC time to fully reset before further
 operations are carried out against it. To cause the cleaning step to wait after
@@ -407,7 +466,7 @@ The ``update_firmware`` cleaning step accepts JSON in the following format::
             "firmware_images":[
                 {
                     "url": "<url_to_firmware_image1>",
-                    "checksum": "<checksum for image, uses SHA1>",
+                    "checksum": "<checksum for image, uses SHA1, SHA256, or SHA512>",
                     "source": "<optional override source setting for image>",
                     "wait": <number_of_seconds_to_wait>
                 },
@@ -567,7 +626,7 @@ Create Subscription
     :widths: 25, 15, 15, 90
 
     "Destination", "body", "string", "The URI of the destination Event Service"
-    "EventTypes (optional)", "body", "array",  "List of ypes of events that shall be sent to the destination"
+    "EventTypes (optional)", "body", "array",  "List of types of events that shall be sent to the destination"
     "Context (optional)", "body", "string", "A client-supplied string that is stored with the event destination
     subscription"
     "Protocol (optional)", "body", "string", "The protocol type that the event will use for sending

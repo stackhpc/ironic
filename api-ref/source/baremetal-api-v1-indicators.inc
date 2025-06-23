@@ -46,51 +46,10 @@ Response Parameters
    :language: javascript
 
 
-List Indicators for hardware component
-======================================
-
-.. rest_method:: GET /v1/nodes/{node_ident}/management/indicators/{component}
-
-.. versionadded:: 1.63
-
-Retrieves indicators for a given hardware component along with their attributes.
-The components that the ``redfish`` driver may have are: ``system``,
-``chassis`` and ``drive``. The actual list depends on the support by the
-underlying hardware.
-
-Normal response code: 200
-
-Error response codes: 404 (if node or component is not found)
-
-Request
--------
-
-.. rest_parameters:: parameters.yaml
-
-   - node_ident: node_ident
-   - component: component
-
-Response Parameters
--------------------
-
-.. rest_parameters:: parameters.yaml
-
-   - indicators: n_indicators
-   - name: indicator_name
-   - readonly: indicator_readonly
-   - states: indicator_states
-   - links: links
-
-**Example list of indicators for a given component of the node:**
-
-.. literalinclude:: samples/node-indicators-component-list-response.json
-   :language: javascript
-
-
 Get Indicator State
 ===================
 
-.. rest_method:: GET /v1/nodes/{node_ident}/management/indicators/{component}/{ind_ident}
+.. rest_method:: GET /v1/nodes/{node_ident}/management/indicators/{ind_ident}@{component}
 
 .. versionadded:: 1.63
 
@@ -127,7 +86,7 @@ Response Parameters
 Set Indicator State
 ===================
 
-.. rest_method:: PUT /v1/nodes/{node_ident}/management/indicators/{component}/{ind_ident}
+.. rest_method:: PUT /v1/nodes/{node_ident}/management/indicators/{ind_ident}@{component}
 
 .. versionadded:: 1.63
 

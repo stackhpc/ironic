@@ -24,6 +24,9 @@ functionality between a power interface and a deploy interface, when both rely
 on separate vendor_passthru methods.
 """
 
+import random
+import time
+
 from oslo_log import log
 
 from ironic.common import boot_devices
@@ -32,11 +35,40 @@ from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.common import indicator_states
 from ironic.common import states
+from ironic.conf import CONF
 from ironic.drivers import base
 from ironic import objects
 
 
 LOG = log.getLogger(__name__)
+
+
+def parse_sleep_range(sleep_range):
+    if not sleep_range:
+        return 0, 0
+
+    sleep_split = sleep_range.split(',')
+    if len(sleep_split) == 1:
+        a = sleep_split[0]
+        b = sleep_split[0]
+    else:
+        a = sleep_split[0]
+        b = sleep_split[1]
+    return int(a), int(b)
+
+
+def sleep(sleep_range):
+    earliest, latest = parse_sleep_range(sleep_range)
+    if earliest == 0 and latest == 0:
+        # no sleep
+        return
+    if earliest == latest:
+        # constant sleep
+        sleep = earliest
+    else:
+        # triangular random sleep, weighted towards the earliest
+        sleep = random.triangular(earliest, latest, earliest)
+    time.sleep(sleep)
 
 
 class FakePower(base.PowerInterface):
@@ -49,12 +81,15 @@ class FakePower(base.PowerInterface):
         pass
 
     def get_power_state(self, task):
+        sleep(CONF.fake.power_delay)
         return task.node.power_state
 
     def reboot(self, task, timeout=None):
+        sleep(CONF.fake.power_delay)
         pass
 
     def set_power_state(self, task, power_state, timeout=None):
+        sleep(CONF.fake.power_delay)
         if power_state not in [states.POWER_ON, states.POWER_OFF,
                                states.SOFT_REBOOT, states.SOFT_POWER_OFF]:
             raise exception.InvalidParameterValue(
@@ -81,15 +116,19 @@ class FakeBoot(base.BootInterface):
         pass
 
     def prepare_ramdisk(self, task, ramdisk_params, mode='deploy'):
+        sleep(CONF.fake.boot_delay)
         pass
 
     def clean_up_ramdisk(self, task, mode='deploy'):
+        sleep(CONF.fake.boot_delay)
         pass
 
     def prepare_instance(self, task):
+        sleep(CONF.fake.boot_delay)
         pass
 
     def clean_up_instance(self, task):
+        sleep(CONF.fake.boot_delay)
         pass
 
 
@@ -108,18 +147,23 @@ class FakeDeploy(base.DeployInterface):
 
     @base.deploy_step(priority=100)
     def deploy(self, task):
+        sleep(CONF.fake.deploy_delay)
         return None
 
     def tear_down(self, task):
+        sleep(CONF.fake.deploy_delay)
         return states.DELETED
 
     def prepare(self, task):
+        sleep(CONF.fake.deploy_delay)
         pass
 
     def clean_up(self, task):
+        sleep(CONF.fake.deploy_delay)
         pass
 
     def take_over(self, task):
+        sleep(CONF.fake.deploy_delay)
         pass
 
 
@@ -137,9 +181,13 @@ class FakeVendorA(base.VendorInterface):
                 raise exception.MissingParameterValue(_(
                     "Parameter 'bar' not passed to method 'first_method'."))
 
+    # NOTE(TheJulia): As an example, it is advisable to assign
+    # parameters from **kwargs, and then perform handling on
+    # the needful necessary from there.
     @base.passthru(['POST'],
                    description=_("Test if the value of bar is baz"))
     def first_method(self, task, http_method, bar):
+        sleep(CONF.fake.vendor_delay)
         return True if bar == 'baz' else False
 
 
@@ -161,17 +209,35 @@ class FakeVendorB(base.VendorInterface):
     @base.passthru(['POST'],
                    description=_("Test if the value of bar is kazoo"))
     def second_method(self, task, http_method, bar):
+        sleep(CONF.fake.vendor_delay)
         return True if bar == 'kazoo' else False
 
     @base.passthru(['POST'], async_call=False,
                    description=_("Test if the value of bar is meow"))
     def third_method_sync(self, task, http_method, bar):
+        sleep(CONF.fake.vendor_delay)
         return True if bar == 'meow' else False
 
     @base.passthru(['POST'], require_exclusive_lock=False,
                    description=_("Test if the value of bar is woof"))
     def fourth_method_shared_lock(self, task, http_method, bar):
+        sleep(CONF.fake.vendor_delay)
         return True if bar == 'woof' else False
+
+    @base.service_step(requires_ramdisk=False)
+    @base.clean_step(priority=1)
+    @base.passthru(['POST'],
+                   description=_("Test pass-through to wait."))
+    def log_passthrough(self, task, **kwargs):
+        LOG.debug('Test method test_passhtrough_method called with '
+                  'arguments %s.', kwargs)
+        sleep(CONF.fake.vendor_delay)
+        # NOTE(TheJulia): Step methods invoked via an API *cannot*
+        # have return values
+
+    @base.service_step()
+    def trigger_servicewait(self, task, **kwargs):
+        return states.SERVICEWAIT
 
 
 class FakeConsole(base.ConsoleInterface):
@@ -211,17 +277,21 @@ class FakeManagement(base.ManagementInterface):
         return [boot_devices.PXE]
 
     def set_boot_device(self, task, device, persistent=False):
+        sleep(CONF.fake.management_delay)
         if device not in self.get_supported_boot_devices(task):
             raise exception.InvalidParameterValue(_(
                 "Invalid boot device %s specified.") % device)
 
     def get_boot_device(self, task):
+        sleep(CONF.fake.management_delay)
         return {'boot_device': boot_devices.PXE, 'persistent': False}
 
     def get_sensors_data(self, task):
+        sleep(CONF.fake.management_delay)
         return {}
 
     def get_supported_indicators(self, task, component=None):
+        sleep(CONF.fake.management_delay)
         indicators = {
             components.CHASSIS: {
                 'led-0': {
@@ -248,6 +318,7 @@ class FakeManagement(base.ManagementInterface):
                 if not component or component == c}
 
     def get_indicator_state(self, task, component, indicator):
+        sleep(CONF.fake.management_delay)
         indicators = self.get_supported_indicators(task)
         if component not in indicators:
             raise exception.InvalidParameterValue(_(
@@ -271,6 +342,7 @@ class FakeInspect(base.InspectInterface):
         pass
 
     def inspect_hardware(self, task):
+        sleep(CONF.fake.inspect_delay)
         return states.MANAGEABLE
 
 
@@ -282,9 +354,11 @@ class FakeRAID(base.RAIDInterface):
 
     def create_configuration(self, task, create_root_volume=True,
                              create_nonroot_volumes=True):
+        sleep(CONF.fake.raid_delay)
         pass
 
     def delete_configuration(self, task):
+        sleep(CONF.fake.raid_delay)
         pass
 
 
@@ -302,6 +376,7 @@ class FakeBIOS(base.BIOSInterface):
                      'to contain a dictionary with name/value pairs'),
                      'required': True}})
     def apply_configuration(self, task, settings):
+        sleep(CONF.fake.bios_delay)
         # Note: the implementation of apply_configuration in fake interface
         # is just for testing purpose, for real driver implementation, please
         # refer to develop doc at https://docs.openstack.org/ironic/latest/
@@ -328,6 +403,7 @@ class FakeBIOS(base.BIOSInterface):
 
     @base.clean_step(priority=0)
     def factory_reset(self, task):
+        sleep(CONF.fake.bios_delay)
         # Note: the implementation of factory_reset in fake interface is
         # just for testing purpose, for real driver implementation, please
         # refer to develop doc at https://docs.openstack.org/ironic/latest/
@@ -340,6 +416,7 @@ class FakeBIOS(base.BIOSInterface):
 
     @base.clean_step(priority=0)
     def cache_bios_settings(self, task):
+        sleep(CONF.fake.bios_delay)
         # Note: the implementation of cache_bios_settings in fake interface
         # is just for testing purpose, for real driver implementation, please
         # refer to develop doc at https://docs.openstack.org/ironic/latest/
@@ -357,9 +434,11 @@ class FakeStorage(base.StorageInterface):
         return {}
 
     def attach_volumes(self, task):
+        sleep(CONF.fake.storage_delay)
         pass
 
     def detach_volumes(self, task):
+        sleep(CONF.fake.storage_delay)
         pass
 
     def should_write_image(self, task):
@@ -376,7 +455,32 @@ class FakeRescue(base.RescueInterface):
         pass
 
     def rescue(self, task):
+        sleep(CONF.fake.rescue_delay)
         return states.RESCUE
 
     def unrescue(self, task):
+        sleep(CONF.fake.rescue_delay)
         return states.ACTIVE
+
+
+class FakeFirmware(base.FirmwareInterface):
+    """Example implementation of a simple firmware interface."""
+
+    def get_properties(self):
+        return {}
+
+    def validate(self, task):
+        pass
+
+    @base.clean_step(priority=0, argsinfo={
+        'settings': {'description': ('List of Firmware components, each item '
+                     'needs to contain a dictionary with name/value pairs'),
+                     'required': True}})
+    def update(self, task, settings):
+        LOG.debug('Calling update clean step with settings %s.',
+                  settings)
+        sleep(CONF.fake.firmware_delay)
+
+    def cache_firmware_components(self, task):
+        sleep(CONF.fake.firmware_delay)
+        pass

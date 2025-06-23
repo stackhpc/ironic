@@ -14,12 +14,10 @@
 
 from ironic_lib import metrics_utils
 from oslo_log import log
-from oslo_utils import importutils
+import sushy
 
 from ironic.common import exception
 from ironic.common.i18n import _
-from ironic.common import states
-from ironic.conductor import utils as manager_utils
 from ironic.drivers import base
 from ironic.drivers.modules import deploy_utils
 from ironic.drivers.modules.redfish import utils as redfish_utils
@@ -28,8 +26,6 @@ from ironic import objects
 LOG = log.getLogger(__name__)
 
 METRICS = metrics_utils.get_metrics_logger(__name__)
-
-sushy = importutils.try_import('sushy')
 
 registry_fields = ('attribute_type', 'allowable_values', 'lower_bound',
                    'max_length', 'min_length', 'read_only',
@@ -46,13 +42,6 @@ class RedfishBIOS(base.BIOSInterface):
             'required': True
         }
     }
-
-    def __init__(self):
-        super(RedfishBIOS, self).__init__()
-        if sushy is None:
-            raise exception.DriverLoadError(
-                driver='redfish',
-                reason=_("Unable to import the sushy library"))
 
     def _parse_allowable_values(self, node, allowable_values):
         """Convert the BIOS registry allowable_value list to expected strings
@@ -197,6 +186,7 @@ class RedfishBIOS(base.BIOSInterface):
                       {'node_uuid': node.uuid, 'attrs': current_attrs})
             self._clear_reboot_requested(task)
 
+    @base.service_step(priority=0, argsinfo=_APPLY_CONFIGURATION_ARGSINFO)
     @base.clean_step(priority=0, argsinfo=_APPLY_CONFIGURATION_ARGSINFO)
     @base.deploy_step(priority=0, argsinfo=_APPLY_CONFIGURATION_ARGSINFO)
     @base.cache_bios_settings
@@ -230,12 +220,16 @@ class RedfishBIOS(base.BIOSInterface):
             LOG.debug('Apply BIOS configuration for node %(node_uuid)s: '
                       '%(settings)r', {'node_uuid': task.node.uuid,
                                        'settings': settings})
-
-            if bios.supported_apply_times and (
-                    sushy.APPLY_TIME_ON_RESET in bios.supported_apply_times):
-                apply_time = sushy.APPLY_TIME_ON_RESET
-            else:
-                apply_time = None
+            apply_time = None
+            try:
+                if bios.supported_apply_times and (
+                        sushy.APPLY_TIME_ON_RESET in
+                        bios.supported_apply_times):
+                    apply_time = sushy.APPLY_TIME_ON_RESET
+            except AttributeError:
+                LOG.warning('SupportedApplyTimes attribute missing for BIOS'
+                            ' configuration on node %(node_uuid)s: ',
+                            {'node_uuid': task.node.uuid})
 
             try:
                 bios.set_attributes(attributes, apply_time=apply_time)
@@ -368,7 +362,4 @@ class RedfishBIOS(base.BIOSInterface):
         last_error = (_('Redfish BIOS apply_configuration step failed. '
                         'Attributes %(attrs)s are not updated.') %
                       {'attrs': attrs_not_updated})
-        if task.node.provision_state in [states.CLEANING, states.CLEANWAIT]:
-            manager_utils.cleaning_error_handler(task, last_error)
-        if task.node.provision_state in [states.DEPLOYING, states.DEPLOYWAIT]:
-            manager_utils.deploying_error_handler(task, error_msg, last_error)
+        deploy_utils.step_error_handler(task, error_msg, last_error)

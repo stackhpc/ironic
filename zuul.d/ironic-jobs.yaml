@@ -1,9 +1,10 @@
+---
 - job:
     name: ironic-base
     abstract: true
     description: Base job for devstack/tempest based ironic jobs.
     parent: devstack-tempest
-    nodeset: openstack-single-node-focal
+    nodeset: openstack-single-node-jammy
     post-run: playbooks/ci-workarounds/get_extra_logging.yaml
     timeout: 10800
     required-projects:
@@ -34,7 +35,7 @@
       devstack_localrc:
         DEFAULT_INSTANCE_TYPE: baremetal
         FORCE_CONFIG_DRIVE: True
-        INSTALL_TEMPEST: False # Don't install a tempest package globaly
+        INSTALL_TEMPEST: False # Don't install a tempest package globally
         VIRT_DRIVER: ironic
         BUILD_TIMEOUT: 1800
         IRONIC_BAREMETAL_BASIC_OPS: True
@@ -64,12 +65,13 @@
         # NOTE(TheJulia): Disable neutron firewall as bug
         # https://bugs.launchpad.net/neutron/+bug/1944201
         # causes us an abnormally high job failure rate due to the ports
-        # not being found (as neutron crashed on initailization).
+        # not being found (as neutron crashed on initialization).
         Q_USE_SECGROUP: False
         # Default API workers is 2, however only 1 is needed,
         # which cuts API memory utilziation in half reducing the risk of
         # oom-killer events in CI.
         API_WORKERS: 1
+        CIRROS_VERSION: 0.6.1
       devstack_plugins:
         ironic: https://opendev.org/openstack/ironic
       tempest_plugins:
@@ -99,6 +101,12 @@
         s-object: False
         s-proxy: False
 
+# NOTE(TheJulia): This job is being phased out as it ends up executing
+# the wholedisk standalone deploy, the partition standalone deploy,
+# software raid tests, and ramdisk iso boot tests. All of this while in
+# UEFI mode. Although the redfish test runs the exact same tests and *more*.
+# On top of that, there really is not a good variation which would be
+# impacted through IPMI while we keep other ipmi jobs in our CI config.
 - job:
     name: ironic-standalone
     description:
@@ -142,11 +150,9 @@
       devstack_services:
         n-api: False
         n-api-meta: False
-        n-cauth: False
         n-cond: False
         n-cpu: False
         n-novnc: False
-        n-obj: False
         n-sch: False
         nova: False
         placement-api: False
@@ -183,7 +189,7 @@
         IRONIC_AGENT_IMAGE_DOWNLOAD_SOURCE: http
         IRONIC_AUTOMATED_CLEAN_ENABLED: False
         IRONIC_DEPLOY_DRIVER: redfish
-        IRONIC_ENABLED_BOOT_INTERFACES: "ipxe,redfish-virtual-media"
+        IRONIC_ENABLED_BOOT_INTERFACES: "ipxe,redfish-virtual-media,http-ipxe,pxe,http"
         IRONIC_ENABLED_HARDWARE_TYPES: redfish
         IRONIC_ENABLED_POWER_INTERFACES: redfish
         IRONIC_ENABLED_MANAGEMENT_INTERFACES: redfish
@@ -202,11 +208,9 @@
       devstack_services:
         n-api: False
         n-api-meta: False
-        n-cauth: False
         n-cond: False
         n-cpu: False
         n-novnc: False
-        n-obj: False
         n-sch: False
         nova: False
         placement-api: False
@@ -257,6 +261,10 @@
         IRONIC_DEPLOY_CALLBACK_WAIT_TIMEOUT: 3600
         IRONIC_PXE_BOOT_RETRY_TIMEOUT: 3600
 
+# NOTE(TheJulia): This job should likely be phased out as the standalone
+# job mostly checks the related code paths, the overlap pertinant here is
+# BIOS mode, which is not commonly deployed, and the minimum feature set
+# flag for the emulator.
 - job:
     name: ironic-tempest-bios-redfish-pxe
     description: "Deploy ironic node over PXE using BIOS boot mode"
@@ -274,6 +282,10 @@
         # Reset the callback to a normal-ish value.
         IRONIC_CALLBACK_TIMEOUT: 600
         IRONIC_BOOT_MODE: bios
+        # Make sure this feature works even with the minimum implementation
+        IRONIC_REDFISH_EMULATOR_FEATURE_SET: minimum
+        # Test sharding support
+        IRONIC_SHARDS: 1
       devstack_services:
         # Parent job uses swift, this one does not, thus we can turn it off.
         s-account: False
@@ -286,6 +298,9 @@
     description: "Deploy ironic node over Redfish virtual media using UEFI boot mode"
     parent: ironic-base
     vars:
+      # NOTE(iurygregory): switch to only wholedisk test, since the
+      # partition test is failling randomly.
+      tempest_test_regex: test_baremetal_server_ops_wholedisk_image
       devstack_localrc:
         IRONIC_DEPLOY_DRIVER: redfish
         IRONIC_ENABLED_HARDWARE_TYPES: redfish
@@ -299,9 +314,10 @@
         # result and makes this job VERY sensitive to heavy disk IO of the
         # underlying hypervisor/cloud.
         IRONIC_CALLBACK_TIMEOUT: 800
-        IRONIC_GRUB2_SHIM_FILE: https://mirror.iad3.inmotion.opendev.org/centos-stream/9-stream/BaseOS/x86_64/os/EFI/BOOT/BOOTX64.EFI
-        IRONIC_GRUB2_FILE: https://mirror.iad3.inmotion.opendev.org/centos-stream/9-stream/BaseOS/x86_64/os/EFI/BOOT/grubx64.efi
+        IRONIC_GRUB2_SHIM_FILE: https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/EFI/BOOT/BOOTX64.EFI
+        IRONIC_GRUB2_FILE: https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/EFI/BOOT/grubx64.efi
         IRONIC_GRUB2_CONFIG_PATH: EFI/BOOT/grub.cfg
+        IRONIC_REDFISH_EMULATOR_FEATURE_SET: vmedia
       devstack_services:
         s-account: True
         s-container: True
@@ -311,7 +327,7 @@
 - job:
     name: ironic-inspector-tempest-uefi-redfish-vmedia
     description: "Inspect and deploy ironic node over Redfish virtual media using UEFI"
-    parent: ironic-tempest-partition-uefi-redfish-vmedia
+    parent: ironic-tempest-uefi-redfish-vmedia
     required-projects:
       - opendev.org/openstack/ironic-inspector
     vars:
@@ -346,7 +362,7 @@
 # could be an issue with the lookup in ironic-python-agent
 - job:
     name: ironic-tempest-ipa-wholedisk-bios-agent_ipmitool
-    description: ironic-tempest-ipa-wholedisk-bios-agent_ipmitool
+    description: Gate-ish job with classic name. Executes rescue!
     parent: ironic-base
     vars:
       devstack_localrc:
@@ -365,26 +381,92 @@
         s-proxy: True
 
 - job:
-    name: ironic-tempest-wholedisk-bios-snmp-pxe
-    description: SNMP power, no-op management and whole disk images.
+    name: ironic-tempest-ramdisk-bios-snmp-pxe
+    description: SNMP power, iPXE, OVN, no-op management and whole disk images.
     parent: ironic-base
     vars:
+      # NOTE(TheJulia): No reason to go much further than the network boot,
+      # Hence the use of the ramdisk test scenario as opposed to the others.
+      tempest_test_regex: test_ramdisk_iso
       devstack_localrc:
         IRONIC_ENABLED_HARDWARE_TYPES: snmp
         IRONIC_DEPLOY_DRIVER: snmp
+        IRONIC_ENABLED_DEPLOY_INTERFACES: "ramdisk"
         IRONIC_TEMPEST_WHOLE_DISK_IMAGE: True
         IRONIC_VM_EPHEMERAL_DISK: 0
         IRONIC_AUTOMATED_CLEAN_ENABLED: False
-        IRONIC_ENFORCE_SCOPE: True
+        # NOTE(TheJulia): Explicitly set scope enforcement to False until we
+        # remove the legacy policies.
+        IRONIC_ENFORCE_SCOPE: False
         IRONIC_BOOT_MODE: bios
+        Q_AGENT: ovn
+        Q_ML2_TENANT_NETWORK_TYPE: vlan
+        Q_ML2_PLUGIN_MECHANISM_DRIVERS: ovn
+        ENABLE_CHASSIS_AS_GW: True
+        ML2_L3_PLUGIN: "ovn-router,trunk"
+        OVN_DBS_LOG_LEVEL: dbg
+        OVN_BUILD_FROM_SOURCE: True
+        Q_BUILD_OVS_FROM_GIT: True
+        # NOTE(TheJulia): Ubuntu ships an out of date OVN package, so
+        # we need to build from source. These are the minimum versions
+        # representing June 2023 release. Ubuntu Kinetic is shipping Q3 2022
+        # i.e. OVN 22.09, so likely possible to remove sometime *after*
+        # Ubuntu Mantic OVN 2023.03.
+        OVN_BRANCH: v23.06.0
+        OVS_BRANCH: v3.1.1
+      devstack_services:
+        q-agt: False
+        q-dhcp: False
+        q-l3: False
+        ovn-controller: True
+        ovn-northd: True
+        q-ovn-metadata-agent: True
+        n-api: False
+        n-api-meta: False
+        n-cond: False
+        n-cpu: False
+        n-novnc: False
+        n-sch: False
+        nova: False
+        placement-api: False
+        s-account: False
+        s-container: False
+        s-object: False
+        s-proxy: False
 
 - job:
-    name: ironic-tempest-partition-uefi-ipmi-pxe
-    description: IPMI power, UEFI, partition image.
+    name: ironic-tempest-ovn-uefi-ipmi-pxe
+    description: IPMI power, UEFI, iPXE, OVN image.
     parent: ironic-base
     vars:
+      # NOTE(iurygregory): switch to only wholedisk test, since the
+      # partition test is failling randomly.
+      tempest_test_regex: test_baremetal_server_ops_wholedisk_image
       devstack_localrc:
         IRONIC_AUTOMATED_CLEAN_ENABLED: False
+        Q_AGENT: ovn
+        Q_ML2_TENANT_NETWORK_TYPE: vlan
+        Q_ML2_PLUGIN_MECHANISM_DRIVERS: ovn
+        ENABLE_CHASSIS_AS_GW: True
+        ML2_L3_PLUGIN: "ovn-router,trunk"
+        OVN_DBS_LOG_LEVEL: dbg
+        OVN_BUILD_FROM_SOURCE: True
+        Q_BUILD_OVS_FROM_GIT: True
+        # NOTE(TheJulia): Ubuntu ships an out of date OVN package, so
+        # we need to build from source. These are the minimum versions
+        # representing June 2023 release. Ubuntu Kinetic is shipping Q3 2022
+        # i.e. OVN 22.09, so likely possible to remove sometime *after*
+        # Ubuntu Mantic which is OVN 2023.03.
+        OVN_BRANCH: v23.06.0
+        OVS_BRANCH: v3.1.1
+      devstack_services:
+        q-agt: False
+        q-dhcp: False
+        q-l3: False
+        ovn-controller: True
+        ovn-northd: True
+        ovn-vswitchd: True
+        q-ovn-metadata-agent: True
 
 - job:
     name: ironic-tempest-bfv
@@ -395,8 +477,8 @@
       devstack_localrc:
         IRONIC_ENABLED_STORAGE_INTERFACES: cinder,noop
         IRONIC_STORAGE_INTERFACE: cinder
-        IRONIC_ENABLED_BOOT_INTERFACES: ipxe,pxe,fake
-        IRONIC_DEFAULT_BOOT_INTERFACE: ipxe
+        IRONIC_ENABLED_BOOT_INTERFACES: http-ipxe,ipxe,pxe,fake
+        IRONIC_DEFAULT_BOOT_INTERFACE: http-ipxe
         IRONIC_TEMPEST_WHOLE_DISK_IMAGE: True
         IRONIC_VM_EPHEMERAL_DISK: 0
         IRONIC_VM_COUNT: 3
@@ -479,14 +561,11 @@
       devstack_services:
         rabbit: False
         g-api: False
-        g-reg: False
         n-api: False
         n-api-meta: False
-        n-cauth: False
         n-cond: False
         n-cpu: False
         n-novnc: False
-        n-obj: False
         n-sch: False
         nova: False
         placement-api: False
@@ -509,7 +588,7 @@
     name: ironic-tempest-ipa-wholedisk-direct-tinyipa-multinode
     description: ironic-tempest-ipa-wholedisk-direct-tinyipa-multinode
     parent: tempest-multinode-full-base
-    nodeset: openstack-two-node-focal
+    nodeset: openstack-two-node-jammy
     pre-run: playbooks/ci-workarounds/pre.yaml
     required-projects:
       - opendev.org/openstack/ironic
@@ -546,7 +625,7 @@
         GENERIC_SWITCH_KEY_FILE: /opt/stack/.ssh/id_rsa
         HOST_TOPOLOGY: multinode
         HOST_TOPOLOGY_ROLE: primary
-        INSTALL_TEMPEST: False # Don't install a tempest package globaly
+        INSTALL_TEMPEST: False # Don't install a tempest package globally
         IRONIC_AUTOMATED_CLEAN_ENABLED: False
         HOST_TOPOLOGY_SUBNODES: "{{ hostvars['compute1']['nodepool']['public_ipv4'] }}"
         IRONIC_BAREMETAL_BASIC_OPS: True
@@ -608,16 +687,13 @@
 
         dstat: True
         g-api: True
-        g-reg: True
         key: True
         mysql: True
         n-api: True
         n-api-meta: True
-        n-cauth: True
         n-cond: True
         n-cpu: True
         n-novnc: True
-        n-obj: True
         n-sch: True
         placement-api: True
         q-agt: True
@@ -675,12 +751,39 @@
           n-cpu: True
 
 - job:
+    # NOTE(JayF) This job sets up two nova-computes with two different shards
+    # TODO(JayF) Add a post-run validation to ensure the two n-cpus did not
+    #            see each others' nodes
+    name: ironic-tempest-ipa-wholedisk-direct-tinyipa-multinode-shard
+    description: ironic-tempest-ipa-wholedisk-direct-tinyipa-multinode-shard
+    parent: ironic-tempest-ipa-wholedisk-direct-tinyipa-multinode
+    nodeset: openstack-two-node-jammy
+    vars:
+      tempest_test_regex: "BaremetalBasicOps"
+      devstack_localrc:
+        IRONIC_SHARDS: 1
+        IRONIC_SHARD_1_NAME: "main-node"
+    group-vars:
+      subnode:
+        devstack_localrc:
+          IRONIC_SHARDS: 1
+          IRONIC_SHARD_1_NAME: "subnode"
+
+- job:
     name: ironic-tox-unit-with-driver-libs
     parent: openstack-tox
     description: |
       Run python 3 unit tests with driver dependencies installed.
     vars:
       tox_envlist: unit-with-driver-libs
+
+- job:
+    name: ironic-tox-unit-mysql-migrations
+    parent: openstack-tox
+    description: |
+      Run MySQL based data model migrations separate to isolate failures.
+    vars:
+      tox_envlist: mysql-migrations
 
 - job:
     name: ironic-inspector-tempest-discovery-fast-track
@@ -724,7 +827,6 @@
       - ^ironic/tests/.*$
       - ^releasenotes/.*$
       - ^setup.cfg$
-      - ^tools/(?!bandit\.yml).*$
       - ^tox.ini$
 
 - job:
@@ -896,6 +998,12 @@
           SWIFT_TEMPURL_KEY: secretkey
           EBTABLES_RACE_FIX: True
           LIBVIRT_STORAGE_POOL_PATH: /opt/libvirt/images
+          INSTANCE_WAIT: 120
+          MYSQL_GATHER_PERFORMANCE: False
+          CIRROS_VERSION: 0.6.1
+          # Required as different access rights are used by default
+          # and the classic devstack config which is defaulted doesn't work.
+          IRONIC_ENFORCE_SCOPE: True
         old:
           IRONIC_VM_LOG_DIR: '{{ devstack_bases.old }}/ironic-bm-logs'
       grenade_localrc:
@@ -968,7 +1076,7 @@
           HOST_TOPOLOGY: multinode
           HOST_TOPOLOGY_ROLE: primary
           BUILD_TIMEOUT: 1200
-          INSTALL_TEMPEST: False # Don't install a tempest package globaly
+          INSTALL_TEMPEST: False # Don't install a tempest package globally
           HOST_TOPOLOGY_SUBNODES: "{{ hostvars['compute1']['nodepool']['public_ipv4'] }}"
           IRONIC_BAREMETAL_BASIC_OPS: True
           IRONIC_AUTOMATED_CLEAN_ENABLED: False
@@ -1109,3 +1217,12 @@
       # important to set the working dir to the Ironic checkout.
       zuul_work_dir: "{{ ansible_user_dir }}/{{ zuul.projects['opendev.org/openstack/ironic'].src_dir }}"
 
+- job:
+    name: ironic-grenade-skip-level
+    parent: ironic-grenade
+    vars:
+      grenade_from_branch: stable/zed
+      grenade_to_branch: master
+      grenade_localrc:
+        # NOTE(iurygregory): This is required for skip upgrades.
+        NOVA_ENABLE_UPGRADE_WORKAROUND: True

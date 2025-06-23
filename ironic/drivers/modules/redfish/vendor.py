@@ -17,16 +17,14 @@ Vendor Interface for Redfish drivers and its supporting methods.
 
 from ironic_lib import metrics_utils
 from oslo_log import log
-from oslo_utils import importutils
 import rfc3986
+import sushy
 
 from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.drivers import base
 from ironic.drivers.modules.redfish import boot as redfish_boot
 from ironic.drivers.modules.redfish import utils as redfish_utils
-
-sushy = importutils.try_import('sushy')
 
 LOG = log.getLogger(__name__)
 METRICS = metrics_utils.get_metrics_logger(__name__)
@@ -95,6 +93,9 @@ class RedfishVendorPassthru(base.VendorInterface):
     # @task_manager.require_exclusive_lock
     def eject_vmedia(self, task, **kwargs):
         """Eject a virtual media device.
+
+        Deprecated in favour of the generic API.
+        This should be removed during the 2024.2 cycle.
 
         :param task: A TaskManager object.
         :param kwargs: The arguments sent with vendor passthru. The optional

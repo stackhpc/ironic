@@ -27,6 +27,7 @@ from oslo_utils import uuidutils
 from ironic.common import driver_factory
 from ironic.common import exception
 from ironic.common import states
+from ironic.common import utils as common_utils
 from ironic.conductor import base_manager
 from ironic.conductor import manager
 from ironic.conductor import notification_utils
@@ -305,10 +306,37 @@ class StartStopTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
     def test_start_dbapi_single_call(self, mock_dbapi):
         self._start_service()
         # NOTE(TheJulia): This seems like it should only be 1, but
-        # the hash ring initailization pulls it's own database connection
+        # the hash ring initialization pulls it's own database connection
         # instance, which is likely a good thing, thus this is 2 instead of
         # 3 without reuse of the database connection.
         self.assertEqual(2, mock_dbapi.call_count)
+
+    def test_start_with_json_rpc(self):
+        CONF.set_override('rpc_transport', 'json-rpc')
+        CONF.set_override('host', 'foo.bar.baz')
+        self._start_service()
+        res = objects.Conductor.get_by_hostname(self.context, self.hostname)
+        self.assertEqual(self.hostname, res['hostname'])
+
+    def test_start_with_json_rpc_port(self):
+        CONF.set_override('rpc_transport', 'json-rpc')
+        CONF.set_override('host', 'foo.bar.baz')
+        CONF.set_override('port', 8192, group='json_rpc')
+
+        self._start_service()
+        res = objects.Conductor.get_by_hostname(self.context,
+                                                self.service.host)
+        self.assertEqual(f'{self.hostname}:8192', res['hostname'])
+
+    def test_start_without_jsonrpc_port_pined_version(self):
+        CONF.set_override('rpc_transport', 'json-rpc')
+        CONF.set_override('host', 'foo.bar.baz')
+        CONF.set_override('port', 8192, group='json_rpc')
+        CONF.set_override('pin_release_version', '21.4')
+        self._start_service()
+        res = objects.Conductor.get_by_hostname(self.context,
+                                                self.service.host)
+        self.assertEqual(self.hostname, res['hostname'])
 
 
 class KeepAliveTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
@@ -322,12 +350,24 @@ class KeepAliveTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                                    'is_set', autospec=True) as mock_is_set:
                 mock_is_set.side_effect = [False, True]
                 self.service._conductor_service_record_keepalive()
-            mock_touch.assert_called_once_with(self.hostname)
+            mock_touch.assert_not_called()
+            with mock.patch.object(self.service._keepalive_evt,
+                                   'is_set', autospec=True) as mock_is_set:
+                mock_is_set.side_effect = [False, True]
+                with mock.patch.object(common_utils, 'is_ironic_using_sqlite',
+                                       autospec=True) as mock_is_sqlite:
+                    mock_is_sqlite.return_value = False
+                    self.service._conductor_service_record_keepalive()
+                    self.assertEqual(1, mock_is_sqlite.call_count)
+            mock_touch.assert_called_once_with(self.hostname, online=True)
 
-    def test__conductor_service_record_keepalive_failed_db_conn(self):
+    @mock.patch.object(common_utils, 'is_ironic_using_sqlite', autospec=True)
+    def test__conductor_service_record_keepalive_failed_db_conn(
+            self, is_sqlite_mock):
         self._start_service()
         # avoid wasting time at the event.wait()
         CONF.set_override('heartbeat_interval', 0, 'conductor')
+        is_sqlite_mock.return_value = False
         with mock.patch.object(self.dbapi, 'touch_conductor',
                                autospec=True) as mock_touch:
             mock_touch.side_effect = [None, db_exception.DBConnectionError(),
@@ -337,11 +377,15 @@ class KeepAliveTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                 mock_is_set.side_effect = [False, False, False, True]
                 self.service._conductor_service_record_keepalive()
             self.assertEqual(3, mock_touch.call_count)
+        self.assertEqual(1, is_sqlite_mock.call_count)
 
-    def test__conductor_service_record_keepalive_failed_error(self):
+    @mock.patch.object(common_utils, 'is_ironic_using_sqlite', autospec=True)
+    def test__conductor_service_record_keepalive_failed_error(self,
+                                                              is_sqlite_mock):
         self._start_service()
-        # avoid wasting time at the event.wait()
+        # minimal time at the event.wait()
         CONF.set_override('heartbeat_interval', 0, 'conductor')
+        is_sqlite_mock.return_value = False
         with mock.patch.object(self.dbapi, 'touch_conductor',
                                autospec=True) as mock_touch:
             mock_touch.side_effect = [None, Exception(),
@@ -351,26 +395,62 @@ class KeepAliveTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                 mock_is_set.side_effect = [False, False, False, True]
                 self.service._conductor_service_record_keepalive()
             self.assertEqual(3, mock_touch.call_count)
+        self.assertEqual(1, is_sqlite_mock.call_count)
 
 
 class ManagerSpawnWorkerTestCase(tests_base.TestCase):
     def setUp(self):
         super(ManagerSpawnWorkerTestCase, self).setUp()
         self.service = manager.ConductorManager('hostname', 'test-topic')
-        self.executor = mock.Mock(spec=futurist.GreenThreadPoolExecutor)
-        self.service._executor = self.executor
+        self.service._executor = mock.Mock(
+            spec=futurist.GreenThreadPoolExecutor)
+        self.service._reserved_executor = mock.Mock(
+            spec=futurist.GreenThreadPoolExecutor)
+
+        self.func = lambda: None
 
     def test__spawn_worker(self):
-        self.service._spawn_worker('fake', 1, 2, foo='bar', cat='meow')
+        self.service._spawn_worker(self.func, 1, 2, foo='bar', cat='meow')
 
-        self.executor.submit.assert_called_once_with(
-            'fake', 1, 2, foo='bar', cat='meow')
+        self.service._executor.submit.assert_called_once_with(
+            self.func, 1, 2, foo='bar', cat='meow')
+        self.service._reserved_executor.submit.assert_not_called()
 
-    def test__spawn_worker_none_free(self):
-        self.executor.submit.side_effect = futurist.RejectedSubmission()
+    def test__spawn_worker_reserved(self):
+        self.service._executor.submit.side_effect = \
+            futurist.RejectedSubmission()
+
+        self.service._spawn_worker(self.func, 1, 2, foo='bar', cat='meow')
+
+        self.service._executor.submit.assert_called_once_with(
+            self.func, 1, 2, foo='bar', cat='meow')
+        self.service._reserved_executor.submit.assert_called_once_with(
+            self.func, 1, 2, foo='bar', cat='meow')
+
+    def test__spawn_worker_cannot_use_reserved(self):
+        self.service._executor.submit.side_effect = \
+            futurist.RejectedSubmission()
 
         self.assertRaises(exception.NoFreeConductorWorker,
-                          self.service._spawn_worker, 'fake')
+                          self.service._spawn_worker, self.func,
+                          _allow_reserved_pool=False)
+
+    def test__spawn_worker_no_reserved(self):
+        self.service._executor.submit.side_effect = \
+            futurist.RejectedSubmission()
+        self.service._reserved_executor = None
+
+        self.assertRaises(exception.NoFreeConductorWorker,
+                          self.service._spawn_worker, self.func)
+
+    def test__spawn_worker_none_free(self):
+        self.service._executor.submit.side_effect = \
+            futurist.RejectedSubmission()
+        self.service._reserved_executor.submit.side_effect = \
+            futurist.RejectedSubmission()
+
+        self.assertRaises(exception.NoFreeConductorWorker,
+                          self.service._spawn_worker, self.func)
 
 
 @mock.patch.object(objects.Conductor, 'unregister_all_hardware_interfaces',

@@ -21,6 +21,7 @@ import sys
 import tempfile
 from unittest import mock
 from urllib import parse as urlparse
+import uuid
 
 import fixtures
 from oslo_config import cfg
@@ -43,17 +44,16 @@ from ironic.common import indicator_states
 from ironic.common import policy
 from ironic.common import states
 from ironic.conductor import rpcapi
+from ironic.conf import CONF
 from ironic.drivers.modules import inspect_utils
-from ironic.drivers.modules import inspector
 from ironic import objects
 from ironic.objects import fields as obj_fields
 from ironic import tests as tests_root
-from ironic.tests import base
 from ironic.tests.unit.api import base as test_api_base
 from ironic.tests.unit.api import utils as test_api_utils
+from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.objects import utils as obj_utils
 
-CONF = inspector.CONF
 
 with open(
         os.path.join(
@@ -145,6 +145,7 @@ class TestListNodes(test_api_base.BaseApiTest):
         self.assertNotIn('retired_reason', data['nodes'][0])
         self.assertNotIn('lessee', data['nodes'][0])
         self.assertNotIn('network_data', data['nodes'][0])
+        self.assertNotIn('service_steps', data['nodes'][0])
 
     @mock.patch.object(policy, 'check', autospec=True)
     @mock.patch.object(policy, 'check_policy', autospec=True)
@@ -223,6 +224,7 @@ class TestListNodes(test_api_base.BaseApiTest):
         self.assertIn('lessee', data)
         self.assertNotIn('allocation_id', data)
         self.assertIn('allocation_uuid', data)
+        self.assertIn('service_step', data)
 
     def test_get_one_configdrive_dict(self):
         fake_instance_info = {
@@ -521,6 +523,15 @@ class TestListNodes(test_api_base.BaseApiTest):
         # We always append "links"
         self.assertCountEqual(['extra', 'instance_info', 'links'], data)
 
+    def test_get_one_custom_fields_as_list(self):
+        node = obj_utils.create_test_node(self.context,
+                                          chassis_id=self.chassis.id)
+        data = self.get_json(
+            '/nodes/%s?fields=extra&fields=instance_info' % node.uuid,
+            headers={api_base.Version.string: str(api_v1.max_version())})
+        # We always append "links"
+        self.assertCountEqual(['extra', 'instance_info', 'links'], data)
+
     def test_get_collection_custom_fields(self):
         fields = 'uuid,instance_info'
         for i in range(3):
@@ -530,6 +541,21 @@ class TestListNodes(test_api_base.BaseApiTest):
 
         data = self.get_json(
             '/nodes?fields=%s' % fields,
+            headers={api_base.Version.string: str(api_v1.max_version())})
+
+        self.assertEqual(3, len(data['nodes']))
+        for node in data['nodes']:
+            # We always append "links"
+            self.assertCountEqual(['uuid', 'instance_info', 'links'], node)
+
+    def test_get_collection_custom_fields_as_list(self):
+        for i in range(3):
+            obj_utils.create_test_node(self.context,
+                                       uuid=uuidutils.generate_uuid(),
+                                       instance_uuid=uuidutils.generate_uuid())
+
+        data = self.get_json(
+            '/nodes?fields=uuid&fields=instance_info',
             headers={api_base.Version.string: str(api_v1.max_version())})
 
         self.assertEqual(3, len(data['nodes']))
@@ -843,6 +869,64 @@ class TestListNodes(test_api_base.BaseApiTest):
         self.assertIn('retired_reason', data['nodes'][0])
         self.assertIn('network_data', data['nodes'][0])
 
+    def test_detail_snmpv3(self):
+        driver_info = {
+            'snmp_version': 3,
+            'snmp_user': 'test-user',
+            'snmp_auth_protocol': 'sha',
+            'snmp_auth_key': 'test-auth-key',
+            'snmp_priv_protocol': 'aes',
+            'snmp_priv_key': 'test-priv-key'
+        }
+        sanitized_driver_info = driver_info.copy()
+        sanitized_driver_info['snmp_auth_key'] = '******'
+        sanitized_driver_info['snmp_priv_key'] = '******'
+
+        node = obj_utils.create_test_node(self.context,
+                                          chassis_id=self.chassis.id,
+                                          driver_info=driver_info)
+        data = self.get_json(
+            '/nodes/detail',
+            headers={api_base.Version.string: str(api_v1.max_version())})
+        self.assertEqual(node.uuid, data['nodes'][0]["uuid"])
+        self.assertIn('name', data['nodes'][0])
+        self.assertIn('driver', data['nodes'][0])
+        self.assertIn('driver_info', data['nodes'][0])
+        self.assertEqual(sanitized_driver_info,
+                         data['nodes'][0]['driver_info'])
+        self.assertIn('extra', data['nodes'][0])
+        self.assertIn('properties', data['nodes'][0])
+        self.assertIn('chassis_uuid', data['nodes'][0])
+        self.assertIn('reservation', data['nodes'][0])
+        self.assertIn('maintenance', data['nodes'][0])
+        self.assertIn('console_enabled', data['nodes'][0])
+        self.assertIn('target_power_state', data['nodes'][0])
+        self.assertIn('target_provision_state', data['nodes'][0])
+        self.assertIn('provision_updated_at', data['nodes'][0])
+        self.assertIn('inspection_finished_at', data['nodes'][0])
+        self.assertIn('inspection_started_at', data['nodes'][0])
+        self.assertIn('raid_config', data['nodes'][0])
+        self.assertIn('target_raid_config', data['nodes'][0])
+        self.assertIn('network_interface', data['nodes'][0])
+        self.assertIn('resource_class', data['nodes'][0])
+        for field in api_utils.V31_FIELDS:
+            self.assertIn(field, data['nodes'][0])
+        self.assertIn('storage_interface', data['nodes'][0])
+        self.assertIn('traits', data['nodes'][0])
+        self.assertIn('conductor_group', data['nodes'][0])
+        self.assertIn('automated_clean', data['nodes'][0])
+        self.assertIn('protected', data['nodes'][0])
+        self.assertIn('protected_reason', data['nodes'][0])
+        self.assertIn('owner', data['nodes'][0])
+        self.assertIn('lessee', data['nodes'][0])
+        # never expose the chassis_id
+        self.assertNotIn('chassis_id', data['nodes'][0])
+        self.assertNotIn('allocation_id', data['nodes'][0])
+        self.assertIn('allocation_uuid', data['nodes'][0])
+        self.assertIn('retired', data['nodes'][0])
+        self.assertIn('retired_reason', data['nodes'][0])
+        self.assertIn('network_data', data['nodes'][0])
+
     def test_detail_instance_uuid(self):
         instance_uuid = '6eccd391-961c-4da5-b3c5-e2fa5cfbbd9d'
         node = obj_utils.create_test_node(
@@ -884,14 +968,14 @@ class TestListNodes(test_api_base.BaseApiTest):
         mock_authorize.side_effect = mock_authorize_function
 
         instance_uuid = '6eccd391-961c-4da5-b3c5-e2fa5cfbbd9d'
-        requestor_uuid = '46c0bf8a-846d-49a5-9724-5a61a5efa6bf'
+        requester_uuid = '46c0bf8a-846d-49a5-9724-5a61a5efa6bf'
         obj_utils.create_test_node(
             self.context,
             owner='97879042-c0bf-4216-882a-66a7cbf2bd74',
             instance_uuid=instance_uuid)
         data = self.get_json(
             '/nodes/detail?instance_uuid=%s' % instance_uuid,
-            headers={'X-Project-ID': requestor_uuid,
+            headers={'X-Project-ID': requester_uuid,
                      api_base.Version.string: str(api_v1.max_version())})
         self.assertEqual(0, len(data['nodes']))
 
@@ -904,14 +988,14 @@ class TestListNodes(test_api_base.BaseApiTest):
         mock_authorize.side_effect = mock_authorize_function
 
         instance_uuid = '6eccd391-961c-4da5-b3c5-e2fa5cfbbd9d'
-        requestor_uuid = '46c0bf8a-846d-49a5-9724-5a61a5efa6bf'
+        requester_uuid = '46c0bf8a-846d-49a5-9724-5a61a5efa6bf'
         node = obj_utils.create_test_node(
             self.context,
-            owner=requestor_uuid,
+            owner=requester_uuid,
             instance_uuid=instance_uuid)
         data = self.get_json(
             '/nodes/detail?instance_uuid=%s' % instance_uuid,
-            headers={'X-Project-ID': requestor_uuid,
+            headers={'X-Project-ID': requester_uuid,
                      api_base.Version.string: str(api_v1.max_version())})
         self.assertEqual(1, len(data['nodes']))
         # Assert we did get the node and it matched.
@@ -4494,6 +4578,27 @@ class TestPost(test_api_base.BaseApiTest):
                                headers={api_base.Version.string: "1.21"})
         self.assertEqual('class2', result['resource_class'])
 
+    def test_create_node_with_default_conductor_group(self):
+        self.config(default_conductor_group='magic')
+
+        ndict = test_api_utils.post_get_test_node()
+        self.post_json('/nodes', ndict)
+
+        # newer version is needed to see the resource_class field
+        result = self.get_json('/nodes/%s' % ndict['uuid'],
+                               headers={api_base.Version.string: "1.46"})
+        self.assertEqual('magic', result['conductor_group'])
+
+    def test_create_node_explicit_default_conductor_group(self):
+        self.config(default_conductor_group='meow')
+        ndict = test_api_utils.post_get_test_node(conductor_group='mouse')
+        self.post_json('/nodes', ndict,
+                       headers={api_base.Version.string: "1.46"})
+
+        result = self.get_json('/nodes/%s' % ndict['uuid'],
+                               headers={api_base.Version.string: "1.46"})
+        self.assertEqual('mouse', result['conductor_group'])
+
     def test_create_node_doesnt_contain_id(self):
         # FIXME(comstud): I'd like to make this test not use the
         # dbapi, however, no matter what I do when trying to mock
@@ -6345,6 +6450,140 @@ ORHMKeXMO8fcK0By7CiMKwHSXCoEQgfQhWwpMdSsO8LgHCjh87DQc= """
             self.assertEqual(http_client.BAD_REQUEST, ret.status_code)
         self.assertEqual(0, mock_dpa.call_count)
 
+    @mock.patch.object(rpcapi.ConductorAPI, 'do_provisioning_action',
+                       autospec=True)
+    def test_unhold_cleanhold(self, mock_dpa):
+        self.node.provision_state = states.CLEANHOLD
+        self.node.save()
+
+        ret = self.put_json('/nodes/%s/states/provision' % self.node.uuid,
+                            {'target': states.VERBS['unhold']},
+                            headers={api_base.Version.string: "1.85"})
+        self.assertEqual(http_client.ACCEPTED, ret.status_code)
+        self.assertEqual(b'', ret.body)
+        mock_dpa.assert_called_once_with(mock.ANY, mock.ANY, self.node.uuid,
+                                         states.VERBS['unhold'],
+                                         'test-topic')
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'do_provisioning_action',
+                       autospec=True)
+    def test_abort_cleanhold(self, mock_dpa):
+        self.node.provision_state = states.CLEANHOLD
+        self.node.save()
+
+        ret = self.put_json('/nodes/%s/states/provision' % self.node.uuid,
+                            {'target': states.VERBS['abort']},
+                            headers={api_base.Version.string: "1.85"})
+        self.assertEqual(http_client.ACCEPTED, ret.status_code)
+        self.assertEqual(b'', ret.body)
+        mock_dpa.assert_called_once_with(mock.ANY, mock.ANY, self.node.uuid,
+                                         states.VERBS['abort'],
+                                         'test-topic')
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'do_provisioning_action',
+                       autospec=True)
+    def test_unhold_deployhold(self, mock_dpa):
+        self.node.provision_state = states.DEPLOYHOLD
+        self.node.save()
+
+        ret = self.put_json('/nodes/%s/states/provision' % self.node.uuid,
+                            {'target': states.VERBS['unhold']},
+                            headers={api_base.Version.string: "1.85"})
+        self.assertEqual(http_client.ACCEPTED, ret.status_code)
+        self.assertEqual(b'', ret.body)
+        mock_dpa.assert_called_once_with(mock.ANY, mock.ANY, self.node.uuid,
+                                         states.VERBS['unhold'],
+                                         'test-topic')
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'do_provisioning_action',
+                       autospec=True)
+    def test_abort_deployhold(self, mock_dpa):
+        self.node.provision_state = states.DEPLOYHOLD
+        self.node.save()
+
+        ret = self.put_json('/nodes/%s/states/provision' % self.node.uuid,
+                            {'target': states.VERBS['abort']},
+                            headers={api_base.Version.string: "1.85"})
+        self.assertEqual(http_client.ACCEPTED, ret.status_code)
+        self.assertEqual(b'', ret.body)
+        mock_dpa.assert_called_once_with(mock.ANY, mock.ANY, self.node.uuid,
+                                         states.VERBS['abort'],
+                                         'test-topic')
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'do_provisioning_action',
+                       autospec=True)
+    def test_unhold_cleanhold_not_allowed(self, mock_dpa):
+        self.node.provision_state = states.CLEANHOLD
+        self.node.save()
+
+        ret = self.put_json('/nodes/%s/states/provision' % self.node.uuid,
+                            {'target': states.VERBS['unhold']},
+                            headers={api_base.Version.string: "1.84"},
+                            expect_errors=True)
+        self.assertEqual(http_client.NOT_ACCEPTABLE, ret.status_code)
+        mock_dpa.assert_not_called()
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'do_provisioning_action',
+                       autospec=True)
+    def test_unhold_deployhold_not_allowed(self, mock_dpa):
+        self.node.provision_state = states.DEPLOYHOLD
+        self.node.save()
+
+        ret = self.put_json('/nodes/%s/states/provision' % self.node.uuid,
+                            {'target': states.VERBS['unhold']},
+                            headers={api_base.Version.string: "1.84"},
+                            expect_errors=True)
+        self.assertEqual(http_client.NOT_ACCEPTABLE, ret.status_code)
+        mock_dpa.assert_not_called()
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'do_provisioning_action',
+                       autospec=True)
+    def test_unhold_servicehold(self, mock_dpa):
+        self.node.provision_state = states.SERVICEHOLD
+        self.node.save()
+
+        ret = self.put_json('/nodes/%s/states/provision' % self.node.uuid,
+                            {'target': states.VERBS['unhold']},
+                            headers={api_base.Version.string: "1.86"})
+        self.assertEqual(http_client.ACCEPTED, ret.status_code)
+        self.assertEqual(b'', ret.body)
+        mock_dpa.assert_called_once_with(mock.ANY, mock.ANY, self.node.uuid,
+                                         states.VERBS['unhold'],
+                                         'test-topic')
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'do_node_service',
+                       autospec=True)
+    def test_service(self, mock_dns):
+        self.node.provision_state = states.SERVICEHOLD
+        self.node.save()
+
+        ret = self.put_json('/nodes/%s/states/provision' % self.node.uuid,
+                            {'target': states.VERBS['service'],
+                             'service_steps': [{
+                                 'interface': 'deploy',
+                                 'step': 'meow'}]},
+                            headers={api_base.Version.string: "1.87"})
+        self.assertEqual(http_client.ACCEPTED, ret.status_code)
+        self.assertEqual(b'', ret.body)
+        mock_dns.assert_called_once_with(
+            mock.ANY, mock.ANY, self.node.uuid,
+            [{'interface': 'deploy', 'step': 'meow'}],
+            None, topic='test-topic')
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'do_node_service',
+                       autospec=True)
+    def test_service_args_required(self, mock_dns):
+        self.node.provision_state = states.SERVICEHOLD
+        self.node.save()
+
+        ret = self.put_json('/nodes/%s/states/provision' % self.node.uuid,
+                            {'target': states.VERBS['service']},
+                            headers={api_base.Version.string: "1.87"},
+                            expect_errors=True)
+        self.assertEqual(http_client.BAD_REQUEST, ret.status_code)
+        self.assertIn('error_message', ret.json)
+        mock_dns.assert_not_called()
+
     def test_set_console_mode_enabled(self):
         with mock.patch.object(rpcapi.ConductorAPI,
                                'set_console_mode',
@@ -6768,7 +7007,7 @@ ORHMKeXMO8fcK0By7CiMKwHSXCoEQgfQhWwpMdSsO8LgHCjh87DQc= """
         self.assertEqual(http_client.BAD_REQUEST, ret.status_code)
 
 
-class TestCheckCleanSteps(base.TestCase):
+class TestCheckCleanSteps(db_base.DbTestCase):
     def test__check_clean_steps_not_list(self):
         clean_steps = {"step": "upgrade_firmware", "interface": "deploy"}
         self.assertRaisesRegex(exception.InvalidParameterValue,
@@ -6808,9 +7047,14 @@ class TestCheckCleanSteps(base.TestCase):
 
     def test__check_clean_steps_step_min_length_step_value(self):
         clean_steps = [{"step": "", "interface": "deploy"}]
-        self.assertRaisesRegex(exception.InvalidParameterValue,
-                               'is too short',
-                               api_node._check_clean_steps, clean_steps)
+        try:
+            self.assertRaisesRegex(exception.InvalidParameterValue,
+                                   'is too short',
+                                   api_node._check_clean_steps, clean_steps)
+        except Exception:
+            self.assertRaisesRegex(exception.InvalidParameterValue,
+                                   'should be non-empty',
+                                   api_node._check_clean_steps, clean_steps)
 
     def test__check_clean_steps_step_interface_value_invalid(self):
         clean_steps = [{"step": "upgrade_firmware", "interface": "not"}]
@@ -6831,10 +7075,85 @@ class TestCheckCleanSteps(base.TestCase):
 
         step1 = {"step": "upgrade_firmware", "interface": "deploy",
                  "args": {"arg1": "value1", "arg2": "value2"}}
+        # NOTE(TheJulia): _check_service_steps and _check_deploy_steps
+        # both route back to _check_steps which is what backs _check
+        # clean steps. It is needful duplication for cases, but it doesn't
+        # make a ton of sense to copy/paste everything over and over unless
+        # there is a specific case. In any case, do the needful here.
         api_node._check_clean_steps([step1])
 
-        step2 = {"step": "configure raid", "interface": "raid"}
+        step2 = {"step": "configure raid", "interface": "raid",
+                 "args": {}}
         api_node._check_clean_steps([step1, step2])
+
+        api_node._check_service_steps([step1])
+        api_node._check_service_steps([step1, step2])
+        # Schema differences exist, cleaning doesn't have a schema for
+        # priority when validated.
+
+        step1['priority'] = 10
+        step2['priority'] = 12
+        api_node._check_deploy_steps([step1])
+
+        api_node._check_deploy_steps([step1, step2])
+
+    @mock.patch.object(api_utils, 'check_node_policy_and_retrieve',
+                       autospec=True)
+    def test__check_clean_steps_child_node(self, mock_policy):
+        node = obj_utils.create_test_node(
+            self.context,
+            provision_state=states.AVAILABLE,
+            name='node-1337')
+        obj_utils.create_test_node(
+            self.context,
+            provision_state=states.AVAILABLE,
+            name='node-n071337',
+            parent_node=node.uuid,
+            uuid=uuidutils.generate_uuid())
+        clean_steps = [{"step": "upgrade_firmware", "interface": "deploy",
+                        "execute_on_child_nodes": True}]
+        api_node._check_clean_steps(clean_steps)
+        mock_policy.assert_not_called()
+
+    @mock.patch.object(api_utils, 'check_node_policy_and_retrieve',
+                       autospec=True)
+    def test__check_clean_steps_child_node_list(self, mock_policy):
+        node = obj_utils.create_test_node(
+            self.context,
+            provision_state=states.AVAILABLE,
+            name='node-1337')
+        child_node_1 = obj_utils.create_test_node(
+            self.context,
+            provision_state=states.AVAILABLE,
+            name='node-n071337',
+            parent_node=node.uuid,
+            uuid=uuidutils.generate_uuid())
+        child_node_2 = obj_utils.create_test_node(
+            self.context,
+            provision_state=states.AVAILABLE,
+            name='node-1337-card1',
+            parent_node=node.uuid,
+            uuid=uuidutils.generate_uuid())
+
+        clean_steps = [{"step": "upgrade_firmware", "interface": "deploy",
+                        "execute_on_child_nodes": True,
+                        "limit_child_node_execution": [child_node_1.uuid,
+                                                       child_node_2.uuid]}]
+        api_node._check_clean_steps(clean_steps)
+        mock_policy.assert_has_calls([
+            mock.call('baremetal:node:set_provision_state',
+                      child_node_1.uuid),
+            mock.call('baremetal:node:set_provision_state',
+                      child_node_2.uuid)])
+
+    @mock.patch.object(api_node, '_check_steps', autospec=True)
+    def test_check__check_steps_wrappers(self, check_mock):
+        api_node._check_clean_steps({})
+        self.assertEqual(1, check_mock.call_count)
+        api_node._check_deploy_steps({})
+        self.assertEqual(2, check_mock.call_count)
+        api_node._check_service_steps({})
+        self.assertEqual(3, check_mock.call_count)
 
 
 class TestAttachDetachVif(test_api_base.BaseApiTest):
@@ -7918,7 +8237,9 @@ class TestNodeHistory(test_api_base.BaseApiTest):
 
 
 class TestNodeInventory(test_api_base.BaseApiTest):
-    fake_inventory_data = {"cpu": "amd"}
+    fake_inventory_data = {'cpu': {'count': 1,
+                                   'model_name': 'qemu64',
+                                   'architecture': 'x86_64'}}
     fake_plugin_data = {"disks": [{"name": "/dev/vda"}]}
 
     def setUp(self):
@@ -7927,20 +8248,15 @@ class TestNodeInventory(test_api_base.BaseApiTest):
         self.node = obj_utils.create_test_node(
             self.context,
             provision_state=states.AVAILABLE, name='node-81')
-        self.node.save()
-        self.node.obj_reset_changes()
+        CONF.set_override('data_backend', 'database', group='inventory')
 
-    def _add_inventory(self):
-        self.inventory = objects.NodeInventory(
-            node_id=self.node.id, inventory_data=self.fake_inventory_data,
-            plugin_data=self.fake_plugin_data)
-        self.inventory.create()
-
-    def test_get_old_version(self):
+    @mock.patch.object(inspect_utils, 'get_inspection_data', autospec=True)
+    def test_get_old_version(self, mock_get):
         ret = self.get_json('/nodes/%s/inventory' % self.node.uuid,
                             headers={api_base.Version.string: "1.80"},
                             expect_errors=True)
         self.assertEqual(http_client.NOT_FOUND, ret.status_code)
+        mock_get.assert_not_called()
 
     def test_get_inventory_no_inventory(self):
         ret = self.get_json('/nodes/%s/inventory' % self.node.uuid,
@@ -7949,22 +8265,558 @@ class TestNodeInventory(test_api_base.BaseApiTest):
         self.assertEqual(http_client.NOT_FOUND, ret.status_code)
 
     def test_get_inventory(self):
-        self._add_inventory()
-        CONF.set_override('data_backend', 'database',
-                          group='inventory')
+        obj_utils.create_test_inventory(
+            self.context, self.node,
+            inventory_data=self.fake_inventory_data,
+            plugin_data=self.fake_plugin_data)
         ret = self.get_json('/nodes/%s/inventory' % self.node.uuid,
                             headers={api_base.Version.string: self.version})
         self.assertEqual({'inventory': self.fake_inventory_data,
                           'plugin_data': self.fake_plugin_data}, ret)
 
-    @mock.patch.object(inspect_utils, '_get_introspection_data_from_swift',
-                       autospec=True)
-    def test_get_inventory_swift(self, mock_get_data):
-        CONF.set_override('data_backend', 'swift',
-                          group='inventory')
-        mock_get_data.return_value = {"inventory": self.fake_inventory_data,
-                                      "plugin_data": self.fake_plugin_data}
-        ret = self.get_json('/nodes/%s/inventory' % self.node.uuid,
+
+class TestNodeShardGets(test_api_base.BaseApiTest):
+    def setUp(self):
+        super(TestNodeShardGets, self).setUp()
+        p = mock.patch.object(rpcapi.ConductorAPI, 'get_topic_for',
+                              autospec=True)
+        self.mock_gtf = p.start()
+        self.mock_gtf.return_value = 'test-topic'
+        self.addCleanup(p.stop)
+        self.mock_get_conductor_for = self.useFixture(
+            fixtures.MockPatchObject(rpcapi.ConductorAPI, 'get_conductor_for',
+                                     autospec=True)).mock
+        self.mock_get_conductor_for.return_value = 'fake.conductor'
+        self.node = obj_utils.create_test_node(self.context, shard='foo')
+        self.headers = {api_base.Version.string: '1.82'}
+
+    def test_get_node_shard_field(self):
+        result = self.get_json(
+            '/nodes/%s' % self.node.uuid, headers=self.headers)
+        self.assertEqual('foo', result['shard'])
+
+    def test_get_node_shard_field_fails_wrong_version(self):
+        headers = {api_base.Version.string: '1.80'}
+        result = self.get_json('/nodes/%s' % self.node.uuid, headers=headers)
+        self.assertNotIn('shard', result)
+
+    def test_filtering_by_shard(self):
+        result = self.get_json(
+            '/nodes?shard=foo', fields='shard', headers=self.headers)
+        self.assertEqual(1, len(result['nodes']))
+        self.assertEqual('foo', result['nodes'][0]['shard'])
+
+    def test_filtering_by_shard_fails_wrong_version(self):
+        headers = {api_base.Version.string: '1.80'}
+
+        result = self.get_json('/nodes?shard=foo',
+                               expect_errors=True, headers=headers)
+        self.assertEqual(http_client.NOT_ACCEPTABLE, result.status_code)
+
+    def test_filtering_by_single_shard_detail(self):
+        result = self.get_json('/nodes/detail?shard=foo', headers=self.headers)
+        self.assertEqual(1, len(result['nodes']))
+        self.assertEqual('foo', result['nodes'][0]['shard'])
+
+    def test_filtering_by_multi_shard_detail(self):
+        obj_utils.create_test_node(
+            self.context, uuid=uuid.uuid4(), shard='bar')
+        result = self.get_json(
+            '/nodes?shard=foo,bar', headers=self.headers)
+        self.assertEqual(2, len(result['nodes']))
+
+    def test_filtering_by_multi_shard_as_list(self):
+        obj_utils.create_test_node(
+            self.context, uuid=uuid.uuid4(), shard='bar')
+        result = self.get_json(
+            '/nodes?shard=foo&shard=bar', headers=self.headers)
+        self.assertEqual(2, len(result['nodes']))
+
+    def test_filtering_by_shard_detail_fails_wrong_version(self):
+        headers = {api_base.Version.string: '1.80'}
+
+        result = self.get_json('/nodes/detail?shard=foo',
+                               expect_errors=True, headers=headers)
+        self.assertEqual(http_client.NOT_ACCEPTABLE, result.status_code)
+
+    def test_filtering_by_sharded(self):
+        obj_utils.create_test_node(self.context, uuid=uuid.uuid4())
+        obj_utils.create_test_node(self.context, uuid=uuid.uuid4())
+        # We now have one node in shard foo (setUp) and two unsharded.
+        result_true = self.get_json(
+            '/nodes?sharded=true', headers=self.headers)
+        result_false = self.get_json(
+            '/nodes?sharded=false', headers=self.headers)
+        self.assertEqual(1, len(result_true['nodes']))
+        self.assertEqual(2, len(result_false['nodes']))
+
+
+@mock.patch.object(rpcapi.ConductorAPI, 'create_node',
+                   lambda _api, _ctx, node, _topic: _create_node_locally(node))
+class TestNodeShardPost(test_api_base.BaseApiTest):
+    def setUp(self):
+        super(TestNodeShardPost, self).setUp()
+        p = mock.patch.object(rpcapi.ConductorAPI, 'get_topic_for',
+                              autospec=True)
+        self.mock_gtf = p.start()
+        self.mock_gtf.return_value = 'test-topic'
+        self.addCleanup(p.stop)
+        self.chassis = obj_utils.create_test_chassis(self.context)
+
+    def test_create_node_with_shard(self):
+        shard = 'foo'
+        ndict = test_api_utils.post_get_test_node(shard=shard)
+        headers = {api_base.Version.string: '1.82'}
+        response = self.post_json('/nodes', ndict, headers=headers)
+        self.assertEqual(http_client.CREATED, response.status_int)
+
+        result = self.get_json('/nodes/%s' % ndict['uuid'], headers=headers)
+        self.assertEqual(ndict['uuid'], result['uuid'])
+        self.assertEqual(shard, result['shard'])
+
+    def test_create_node_with_shard_fail_wrong_version(self):
+        headers = {api_base.Version.string: '1.80'}
+        shard = 'foo'
+        ndict = test_api_utils.post_get_test_node(shard=shard)
+        response = self.post_json(
+            '/nodes', ndict, expect_errors=True, headers=headers)
+        self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_int)
+
+
+class TestNodeShardPatch(test_api_base.BaseApiTest):
+    def setUp(self):
+        super(TestNodeShardPatch, self).setUp()
+        self.node = obj_utils.create_test_node(self.context, name='node-57.1')
+        p = mock.patch.object(rpcapi.ConductorAPI, 'get_topic_for',
+                              autospec=True)
+        self.mock_gtf = p.start()
+        self.mock_gtf.return_value = 'test-topic'
+        self.addCleanup(p.stop)
+        p = mock.patch.object(rpcapi.ConductorAPI, 'update_node',
+                              autospec=True)
+        self.mock_update_node = p.start()
+        self.addCleanup(p.stop)
+
+    def test_node_add_shard(self):
+        self.mock_update_node.return_value = self.node
+        (self
+         .mock_update_node
+         .return_value
+         .updated_at) = "2013-12-03T06:20:41.184720+00:00"
+        headers = {api_base.Version.string: '1.82'}
+        shard = 'shard1'
+        body = [{
+            'path': '/shard',
+            'value': shard,
+            'op': 'add',
+        }]
+
+        response = self.patch_json(
+            '/nodes/%s' % self.node.uuid, body, headers=headers)
+        self.assertEqual(http_client.OK, response.status_code)
+        self.mock_update_node.assert_called_once()
+
+    def test_node_add_shard_fail_wrong_version(self):
+        self.mock_update_node.return_value = self.node
+        (self
+         .mock_update_node
+         .return_value
+         .updated_at) = "2013-12-03T06:20:41.184720+00:00"
+        headers = {api_base.Version.string: '1.80'}
+        shard = 'shard1'
+        body = [{
+            'path': '/shard',
+            'value': shard,
+            'op': 'add',
+        }]
+
+        response = self.patch_json('/nodes/%s' % self.node.uuid,
+                                   body, expect_errors=True, headers=headers)
+        self.mock_update_node.assert_not_called()
+        self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_code)
+
+
+class TestNodeChildrenTestCase(test_api_base.BaseApiTest):
+    def setUp(self):
+        super(TestNodeChildrenTestCase, self).setUp()
+        self.node = obj_utils.create_test_node(self.context, name='din')
+        self.child_node = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            name='not-yoda',
+            parent_node=self.node.uuid)
+        self.headers = {api_base.Version.string: '1.83'}
+
+    def test_list_nodes(self):
+        response = self.get_json(
+            '/nodes/', headers=self.headers)
+        self.assertEqual(1, len(response['nodes']))
+        self.assertEqual('din', response['nodes'][0]['name'])
+
+    def test_get_child_node(self):
+        response = self.get_json(
+            '/nodes/%s/children' % self.node.uuid, headers=self.headers)
+        self.assertEqual(1, len(response['children']))
+        self.assertEqual(self.child_node.uuid, response['children'][0])
+
+    def test_list_nodes_with_include_children(self):
+        response = self.get_json(
+            '/nodes/?include_children=True', headers=self.headers)
+        self.assertEqual(2, len(response['nodes']))
+
+    def test_list_nodes_ignores_parent_if_include_children_indicated(self):
+        response = self.get_json(
+            '/nodes/?include_children=True&parent_node=111',
+            headers=self.headers)
+        self.assertEqual(2, len(response['nodes']))
+
+    @mock.patch.object(api_utils, 'check_list_policy', autospec=True)
+    def test_list_nodes_cannot_see_children_if_not_owned(self, mock_policy):
+        project_id = uuidutils.generate_uuid()
+        mock_policy.return_value = project_id
+        self.node['owner'] = project_id
+        self.node.save()
+        response = self.get_json(
+            '/nodes/?parent_node={}'.format(project_id),
+            headers=self.headers)
+        self.assertEqual(0, len(response['nodes']))
+
+    @mock.patch.object(api_utils, 'check_list_policy', autospec=True)
+    def test_list_nodes_with_children_only_parent(self, mock_policy):
+        project_id = uuidutils.generate_uuid()
+        headers = self.headers.copy()
+        mock_policy.return_value = project_id
+        self.node['lessee'] = project_id
+        self.node.save()
+        response = self.get_json(
+            '/nodes/?include_children=True&'
+            'fields=uuid,lessee,name,parent_node',
+            headers=headers)
+        self.assertEqual(1, len(response['nodes']))
+        self.assertEqual(self.node.uuid, response['nodes'][0]['uuid'])
+
+    def test_list_nodes_lists_empty_for_specific_parent(self):
+        node = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            name='kryze',
+            parent_node=self.node.uuid)
+        response = self.get_json(
+            '/nodes/?parent_node={}'.format(node.uuid), headers=self.headers)
+        self.assertEqual(0, len(response['nodes']))
+
+    def test_list_node_children_by_single_node(self):
+        obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            name='kryze',
+            parent_node=self.node.uuid)
+        response = self.get_json(
+            '/nodes/{}/children'.format(self.node.uuid), headers=self.headers)
+        self.assertEqual(2, len(response['children']))
+
+
+@mock.patch.object(rpcapi.ConductorAPI, 'create_node',
+                   lambda _api, _ctx, node, _topic: _create_node_locally(node))
+class TestNodeParentNodePost(test_api_base.BaseApiTest):
+    def setUp(self):
+        super(TestNodeParentNodePost, self).setUp()
+        self.node = obj_utils.create_test_node(self.context, name='din')
+
+        p = mock.patch.object(rpcapi.ConductorAPI, 'get_topic_for',
+                              autospec=True)
+        self.mock_gtf = p.start()
+        self.mock_gtf.return_value = 'test-topic'
+        self.addCleanup(p.stop)
+        self.chassis = obj_utils.create_test_chassis(self.context)
+
+    def test_create_node_with_parent_node(self):
+        ndict = test_api_utils.post_get_test_node(
+            uuid=uuidutils.generate_uuid())
+        ndict['parent_node'] = self.node.uuid
+        headers = {api_base.Version.string: '1.83'}
+        response = self.post_json('/nodes', ndict, headers=headers)
+        self.assertEqual(http_client.CREATED, response.status_int)
+
+        result = self.get_json('/nodes/{}'.format(ndict['uuid']),
+                               headers=headers)
+        self.assertEqual(ndict['uuid'], result['uuid'])
+        self.assertEqual(self.node.uuid, result['parent_node'])
+
+    def test_create_node_with_parent_node_fail_wrong_version(self):
+        headers = {api_base.Version.string: '1.82'}
+        ndict = test_api_utils.post_get_test_node(
+            uuid=uuidutils.generate_uuid())
+        ndict['parent_node'] = self.node.uuid
+        response = self.post_json(
+            '/nodes', ndict, expect_errors=True, headers=headers)
+        self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_int)
+
+    def test_create_node_with_named_parent_node_succeeds(self):
+        ndict = test_api_utils.post_get_test_node(
+            uuid=uuidutils.generate_uuid())
+        ndict['parent_node'] = 'din'
+        headers = {api_base.Version.string: '1.83'}
+        response = self.post_json('/nodes', ndict, expect_errors=True,
+                                  headers=headers)
+        self.assertEqual(http_client.CREATED, response.status_int)
+        self.assertEqual(self.node.uuid, response.json['parent_node'])
+
+
+class TestNodeParentNodePatch(test_api_base.BaseApiTest):
+    def setUp(self):
+        super(TestNodeParentNodePatch, self).setUp()
+        self.node = obj_utils.create_test_node(
+            self.context,
+            name='djarin')
+        self.child_node = obj_utils.create_test_node(
+            self.context,
+            name='the_child',
+            uuid=uuidutils.generate_uuid())
+
+        p = mock.patch.object(rpcapi.ConductorAPI, 'get_topic_for',
+                              autospec=True)
+        self.mock_gtf = p.start()
+        self.mock_gtf.return_value = 'test-topic'
+        self.addCleanup(p.stop)
+        p = mock.patch.object(rpcapi.ConductorAPI, 'update_node',
+                              autospec=True)
+        self.mock_update_node = p.start()
+        self.addCleanup(p.stop)
+
+    def test_node_add_parent(self):
+        self.mock_update_node.return_value = self.node
+        (self
+         .mock_update_node
+         .return_value
+         .updated_at) = "2013-12-03T06:20:41.184720+00:00"
+        headers = {api_base.Version.string: '1.83'}
+        body = [{
+            'path': '/parent_node',
+            'value': self.node.uuid,
+            'op': 'add',
+        }]
+
+        response = self.patch_json(
+            '/nodes/%s' % self.child_node.uuid, body, headers=headers)
+        self.assertEqual(http_client.OK, response.status_code)
+        self.mock_update_node.assert_called_once()
+
+    def test_node_add_parent_node_fail_wrong_version(self):
+        headers = {api_base.Version.string: '1.82'}
+        body = [{
+            'path': '/parent_node',
+            'value': self.node.uuid,
+            'op': 'add',
+        }]
+
+        response = self.patch_json('/nodes/%s' % self.child_node.uuid,
+                                   body, expect_errors=True, headers=headers)
+        self.mock_update_node.assert_not_called()
+        self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_code)
+
+    def test_node_add_parent_node_not_uuid(self):
+        headers = {api_base.Version.string: '1.83'}
+        body = [{
+            'path': '/parent_node',
+            'value': 'djarin',
+            'op': 'add',
+        }]
+
+        self.patch_json('/nodes/%s' % self.child_node.uuid,
+                        body, expect_errors=True, headers=headers)
+        self.mock_update_node.assert_called_once()
+        test_node = self.mock_update_node.call_args.args[2]
+        self.assertEqual(self.node.uuid, test_node.parent_node)
+
+    def test_node_remove_parent(self):
+        self.mock_update_node.return_value = self.node
+        (self
+         .mock_update_node
+         .return_value
+         .updated_at) = "2013-12-03T06:20:41.184720+00:00"
+        headers = {api_base.Version.string: '1.83'}
+        body = [{
+            'path': '/parent_node',
+            'op': 'remove',
+        }]
+
+        response = self.patch_json(
+            '/nodes/%s' % self.child_node.uuid, body, headers=headers)
+        self.assertEqual(http_client.OK, response.status_code)
+        self.mock_update_node.assert_called_once()
+
+
+class TestNodeFirmwareComponent(test_api_base.BaseApiTest):
+
+    def setUp(self):
+        super(TestNodeFirmwareComponent, self).setUp()
+        self.version = "1.86"
+        self.node = obj_utils.create_test_node(
+            self.context, id=1)
+
+        self.fw_cmp = obj_utils.create_test_firmware_component(
+            self.context, node_id=self.node.id)
+        self.fw_cmp2 = obj_utils.create_test_firmware_component(
+            self.context, node_id=self.node.id, component='BIOS')
+
+    def test_get_all_firmware_components(self):
+        ret = self.get_json('/nodes/%s/firmware' % self.node.uuid,
                             headers={api_base.Version.string: self.version})
-        self.assertEqual({'inventory': self.fake_inventory_data,
-                          'plugin_data': self.fake_plugin_data}, ret)
+        expected_components = [
+            {'created_at': ret['firmware'][0]['created_at'],
+             'updated_at': ret['firmware'][0]['updated_at'],
+             'component': 'BIOS',
+             'initial_version': 'v1.0.0', 'current_version': 'v1.0.0',
+             'last_version_flashed': None},
+            {'created_at': ret['firmware'][1]['created_at'],
+             'updated_at': ret['firmware'][1]['updated_at'],
+             'component': 'bmc',
+             'initial_version': 'v1.0.0', 'current_version': 'v1.0.0',
+             'last_version_flashed': None}]
+        self.assertEqual({'firmware': expected_components}, ret)
+
+    def test_wrong_version_get_all_firmware_components_old_version(self):
+        ret = self.get_json('/nodes/%s/firmware' % self.node.uuid,
+                            headers={api_base.Version.string: "1.81"},
+                            expect_errors=True)
+
+        self.assertEqual(http_client.NOT_FOUND, ret.status_int)
+
+
+@mock.patch.object(rpcapi.ConductorAPI, 'get_topic_for',
+                   lambda *_: 'test-topic')
+class TestNodeVmedia(test_api_base.BaseApiTest):
+
+    def setUp(self):
+        super().setUp()
+        self.version = "1.89"
+        self.node = obj_utils.create_test_node(self.context)
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'attach_virtual_media',
+                       autospec=True)
+    def test_attach(self, mock_attach):
+        vmedia = {'device_type': boot_devices.CDROM,
+                  'image_url': 'https://image',
+                  'image_download_source': 'http'}
+        ret = self.post_json('/nodes/%s/vmedia' % self.node.uuid, vmedia,
+                             headers={api_base.Version.string: self.version})
+        self.assertEqual(http_client.NO_CONTENT, ret.status_int)
+        mock_attach.assert_called_once_with(
+            mock.ANY, mock.ANY, self.node.uuid,
+            device_type=boot_devices.CDROM, image_url='https://image',
+            image_download_source='http', topic='test-topic')
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'attach_virtual_media',
+                       autospec=True)
+    def test_attach_required_only(self, mock_attach):
+        vmedia = {'device_type': boot_devices.CDROM,
+                  'image_url': 'http://image'}
+        ret = self.post_json('/nodes/%s/vmedia' % self.node.uuid, vmedia,
+                             headers={api_base.Version.string: self.version})
+        self.assertEqual(http_client.NO_CONTENT, ret.status_int)
+        mock_attach.assert_called_once_with(
+            mock.ANY, mock.ANY, self.node.uuid,
+            device_type=boot_devices.CDROM, image_url='http://image',
+            image_download_source='local', topic='test-topic')
+
+    def test_attach_missing_device_type(self):
+        vmedia = {'image_url': 'http://image'}
+        ret = self.post_json('/nodes/%s/vmedia' % self.node.uuid, vmedia,
+                             headers={api_base.Version.string: self.version},
+                             expect_errors=True)
+        self.assertEqual(http_client.BAD_REQUEST, ret.status_int)
+        self.assertIn(b"device_type", ret.body)
+
+    def test_attach_invalid_device_type(self):
+        vmedia = {'device_type': 'cat',
+                  'image_url': 'http://image'}
+        ret = self.post_json('/nodes/%s/vmedia' % self.node.uuid, vmedia,
+                             headers={api_base.Version.string: self.version},
+                             expect_errors=True)
+        self.assertEqual(http_client.BAD_REQUEST, ret.status_int)
+        self.assertIn(b"cat", ret.body)
+
+    def test_attach_missing_image_url(self):
+        vmedia = {'device_type': boot_devices.CDROM}
+        ret = self.post_json('/nodes/%s/vmedia' % self.node.uuid, vmedia,
+                             headers={api_base.Version.string: self.version},
+                             expect_errors=True)
+        self.assertEqual(http_client.BAD_REQUEST, ret.status_int)
+        self.assertIn(b"image_url", ret.body)
+
+    def test_attach_invalid_image_url(self):
+        vmedia = {'device_type': boot_devices.CDROM,
+                  'image_url': 'abcd'}
+        ret = self.post_json('/nodes/%s/vmedia' % self.node.uuid, vmedia,
+                             headers={api_base.Version.string: self.version},
+                             expect_errors=True)
+        self.assertEqual(http_client.BAD_REQUEST, ret.status_int)
+        self.assertIn(b"URL scheme", ret.body)
+
+    def test_attach_wrong_version(self):
+        vmedia = {'device_type': boot_devices.CDROM,
+                  'image_url': 'http://image'}
+        ret = self.post_json('/nodes/%s/vmedia' % self.node.uuid, vmedia,
+                             headers={api_base.Version.string: "1.87"},
+                             expect_errors=True)
+        self.assertEqual(http_client.NOT_FOUND, ret.status_int)
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'detach_virtual_media',
+                       autospec=True)
+    def test_detach_everything(self, mock_detach):
+        ret = self.delete('/nodes/%s/vmedia' % self.node.uuid,
+                          headers={api_base.Version.string: self.version})
+        self.assertEqual(http_client.NO_CONTENT, ret.status_int)
+        mock_detach.assert_called_once_with(
+            mock.ANY, mock.ANY, self.node.uuid,
+            device_types=None, topic='test-topic')
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'detach_virtual_media',
+                       autospec=True)
+    def test_detach_specific_via_url(self, mock_detach):
+        ret = self.delete('/nodes/%s/vmedia/%s'
+                          % (self.node.uuid, boot_devices.CDROM),
+                          headers={api_base.Version.string: self.version})
+        self.assertEqual(http_client.NO_CONTENT, ret.status_int)
+        mock_detach.assert_called_once_with(
+            mock.ANY, mock.ANY, self.node.uuid,
+            device_types=[boot_devices.CDROM], topic='test-topic')
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'detach_virtual_media',
+                       autospec=True)
+    def test_detach_specific_via_argument(self, mock_detach):
+        ret = self.delete('/nodes/%s/vmedia?device_types=%s'
+                          % (self.node.uuid, boot_devices.CDROM),
+                          headers={api_base.Version.string: self.version})
+        self.assertEqual(http_client.NO_CONTENT, ret.status_int)
+        mock_detach.assert_called_once_with(
+            mock.ANY, mock.ANY, self.node.uuid,
+            device_types=[boot_devices.CDROM], topic='test-topic')
+
+    @mock.patch.object(rpcapi.ConductorAPI, 'detach_virtual_media',
+                       autospec=True)
+    def test_detach_several_via_argument(self, mock_detach):
+        ret = self.delete('/nodes/%s/vmedia?device_types=%s&device_types=%s'
+                          % (self.node.uuid,
+                             boot_devices.CDROM, boot_devices.DISK),
+                          headers={api_base.Version.string: self.version})
+        self.assertEqual(http_client.NO_CONTENT, ret.status_int)
+        mock_detach.assert_called_once_with(
+            mock.ANY, mock.ANY, self.node.uuid,
+            device_types=[boot_devices.CDROM, boot_devices.DISK],
+            topic='test-topic')
+
+    def test_detach_wrong_device_types(self):
+        ret = self.delete('/nodes/%s/vmedia?device_types=cdrom,cat'
+                          % self.node.uuid,
+                          headers={api_base.Version.string: self.version},
+                          expect_errors=True)
+        self.assertEqual(http_client.BAD_REQUEST, ret.status_int)
+        self.assertIn(b"cat", ret.body)
+
+    def test_detach_wrong_version(self):
+        ret = self.delete('/nodes/%s/vmedia' % self.node.uuid,
+                          headers={api_base.Version.string: "1.87"},
+                          expect_errors=True)
+        self.assertEqual(http_client.NOT_FOUND, ret.status_int)

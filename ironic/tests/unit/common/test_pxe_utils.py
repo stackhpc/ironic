@@ -858,7 +858,8 @@ class TestPXEUtils(db_base.DbTestCase):
                                       'config'),
                          pxe_utils.get_pxe_config_file_path(self.node.uuid))
 
-    def _dhcp_options_for_instance(self, ip_version=4, ipxe=False):
+    def _dhcp_options_for_instance(self, ip_version=4, ipxe=False,
+                                   http_boot=False):
         self.config(ip_version=ip_version, group='pxe')
         if ip_version == 4:
             self.config(tftp_server='192.0.2.1', group='pxe')
@@ -878,12 +879,14 @@ class TestPXEUtils(db_base.DbTestCase):
             else:
                 self.config(pxe_bootfile_name='fake-bootfile', group='pxe')
         self.config(tftp_root='/tftp-path', group='pxe')
+        if http_boot:
+            self.config(http_url='https://foo.bar', group='deploy')
         if ipxe:
             bootfile = 'fake-bootfile-ipxe'
         else:
             bootfile = 'fake-bootfile'
 
-        if ip_version == 6:
+        if ip_version == 6 and not http_boot:
             # NOTE(TheJulia): DHCPv6 RFCs seem to indicate that the prior
             # options are not imported, although they may be supported
             # by vendors. The apparent proper option is to return a
@@ -891,12 +894,24 @@ class TestPXEUtils(db_base.DbTestCase):
             expected_info = [{'opt_name': '59',
                               'opt_value': 'tftp://[ff80::1]/%s' % bootfile,
                               'ip_version': ip_version}]
-        elif ip_version == 4:
+        elif ip_version == 6 and http_boot:
+            if not ipxe:
+                expected_info = [
+                    {'ip_version': 6,
+                     'opt_name': '59',
+                     'opt_value': 'https://foo.bar/%s' % bootfile}]
+            else:
+                expected_info = [
+                    {'ip_version': 6,
+                     'opt_name': 'tag:!ipxe6,59',
+                     'opt_value': 'https://foo.bar/%s' % bootfile},
+                    {'ip_version': 6,
+                     'opt_name': 'tag:ipxe6,59',
+                     'opt_value': 'https://foo.bar/boot.ipxe'},
+                ]
+        elif ip_version == 4 and not http_boot:
             expected_info = [{'opt_name': '67',
                               'opt_value': bootfile,
-                              'ip_version': ip_version},
-                             {'opt_name': '210',
-                              'opt_value': '/tftp-path/',
                               'ip_version': ip_version},
                              {'opt_name': '66',
                               'opt_value': '192.0.2.1',
@@ -908,9 +923,41 @@ class TestPXEUtils(db_base.DbTestCase):
                               'opt_value': '192.0.2.1',
                               'ip_version': ip_version}
                              ]
+        elif ip_version == 4 and http_boot:
+            if not ipxe:
+                expected_info = [
+                    {'ip_version': 4,
+                     'opt_name': '67',
+                     'opt_value': 'https://foo.bar/%s' % bootfile},
+                    {'ip_version': 4,
+                     'opt_name': '60',
+                     'opt_value': 'HTTPClient'}
+                ]
+            else:
+                expected_info = [
+                    {'ip_version': 4,
+                     'opt_name': 'tag:!ipxe,67',
+                     'opt_value': 'https://foo.bar/%s' % bootfile},
+                    {'ip_version': 4,
+                     'opt_name': 'tag:ipxe,67',
+                     'opt_value': 'https://foo.bar/boot.ipxe'},
+                    {'ip_version': 4,
+                     'opt_name': '60',
+                     'opt_value': 'HTTPClient'}
+                ]
+
         with task_manager.acquire(self.context, self.node.uuid) as task:
+            if ipxe:
+                # Since we are using fake, we need to somehow assert it
+                # with simplicity :\
+                task.driver.boot.ipxe_enabled = True
+            # NOTE(TheJulia): If we *are* testing ipxe, *always* call the
+            # this method with ipxe_enabled set, because it informed via
+            # the call, not via the task.
             self.assertEqual(expected_info,
-                             pxe_utils.dhcp_options_for_instance(task))
+                             pxe_utils.dhcp_options_for_instance(
+                                 task, ipxe_enabled=ipxe,
+                                 http_boot_enabled=http_boot))
 
     def test_dhcp_options_for_instance(self):
         self.config(default_boot_mode='uefi', group='deploy')
@@ -928,6 +975,24 @@ class TestPXEUtils(db_base.DbTestCase):
         self.config(tftp_server='ff80::1', group='pxe')
         self.config(default_boot_mode='bios', group='deploy')
         self._dhcp_options_for_instance(ip_version=6)
+
+    def test_dhcp_options_for_instance_http_ipv4(self):
+        self.config(default_boot_mode='uefi', group='deploy')
+        self._dhcp_options_for_instance(ip_version=4, http_boot=True)
+
+    def test_dhcp_options_for_instance_http_ipv6(self):
+        self.config(default_boot_mode='uefi', group='deploy')
+        self._dhcp_options_for_instance(ip_version=6, http_boot=True)
+
+    def test_dhcp_options_for_instance_http_ipxe_ipv4(self):
+        self.config(default_boot_mode='uefi', group='deploy')
+        self._dhcp_options_for_instance(ip_version=4, ipxe=True,
+                                        http_boot=True)
+
+    def test_dhcp_options_for_instance_http_ipxe_ipv6(self):
+        self.config(default_boot_mode='uefi', group='deploy')
+        self._dhcp_options_for_instance(ip_version=6, ipxe=True,
+                                        http_boot=True)
 
     def _test_get_kernel_ramdisk_info(self, expected_dir, mode='deploy',
                                       ipxe_enabled=False):
@@ -1108,7 +1173,7 @@ class TestPXEUtils(db_base.DbTestCase):
         self.config(group='pxe', dir_permission=0o777)
 
         def write_to_file(path, contents):
-            self.assertEqual('/tftpboot/grub/grub.cfg', path)
+            self.assertIn('/grub/grub.cfg', path)
             self.assertIn(
                 'configfile /tftpboot/$net_default_mac.conf',
                 contents
@@ -1118,9 +1183,18 @@ class TestPXEUtils(db_base.DbTestCase):
                         wraps=write_to_file):
             pxe_utils.place_common_config()
 
-        mock_isdir.assert_called_once_with('/tftpboot/grub')
-        mock_makedirs.assert_called_once_with('/tftpboot/grub', 511)
-        mock_chmod.assert_called_once_with('/tftpboot/grub', 0o777)
+        mock_isdir.assert_has_calls([
+            mock.call('/tftpboot/grub'),
+            mock.call('/httpboot/grub')
+        ])
+        mock_makedirs.assert_has_calls([
+            mock.call('/tftpboot/grub', 511),
+            mock.call('/httpboot/grub', 511)
+        ])
+        mock_chmod.assert_has_calls([
+            mock.call('/tftpboot/grub', 0o777),
+            mock.call('/httpboot/grub', 0o777)
+        ])
 
     @mock.patch.object(os, 'makedirs', autospec=True)
     @mock.patch.object(os.path, 'isdir', autospec=True)
@@ -1136,9 +1210,12 @@ class TestPXEUtils(db_base.DbTestCase):
         with mock.patch('ironic.common.utils.write_to_file',
                         autospec=True) as mock_write:
             pxe_utils.place_common_config()
-            mock_write.assert_called_once()
+            self.assertEqual(2, mock_write.call_count)
 
-        mock_isdir.assert_called_once_with('/tftpboot/grub')
+        mock_isdir.assert_has_calls([
+            mock.call('/tftpboot/grub'),
+            mock.call('/httpboot/grub')
+        ])
         mock_makedirs.assert_not_called()
         mock_chmod.assert_not_called()
 
@@ -1197,12 +1274,21 @@ class PXEInterfacesTestCase(db_base.DbTestCase):
     def test_parse_driver_info_rescue(self):
         self._test_parse_driver_info(mode='rescue')
 
-    def _test_parse_driver_info_from_conf(self, mode='deploy'):
-        del self.node.driver_info['%s_kernel' % mode]
-        del self.node.driver_info['%s_ramdisk' % mode]
-        exp_info = {'%s_ramdisk' % mode: 'glance://%s_ramdisk_uuid' % mode,
-                    '%s_kernel' % mode: 'glance://%s_kernel_uuid' % mode}
-        self.config(group='conductor', **exp_info)
+    def _test_parse_driver_info_from_conf(self, mode='deploy', by_arch=False):
+        ramdisk = 'glance://%s_ramdisk_uuid' % mode
+        kernel = 'glance://%s_kernel_uuid' % mode
+        if by_arch:
+            exp_info = {'%s_ramdisk' % mode: ramdisk,
+                        '%s_kernel' % mode: kernel}
+            config = {'%s_ramdisk_by_arch' % mode: ramdisk,
+                      '%s_kernel_by_arch' % mode: kernel}
+        else:
+            del self.node.driver_info['%s_kernel' % mode]
+            del self.node.driver_info['%s_ramdisk' % mode]
+            exp_info = {'%s_ramdisk' % mode: ramdisk,
+                        '%s_kernel' % mode: kernel}
+            config = exp_info
+        self.config(group='conductor', **config)
         image_info = pxe_utils.parse_driver_info(self.node, mode=mode)
         self.assertEqual(exp_info, image_info)
 
@@ -1212,9 +1298,21 @@ class PXEInterfacesTestCase(db_base.DbTestCase):
     def test_parse_driver_info_from_conf_rescue(self):
         self._test_parse_driver_info_from_conf(mode='rescue')
 
+    def test_parse_driver_info_from_conf_deploy_by_arch(self):
+        self._test_parse_driver_info_from_conf(by_arch=True)
+
+    def test_parse_driver_info_from_conf_rescue_by_arch(self):
+        self._test_parse_driver_info_from_conf(mode='rescue', by_arch=True)
+
     def test_parse_driver_info_mixed_source_deploy(self):
         self.config(deploy_kernel='file:///image',
                     deploy_ramdisk='file:///image',
+                    group='conductor')
+        self._test_parse_driver_info_missing_ramdisk()
+
+    def test_parse_driver_info_mixed_source_deploy_by_arch(self):
+        self.config(deploy_kernel_by_arch={'x86_64': 'file:///image'},
+                    deploy_ramdisk_by_arch={'x86_64': 'file:///image'},
                     group='conductor')
         self._test_parse_driver_info_missing_ramdisk()
 
@@ -1379,7 +1477,7 @@ class PXEInterfacesTestCase(db_base.DbTestCase):
             image_info = pxe_utils.get_instance_image_info(
                 task, ipxe_enabled=False)
             self.assertEqual(expected_info, image_info)
-            # In the absense of kickstart template in both instance_info and
+            # In the absence of kickstart template in both instance_info and
             # image default kickstart template is used
             self.assertEqual('file://' + CONF.anaconda.default_ks_template,
                              image_info['ks_template'][0])
@@ -1438,7 +1536,7 @@ class PXEInterfacesTestCase(db_base.DbTestCase):
             image_info = pxe_utils.get_instance_image_info(
                 task, ipxe_enabled=False)
             self.assertEqual(expected_info, image_info)
-            # In the absense of kickstart template in both instance_info and
+            # In the absence of kickstart template in both instance_info and
             # image default kickstart template is used
             self.assertEqual('file://' + CONF.anaconda.default_ks_template,
                              image_info['ks_template'][0])
@@ -2144,8 +2242,6 @@ class iPXEBuildConfigOptionsTestCase(db_base.DbTestCase):
         if iso_boot:
             self.node.instance_info = {'boot_iso': 'http://test.url/file.iso'}
             self.node.save()
-            print(expected_options)
-            print(image_info)
             iso_url = os.path.join(http_url, self.node.uuid, 'boot_iso')
             expected_options.update(
                 {
@@ -2369,6 +2465,41 @@ class iPXEBuildConfigOptionsTestCase(db_base.DbTestCase):
             unlink_mock.assert_has_calls(ensure_calls)
             rmtree_mock.assert_called_once_with(
                 os.path.join(CONF.deploy.http_root, self.node.uuid))
+
+
+@mock.patch.object(ipxe.iPXEBoot, '__init__', lambda self: None)
+class iPXEBuildServicePXEConfigTestCase(db_base.DbTestCase):
+    def setUp(self):
+        super(iPXEBuildServicePXEConfigTestCase, self).setUp()
+        n = {
+            'driver': 'fake-hardware',
+            'boot_interface': 'ipxe',
+            'instance_info': INST_INFO_DICT,
+            'driver_info': DRV_INFO_DICT,
+            'driver_internal_info': DRV_INTERNAL_INFO_DICT,
+        }
+        self.config(enabled_boot_interfaces=['ipxe'])
+        self.node = object_utils.create_test_node(self.context, **n)
+
+    @mock.patch.object(pxe_utils, 'create_pxe_config', autospec=True)
+    @mock.patch.object(deploy_utils, 'switch_pxe_config', autospec=True)
+    def test_build_service_pxe_config_adopt(self, mock_switch, mock_pxe_utils):
+        self.node.provision_state = states.ADOPTING
+
+        driver_internal_info = self.node.driver_internal_info
+        driver_internal_info['is_whole_disk_image'] = True
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+
+        image_info = {}
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            pxe_utils.build_service_pxe_config(task, image_info, 'id',
+                                               is_whole_disk_image=True)
+
+        mock_pxe_utils.assert_called()
+        mock_switch.assert_called()
 
 
 @mock.patch.object(ironic_utils, 'unlink_without_raise', autospec=True)

@@ -63,7 +63,7 @@ sudo sed -i 's/^.*password_encryption =.*/password_encryption = scram-sha-256/' 
 sudo cat $PG_HBA
 sudo cat $PG_CONF
 
-# restart postgres fo new HBA file is loaded
+# restart postgres with new HBA file is loaded
 sudo systemctl stop postgresql || true
 sudo systemctl start postgresql || true
 
@@ -83,5 +83,5 @@ EOF
 chmod 0600 $HOME/.pgpass
 
 # Now create our database
-psql -h 127.0.0.1 -U $DB_USER -d template1 -c "DROP DATABASE IF EXISTS openstack_citest"
+psql -h 127.0.0.1 -U $DB_USER -d postgres -c "DROP DATABASE IF EXISTS openstack_citest"
 createdb -h 127.0.0.1 -U $DB_USER -l C -T template0 -E utf8 openstack_citest

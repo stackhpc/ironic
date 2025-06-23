@@ -22,6 +22,7 @@ from testtools import matchers
 
 from ironic.common import context
 from ironic.common import exception
+from ironic.db.sqlalchemy.api import Connection as db_conn
 from ironic import objects
 from ironic.objects import node as node_objects
 from ironic.tests.unit.db import base as db_base
@@ -35,7 +36,7 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
         super(TestNodeObject, self).setUp()
         self.ctxt = context.get_admin_context()
         self.fake_node = db_utils.get_test_node()
-        self.node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+        self.node = obj_utils.get_test_node(self.context, **self.fake_node)
 
     def test_as_dict_insecure(self):
         self.node.driver_info['ipmi_password'] = 'fake'
@@ -479,15 +480,15 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
                               node_id)
 
     def test_release(self):
-        with mock.patch.object(self.dbapi, 'release_node',
+        with mock.patch.object(db_conn, 'release_node',
                                autospec=True) as mock_release:
             node_id = self.fake_node['id']
             fake_tag = 'fake-tag'
             objects.Node.release(self.context, fake_tag, node_id)
-            mock_release.assert_called_once_with(fake_tag, node_id)
+            mock_release.assert_called_once_with(mock.ANY, fake_tag, node_id)
 
     def test_release_node_not_found(self):
-        with mock.patch.object(self.dbapi, 'release_node',
+        with mock.patch.object(db_conn, 'release_node',
                                autospec=True) as mock_release:
             node_id = 'non-existent'
             mock_release.side_effect = exception.NodeNotFound(node=node_id)
@@ -496,25 +497,25 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
                               'fake-tag', node_id)
 
     def test_touch_provisioning(self):
-        with mock.patch.object(self.dbapi, 'get_node_by_uuid',
+        with mock.patch.object(db_conn, 'get_node_by_uuid',
                                autospec=True) as mock_get_node:
             mock_get_node.return_value = self.fake_node
-            with mock.patch.object(self.dbapi, 'touch_node_provisioning',
+            with mock.patch.object(db_conn, 'touch_node_provisioning',
                                    autospec=True) as mock_touch:
                 node = objects.Node.get(self.context, self.fake_node['uuid'])
                 node.touch_provisioning()
-                mock_touch.assert_called_once_with(node.id)
+                mock_touch.assert_called_once_with(mock.ANY, node.id)
 
     def test_create(self):
         node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
-        with mock.patch.object(self.dbapi, 'create_node',
+        with mock.patch.object(db_conn, 'create_node',
                                autospec=True) as mock_create_node:
             mock_create_node.return_value = db_utils.get_test_node()
 
             node.create()
 
             args, _kwargs = mock_create_node.call_args
-            self.assertEqual(objects.Node.VERSION, args[0]['version'])
+            self.assertEqual(objects.Node.VERSION, args[1]['version'])
             self.assertEqual(1, mock_create_node.call_count)
 
     def test_create_with_invalid_properties(self):
@@ -534,10 +535,10 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
                                autospec=True) as mock_get_node:
             mock_get_node.return_value = self.fake_node
             node = objects.Node.get(self.context, uuid)
-            node.properties = {"local_gb": "5G", "memory_mb": "5",
-                               'cpus': '-1', 'cpu_arch': 'x86_64'}
+            node.properties = {"local_gb": "5G", "memory_mb": "-5",
+                               'cpu_arch': 'x86_64'}
             self.assertRaisesRegex(exception.InvalidParameterValue,
-                                   ".*local_gb=5G, cpus=-1$", node.save)
+                                   ".*local_gb=5G, memory_mb=-5$", node.save)
             mock_get_node.assert_called_once_with(uuid)
 
     def test__validate_property_values_success(self):
@@ -549,7 +550,6 @@ class TestNodeObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
             values = self.fake_node
             expect = {
                 'cpu_arch': 'x86_64',
-                "cpus": '8',
                 "local_gb": '10',
                 "memory_mb": '4096',
             }
@@ -1376,6 +1376,68 @@ class TestConvertToVersion(db_base.DbTestCase):
         node._convert_to_version("1.35", False)
         self.assertIsNone(node.boot_mode)
         self.assertIsNone(node.secure_boot)
+        self.assertEqual({}, node.obj_get_changes())
+
+    def test_firmware_supported_missing(self):
+        # firmware_interface not set, should be set to default.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+        delattr(node, 'firmware_interface')
+        node.obj_reset_changes()
+
+        node._convert_to_version("1.39")
+
+        self.assertIsNone(node.firmware_interface)
+        self.assertEqual({'firmware_interface': None},
+                         node.obj_get_changes())
+
+    def test_firmware_supported_set(self):
+        # firmware_interface set, no change required.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+
+        node.firmware_interface = 'fake'
+        node.obj_reset_changes()
+        node._convert_to_version("1.39")
+        self.assertEqual('fake', node.firmware_interface)
+        self.assertEqual({}, node.obj_get_changes())
+
+    def test_firmware_unsupported_missing(self):
+        # firmware_interface not set, no change required.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+
+        delattr(node, 'firmware_interface')
+        node.obj_reset_changes()
+        node._convert_to_version("1.38")
+        self.assertNotIn('firmware_interface', node)
+        self.assertEqual({}, node.obj_get_changes())
+
+    def test_firmware_unsupported_set_remove(self):
+        # firmware_interface set, should be removed.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+
+        node.firmware_interface = 'fake'
+        node.obj_reset_changes()
+        node._convert_to_version("1.38")
+        self.assertNotIn('firmware_interface', node)
+        self.assertEqual({}, node.obj_get_changes())
+
+    def test_firmware_unsupported_set_no_remove_non_default(self):
+        # firmware_interface set, should be set to default.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+
+        node.firmware_interface = 'fake'
+        node.obj_reset_changes()
+        node._convert_to_version("1.38", False)
+        self.assertIsNone(node.firmware_interface)
+        self.assertEqual({'firmware_interface': None}, node.obj_get_changes())
+
+    def test_firmware_unsupported_set_no_remove_default(self):
+        # firmware_interface set, no change required.
+        node = obj_utils.get_test_node(self.ctxt, **self.fake_node)
+
+        node.firmware_interface = None
+        node.obj_reset_changes()
+        node._convert_to_version("1.38", False)
+        self.assertIsNone(node.firmware_interface)
         self.assertEqual({}, node.obj_get_changes())
 
 

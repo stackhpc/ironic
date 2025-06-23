@@ -28,6 +28,7 @@ import jsonschema
 from jsonschema import exceptions as json_schema_exc
 from oslo_log import log as logging
 from oslo_utils import importutils
+import sushy
 
 from ironic.common import boot_devices
 from ironic.common import exception
@@ -48,7 +49,6 @@ from ironic.drivers.modules.redfish import utils as redfish_utils
 
 
 drac_exceptions = importutils.try_import('dracclient.exceptions')
-sushy = importutils.try_import('sushy')
 
 LOG = logging.getLogger(__name__)
 
@@ -366,7 +366,7 @@ class DracRedfishManagement(redfish_management.RedfishManagement):
     @base.clean_step(priority=0, argsinfo=EXPORT_CONFIGURATION_ARGSINFO,
                      requires_ramdisk=False)
     def export_configuration(self, task, export_configuration_location):
-        """Export the configuration of the server.
+        """(Deprecated) Export the configuration of the server.
 
         Exports the configuration of the server against which the step is run
         and stores it in specific format in indicated location.
@@ -416,7 +416,7 @@ class DracRedfishManagement(redfish_management.RedfishManagement):
     @base.clean_step(priority=0, argsinfo=IMPORT_CONFIGURATION_ARGSINFO,
                      requires_ramdisk=False)
     def import_configuration(self, task, import_configuration_location):
-        """Import and apply the configuration to the server.
+        """(Deprecated) Import and apply the configuration to the server.
 
         Gets pre-created configuration from storage by given location and
         imports that into given server. Uses Dell's Server Configuration
@@ -689,6 +689,10 @@ class DracRedfishManagement(redfish_management.RedfishManagement):
 
 
 class DracWSManManagement(base.ManagementInterface):
+
+    # NOTE(TheJulia): Deprecating November 2023 in favor of Redfish
+    # and due to a lack of active driver maintenance.
+    supported = False
 
     def get_properties(self):
         """Return the properties of the interface."""

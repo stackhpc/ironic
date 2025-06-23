@@ -5,7 +5,7 @@ Ironic supports booting a user provided ramdisk or an ISO image (starting with
 the Victoria release) instead of deploying a node.
 Most commonly this is performed when an instance is booted via PXE, iPXE or
 Virtual Media, with the only local storage contents being those in memory.
-It is suported by ``pxe``, ``ipxe``, ``redfish-virtual-media`` and
+It is supported by ``pxe``, ``ipxe``, ``redfish-virtual-media`` and
 ``ilo-virtual-media`` boot interfaces.
 
 Configuration
@@ -92,6 +92,13 @@ For example,
     baremetal node set <NODE> \
         --instance-info boot_iso=http://path/to/boot.iso
     baremetal node deploy <NODE>
+
+.. note::
+
+   While this interface example utilizes a HTTP URL, as with all fields
+   referencing file artifacts in the ``instance_info`` field, a user is
+   able to request a file path URL, or an HTTPS URL, or as a Glance Image
+   Service object UUID.
 
 .. warning::
    This feature, when utilized with the ``ipxe`` ``boot_interface``,

@@ -76,20 +76,6 @@ class ExecuteTestCase(base.TestCase):
         execute_mock.assert_called_once_with('foo',
                                              env_variables={'foo': 'bar'})
 
-    def test_execute_get_root_helper(self):
-        with mock.patch.object(
-                processutils, 'execute', autospec=True) as execute_mock:
-            helper = utils._get_root_helper()
-            utils.execute('foo', run_as_root=True)
-            execute_mock.assert_called_once_with('foo', run_as_root=True,
-                                                 root_helper=helper)
-
-    def test_execute_without_root_helper(self):
-        with mock.patch.object(
-                processutils, 'execute', autospec=True) as execute_mock:
-            utils.execute('foo', run_as_root=False)
-            execute_mock.assert_called_once_with('foo', run_as_root=False)
-
 
 class GenericUtilsTestCase(base.TestCase):
     @mock.patch.object(utils, 'hashlib', autospec=True)
@@ -320,6 +306,12 @@ class GenericUtilsTestCase(base.TestCase):
         with mock.patch('builtins.open', mock_open) as m:
             self.assertFalse(utils.is_fips_enabled())
             m.assert_called_once_with('/proc/sys/crypto/fips_enabled', 'r')
+
+    def test_wrap_ipv6(self):
+        self.assertEqual('[2001:DB8::1]', utils.wrap_ipv6('2001:DB8::1'))
+        self.assertEqual('example.com', utils.wrap_ipv6('example.com'))
+        self.assertEqual('192.168.24.1', utils.wrap_ipv6('192.168.24.1'))
+        self.assertEqual('[2001:DB8::1]', utils.wrap_ipv6('[2001:DB8::1]'))
 
 
 class TempFilesTestCase(base.TestCase):

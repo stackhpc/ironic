@@ -9,19 +9,18 @@ pbr>=3.1.1 # Apache-2.0
 SQLAlchemy>=1.4.0 # MIT
 alembic>=1.4.2 # MIT
 automaton>=1.9.0 # Apache-2.0
-eventlet!=0.18.3,!=0.20.1,>=0.18.2 # MIT
+eventlet>=0.30.1 # MIT
 WebOb>=1.7.1 # MIT
 python-cinderclient!=4.0.0,>=3.3.0 # Apache-2.0
 python-glanceclient>=2.8.0 # Apache-2.0
 keystoneauth1>=4.2.0 # Apache-2.0
-ironic-lib>=4.6.1 # Apache-2.0
-python-swiftclient>=3.2.0 # Apache-2.0
-pytz>=2013.6 # MIT
+ironic-lib>=6.0.0 # Apache-2.0
 stevedore>=1.29.0 # Apache-2.0
 oslo.concurrency>=4.2.0 # Apache-2.0
 oslo.config>=6.8.0 # Apache-2.0
 oslo.context>=2.22.0 # Apache-2.0
 oslo.db>=9.1.0 # Apache-2.0
+# TODO(dtantsur): remove rootwrap when we no longer provide ironic-rootwrap CLI
 oslo.rootwrap>=5.8.0 # Apache-2.0
 oslo.log>=4.3.0 # Apache-2.0
 oslo.middleware>=3.31.0 # Apache-2.0
@@ -40,11 +39,13 @@ jsonpatch!=1.20,>=1.16 # BSD
 Jinja2>=3.0.0 # BSD License (3 clause)
 keystonemiddleware>=9.5.0 # Apache-2.0
 oslo.messaging>=14.1.0 # Apache-2.0
-tenacity>=6.2.0  # Apache-2.0
+tenacity>=6.3.1  # Apache-2.0
 oslo.versionedobjects>=1.31.2 # Apache-2.0
-jsonschema>=3.2.0 # MIT
+jsonschema>=4.0.0 # MIT
 psutil>=3.2.2 # BSD
 futurist>=1.2.0 # Apache-2.0
 tooz>=2.7.0 # Apache-2.0
 openstacksdk>=0.48.0 # Apache-2.0
-sushy>=4.3.0
+sushy>=4.8.0
+construct>=2.9.39 # MIT
+netaddr>=0.9.0 # BSD
