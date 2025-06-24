@@ -137,7 +137,7 @@ def _set_boot_device(task, system, device, persistent=False,
 
     vendor = task.node.properties.get('vendor', None)
 
-    if vendor and vendor.lower() in ['redfish_compatible', 'megarac','megarac-spx']:
+    if vendor and vendor.lower() in ['redfish_compatible', 'megarac', 'megarac-spx']:
         enabled = BOOT_DEVICE_PERSISTENT_MAP_REV[persistent]
         mode = sushy.BOOT_SOURCE_MODE_UEFI
         LOG.debug('Setting BootSourceOverrideTarget to %(target)s, '
