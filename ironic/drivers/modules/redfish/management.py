@@ -138,6 +138,7 @@ def _set_boot_device(task, system, device, persistent=False,
     vendor = task.node.properties.get('vendor', None)
 
     if vendor and vendor.lower() in ['redfish_compatible', 'megarac', 'megarac-spx']:
+        LOG.warning(">>> Custom Redfish boot patch is being used <<<")
         enabled = BOOT_DEVICE_PERSISTENT_MAP_REV[persistent]
         mode = sushy.BOOT_SOURCE_MODE_UEFI
         LOG.debug('Setting BootSourceOverrideTarget to %(target)s, '
@@ -149,7 +150,7 @@ def _set_boot_device(task, system, device, persistent=False,
         try:
             system.set_system_boot_options(
                 device, enabled=enabled,
-                boot_source_mode=mode,
+                mode=mode,
                 http_boot_uri=http_boot_url
             )
         except sushy.exceptions.SushyError as e:
