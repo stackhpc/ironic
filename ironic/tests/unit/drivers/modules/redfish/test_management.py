@@ -1756,7 +1756,7 @@ class RedfishManagementTestCase(db_base.DbTestCase):
             fake_system.set_system_boot_options.assert_called_once_with(
                 sushy.BOOT_SOURCE_TARGET_PXE,
                 enabled=sushy.BOOT_SOURCE_ENABLED_CONTINUOUS,
-                boot_source_mode=sushy.BOOT_SOURCE_MODE_UEFI,
+                mode=sushy.BOOT_SOURCE_MODE_UEFI,
                 http_boot_uri=None
             )
 
