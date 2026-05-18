@@ -50,6 +50,9 @@ def do_node_clean(task, clean_steps=None, disable_ramdisk=False):
         node.clean_step = None
         node.save()
 
+        # Switch back to original interface, if necessary
+        task.driver.deploy.restore_interface(task)
+
         task.process_event('done')
         how = ('API' if node.automated_clean is False else 'configuration')
         LOG.info('Automated cleaning is disabled via %(how)s, node %(node)s '
