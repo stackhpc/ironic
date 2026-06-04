@@ -34,7 +34,8 @@ libvirt-dev [platform:dpkg devstack]
 libvirt-devel [platform:rpm devstack]
 qemu [platform:dpkg devstack build-image-dib]
 qemu-kvm [platform:dpkg devstack]
-qemu-utils [platform:dpkg devstack build-image-dib]
+# NOTE(Alex-Welsh): added test
+qemu-utils [platform:dpkg devstack build-image-dib test]
 qemu-system-data [platform:dpkg devstack]
 sgabios [platform:rpm devstack]
 ipxe-qemu [platform:dpkg devstack]
@@ -46,7 +47,9 @@ iptables [devstack]
 net-tools [platform:rpm devstack]
 
 # these are needed to compile Python dependencies from sources
-python-dev [platform:dpkg test]
+# NOTE(Alex-Welsh): Package python-dev is not available, python-dev-is-python3 replaces it
+#python-dev [platform:dpkg test]
+python-dev-is-python3 [platform:dpkg test]
 python3-all-dev [platform:dpkg !platform:ubuntu-precise test]
 python3-devel [platform:rpm test]
 build-essential [platform:dpkg test]
