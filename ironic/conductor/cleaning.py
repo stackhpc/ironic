@@ -45,13 +45,13 @@ def do_node_clean(task, clean_steps=None, disable_ramdisk=False):
     LOG.debug('Starting %(type)s cleaning for node %(node)s',
               {'type': clean_type, 'node': node.uuid})
 
+    # Switch back to original interface, if necessary
+    task.driver.deploy.restore_interface(task)
+
     if not manual_clean and utils.skip_automated_cleaning(node):
         # Skip cleaning, move to AVAILABLE.
         node.clean_step = None
         node.save()
-
-        # Switch back to original interface, if necessary
-        task.driver.deploy.restore_interface(task)
 
         task.process_event('done')
         how = ('API' if node.automated_clean is False else 'configuration')
