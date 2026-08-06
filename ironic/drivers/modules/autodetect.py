@@ -19,13 +19,15 @@ from ironic.common.i18n import _
 from ironic.common import metrics_utils
 from ironic.conf import CONF
 from ironic.drivers import base
+from ironic.drivers.modules import agent_base
 
 LOG = logging.getLogger(__name__)
 
 METRICS = metrics_utils.get_metrics_logger(__name__)
 
 
-class AutodetectDeploy(base.DeployInterface):
+class AutodetectDeploy(agent_base.AgentBaseMixin, agent_base.HeartbeatMixin,
+                       base.DeployInterface):
     """Deploy interface that auto-detects the appropriate deployment method.
 
     """
