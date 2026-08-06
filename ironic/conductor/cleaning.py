@@ -282,6 +282,9 @@ def do_next_clean_step(task, step_index, disable_ramdisk=None):
                                                 tear_down_cleaning=False)
     utils.node_update_cache(task)
     LOG.info('Node %s cleaning complete', node.uuid)
+
+    # Switch back to original interface, if necessary
+    task.driver.deploy.restore_interface(task)
     event = 'manage' if manual_clean or node.retired else 'done'
     # NOTE(rloo): No need to specify target prov. state; we're done
     task.process_event(event)
