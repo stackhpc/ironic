@@ -142,6 +142,21 @@ def _is_during_post_error(exc):
                   'will trigger retry logic. Error: %s', exc)
     return is_post_error
 
+def _bmc_wants_retry(exc):
+    """Check if the BMC asked for the request to be retried in the exception.
+    
+    Dell iDRAC BMCs reject some requests with the message 'The service is 
+    temporarily unavailable.  Retry in 30 seconds.'
+
+    :param exc: An exception instance
+    :returns: True if the BMC asked for the request to be retried, False
+              otherwise
+    """
+    wants_retry = 'Retry in 30 seconds' in str(exc)
+    if wants_retry:
+        LOG.debug('Detected UnableToModifyDuringSystemPOST error from BMC, '
+                    'will trigger retry logic. Error: %s', exc)
+    return wants_retry
 
 def _set_boot_device(task, system, device, persistent=False,
                      http_boot_url=None):
@@ -189,6 +204,9 @@ def _set_boot_device(task, system, device, persistent=False,
         enabled = (desired_enabled
                    if desired_enabled != current_enabled else None)
 
+    def _retry_set_boot_device(exc):
+        return _is_during_post_error(exc) or _bmc_wants_retry(exc)
+
     # Logging callback for retry attempts (closure captures task)
     def _log_post_boot_retry(retry_state):
         LOG.warning('BMC is in POST, unable to modify boot device for '
@@ -200,7 +218,7 @@ def _set_boot_device(task, system, device, persistent=False,
                      'total': CONF.redfish.post_boot_retry_attempts})
 
     @tenacity.retry(
-        retry=tenacity.retry_if_exception(_is_during_post_error),
+        retry=tenacity.retry_if_exception(_retry_set_boot_device),
         stop=tenacity.stop_after_attempt(CONF.redfish.post_boot_retry_attempts),
         wait=tenacity.wait_exponential(
             multiplier=1,
