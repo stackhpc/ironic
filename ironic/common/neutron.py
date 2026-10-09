@@ -305,7 +305,7 @@ def add_ports_to_network(task, network_uuid, security_groups=None):
     client = get_client(context=task.context, auth_from_config=True)
     node = task.node
     pxe_capability = 'pxe_boot' in task.driver.boot.capabilities
-    add_all_ports = CONF.neutron.add_all_ports or not pxe_capability
+    add_all_ports = CONF.neutron.add_all_ports
 
     # If Security Groups are specified, verify that they exist
     _verify_security_groups(security_groups, client)
@@ -458,7 +458,7 @@ def remove_ports_from_network(task, network_uuid):
     :raises: NetworkError
     """
     pxe_capability = 'pxe_boot' in task.driver.boot.capabilities
-    add_all_ports = CONF.neutron.add_all_ports or not pxe_capability
+    add_all_ports = CONF.neutron.add_all_ports
     if not add_all_ports:
         macs = [p.address for p in task.ports if p.pxe_enabled]
     else:
