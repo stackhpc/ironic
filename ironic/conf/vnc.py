@@ -105,12 +105,16 @@ opts = [
              'resource creation. '
              '"container" manages containers directly through a Docker '
              'compatible container engine (Docker or Podman), appropriate '
-             'when ironic-conductor itself runs in a container.'),
+             'when ironic-conductor itself runs in a container. '
+             '"container-kolla" is the same, but runs the console '
+             'container with host networking instead of a published '
+             'port, appropriate for containerised deployments such as '
+             'Kolla where port publication is not possible.'),
     cfg.StrOpt(
         'console_image',
         mutable=True,
-        help='Container image reference for the "systemd", "kubernetes" '
-             'and "container" console container '
+        help='Container image reference for the "systemd", "kubernetes", '
+             '"container" and "container-kolla" console container '
              'providers, and any other out-of-tree provider which requires a '
              'configurable image reference.'),
     cfg.StrOpt(
@@ -153,22 +157,24 @@ opts = [
     cfg.StrOpt(
         'container_executable',
         default='docker',
-        help='For the container provider, name or absolute path of the '
-             'Docker compatible CLI binary to invoke. Set to "podman" to '
-             'use Podman\'s Docker compatible CLI (Podman 4.0 or later '
-             'recommended).'),
+        help='For the container and container-kolla providers, name or '
+             'absolute path of the Docker compatible CLI binary to '
+             'invoke. Set to "podman" to use Podman\'s Docker '
+             'compatible CLI (Podman 4.0 or later recommended).'),
     cfg.StrOpt(
         'container_host',
-        help='For the container provider, the container engine endpoint '
-             'URL, for example "unix:///var/run/docker.sock" or a "tcp://" '
-             'URL. When set it is exported to the CLI as both DOCKER_HOST '
-             'and CONTAINER_HOST; when unset the CLI\'s default socket '
-             'resolution applies. The engine is assumed to run on the '
+        help='For the container and container-kolla providers, the container '
+             'engine endpoint URL, for example "unix:///var/run/docker.sock" '
+             'or a "tcp://" URL. When set it is exported to the CLI as both '
+             'DOCKER_HOST and CONTAINER_HOST; when unset the CLI\'s default '
+             'socket resolution applies. The engine is assumed to run on the '
              'conductor host: a remote engine requires '
              'container_publish_port to bind an address which is valid and '
-             'routable on the engine host. A TCP endpoint must be '
-             'protected with TLS, configured through the standard Docker '
-             'client environment variables.'),
+             'routable on the engine host, and the container-kolla provider '
+             'requires a local engine as its containers join the host '
+             'network. A TCP endpoint must be protected with TLS, '
+             'configured through the standard Docker client environment '
+             'variables.'),
     cfg.StrOpt(
         'container_publish_port',
         default='$my_ip::5900',
@@ -184,7 +190,9 @@ opts = [
              'by ironic-novncproxy and/or nova-novncproxy. The VNC servers '
              'have no authentication or encryption so they also should not '
              'be exposed to public access. Additionally, the containers '
-             'need to be able to access BMC management endpoints.'),
+             'need to be able to access BMC management endpoints. Not used '
+             'by the container-kolla provider, which runs the console '
+             'container with host networking.'),
     cfg.StrOpt(
         'container_command_template',
         default=os.path.join(
@@ -202,6 +210,20 @@ opts = [
              'container port 5900 and the value-less "--env APP_INFO" '
              'entry (the credentials are supplied through the CLI\'s '
              'process environment).'),
+    cfg.StrOpt(
+        'container_kolla_command_template',
+        default=os.path.join(
+            '$pybasedir',
+            'console/container/ironic-console-container-kolla.template'),
+        mutable=True,
+        help='For the container-kolla provider, path to the Jinja2 '
+             'template which renders the argument vector for '
+             'container_executable to run a console container. As for '
+             '"container_command_template", the rendered text is split '
+             'with shlex ("#" starts a comment) and run with no shell. '
+             'The default template requires that "console_image" be set '
+             'and runs the container with host networking instead of '
+             'publishing the VNC port.'),
     cfg.StrOpt(
         'cert_file',
         deprecated_name='ssl_cert_file',

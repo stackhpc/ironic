@@ -26,6 +26,7 @@ from ironic.common import console_factory
 from ironic.common import exception
 from ironic.common import utils
 from ironic.console.container import container
+from ironic.console.container import container_kolla
 from ironic.console.container import fake
 from ironic.console.container import kubernetes
 from ironic.console.container import systemd
@@ -1583,3 +1584,186 @@ class TestContainerConsoleContainer(base.TestCase):
         self.assertRaisesRegex(
             exception.ConsoleContainerError, 'ouch',
             self.provider.stop_all_containers)
+
+
+class TestContainerKollaConsoleContainer(base.TestCase):
+
+    def setUp(self):
+        super(TestContainerKollaConsoleContainer, self).setUp()
+        _reset_provider('container-kolla')
+        self.addCleanup(_reset_provider, 'fake')
+
+        CONF.set_override('console_image', 'test-image', 'vnc')
+
+        # The __init__ of the provider renders the real default template,
+        # which validates that it exists and parses.
+        with mock.patch.object(utils, 'execute', autospec=True) as mock_exec:
+            self.provider = console_factory.ConsoleContainerFactory().provider
+            mock_exec.assert_has_calls([
+                mock.call('docker', 'version'),
+            ])
+
+    def test_provider(self):
+        self.assertIsInstance(
+            self.provider, container_kolla.ContainerKollaConsoleContainer)
+        self.assertEqual('container-kolla', self.provider.provider_name)
+
+    def test__render_template(self):
+        CONF.set_override('read_only', True, 'vnc')
+
+        # host networking replaces the published port
+        self.assertEqual([
+            'run', '--detach', '--rm',
+            '--name', 'ironic-console-1234',
+            '--label', 'org.openstack.ironic.console=true',
+            '--label', 'org.openstack.ironic.conductor=fake-mini',
+            '--label', 'org.openstack.ironic.node=1234',
+            '--network', 'host',
+            '--pull', 'missing',
+            '--env', 'APP=fake-app',
+            '--env', 'APP_INFO',
+            '--env', 'READ_ONLY=True',
+            'test-image',
+        ], self.provider._render_template('1234', app_name='fake-app'))
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test__host_port(self, mock_exec):
+        # with host networking the VNC server listens on port 5900 of the
+        # conductor host, so the endpoint is known without querying the
+        # engine
+        CONF.set_override('my_ip', '203.0.113.5')
+        self.assertEqual(
+            ('203.0.113.5', 5900),
+            self.provider._host_port('ironic-console-1234'))
+        mock_exec.assert_not_called()
+
+    @mock.patch.object(container_kolla.ContainerKollaConsoleContainer,
+                       '_wait_for_listen', autospec=True)
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_start_container(self, mock_exec, mock_wait):
+        CONF.set_override('my_ip', '203.0.113.5')
+        task = mock.Mock(node=mock.Mock(uuid='1234'))
+
+        mock_exec.side_effect = [
+            (None, None),             # rm of any stale container
+            ('cid123\n', None),       # run
+        ]
+
+        self.assertEqual(
+            ('203.0.113.5', 5900),
+            self.provider.start_container(task, 'fake-app', {'foo': 'bar'}))
+
+        mock_exec.assert_has_calls([
+            mock.call('docker', 'rm', '--force', 'ironic-console-1234',
+                      check_exit_code=False),
+            mock.call(
+                'docker', 'run', '--detach', '--rm',
+                '--name', 'ironic-console-1234',
+                '--label', 'org.openstack.ironic.console=true',
+                '--label', 'org.openstack.ironic.conductor=fake-mini',
+                '--label', 'org.openstack.ironic.node=1234',
+                '--network', 'host',
+                '--pull', 'missing',
+                '--env', 'APP=fake-app',
+                '--env', 'APP_INFO',
+                '--env', 'READ_ONLY=False',
+                'test-image',
+                env_variables=mock.ANY),
+        ])
+        # no published ports, so no port discovery through the engine
+        for call in mock_exec.call_args_list:
+            self.assertNotIn('port', call.args)
+        mock_wait.assert_called_once_with(self.provider, '203.0.113.5', 5900)
+
+        # app_info is passed through the CLI process environment, never
+        # on the command line
+        run_call = mock_exec.call_args_list[1]
+        self.assertNotIn('{"foo": "bar"}', run_call.args)
+        self.assertEqual(
+            '{"foo": "bar"}', run_call.kwargs['env_variables']['APP_INFO'])
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_start_container_run_failed(self, mock_exec):
+        task = mock.Mock(node=mock.Mock(uuid='1234'))
+
+        mock_exec.side_effect = [
+            (None, None),  # rm of any stale container
+            processutils.ProcessExecutionError(stderr='ouch'),  # run
+            ('a log line', None),  # logs
+            (None, None),  # rm
+        ]
+
+        self.assertRaisesRegex(
+            exception.ConsoleContainerError, 'ouch',
+            self.provider.start_container, task, 'fake-app', {})
+
+        mock_exec.assert_has_calls([
+            mock.call('docker', 'logs', 'ironic-console-1234',
+                      check_exit_code=False),
+            mock.call('docker', 'rm', '--force', 'ironic-console-1234',
+                      check_exit_code=False),
+        ])
+
+    @mock.patch.object(container_kolla.ContainerKollaConsoleContainer,
+                       '_wait_for_listen', autospec=True)
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_start_container_wait_failed(self, mock_exec, mock_wait):
+        CONF.set_override('my_ip', '203.0.113.5')
+        task = mock.Mock(node=mock.Mock(uuid='1234'))
+
+        mock_exec.side_effect = [
+            (None, None),             # rm of any stale container
+            ('cid123\n', None),       # run
+            ('a log line', None),     # logs
+            (None, None),             # rm
+        ]
+        mock_wait.side_effect = exception.ConsoleContainerError(
+            provider='container-kolla', reason='RFB data not returned')
+
+        self.assertRaisesRegex(
+            exception.ConsoleContainerError, 'RFB data not returned',
+            self.provider.start_container, task, 'fake-app', {})
+
+        mock_exec.assert_has_calls([
+            mock.call('docker', 'logs', 'ironic-console-1234',
+                      check_exit_code=False),
+            mock.call('docker', 'rm', '--force', 'ironic-console-1234',
+                      check_exit_code=False),
+        ])
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_stop_container(self, mock_exec):
+        task = mock.Mock(node=mock.Mock(uuid='1234'))
+        mock_exec.return_value = (None, None)
+
+        self.provider.stop_container(task)
+
+        mock_exec.assert_has_calls([
+            mock.call('docker', 'logs', 'ironic-console-1234',
+                      check_exit_code=False),
+            mock.call('docker', 'rm', '--force', 'ironic-console-1234',
+                      check_exit_code=False),
+        ])
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_stop_all_containers(self, mock_exec):
+        mock_exec.side_effect = [
+            ('abc123\ndef456\n', None),  # ps
+            (None, None),                # logs abc123
+            (None, None),                # rm abc123
+            (None, None),                # logs def456
+            (None, None),                # rm def456
+        ]
+
+        self.provider.stop_all_containers()
+
+        mock_exec.assert_has_calls([
+            mock.call('docker', 'ps', '--all', '--quiet', '--filter',
+                      'label=org.openstack.ironic.conductor=fake-mini'),
+            mock.call('docker', 'logs', 'abc123', check_exit_code=False),
+            mock.call('docker', 'rm', '--force', 'abc123',
+                      check_exit_code=False),
+            mock.call('docker', 'logs', 'def456', check_exit_code=False),
+            mock.call('docker', 'rm', '--force', 'def456',
+                      check_exit_code=False),
+        ])
