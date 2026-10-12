@@ -36,6 +36,7 @@ Bugs = "https://bugs.launchpad.net/ironic"
 systemd = "ironic.console.container.systemd:SystemdConsoleContainer"
 kubernetes = "ironic.console.container.kubernetes:KubernetesConsoleContainer"
 container = "ironic.console.container.container:ContainerConsoleContainer"
+container-kolla = "ironic.console.container.container_kolla:ContainerKollaConsoleContainer"
 fake = "ironic.console.container.fake:FakeConsoleContainer"
 
 # TODO(stephenfin): Remove the oslo.db call that requires this. It's unnecessary
