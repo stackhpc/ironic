@@ -1403,6 +1403,64 @@ class TestContainerConsoleContainer(base.TestCase):
             exception.ConsoleContainerError, 'ouch',
             self.provider._host_port, 'ironic-console-1234')
 
+    @mock.patch('time.sleep', autospec=True)
+    @mock.patch('socket.create_connection', autospec=True)
+    def test__wait_for_listen_success(self, mock_create_connection,
+                                      mock_sleep):
+        mock_socket = mock.MagicMock()
+        mock_socket.recv.return_value = b'x' * 12
+        mock_create_connection.return_value.__enter__.return_value = (
+            mock_socket)
+
+        self.provider._wait_for_listen('127.0.0.1', 5900)
+
+        mock_create_connection.assert_called_once_with(('127.0.0.1', 5900),
+                                                       timeout=1)
+        mock_socket.recv.assert_called_once_with(12)
+        mock_sleep.assert_not_called()
+
+    @mock.patch('time.sleep', autospec=True)
+    @mock.patch('socket.create_connection', autospec=True)
+    def test__wait_for_listen_timeout(self, mock_create_connection,
+                                      mock_sleep):
+        CONF.set_override('wait_for_ready_timeout', 3, 'vnc')
+        mock_create_connection.side_effect = socket.error
+
+        self.assertRaisesRegex(
+            exception.ConsoleContainerError,
+            "RFB data not returned by 127.0.0.1:5900",
+            self.provider._wait_for_listen, '127.0.0.1', 5900)
+
+        self.assertEqual(3, mock_create_connection.call_count)
+        self.assertEqual(3, mock_sleep.call_count)
+
+    @mock.patch('time.sleep', autospec=True)
+    @mock.patch('socket.create_connection', autospec=True)
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_start_container_waits_for_listen(
+            self, mock_exec, mock_create_connection, mock_sleep):
+        # regression test: start_container drives the real
+        # _wait_for_listen, not a mocked one
+        CONF.set_override('container_publish_port', '192.0.2.2::5900', 'vnc')
+        task = mock.Mock(node=mock.Mock(uuid='1234'))
+
+        mock_exec.side_effect = [
+            (None, None),                 # rm of any stale container
+            ('cid123\n', None),           # run
+            ('192.0.2.2:33819\n', None),  # port
+        ]
+        mock_socket = mock.MagicMock()
+        mock_socket.recv.return_value = b'x' * 12
+        mock_create_connection.return_value.__enter__.return_value = (
+            mock_socket)
+
+        self.assertEqual(
+            ('192.0.2.2', 33819),
+            self.provider.start_container(task, 'fake-app', {'foo': 'bar'}))
+
+        mock_create_connection.assert_called_once_with(
+            ('192.0.2.2', 33819), timeout=1)
+
     @mock.patch.object(container.ContainerConsoleContainer,
                        '_wait_for_listen', autospec=True)
     @mock.patch.object(utils, 'execute', autospec=True)
@@ -1614,6 +1672,66 @@ class TestContainerKollaConsoleContainer(base.TestCase):
             ('203.0.113.5', 5900),
             self.provider._host_port('ironic-console-1234'))
         mock_exec.assert_not_called()
+
+    @mock.patch('time.sleep', autospec=True)
+    @mock.patch('socket.create_connection', autospec=True)
+    def test__wait_for_listen_success(self, mock_create_connection,
+                                      mock_sleep):
+        mock_socket = mock.MagicMock()
+        mock_socket.recv.return_value = b'x' * 12
+        mock_create_connection.return_value.__enter__.return_value = (
+            mock_socket)
+
+        self.provider._wait_for_listen('203.0.113.5', 5900)
+
+        mock_create_connection.assert_called_once_with(('203.0.113.5', 5900),
+                                                       timeout=1)
+        mock_socket.recv.assert_called_once_with(12)
+        mock_sleep.assert_not_called()
+
+    @mock.patch('time.sleep', autospec=True)
+    @mock.patch('socket.create_connection', autospec=True)
+    def test__wait_for_listen_timeout(self, mock_create_connection,
+                                      mock_sleep):
+        CONF.set_override('wait_for_ready_timeout', 3, 'vnc')
+        mock_create_connection.side_effect = socket.error
+
+        self.assertRaisesRegex(
+            exception.ConsoleContainerError,
+            "RFB data not returned by 203.0.113.5:5900",
+            self.provider._wait_for_listen, '203.0.113.5', 5900)
+
+        self.assertEqual(3, mock_create_connection.call_count)
+        self.assertEqual(3, mock_sleep.call_count)
+
+    @mock.patch('time.sleep', autospec=True)
+    @mock.patch('socket.create_connection', autospec=True)
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_start_container_waits_for_listen(
+            self, mock_exec, mock_create_connection, mock_sleep):
+        # regression test: start_container drives the real
+        # _wait_for_listen, not a mocked one
+        CONF.set_override('my_ip', '203.0.113.5')
+        task = mock.Mock(node=mock.Mock(uuid='1234'))
+
+        mock_exec.side_effect = [
+            (None, None),             # rm of any stale container
+            ('cid123\n', None),       # run
+        ]
+        mock_socket = mock.MagicMock()
+        mock_socket.recv.return_value = b'x' * 12
+        mock_create_connection.return_value.__enter__.return_value = (
+            mock_socket)
+
+        self.assertEqual(
+            ('203.0.113.5', 5900),
+            self.provider.start_container(task, 'fake-app', {'foo': 'bar'}))
+
+        # no published ports, so no port discovery through the engine
+        for call in mock_exec.call_args_list:
+            self.assertNotIn('port', call.args)
+        mock_create_connection.assert_called_once_with(
+            ('203.0.113.5', 5900), timeout=1)
 
     @mock.patch.object(container_kolla.ContainerKollaConsoleContainer,
                        '_wait_for_listen', autospec=True)

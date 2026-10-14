@@ -17,6 +17,8 @@ Docker compatible engine console container provider.
 import json
 import os
 import shlex
+import socket
+import time
 
 from oslo_concurrency import processutils
 from oslo_log import log as logging
@@ -25,6 +27,7 @@ from ironic.common import exception
 from ironic.common import utils
 from ironic.conf import CONF
 from ironic.console.container import base
+from ironic.console.rfb import auth
 
 LOG = logging.getLogger(__name__)
 
@@ -233,6 +236,34 @@ class ContainerConsoleContainer(base.BaseConsoleContainer):
             raise exception.ConsoleContainerError(
                 provider=self.provider_name, reason=e)
         return host, port
+
+    def _wait_for_listen(self, host, port):
+        """Blocks until the VNC port is returning data.
+
+        Attempts a TCP connection to the VNC server for up to
+        [vnc]wait_for_ready_timeout seconds, requesting 12 bytes of
+        data each time. This will either fail to connect, or return
+        zero bytes, until the container is listening on the port.
+
+        :param host: Host IP address of the VNC server
+        :param port: Port of the VNC server
+        :raises: ConsoleContainerError if the timeout is reached
+        """
+        for i in range(CONF.vnc.wait_for_ready_timeout):
+            try:
+                LOG.debug("Attempt %s to connect to %s:%s", i, host, port)
+                with socket.create_connection((host, port), timeout=1) as sock:
+                    b = sock.recv(auth.VERSION_LENGTH)
+                    if len(b) == auth.VERSION_LENGTH:
+                        return
+                    LOG.debug("Expected %s bytes, got %s",
+                              auth.VERSION_LENGTH, len(b))
+            except Exception:
+                pass
+            time.sleep(1)
+        reason = f"RFB data not returned by {host}:{port}"
+        raise exception.ConsoleContainerError(
+            provider=self.provider_name, reason=reason)
 
     def _handle_failed_start(self, container, uuid):
         """Capture diagnostics and clean up after a failed start.

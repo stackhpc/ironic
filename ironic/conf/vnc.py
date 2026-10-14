@@ -17,6 +17,8 @@ import os
 from oslo_config import cfg
 from oslo_config import types
 
+from ironic.common.i18n import _
+
 
 opts = [
     cfg.BoolOpt(
