@@ -136,8 +136,6 @@ following role rules::
 The provider assumes that ironic-novnc is running in the cluster, and can
 connect a VNC server using the console container's ``hostIP``.
 
-<<<<<<< HEAD
-=======
 Docker/Podman container provider
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
