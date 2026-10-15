@@ -18,16 +18,27 @@
 from oslo_config import cfg
 from oslo_config import types
 
+from ironic.common import automated_clean_methods
+from ironic.common import boot_modes
 from ironic.common.i18n import _
+from ironic.common import lessee_sources
+from ironic.conf import types as ir_types
+
 
 opts = [
     cfg.IntOpt('workers_pool_size',
-               default=100, min=3,
-               help=_('The size of the workers greenthread pool. '
+               default=300, min=3,
+               help=_('The size of the workers thread pool. '
                       'Note that 2 threads will be reserved by the conductor '
                       'itself for handling heart beats and periodic tasks. '
                       'On top of that, `sync_power_state_workers` will take '
-                      'up to 7 green threads with the default value of 8.')),
+                      'up to 7 threads with the default value of 8.')),
+    cfg.IntOpt('reserved_workers_pool_percentage',
+               default=5, min=0, max=50,
+               help=_('The percentage of the whole workers pool that will be '
+                      'kept for API requests and other important tasks. '
+                      'This part of the pool will not be used for periodic '
+                      'tasks or agent heartbeats. Set to 0 to disable.')),
     cfg.IntOpt('heartbeat_interval',
                default=10,
                help=_('Seconds between conductor heart beats.')),
@@ -41,7 +52,7 @@ opts = [
                       'of a conductor. A conductor is considered inactive '
                       'when this time has been exceeded.')),
     cfg.IntOpt('sync_power_state_interval',
-               default=60,
+               default=120,
                help=_('Interval between syncing the node power state to the '
                       'database, in seconds. Set to 0 to disable syncing.')),
     cfg.IntOpt('check_provision_state_interval',
@@ -63,6 +74,16 @@ opts = [
                default=3600, min=0,
                help=_('Interval between cleaning up image caches, in seconds. '
                       'Set to 0 to disable periodic clean-up.')),
+    cfg.BoolOpt('clear_image_cache_on_deploy_failure',
+                default=False,
+                mutable=True,
+                help=_('Whether to clear cached instance images when '
+                       'deployment fails or aborted. When enabled, cached '
+                       'images are removed during deployment failure state '
+                       'transitions. When disabled (default), cached images '
+                       'are preserved for retry attempts and will be cleaned '
+                       'up eventually via periodic cache cleanup '
+                       'based on the defined TTL.')),
     cfg.IntOpt('deploy_callback_timeout',
                default=1800,
                min=0,
@@ -84,8 +105,8 @@ opts = [
     cfg.IntOpt('sync_power_state_workers',
                default=8, min=1,
                help=_('The maximum number of worker threads that can be '
-                      'started simultaneously to sync nodes power states from '
-                      'the periodic task.')),
+                      'started simultaneously to sync nodes power states '
+                      'from the periodic task.')),
     cfg.IntOpt('periodic_max_workers',
                default=8,
                help=_('Maximum number of worker threads that can be started '
@@ -97,41 +118,6 @@ opts = [
     cfg.IntOpt('node_locked_retry_interval',
                default=1,
                help=_('Seconds to sleep between node lock attempts.')),
-    cfg.BoolOpt('send_sensor_data',
-                default=False,
-                help=_('Enable sending sensor data message via the '
-                       'notification bus')),
-    cfg.IntOpt('send_sensor_data_interval',
-               default=600,
-               min=1,
-               help=_('Seconds between conductor sending sensor data message '
-                      'to ceilometer via the notification bus.')),
-    cfg.IntOpt('send_sensor_data_workers',
-               default=4, min=1,
-               help=_('The maximum number of workers that can be started '
-                      'simultaneously for send data from sensors periodic '
-                      'task.')),
-    cfg.IntOpt('send_sensor_data_wait_timeout',
-               default=300,
-               help=_('The time in seconds to wait for send sensors data '
-                      'periodic task to be finished before allowing periodic '
-                      'call to happen again. Should be less than '
-                      'send_sensor_data_interval value.')),
-    cfg.ListOpt('send_sensor_data_types',
-                default=['ALL'],
-                help=_('List of comma separated meter types which need to be'
-                       ' sent to Ceilometer. The default value, "ALL", is a '
-                       'special value meaning send all the sensor data.')),
-    cfg.BoolOpt('send_sensor_data_for_undeployed_nodes',
-                default=False,
-                help=_('The default for sensor data collection is to only '
-                       'collect data for machines that are deployed, however '
-                       'operators may desire to know if there are failures '
-                       'in hardware that is not presently in use. '
-                       'When set to true, the conductor will collect sensor '
-                       'information from all nodes when sensor data '
-                       'collection is enabled via the send_sensor_data '
-                       'setting.')),
     cfg.IntOpt('sync_local_state_interval',
                default=180,
                help=_('When conductors join or leave the cluster, existing '
@@ -150,8 +136,8 @@ opts = [
                min=60,
                help=_('The timeout (in seconds) after which a configdrive '
                       'temporary URL becomes invalid. Defaults to '
-                      'deploy_callback_timeout if it is set, otherwise to '
-                      '1800 seconds. Used when '
+                      'deploy_callback_timeout + 120 seconds if it is set, '
+                      'otherwise to 1800 seconds. Used when '
                       'configdrive_use_object_store is True.')),
     cfg.IntOpt('inspect_wait_timeout',
                default=1800,
@@ -171,12 +157,71 @@ opts = [
                        'state. When enabled, the particular steps '
                        'performed to clean a node depend on which driver '
                        'that node is managed by; see the individual '
-                       'driver\'s documentation for details. '
-                       'NOTE: The introduction of the cleaning operation '
-                       'causes instance deletion to take significantly '
-                       'longer. In an environment where all tenants are '
-                       'trusted (eg, because there is only one tenant), '
-                       'this option could be safely disabled.')),
+                       'driver\'s documentation for details.')),
+    cfg.StrOpt('automated_cleaning_step_source',
+               default='autogenerated',
+               mutable=True,
+               choices=[
+                   (automated_clean_methods.AUTOGENERATED, _(
+                       'Collects steps from hardware interfaces and orders '
+                       'by priority. This provides the original Ironic '
+                       'cleaning behavior originally implemented in Kilo.')),
+                   (automated_clean_methods.RUNBOOK, _(
+                       'Runs cleaning via a runbook specified in '
+                       'configuration or node driver_info. If a runbook '
+                       'is not specified while automated_clean is enabled, '
+                       'cleaning will fail.')),
+                   (automated_clean_methods.HYBRID, _(
+                       'Runs cleaning via a runbook if one is specified in '
+                       'configuration or node driver_info. If a runbook '
+                       'is not specified while automated_clean is enabled, '
+                       'Ironic will fallback to \'autogenerated\' '
+                       'cleaning steps.'))
+               ],
+               help=_('Determines how automated_cleaning is performed; the '
+                      'default, \'autogenerated\' collects steps from '
+                      'hardware interfaces, then ordering by priority; '
+                      '\'runbook\' requires a runbook to be specified in '
+                      'config or driver_info, which is then used to clean the'
+                      'node; \'hybrid\' uses a runbook if available, '
+                      'and falls-back to autogenerated cleaning steps if not.'
+                      )),
+    cfg.StrOpt('automated_cleaning_runbook',
+               default=None,
+               mutable=True,
+               help=_('If set and [conductor]/automated_clean_step_source '
+                      'is set to \'hybrid\' or \'runbook\', the runbook '
+                      'UUID or name provided here will be used during '
+                      'automated_cleaning for nodes which do not have a '
+                      'resource_class-specific runbook or runbook set in '
+                      'driver_info.')),
+    cfg.DictOpt('automated_cleaning_runbook_by_resource_class',
+                default={},
+                mutable=True,
+                help=_('A dictionary of key-value pairs of node '
+                       'resource_class and runbook UUID or name which will be '
+                       'used to clean the node if '
+                       '[conductor]automated_clean_step_source is set to '
+                       '\'hybrid\' or \'runbook\' and a more specific runbook '
+                       'has not been configured in driver_info.')),
+    cfg.BoolOpt('automated_cleaning_runbook_from_node',
+                default=False,
+                mutable=True,
+                help=_('When enabled, allows an administrator to configure '
+                       'a runbook in '
+                       'node[\'driver_info\'][\'cleaning_runbook\'] to '
+                       'use for that node when '
+                       '[conductor]automated_clean_step_source is set to '
+                       '\'hybrid\' or \'runbook\'. '
+                       'NOTE: This will permit any user with access to edit '
+                       'node[\'driver_info\'] to circumvent cleaning.')),
+    cfg.BoolOpt('automated_cleaning_runbook_validate_traits',
+                default=True,
+                mutable=True,
+                help=_('When enabled, this option requires validation of a '
+                       'runbook before it\'s used for automated cleaning. '
+                       'Nodes configured with a runbook that is not validated '
+                       'for use via trait matching will fail to clean.')),
     cfg.BoolOpt('allow_provisioning_in_maintenance',
                 default=True,
                 mutable=True,
@@ -195,6 +240,13 @@ opts = [
                help=_('Timeout (seconds) to wait for a callback from the '
                       'ramdisk doing the cleaning. If the timeout is reached '
                       'the node will be put in the "clean failed" provision '
+                      'state. Set to 0 to disable timeout.')),
+    cfg.IntOpt('service_callback_timeout',
+               default=1800,
+               min=0,
+               help=_('Timeout (seconds) to wait for a callback from the '
+                      'ramdisk doing the servicing. If the timeout is reached '
+                      'the node will be put in the "service failed" provision '
                       'state. Set to 0 to disable timeout.')),
     cfg.IntOpt('rescue_callback_timeout',
                default=1800,
@@ -234,26 +286,50 @@ opts = [
                 default=True,
                 mutable=True,
                 help=_('Allow deleting nodes which are in state '
-                       '\'available\'. Defaults to True.')),
+                       '\'available\'.')),
     cfg.BoolOpt('enable_mdns', default=False,
                 help=_('Whether to enable publishing the baremetal API '
                        'endpoint via multicast DNS.')),
     cfg.StrOpt('deploy_kernel',
                mutable=True,
-               help=_('Glance ID, http:// or file:// URL of the kernel of '
-                      'the default deploy image.')),
+               help=_('Glance ID, http:// or file:// URL of the '
+                      'kernel of the default deploy image.')),
     cfg.StrOpt('deploy_ramdisk',
                mutable=True,
-               help=_('Glance ID, http:// or file:// URL of the initramfs of '
-                      'the default deploy image.')),
+               help=_('Glance ID, http:// or file:// URL of the '
+                      'initramfs of the default deploy image.')),
+    cfg.DictOpt('deploy_kernel_by_arch',
+                default={},
+                mutable=True,
+                help=_('A dictionary of key-value pairs of each architecture '
+                       'with the Glance ID, http:// or file:// URL of the '
+                       'kernel of the default deploy image.')),
+    cfg.DictOpt('deploy_ramdisk_by_arch',
+                default={},
+                mutable=True,
+                help=_('A dictionary of key-value pairs of each architecture '
+                       'with the Glance ID, http:// or file:// URL of the '
+                       'initramfs of the default deploy image.')),
     cfg.StrOpt('rescue_kernel',
                mutable=True,
-               help=_('Glance ID, http:// or file:// URL of the kernel of '
-                      'the default rescue image.')),
+               help=_('Glance ID, http:// or file:// URL of the '
+                      'kernel of the default rescue image.')),
     cfg.StrOpt('rescue_ramdisk',
                mutable=True,
-               help=_('Glance ID, http:// or file:// URL of the initramfs of '
-                      'the default rescue image.')),
+               help=_('Glance ID, http:// or file:// URL of the '
+                      'initramfs of the default rescue image.')),
+    cfg.DictOpt('rescue_kernel_by_arch',
+                default={},
+                mutable=True,
+                help=_('A dictionary of key-value pairs of each architecture '
+                       'with the Glance ID, http:// or file:// URL of the '
+                       'kernel of the default rescue image.')),
+    cfg.DictOpt('rescue_ramdisk_by_arch',
+                default={},
+                mutable=True,
+                help=_('A dictionary of key-value pairs of each architecture '
+                       'with the Glance ID, http:// or file:// URL of the '
+                       'initramfs of the default rescue image.')),
     cfg.StrOpt('rescue_password_hash_algorithm',
                default='sha256',
                choices=['sha256', 'sha512'],
@@ -261,8 +337,7 @@ opts = [
                help=_('Password hash algorithm to be used for the rescue '
                       'password.')),
     cfg.BoolOpt('require_rescue_password_hashed',
-                # TODO(TheJulia): Change this to True in Victoria.
-                default=False,
+                default=True,
                 mutable=True,
                 help=_('Option to cause the conductor to not fallback to '
                        'an un-hashed version of the rescue password, '
@@ -274,7 +349,8 @@ opts = [
                       'partition image containing EFI boot loader. This image '
                       'will be used by ironic when building UEFI-bootable ISO '
                       'out of kernel and ramdisk. Required for UEFI boot from '
-                      'partition images.')),
+                      'partition images. Can be overridden per-architecture '
+                      'using the bootloader_by_arch option.')),
     cfg.MultiOpt('clean_step_priority_override',
                  item_type=types.Dict(),
                  default={},
@@ -304,8 +380,8 @@ opts = [
                min=0,
                mutable=True,
                help=_('Maximum number of history entries which will be stored '
-                      'in the database per node. Default is 300. This setting '
-                      'excludes the minimum number of days retained using the '
+                      'in the database per node. This setting excludes '
+                      'the minimum number of days retained using the '
                       '[conductor]node_history_minimum_days setting.')),
     cfg.IntOpt('node_history_cleanup_interval',
                min=0,
@@ -313,8 +389,7 @@ opts = [
                mutable=False,
                help=_('Interval in seconds at which node history entries '
                       'can be cleaned up in the database. Setting to 0 '
-                      'disables the periodic task. Defaults to once a day, '
-                      'or 86400 seconds.')),
+                      'disables the periodic task.')),
     cfg.IntOpt('node_history_cleanup_batch_count',
                min=0,
                default=1000,
@@ -323,9 +398,8 @@ opts = [
                       'from the database when performing clean-up. '
                       'Deletes are performed by node, and a node with excess '
                       'records for a node will still be deleted. '
-                      'Defaults to 1000. Operators who find node history '
-                      'building up may wish to '
-                      'lower this threshold and decrease the time between '
+                      'Operators who find node history building up may wish '
+                      'to lower this threshold and decrease the time between '
                       'cleanup operations using the '
                       '``node_history_cleanup_interval`` setting.')),
     cfg.IntOpt('node_history_minimum_days',
@@ -338,6 +412,29 @@ opts = [
                       'node_history_max_entries setting as users of '
                       'this setting are anticipated to need to retain '
                       'history by policy.')),
+    cfg.IntOpt('conductor_cleanup_interval',
+               min=0,
+               default=86400,
+               mutable=False,
+               help=_('Interval in seconds at which stale conductor entries '
+                      'can be cleaned up from the database. Setting to 0 '
+                      'disables the periodic task.')),
+    cfg.IntOpt('conductor_cleanup_timeout',
+               min=60,
+               default=1209600,
+               mutable=True,
+               help=_('Timeout in seconds after which offline conductors '
+                      'are considered stale and can be cleaned up from the '
+                      'database. THis is always required to be at least 3x '
+                      'larger than [conductor]heartbeat_timeout since if '
+                      'otherwise, active conductors might be mistakenly '
+                      'removed from the database.')),
+    cfg.IntOpt('conductor_cleanup_batch_size',
+               min=1,
+               default=50,
+               mutable=True,
+               help=_('The maximum number of stale conductor records to clean '
+                      'up from the database in a single cleanup operation.')),
     cfg.MultiOpt('verify_step_priority_override',
                  item_type=types.Dict(),
                  default={},
@@ -349,15 +446,36 @@ opts = [
                         'for multiple steps. If set to 0, this specific step '
                         'will not run during verification. ')),
     cfg.BoolOpt('automatic_lessee',
-                default=False,
+                default=True,
                 mutable=True,
-                help=_('If the conductor should record the Project ID '
-                       'indicated by Keystone for a requested deployment. '
-                       'Allows rights to be granted to directly access the '
-                       'deployed node as a lessee within the RBAC security '
-                       'model. The conductor does *not* record this value '
-                       'otherwise, and this information is not backfilled '
-                       'for prior instances which have been deployed.')),
+                help=_('Deprecated. If Ironic should set the node.lessee '
+                       'field at deployment. Use '
+                       '[\'conductor\']/automatic_lessee_source instead.'),
+                deprecated_for_removal=True),
+    cfg.StrOpt('automatic_lessee_source',
+               help=_('Source for Project ID the Ironic should '
+                      'record at deployment time in node.lessee field. If set '
+                      'to none, Ironic will not set a lessee field. '
+                      'If set to instance (default), uses Project ID '
+                      'indicated in instance metadata set by Nova or '
+                      'another external deployment service. '
+                      'If set to keystone, Ironic uses Project ID indicated '
+                      'by Keystone context. '),
+               choices=[
+                   (lessee_sources.INSTANCE, _(  # 'instance'
+                    'Populates node.lessee field using metadata from '
+                    'node.instance_info[\'project_id\'] at deployment '
+                    'time. Useful for Nova-fronted deployments.')),
+                   (lessee_sources.REQUEST, _(  # 'request'
+                    'Populates node.lessee field using metadata '
+                    'from request context. Only useful for direct '
+                    'deployment requests to Ironic; not those proxied '
+                    'via an external service like Nova.')),
+                   (lessee_sources.NONE, _(  # 'none'
+                    'Ironic will not populate the node.lessee field.'))
+               ],
+               default='instance',
+               mutable=True),
     cfg.IntOpt('max_concurrent_deploy',
                default=250,
                min=1,
@@ -384,6 +502,287 @@ opts = [
                       'is a global setting applying to all requests this '
                       'conductor receives, regardless of access rights. '
                       'The concurrent clean limit cannot be disabled.')),
+    cfg.BoolOpt('max_concurrent_per_conductor_group',
+                default=False,
+                mutable=True,
+                help=_('When set to True, the max_concurrent_deploy and '
+                       'max_concurrent_clean limits are applied per '
+                       'conductor group instead of globally. This allows '
+                       'different conductor groups to have their own '
+                       'independent concurrency limits. When False '
+                       '(the default), the limits apply to all nodes '
+                       'across the entire Ironic deployment.')),
+    cfg.BoolOpt('poweroff_in_cleanfail',
+                default=False,
+                help=_('If True power off nodes in the ``clean failed`` '
+                       'state. Default False. Option may be unsafe '
+                       'when using Cleaning to perform '
+                       'hardware-transformative actions such as '
+                       'firmware upgrade.')),
+    cfg.BoolOpt('poweroff_in_servicefail',
+                default=False,
+                help=_('If True power off nodes in the ``service failed`` '
+                       'state. Default False. Option may be unsafe '
+                       'when using service to perform '
+                       'hardware-transformative actions such as '
+                       'firmware upgrade.')),
+    cfg.BoolOpt('permit_child_node_step_async_result',
+                default=False,
+                mutable=True,
+                help=_('This option allows child node steps to not error if '
+                       'the resulting step execution returned a "wait" '
+                       'state. Under normal conditions, child nodes are not '
+                       'expected to request a wait state. This option exists '
+                       'for operators to use if needed to perform specific '
+                       'tasks where this is known acceptable. Use at your'
+                       'own risk!')),
+    cfg.IntOpt('max_conductor_wait_step_seconds',
+               default=30,
+               min=0,
+               max=1800,
+               mutable=True,
+               help=_('The maximum number of seconds which a step can '
+                      'be requested to explicitly sleep or wait. This '
+                      'value should be changed sparingly as it holds a '
+                      'conductor thread and if used across many nodes at '
+                      'once can exhaust a conductor\'s resources. This'
+                      'capability has a hard coded maximum wait of 1800 '
+                      'seconds, or 30 minutes. If you need to wait longer '
+                      'than the maximum value, we recommend exploring '
+                      'hold steps.')),
+    cfg.ListOpt('disallowed_deployment_boot_modes',
+                item_type=types.String(
+                    choices=[
+                        (boot_modes.UEFI, _('UEFI boot mode')),
+                        (boot_modes.LEGACY_BIOS, _('Legacy BIOS boot mode'))],
+                ),
+                default=[],
+                mutable=True,
+                help=_("Specifies a list of boot modes that are not allowed "
+                       "during deployment. Eg: ['bios']")),
+    cfg.BoolOpt('disable_deep_image_inspection',
+                default=False,
+                # Normally such an option would be mutable, but this is,
+                # a security guard and operators should not expect to change
+                # this option under normal circumstances.
+                mutable=False,
+                help=_('Security Option to permit an operator to disable '
+                       'file content inspections. Under normal conditions, '
+                       'the conductor will inspect requested image contents '
+                       'which are transferred through the conductor. '
+                       'Disabling this option is not advisable and opens '
+                       'the risk of unsafe images being processed which may '
+                       'allow an attacker to leverage unsafe features in '
+                       'various disk image formats to perform a variety of '
+                       'unsafe and potentially compromising actions. '
+                       'This option is *not* mutable, and '
+                       'requires a service restart to change.')),
+    cfg.BoolOpt('conductor_always_validates_images',
+                default=False,
+                # Normally mutable, however from a security context we do want
+                # all logging to be generated from this option to be changed,
+                # and as such is set to False to force a conductor restart.
+                mutable=False,
+                help=_('Security Option to enable the conductor to *always* '
+                       'inspect the image content of any requested deploy, '
+                       'even if the deployment would have normally bypassed '
+                       'the conductor\'s cache. When this is set to False, '
+                       'the Ironic-Python-Agent is responsible '
+                       'for any necessary image checks. Setting this to '
+                       'True will result in a higher utilization of '
+                       'resources (disk space, network traffic) '
+                       'as the conductor will evaluate *all* images. '
+                       'This option is *not* mutable, and requires a '
+                       'service restart to change. This option requires '
+                       '[conductor]disable_deep_image_inspection to be set '
+                       'to False.')),
+    cfg.ListOpt('permitted_image_formats',
+                default=['raw', 'gpt', 'qcow2', 'iso'],
+                mutable=True,
+                help=_('The supported list of image formats which are '
+                       'permitted for deployment with Ironic. If an image '
+                       'format outside of this list is detected, the image '
+                       'validation logic will fail the deployment process.')),
+    cfg.BoolOpt('disable_file_checksum',
+                default=False,
+                mutable=False,
+                help=_('Deprecated Security option: In the default case, '
+                       'image files have their checksums verified before '
+                       'undergoing additional conductor side actions such '
+                       'as image conversion. '
+                       'Enabling this option opens the risk of files being '
+                       'replaced at the source without the user\'s '
+                       'knowledge.'),
+                deprecated_for_removal=True),
+    cfg.BoolOpt('disable_support_for_checksum_files',
+                default=False,
+                mutable=False,
+                help=_('Security option: By default Ironic will attempt to '
+                       'retrieve a remote checksum file via HTTP(S) URL in '
+                       'order to validate an image download. This is '
+                       'functionality aligning with ironic-python-agent '
+                       'support for standalone users. Disabling this '
+                       'functionality by setting this option to True will '
+                       'create a more secure environment, however it may '
+                       'break users in an unexpected fashion.')),
+    cfg.BoolOpt('disable_zstandard_decompression',
+                default=False,
+                mutable=False,
+                help=_('Option to enable disabling transparent decompression '
+                       'of files which are compressed with Zstandard '
+                       'compression. This option is provided should operators '
+                       'wish to disable this functionality, otherwise it is '
+                       'automatically applied by the conductor should a '
+                       'compressed artifact be detected.')),
+    cfg.ListOpt('file_url_allowed_paths',
+                default=['/var/lib/ironic'],
+                item_type=ir_types.ExplicitAbsolutePath(),
+                help=_(
+                    'List of paths that are allowed to be used as file:// '
+                    'URLs. Files in /boot, /dev, /etc, /proc, /sys and other'
+                    'system paths are always disallowed for security reasons. '
+                    'Any files in this path readable by ironic may be used as '
+                    'an image source when deploying. Setting this value to '
+                    '"" (empty) disables file:// URL support. Paths listed '
+                    'here are validated as absolute paths and will be rejected'
+                    'if they contain path traversal mechanisms, such as "..".'
+                )),
+    cfg.IntOpt('graceful_shutdown_timeout',
+               deprecated_group='DEFAULT',
+               deprecated_reason=_(
+                   'This replaces oslo.service '
+                   '[DEFAULT]/graceful_shutdown_timeout option.'),
+               default=60,
+               help='Specify a timeout after which a gracefully shutdown '
+                    'conductor will exit. Zero value means endless wait.'),
+    cfg.DictOpt('bootloader_by_arch',
+                default={},
+                help=_(
+                    'Bootloader ESP image parameter per node architecture. '
+                    'For example: x86_64:bootx64.efi,aarch64:grubaa64.efi. '
+                    'A node\'s cpu_arch property is used as the key to get '
+                    'the appropriate bootloader ESP image. If the node\'s '
+                    'cpu_arch is not in the dictionary, '
+                    'the [conductor]bootloader value will be used instead.'
+                )),
+    cfg.BoolOpt('disable_configdrive_check',
+                default=False,
+                mutable=True,
+                help=_('Option to disable operations which check and '
+                       'potentially fix up configuration drive contents, '
+                       'such as invalid network metadata values. When these '
+                       'issues are detected, and Ironic is able to correct '
+                       'the data, Ironic will do so transparently. Setting '
+                       'this option to True will disable this '
+                       'functionality.')),
+    cfg.BoolOpt('disable_metadata_mtu_check',
+                default=False,
+                mutable=True,
+                help=_('Option to disable consideration of supplied '
+                       'network_data.json link MTU values as basis to '
+                       'regenerate the supplied metadata.')),
+    cfg.BoolOpt('error_on_ramdisk_config_inconsistency',
+                default=False,
+                mutable=True,
+                help=_('Option to determine if Ironic should fail to boot '
+                       'ramdisk in situations where configuration is '
+                       'ambiguous.e.g. if node[driver_info] contains an '
+                       'override for deploy_ramdisk but not deploy_kernel '
+                       'when ambiguous. When set to True, Ironic will raise '
+                       'and fail the provisioning action that required a '
+                       'ramdisk and kernel. When set to False, Ironic will '
+                       'fallback to the next valid, consistent configured '
+                       'ramdisk and kernel for the node.')),
+    cfg.BoolOpt(
+        "record_step_flows_in_history",
+        default=True,
+        help=(
+            "When True, the conductor writes a Node History entry at the "
+            "start and end of every cleaning/servicing/deploy-steps flow. "
+            "Disable this in very high-churn environments to reduce DB load."
+        )),
+    cfg.BoolOpt(
+        'log_step_flows_to_syslog',
+        default=False,
+        help=(
+            "Log steps at the start/end of cleaning/servicing/deployment "
+            "to the conductor service log (WARNING for aborted/failure, "
+            "INFO otherwise.")),
+
+    # NOTE(clif) Trait Based Networking related configuration.
+    cfg.BoolOpt(
+        'enable_trait_based_networking',
+        default=False,
+        help=_(
+            'Enables Trait Based Networking (TBN) feature if True. When '
+            'enabled, will apply traits defined in the TBN configuration file '
+            'to networking actions when building instances with relevant '
+            'traits defined.')),
+    cfg.StrOpt(
+        'trait_based_networking_config_file',
+        default='/etc/ironic/trait_based_networking.yaml',
+        help=_(
+            'The location of the configuration file for trait based '
+            'configuration. Ironic will load this configuration file if TBN '
+            'is enabled and apply the traits defined when building and '
+            'attaching networks to node instances. Ironic will also reload '
+            'this file if it detects the file has changed.'
+        )),
+    cfg.BoolOpt('trait_based_networking_raise_when_no_match',
+                default=True,
+                help=_(
+                    'If True: TBN will raise an exception when no traits '
+                    '(and actions) apply to a node when planning its network.'
+                )),
+    cfg.BoolOpt(
+        'trait_based_networking_enable_default_trait',
+        default=True,
+        help=(
+            'Enables the application of a default trait if no other TBN '
+            'traits apply to a node during network planning. This trait is '
+            'named "CUSTOM_DEFAULT_TBN_TRAIT". If defined in the TBN '
+            'configuration file supplied to ironic, that trait will be used. '
+            'Otherwise, a pre-defined default trait will apply which '
+            'will generate an action to attach the first available port or '
+            'portgroup. To be clear: If this option is set to True and there '
+            'are no matching traits, CUSTOM_DEFAULT_TBN_TRAIT is applied. '
+            'This behavior does not require CUSTOM_DEFAULT_TBN_TRAIT to be '
+            'added to node traits.'
+        )),
+
+    cfg.BoolOpt('enable_health_monitoring',
+                default=True,
+                mutable=True,
+                help=_('Enable automatic hardware health monitoring for '
+                       'nodes. When enabled, the conductor will periodically '
+                       'query the management interface of nodes during power '
+                       'state synchronization to retrieve hardware health '
+                       'status from the BMC. Health information is stored in '
+                       'the node.health field and changes are recorded in '
+                       'node history. Drivers that do not support health '
+                       'monitoring are automatically skipped. Note: this '
+                       'adds one additional BMC query per node during each '
+                       'power sync cycle, which may impact performance in '
+                       'large deployments.')),
+
+    cfg.BoolOpt('disable_kernel_parameter_parsing',
+                default=False,
+                # Normally such an option would be mutable, but this is,
+                # a security guard and operators should not expect to change
+                # this option under normal circumstances.
+                mutable=False,
+                help=_('Disable parsing of kernel parameters. Kernel '
+                       'parameter parsing allows Ironic to detect and prevent '
+                       'malformed kernel parameters before they are passed to '
+                       'nodes. Malformed kernel parameters can pose a '
+                       'security risk. Therefore, it is not recommended to '
+                       'disable this option unless absolutely necessary.'
+                       'This option will be deprecated in the 2028.1 release, '
+                       'and kernel parameter parsing will be strictly '
+                       'enforced. If you encounter valid kernel parameters '
+                       'that fail parsing, please file a bug report against '
+                       'Ironic. Include the parameter string that fails '
+                       'parsing in the report.')),
 ]
 
 

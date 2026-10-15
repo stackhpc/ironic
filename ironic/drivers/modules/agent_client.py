@@ -15,8 +15,8 @@
 from http import client as http_client
 import os
 import ssl
+import time
 
-from ironic_lib import metrics_utils
 from oslo_log import log
 from oslo_serialization import jsonutils
 from oslo_utils import strutils
@@ -25,6 +25,8 @@ import tenacity
 
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import metrics_utils
+from ironic.common import tls_utils
 from ironic.common import utils
 from ironic.conf import CONF
 
@@ -35,6 +37,32 @@ METRICS = metrics_utils.get_metrics_logger(__name__)
 DEFAULT_IPA_PORTAL_PORT = 3260
 
 REBOOT_COMMAND = 'run_image'
+
+# Re-export so that existing references (including tests) continue
+# to resolve via agent_client.TLSHTTPAdapter.
+TLSHTTPAdapter = tls_utils.TLSHTTPAdapter
+
+
+def _build_ssl_context():
+    """Build an SSL context from [agent] TLS configuration.
+
+    :returns: An ssl.SSLContext with the configured TLS
+              settings, or None if no TLS options are set.
+    """
+    tls_min = CONF.agent.tls_minimum_version
+    tls_ciphers = CONF.agent.tls_ciphers
+    ctx = tls_utils.build_ssl_context(
+        tls_minimum_version=tls_min,
+        tls_ciphers=tls_ciphers)
+
+    if ctx:
+        if tls_min:
+            LOG.info("Agent client TLS minimum version set "
+                     "to %s", tls_min)
+        if tls_ciphers:
+            LOG.info("Agent client TLS ciphers configured")
+
+    return ctx
 
 
 def get_client(task):
@@ -78,7 +106,12 @@ class AgentClient(object):
     @METRICS.timer('AgentClient.__init__')
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({'Content-Type': 'application/json'})
+        self.session.headers.update(
+            {'Content-Type': 'application/json'})
+        ssl_ctx = _build_ssl_context()
+        if ssl_ctx:
+            adapter = TLSHTTPAdapter(ssl_context=ssl_ctx)
+            self.session.mount('https://', adapter)
 
     def _get_command_url(self, node):
         """Get URL endpoint for agent command request"""
@@ -181,6 +214,8 @@ class AgentClient(object):
         :raises: AgentAPIError when agent failed to execute specified command.
         :raises: AgentInProgress when the command fails to execute as the agent
                  is presently executing the prior command.
+        :raises: AgentConnectionFailed when connectivity has failed and there
+                 is no prior command to determine the status of.
         :returns: A dict containing command result from agent, see
                   get_commands_status for a sample.
         """
@@ -260,7 +295,7 @@ class AgentClient(object):
                 # is already busy.
                 # NOTE(TheJulia): The agent sends upper case A as of
                 # late victoria, but lower case the entire message
-                # for compatability with pre-late victoria agents
+                # for compatibility with pre-late victoria agents
                 # which returns HTTP 409.
                 raise exception.AgentInProgress(node=node.uuid,
                                                 command=method,
@@ -314,9 +349,15 @@ class AgentClient(object):
         url = self._get_command_url(node)
         LOG.debug('Fetching status of agent commands for node %s', node.uuid)
 
+        request_params = {}
+        agent_token = node.driver_internal_info.get('agent_secret_token')
+        if agent_token:
+            request_params['agent_token'] = agent_token
+
         def _get():
             try:
                 return self.session.get(url,
+                                        params=request_params,
                                         verify=self._get_verify(node),
                                         timeout=CONF.agent.command_timeout)
             except (requests.ConnectionError, requests.Timeout) as e:
@@ -569,6 +610,8 @@ class AgentClient(object):
         :raises: IronicException when failed to issue the request or there was
                  a malformed response from the agent.
         :raises: AgentAPIError when agent failed to execute specified command.
+        :raises: AgentConnectionFailed when an a transient connection failure
+                 breaks the connection while the request is being processed.
         :returns: A dict containing command response from agent.
             See :func:`get_commands_status` for a command result sample.
             The value of key command_result is in the form of:
@@ -623,6 +666,89 @@ class AgentClient(object):
         }
         return self._command(node=node,
                              method='deploy.execute_deploy_step',
+                             params=params)
+
+    @METRICS.timer('AgentClient.get_service_steps')
+    def get_service_steps(self, node, ports):
+        """Get service steps from agent.
+
+        :param node: A node object.
+        :param ports: Ports associated with the node.
+        :raises: IronicException when failed to issue the request or there was
+                 a malformed response from the agent.
+        :raises: AgentAPIError when agent failed to execute specified command.
+        :raises: AgentInProgress when the command fails to execute as the agent
+                 is presently executing the prior command.
+        :returns: A dict containing command response from agent.
+            See :func:`get_commands_status` for a command result sample.
+            The value of key command_result is in the form of:
+
+            ::
+
+              {
+                'service_steps': <a list of service steps>,
+                'hardware_manager_version': <manager version>
+              }
+
+        """
+        params = {
+            'node': node.as_dict(secure=True),
+            'ports': [port.as_dict() for port in ports]
+        }
+        try:
+            response = self._command(node=node,
+                                     method='service.get_service_steps',
+                                     params=params,
+                                     wait=True)
+        except exception.AgentAPIError:
+            # NOTE(TheJulia): This seems logical to do to handle an
+            # older ironic-python-agent, since the net-effect will be
+            # "there is nothing we can issue to the agent".
+            # TODO(TheJulia): Once we know the version where this *is*
+            # supported, we should actually update this log message.
+            # We won't know that until after the initial merge.
+            LOG.warning('Unable to retrieve service steps for node %s.'
+                        'Please upgrade your ironic-python-agent.',
+                        node.uuid)
+            response = {
+                'service_steps': [],
+                'hardware_manager_version': 0,
+            }
+        return response
+
+    @METRICS.timer('AgentClient.execute_service_step')
+    def execute_service_step(self, step, node, ports):
+        """Execute specified service step.
+
+        :param step: A service step dictionary to execute.
+        :param node: A Node object.
+        :param ports: Ports associated with the node.
+        :raises: IronicException when failed to issue the request or there was
+                 a malformed response from the agent.
+        :raises: AgentAPIError when agent failed to execute specified command.
+        :raises: AgentInProgress when the command fails to execute as the agent
+                 is presently executing the prior command.
+        :returns: A dict containing command response from agent.
+            See :func:`get_commands_status` for a command result sample.
+            The value of key command_result is in the form of:
+
+            ::
+
+              {
+                'service_result': <the result of execution, step specific>,
+                'service_step': <the service step issued to agent>
+              }
+
+        """
+        params = {
+            'step': step,
+            'node': node.as_dict(secure=True),
+            'ports': [port.as_dict() for port in ports],
+            'service_version': node.driver_internal_info.get(
+                'hardware_manager_version')
+        }
+        return self._command(node=node,
+                             method='service.execute_service_step',
                              params=params)
 
     @METRICS.timer('AgentClient.get_partition_uuids')
@@ -756,3 +882,75 @@ class AgentClient(object):
                 return self._command(node=node,
                                      method='rescue.finalize_rescue',
                                      params=params)
+
+    @METRICS.timer('AgentClient.lockdown')
+    def lockdown(self, node, fail_if_unavailable=True):
+        """Lock down the agent so that it's not usable any more.
+
+        :param node: A Node object.
+        :param fail_if_unavailable: Whether to fail this call if the agent is
+                                    already unavailable.
+        :raises: IronicException when failed to issue the request or there was
+                 a malformed response from the agent.
+        :raises: AgentAPIError when agent failed to execute specified command.
+        :raises: AgentInProgress when the command fails to execute as the agent
+                 is presently executing the prior command.
+        """
+        if not fail_if_unavailable:
+            try:
+                self.get_commands_status(node, expect_errors=True)
+            except exception.AgentConnectionFailed:
+                LOG.debug('Agent is already down when trying to lock down '
+                          'node %s', node.uuid)
+                return
+            except Exception:
+                LOG.exception('Unexpected exception when checking agent '
+                              'status on node %s, proceeding with lockdown',
+                              node.uuid)
+
+        wait = CONF.agent.post_deploy_get_power_state_retry_interval
+        attempts = CONF.agent.post_deploy_get_power_state_retries + 1
+
+        @tenacity.retry(stop=tenacity.stop_after_attempt(attempts),
+                        retry=tenacity.retry_unless_exception_type(
+                            exception.AgentConnectionFailed),
+                        wait=tenacity.wait_fixed(wait),
+                        sleep=time.sleep,  # for unit testing
+                        reraise=True)
+        def _wait_until_locked_down(node):
+            self.get_commands_status(node, expect_errors=True)
+            LOG.debug('Agent is still available on node %s, waiting for the '
+                      'lockdown command to take effect', node.uuid)
+
+        self.sync(node)
+
+        try:
+            self._command(node=node, method='system.lockdown', params={})
+        except Exception as e:
+            LOG.error('Failed to lock down node %(node_uuid)s. '
+                      '%(cls)s: %(error)s',
+                      {'node_uuid': node.uuid,
+                       'cls': e.__class__.__name__, 'error': e},
+                      exc_info=not isinstance(
+                          e, exception.IronicException))
+            raise
+
+        try:
+            _wait_until_locked_down(node)
+        except exception.AgentConnectionFailed:
+            pass  # expected
+        except tenacity.RetryError:
+            LOG.error('Failed to lock down node %(node_uuid)s in at least '
+                      '%(timeout)d seconds: agent is still available',
+                      {'node_uuid': node.uuid,
+                       'timeout': (wait * (attempts - 1))})
+            raise exception.AgentCommandTimeout(command='system.lockdown',
+                                                node=node.uuid)
+        except Exception as e:
+            LOG.error('Failed to lock down node %(node_uuid)s. '
+                      '%(cls)s: %(error)s',
+                      {'node_uuid': node.uuid,
+                       'cls': e.__class__.__name__, 'error': e},
+                      exc_info=not isinstance(
+                          e, exception.IronicException))
+            raise

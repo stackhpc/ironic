@@ -15,15 +15,13 @@
 import copy
 import inspect
 import threading
+import time
 
-import eventlet
 import futurist
 from futurist import periodics
-from futurist import rejection
-from ironic_lib import mdns
 from oslo_db import exception as db_exception
 from oslo_log import log
-from oslo_utils import excutils
+from oslo_utils import netutils
 from oslo_utils import versionutils
 
 from ironic.common import context as ironic_context
@@ -31,11 +29,15 @@ from ironic.common import driver_factory
 from ironic.common import exception
 from ironic.common import hash_ring
 from ironic.common.i18n import _
+from ironic.common import mdns
 from ironic.common import release_mappings as versions
 from ironic.common import rpc
 from ironic.common import states
+from ironic.common.trait_based_networking import loader
+from ironic.common import utils as common_utils
 from ironic.conductor import allocations
 from ironic.conductor import notification_utils as notify_utils
+from ironic.conductor import periodics as conductor_periodics
 from ironic.conductor import task_manager
 from ironic.conductor import utils
 from ironic.conf import CONF
@@ -43,7 +45,7 @@ from ironic.db import api as dbapi
 from ironic.drivers.modules import deploy_utils
 from ironic import objects
 from ironic.objects import fields as obj_fields
-
+from ironic import version
 
 LOG = log.getLogger(__name__)
 
@@ -58,9 +60,44 @@ class BaseConductorManager(object):
         self.topic = topic
         self.sensors_notifier = rpc.get_sensors_notifier()
         self._started = False
-        self._shutdown = None
+        self._shutdown = threading.Event()
         self._zeroconf = None
         self.dbapi = None
+
+    def __getstate__(self):
+        """Exclude unpicklable objects for spawn safety.
+
+        oslo.service checks if the service is picklable to determine
+        whether to use the spawn or fork multiprocessing context.
+        ``_shutdown`` is a threading.Event (contains ``_thread.lock``);
+        ``sensors_notifier`` and ``dbapi`` may contain unpicklable
+        transport objects and connection-pool locks respectively.
+        ``_executor``, ``_reserved_executor``, ``_periodic_tasks``, and
+        ``_periodic_tasks_worker`` contain thread pools and futures.
+        All are recreated during startup.
+        """
+        state = self.__dict__.copy()
+        state['_shutdown'] = self._shutdown.is_set()
+        state.pop('sensors_notifier', None)
+        state.pop('dbapi', None)
+        state.pop('_executor', None)
+        state.pop('_reserved_executor', None)
+        state.pop('_periodic_tasks', None)
+        state.pop('_periodic_tasks_worker', None)
+        return state
+
+    def __setstate__(self, state):
+        shutdown_was_set = state.pop('_shutdown')
+        self.__dict__.update(state)
+        self._shutdown = threading.Event()
+        if shutdown_was_set:
+            self._shutdown.set()
+        self.sensors_notifier = None  # recreated in init_host()
+        self.dbapi = None  # recreated in prepare_host()/init_host()
+        self._executor = None  # recreated in prepare_host()
+        self._reserved_executor = None  # recreated in prepare_host()
+        self._periodic_tasks = None  # recreated in init_host()
+        self._periodic_tasks_worker = None  # recreated in init_host()
 
     def prepare_host(self):
         """Prepares host for initialization
@@ -72,6 +109,15 @@ class BaseConductorManager(object):
         Under normal operation, this is also when the initial database
         connectivity is established for the conductor's normal operation.
         """
+        # Determine the hostname to utilize/register
+        if (CONF.rpc_transport == 'json-rpc'
+                and CONF.json_rpc.port != 8089
+                and self._use_jsonrpc_port()):
+            # in the event someone configures self.host
+            # as an ipv6 address...
+            host = netutils.escape_ipv6(self.host)
+            self.host = f'{host}:{CONF.json_rpc.port}'
+
         # NOTE(TheJulia) We need to clear locks early on in the process
         # of starting where the database shows we still hold them.
         # This must be done before we re-register our existence in the
@@ -88,12 +134,61 @@ class BaseConductorManager(object):
         # clear all locks held by this conductor before registering
         self.dbapi.clear_node_reservations_for_conductor(self.host)
 
+    def _init_executors(self, total_workers, reserved_percentage):
+        # NOTE(TheJulia): For context, as of 2025.2's development we have
+        # 16 periodics and 8 power sync threads. We end up scaling our
+        # minimum number of workers based upon the configuration later on,
+        # but we do this to try and keep a reasonable balance of workers
+        reserved_workers = int(total_workers * reserved_percentage / 100)
+        remaining = total_workers - reserved_workers
+        LOG.info("Starting workers pool: %d normal workers + %d reserved",
+                 remaining, reserved_workers)
+        # NOTE(TheJulia): We need to create two separate rejection functions
+        # which are individually aware of their maximum sizes in order to
+        # appropriately know if work must be rejected, or not.
+        # In the past, Ironic's internal model prefers we *never* queue
+        # more work than the current item, but  we won't have a choice
+        # with cross-thread activity. The custom rejector
+        # we invoke will result in work being rejected when the new
+        # work would exceed our overall capacity and thus return an API
+        # caller with an HTTP 503 or reschedule a task later.
+        rejection_func = reject_when_reached(remaining)
+        reserved_rejection_func = reject_when_reached(reserved_workers)
+
+        # Calculate our minimum worker count.
+        # This is imperfect because we presently have 8 power sync workers
+        # by default, along with 16 periodics, plus we need a little room
+        # to avoid adding/removing threads constantly. i.e. an idle deployment
+        # should hover around this many workers by default.
+        min_workers = int(
+            CONF.conductor.sync_power_state_workers
+            + (2 * CONF.conductor.periodic_max_workers) + 2)
+
+        if min_workers >= remaining:
+            msg = ("The number of calculated minimum workers %(workers)s "
+                   "exceeds the resulting maximum worker count %(max)s." %
+                   {'workers': min_workers,
+                    'max': remaining})
+            LOG.error("Cannot start ironic: %s", msg)
+            raise exception.IncorrectConfiguration(error=msg)
+
+        self._executor = futurist.DynamicThreadPoolExecutor(
+            min_workers=min_workers,
+            max_workers=remaining,
+            check_and_reject=rejection_func)
+        if reserved_workers:
+            self._reserved_executor = futurist.DynamicThreadPoolExecutor(
+                max_workers=reserved_workers,
+                check_and_reject=reserved_rejection_func)
+        else:
+            self._reserved_executor = None
+
     def init_host(self, admin_context=None, start_consoles=True,
                   start_allocations=True):
         """Initialize the conductor host.
 
         :param admin_context: the admin context to pass to periodic tasks.
-        :param start_consoles: If consoles should be started in intialization.
+        :param start_consoles: If consoles should be started in initialization.
         :param start_allocations: If allocations should be started in
                                   initialization.
         :raises: RuntimeError when conductor is already running.
@@ -102,25 +197,33 @@ class BaseConductorManager(object):
         :raises: DriverLoadError if an enabled driver cannot be loaded.
         :raises: DriverNameConflict if a classic driver and a dynamic driver
                  are both enabled and have the same name.
+        :raises: IncorrectConfiguration if invalid configuration has been
+                 set which cannot permit proper operation.
         """
         if self._started:
             raise RuntimeError(_('Attempt to start an already running '
                                  'conductor manager'))
-        self._shutdown = False
 
         if not self.dbapi:
             self.dbapi = dbapi.get_instance()
 
+        if not self.sensors_notifier:
+            self.sensors_notifier = rpc.get_sensors_notifier()
+
         self._keepalive_evt = threading.Event()
         """Event for the keepalive thread."""
 
-        # TODO(dtantsur): make the threshold configurable?
-        rejection_func = rejection.reject_when_reached(
-            CONF.conductor.workers_pool_size)
-        self._executor = futurist.GreenThreadPoolExecutor(
-            max_workers=CONF.conductor.workers_pool_size,
-            check_and_reject=rejection_func)
-        """Executor for performing tasks async."""
+        self._init_executors(CONF.conductor.workers_pool_size,
+                             CONF.conductor.reserved_workers_pool_percentage)
+
+        # Load TBN configuration if enabled, and bail if configuration is
+        # invalid.
+        if CONF.conductor.enable_trait_based_networking:
+            loader.tbn_config_file_traits()
+            if not loader.is_config_valid():
+                msg = _("Trait Based Networking configuration file could not "
+                        "be loaded or is invalid.")
+                raise exception.IncorrectConfiguration(error=msg)
 
         # TODO(jroll) delete the use_groups argument and use the default
         # in Stein.
@@ -174,9 +277,9 @@ class BaseConductorManager(object):
                 exception.ConductorHardwareInterfacesAlreadyRegistered,
                 exception.InterfaceNotFoundInEntrypoint,
                 exception.NoValidDefaultForInterface) as e:
-            with excutils.save_and_reraise_exception():
-                LOG.error('Failed to register hardware types. %s', e)
-                self.del_host()
+            LOG.error('Failed to register hardware types. %s', e)
+            self.del_host()
+            raise
 
         # Start periodic tasks
         self._periodic_tasks_worker = self._executor.submit(
@@ -184,12 +287,8 @@ class BaseConductorManager(object):
         self._periodic_tasks_worker.add_done_callback(
             self._on_periodic_tasks_stop)
 
-        for state in states.STUCK_STATES_TREATED_AS_FAIL:
-            self._fail_transient_state(
-                state,
-                _("The %(state)s state can't be resumed by conductor "
-                  "%(host)s. Moving to fail state.") %
-                {'state': state, 'host': self.host})
+        # Correct stuck states
+        self._correct_stuck_states()
 
         # Start consoles if it set enabled in a greenthread.
         try:
@@ -206,9 +305,9 @@ class BaseConductorManager(object):
                      '%(hostname)s.',
                      {'hostname': self.host})
         except exception.NoFreeConductorWorker:
-            with excutils.save_and_reraise_exception():
-                LOG.critical('Failed to start keepalive')
-                self.del_host()
+            LOG.critical('Failed to start keepalive')
+            self.del_host()
+            raise
 
         # Resume allocations that started before the restart.
         try:
@@ -222,6 +321,23 @@ class BaseConductorManager(object):
             self._publish_endpoint()
 
         self._started = True
+        LOG.debug('Started Ironic Conductor - %s',
+                  version.version_info.release_string())
+
+    def _correct_stuck_states(self):
+        for state in states.STUCK_STATES_TREATED_AS_FAIL:
+            self._fail_transient_state(
+                state,
+                _("The %(state)s state can't be resumed by conductor "
+                  "%(host)s. Moving to fail state.") %
+                {'state': state, 'host': self.host})
+
+    def _use_jsonrpc_port(self):
+        """Determines if the JSON-RPC port can be used."""
+        release_ver = versions.RELEASE_MAPPING.get(CONF.pin_release_version)
+        version_cap = (release_ver['rpc'] if release_ver
+                       else self.RPC_API_VERSION)
+        return versionutils.is_compatible('1.58', version_cap)
 
     def _use_groups(self):
         release_ver = versions.RELEASE_MAPPING.get(CONF.pin_release_version)
@@ -270,6 +386,7 @@ class BaseConductorManager(object):
             if obj and obj.__class__ not in periodic_task_classes:
                 for name, member in inspect.getmembers(obj):
                     if periodics.is_periodic(member):
+                        conductor_periodics.refresh_periodic_attributes(member)
                         LOG.debug('Found periodic task %(owner)s.%(member)s',
                                   {'owner': obj.__class__.__name__,
                                    'member': name})
@@ -298,15 +415,24 @@ class BaseConductorManager(object):
         # This is only used in tests currently. Delete it?
         self._periodic_task_callables = periodic_task_callables
 
-    def del_host(self, deregister=True):
+    def keepalive_halt(self):
+        if not hasattr(self, '_keepalive_evt'):
+            return
+        self._keepalive_evt.set()
+
+    def del_host(self, deregister=True, clear_node_reservations=True):
         # Conductor deregistration fails if called on non-initialized
         # conductor (e.g. when rpc server is unreachable).
         if not hasattr(self, 'conductor'):
             return
-        self._shutdown = True
-        self._keepalive_evt.set()
-        # clear all locks held by this conductor before deregistering
-        self.dbapi.clear_node_reservations_for_conductor(self.host)
+
+        # the keepalive heartbeat thread will continue to run, but will
+        # now be setting online=False
+        self._shutdown.set()
+
+        if clear_node_reservations:
+            # clear all locks held by this conductor before deregistering
+            self.dbapi.clear_node_reservations_for_conductor(self.host)
         if deregister:
             try:
                 # Inform the cluster that this conductor is shutting down.
@@ -321,11 +447,16 @@ class BaseConductorManager(object):
         else:
             LOG.info('Not deregistering conductor with hostname %(hostname)s.',
                      {'hostname': self.host})
+        # Stop keepalive operations
+        self.keepalive_halt()
         # Waiting here to give workers the chance to finish. This has the
         # benefit of releasing locks workers placed on nodes, as well as
         # having work complete normally.
         self._periodic_tasks.stop()
         self._periodic_tasks.wait()
+        # Shutdown the reserved and normal executors.
+        if self._reserved_executor is not None:
+            self._reserved_executor.shutdown(wait=True)
         self._executor.shutdown(wait=True)
 
         if self._zeroconf is not None:
@@ -333,6 +464,19 @@ class BaseConductorManager(object):
             self._zeroconf = None
 
         self._started = False
+
+    def get_online_conductor_count(self):
+        """Return a count of currently online conductors"""
+        return len(self.dbapi.get_online_conductors())
+
+    def has_reserved(self):
+        """Determines if this host currently has any reserved nodes
+
+        :returns: True if this host has reserved nodes
+        """
+        return bool(self.dbapi.get_nodeinfo_list(
+            filters={'reserved_by_any_of': [self.host]},
+            limit=1))
 
     def _register_and_validate_hardware_interfaces(self, hardware_types):
         """Register and validate hardware interfaces for this conductor.
@@ -403,12 +547,13 @@ class BaseConductorManager(object):
         columns = ['uuid', 'driver', 'conductor_group'] + list(fields or ())
         node_list = self.dbapi.get_nodeinfo_list(columns=columns, **kwargs)
         for result in node_list:
-            if self._shutdown:
+            if self._shutdown.is_set():
                 break
             if self._mapped_to_this_conductor(*result[:3]):
                 yield result
 
-    def _spawn_worker(self, func, *args, **kwargs):
+    def _spawn_worker(self, func, *args, _allow_reserved_pool=True,
+                      **kwargs):
 
         """Create a greenthread to run func(*args, **kwargs).
 
@@ -422,12 +567,24 @@ class BaseConductorManager(object):
         try:
             return self._executor.submit(func, *args, **kwargs)
         except futurist.RejectedSubmission:
+            if not _allow_reserved_pool or self._reserved_executor is None:
+                raise exception.NoFreeConductorWorker()
+
+        LOG.debug('Normal workers pool is full, using reserved pool to run %s',
+                  func.__qualname__)
+        try:
+            return self._reserved_executor.submit(func, *args, **kwargs)
+        except futurist.RejectedSubmission:
             raise exception.NoFreeConductorWorker()
 
     def _conductor_service_record_keepalive(self):
+        if common_utils.is_ironic_using_sqlite():
+            # Exit this keepalive heartbeats are disabled and not
+            # considered.
+            return
         while not self._keepalive_evt.is_set():
             try:
-                self.conductor.touch()
+                self.conductor.touch(online=not self._shutdown.is_set())
             except db_exception.DBConnectionError:
                 LOG.warning('Conductor could not connect to database '
                             'while heartbeating.')
@@ -587,7 +744,7 @@ class BaseConductorManager(object):
                 continue
             finally:
                 # Yield on every iteration
-                eventlet.sleep(0)
+                time.sleep(0)
 
     def _resume_allocations(self, context):
         """Resume unfinished allocations on restart."""
@@ -605,3 +762,40 @@ class BaseConductorManager(object):
         self._zeroconf.register_service('baremetal',
                                         deploy_utils.get_ironic_api_url(),
                                         params=params)
+
+
+def reject_when_reached(pool_size):
+    """Return a function to reject new work for Ironic.
+
+    :param pool_size: The maximum number of items in the execution
+                      pool.
+    :returns: A function which is executed by futurist when attempting
+              to determine if work should be deleted, or not.
+    """
+    # NOTE(TheJulia): This is based upon futurist's rejection.py as of
+    # commit d17f58d. It is extended because Ironic's operating model has
+    # more than one thread actively adding  work which will compete for the
+    # same lock, and then see the other queued item and reject work without
+    # consulting the overall and really even before the other thread is
+    # actually running.
+    # In other words, Ironic's thread and operation model requires a bit more
+    # robustness where it is okay to queue items as long as we won't exceed
+    # the thresholds.
+    def _rejector(executor, backlog):
+        # Get the current size once do we're not revisiting it again
+        # if we are rejecting inbound work.
+        current_size = int(executor.num_workers)
+        # Consult the backlog, which might have a couple entries from other
+        # threads firing up, add 1 to represent the request we're being
+        # invoked for, and ultimately if this will exceed the pool size
+        # when compared to the current executor size.
+        # This does not consider *idle* threads, because
+        # that too requires the same lock which caused backlog to be a
+        # non-zero number in the first place.
+        if backlog + 1 + current_size > pool_size:
+            raise futurist.RejectedSubmission(_(
+                "Queued backlog count is %s, and the pool is presently "
+                "at %s executors. Adding new work would "
+                "go beyond %s, the maximum thread pool size.") %
+                (backlog, current_size, pool_size))
+    return _rejector

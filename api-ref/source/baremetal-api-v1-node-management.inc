@@ -35,7 +35,7 @@ depending on the service configuration.
 
 
 Validate Node
-===============
+=============
 
 .. rest_method:: GET /v1/nodes/{node_ident}/validate
 
@@ -85,7 +85,7 @@ the Node's driver does not support that interface.
 
 
 Set Maintenance Flag
-=============================
+====================
 
 .. rest_method:: PUT /v1/nodes/{node_ident}/maintenance
 
@@ -110,7 +110,7 @@ Request
 .. literalinclude:: samples/node-maintenance-request.json
 
 Clear Maintenance Flag
-==============================
+======================
 
 .. rest_method:: DELETE /v1/nodes/{node_ident}/maintenance
 
@@ -198,7 +198,7 @@ Response
 
 
 Get Supported Boot Devices
-===========================
+==========================
 
 .. rest_method:: GET /v1/nodes/{node_ident}/management/boot_device/supported
 
@@ -306,6 +306,10 @@ Change Node Boot Mode
 
 Request a change to the Node's boot mode.
 
+.. note::
+   Depending on the driver and the underlying hardware, changing boot mode may
+   result in an automatic reboot.
+
 .. versionadded:: 1.76
    A change in node's boot mode can be requested.
 
@@ -340,6 +344,10 @@ Change Node Secure Boot
 .. rest_method:: PUT /v1/nodes/{node_ident}/states/secure_boot
 
 Request a change to the Node's secure boot state.
+
+.. note::
+   Depending on the driver and the underlying hardware, changing the secure
+   boot state may result in an automatic reboot.
 
 .. versionadded:: 1.76
    A change in node's secure boot state can be requested.
@@ -442,6 +450,19 @@ detailed documentation of the Ironic State Machine is available
    ``disable_ramdisk`` can be provided to avoid booting the ramdisk during
    manual cleaning.
 
+.. versionadded:: 1.87
+   A node can be serviced by setting the provision target state to ``service``
+   with a list of ``service_steps``.
+
+.. versionadded:: 1.92
+   Added the ability to allow for predefined sets of steps to be executed
+   during provisioning by passing in a ``runbook_ident`` that's already
+   approved for the given node, as an alternative to providing ``clean_steps``
+   or ``service_steps`` dictionary.
+
+.. versionadded:: 1.95
+   Added the ability to set/unset ``disable_power_off`` on a node.
+
 Normal response code: 202
 
 Error codes:
@@ -460,8 +481,10 @@ Request
     - configdrive: configdrive
     - clean_steps: clean_steps
     - deploy_steps: deploy_steps
+    - service_steps: service_steps
     - rescue_password: rescue_password
     - disable_ramdisk: disable_ramdisk
+    - runbook: runbook_ident
 
 **Example request to deploy a Node, using a configdrive served via local webserver:**
 
@@ -475,6 +498,17 @@ Request
 
 .. literalinclude:: samples/node-set-clean-state.json
 
+**Example request to service a Node, with custom service step:**
+
+.. literalinclude:: samples/node-set-service-state.json
+
+**Example request to set provision state for a Node with a runbook:**
+
+.. literalinclude:: samples/node-set-provision-state.json
+
+.. note:: Use ``runbook`` as an alternative to ``clean_steps`` or
+  ``service_steps``. If ``runbook`` is provided, ``clean_steps`` or
+  ``service_steps`` must not be included in the request.
 
 Set RAID Config
 ===============

@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Copyright 2013 Hewlett-Packard Development Company, L.P.
 #
@@ -64,6 +63,7 @@ class Connection(object, metaclass=abc.ABCMeta):
                             nodes with inspection_started_at field before this
                             interval in seconds
                         :instance_uuid: uuid of instance
+                        :instance_name: name of instance
                         :lessee: node's lessee (e.g. project ID)
                         :maintenance: True | False
                         :owner: node's owner (e.g. project ID)
@@ -72,6 +72,7 @@ class Connection(object, metaclass=abc.ABCMeta):
                         :reserved_by_any_of: [conductor1, conductor2]
                         :resource_class: resource class name
                         :retired: True | False
+                        :shard_in: shard (multiple possibilities)
                         :provision_state: provision state of node
                         :provision_state_in:
                             provision state of node (multiple possibilities)
@@ -106,6 +107,7 @@ class Connection(object, metaclass=abc.ABCMeta):
                         :provisioned_before:
                             nodes with provision_updated_at field before this
                             interval in seconds
+                        :shard: nodes with the given shard
         :param limit: Maximum number of nodes to return.
         :param marker: the last item of the previous page; we return the next
                        result set.
@@ -283,7 +285,8 @@ class Connection(object, metaclass=abc.ABCMeta):
 
     @abc.abstractmethod
     def get_port_list(self, limit=None, marker=None,
-                      sort_key=None, sort_dir=None):
+                      sort_key=None, sort_dir=None,
+                      conductor_groups=None, filters=None):
         """Return a list of ports.
 
         :param limit: Maximum number of ports to return.
@@ -292,11 +295,31 @@ class Connection(object, metaclass=abc.ABCMeta):
         :param sort_key: Attribute by which results should be sorted.
         :param sort_dir: direction in which results should be sorted.
                          (asc, desc)
+        :param conductor_groups: A list of conductor groups to filter by,
+                                 defaults to None
+        :param filters: Filters to apply, defaults to None
+        """
+
+    @abc.abstractmethod
+    def get_ports_by_shards(self, shards, limit=None, marker=None,
+                            sort_key=None, sort_dir=None, project=None,
+                            filters=None):
+        """Return a list of ports contained in the provided shards.
+
+        :param shards: A list of shards to filter ports by.
+        :param limit: Maximum number of ports to return.
+        :param marker: the last item of the previous page; we return the next
+                       result set.
+        :param sort_key: Attribute by which results should be sorted.
+        :param sort_dir: direction in which results should be sorted.
+                         (asc, desc)
+        :param project: a node owner or lessee to match against
+        :param filters: Filters to apply, defaults to None
         """
 
     @abc.abstractmethod
     def get_ports_by_node_id(self, node_id, limit=None, marker=None,
-                             sort_key=None, sort_dir=None):
+                             sort_key=None, sort_dir=None, filters=None):
         """List all the ports for a given node.
 
         :param node_id: The integer node ID.
@@ -306,12 +329,13 @@ class Connection(object, metaclass=abc.ABCMeta):
         :param sort_key: Attribute by which results should be sorted
         :param sort_dir: direction in which results should be sorted
                          (asc, desc)
+        :param filters: Filters to apply, defaults to None
         :returns: A list of ports.
         """
 
     @abc.abstractmethod
     def get_ports_by_portgroup_id(self, portgroup_id, limit=None, marker=None,
-                                  sort_key=None, sort_dir=None):
+                                  sort_key=None, sort_dir=None, filters=None):
         """List all the ports for a given portgroup.
 
         :param portgroup_id: The integer portgroup ID.
@@ -321,6 +345,7 @@ class Connection(object, metaclass=abc.ABCMeta):
         :param sort_key: Attribute by which results should be sorted
         :param sort_dir: Direction in which results should be sorted
                          (asc, desc)
+        :param filters: Filters to apply, defaults to None
         :returns: A list of ports.
         """
 
@@ -387,7 +412,8 @@ class Connection(object, metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def get_portgroup_list(self, limit=None, marker=None,
                            sort_key=None, sort_dir=None,
-                           project=None):
+                           project=None, conductor_groups=None,
+                           filters=None):
         """Return a list of portgroups.
 
         :param limit: Maximum number of portgroups to return.
@@ -397,6 +423,9 @@ class Connection(object, metaclass=abc.ABCMeta):
         :param sort_dir: Direction in which results should be sorted.
                          (asc, desc)
         :param project: A node owner or lessee to filter by.
+        :param conductor_groups: A list of conductor groups to filter by,
+                                 defaults to None
+        :param filters: Filters to apply, defaults to None
         :returns: A list of portgroups.
         """
 
@@ -407,6 +436,22 @@ class Connection(object, metaclass=abc.ABCMeta):
         """List all the portgroups for a given node.
 
         :param node_id: The integer node ID.
+        :param limit: Maximum number of portgroups to return.
+        :param marker: The last item of the previous page; we return the next
+                       result set.
+        :param sort_key: Attribute by which results should be sorted
+        :param sort_dir: Direction in which results should be sorted
+                         (asc, desc)
+        :param project: A node owner or lessee to filter by.
+        :returns: A list of portgroups.
+        """
+
+    @abc.abstractmethod
+    def get_portgroups_by_shards(self, shards, limit=None, marker=None,
+                                 sort_key=None, sort_dir=None, project=None):
+        """Return a list of portgroups contained in the provided shards.
+
+        :param shards: A list of shards to filter portgroups by.
         :param limit: Maximum number of portgroups to return.
         :param marker: The last item of the previous page; we return the next
                        result set.
@@ -575,10 +620,24 @@ class Connection(object, metaclass=abc.ABCMeta):
         """
 
     @abc.abstractmethod
-    def touch_conductor(self, hostname):
-        """Mark a conductor as active by updating its 'updated_at' property.
+    def delete_conductor(self, hostname):
+        """Delete a conductor from the database.
 
         :param hostname: The hostname of this conductor service.
+        :raises: ConductorNotFound if the conductor doesn't exist.
+        """
+
+    @abc.abstractmethod
+    def touch_conductor(self, hostname, online=True):
+        """Mark a conductor as active by updating its 'updated_at' property.
+
+        Calling periodically with ``online=False`` will result in the conductor
+        appearing unregistered, but recently enough to prevent other conductors
+        failing orphan nodes. This improves the behaviour of graceful and drain
+        shutdown.
+
+        :param hostname: The hostname of this conductor service.
+        :param online: Whether the conductor is online.
         :raises: ConductorNotFound
         """
 
@@ -958,16 +1017,6 @@ class Connection(object, metaclass=abc.ABCMeta):
         """
 
     @abc.abstractmethod
-    def get_not_versions(self, model_name, versions):
-        """Returns objects with versions that are not the specified versions.
-
-        :param model_name: the name of the model (class) of desired objects
-        :param versions: list of versions of objects not to be returned
-        :returns: list of the DB objects
-        :raises: IronicException if there is no class associated with the name
-        """
-
-    @abc.abstractmethod
     def check_versions(self, ignore_models=()):
         """Checks the whole database for incompatible objects.
 
@@ -1342,6 +1391,163 @@ class Connection(object, metaclass=abc.ABCMeta):
         """
 
     @abc.abstractmethod
+    def create_runbook(self, values):
+        """Create a runbook.
+
+        :param values: A dict describing the runbook. For example:
+
+                     ::
+
+                      {
+                       'uuid': uuidutils.generate_uuid(),
+                       'name': 'CUSTOM_DT1',
+                      }
+        :raises: RunbookDuplicateName if a runbook with the same
+            name exists.
+        :raises: RunbookAlreadyExists if a runbook with the same
+            UUID exists.
+        :returns: A runbook.
+        """
+
+    @abc.abstractmethod
+    def update_runbook(self, runbook_id, values):
+        """Update a runbook.
+
+        :param runbook_id: ID of the runbook to update.
+        :param values: A dict describing the runbook. For example:
+
+                     ::
+
+                      {
+                       'uuid': uuidutils.generate_uuid(),
+                       'name': 'CUSTOM_DT1',
+                      }
+        :raises: RunbookDuplicateName if a runbook with the same
+            name exists.
+        :raises: RunbookNotFound if the runbook does not exist.
+        :returns: A runbook.
+        """
+
+    @abc.abstractmethod
+    def destroy_runbook(self, runbook_id):
+        """Destroy a runbook.
+
+        :param runbook_id: ID of the runbook to destroy.
+        :raises: RunbookNotFound if the runbook does not exist.
+        """
+
+    @abc.abstractmethod
+    def get_runbook_by_id(self, runbook_id):
+        """Retrieve a runbook by ID.
+
+        :param runbook_id: ID of the runbook to retrieve.
+        :raises: RunbookNotFound if the runbook does not exist.
+        :returns: A runbook.
+        """
+
+    @abc.abstractmethod
+    def get_runbook_by_uuid(self, runbook_uuid):
+        """Retrieve a runbook by UUID.
+
+        :param runbook_uuid: UUID of the runbook to retrieve.
+        :raises: RunbookNotFound if the runbook does not exist.
+        :returns: A runbook.
+        """
+
+    @abc.abstractmethod
+    def get_runbook_by_name(self, runbook_name):
+        """Retrieve a runbook by name.
+
+        :param runbook_name: name of the runbook to retrieve.
+        :raises: RunbookNotFound if the runbook does not exist.
+        :returns: A runbook.
+        """
+
+    @abc.abstractmethod
+    def get_runbook_list(self, limit=None, marker=None, filters=None,
+                         sort_key=None, sort_dir=None):
+        """Retrieve a list of runbooks.
+
+        :param limit: Maximum number of runbooks to return.
+        :param marker: The last item of the previous page; we return the next
+                       result set.
+        :param sort_key: Attribute by which results should be sorted.
+        :param sort_dir: Direction in which results should be sorted.
+                         (asc, desc)
+        :returns: A list of runbooks.
+        """
+
+    @abc.abstractmethod
+    def get_runbook_list_by_names(self, names):
+        """Return a list of runbooks with one of a list of names.
+
+        :param names: List of names to filter by.
+        :returns: A list of runbooks.
+        """
+
+    @abc.abstractmethod
+    def set_runbook_traits(self, runbook_id, traits, version):
+        """Replace all of the runbook traits with the specified list.
+
+        This ignores duplicate traits in the specified list.
+
+        :param runbook_id: The id of a runbook.
+        :param traits: List of Strings; traits to set.
+        :param version: version of the RunbookTrait object.
+        :raises: RunbookNotFound if the runbook is not found.
+        """
+
+    @abc.abstractmethod
+    def unset_runbook_traits(self, runbook_id):
+        """Remove all traits of the runbook.
+
+        :param runbook_id: The id of a runbook.
+        :raises: RunbookNotFound if the runbook is not found.
+        """
+
+    @abc.abstractmethod
+    def get_runbook_traits_by_runbook_id(self, runbook_id):
+        """Return a list of traits for the specified runbook.
+
+        :param runbook_id: The id of a runbook.
+        :returns: A list of RunbookTrait objects.
+        :raises: RunbookNotFound if the runbook is not found.
+        """
+
+    @abc.abstractmethod
+    def add_runbook_trait(self, runbook_id, trait, version):
+        """Add a trait to the runbook.
+
+        If the runbook_id and trait pair already exists, this should still
+        succeed.
+
+        :param runbook_id: The id of a runbook.
+        :param trait: A trait string.
+        :param version: version of the RunbookTrait object.
+        :raises: RunbookNotFound if the runbook is not found.
+        """
+
+    @abc.abstractmethod
+    def delete_runbook_trait(self, runbook_id, trait):
+        """Delete the specified trait from the runbook.
+
+        :param runbook_id: The id of a runbook.
+        :param trait: A trait string.
+        :raises: RunbookNotFound if the runbook is not found.
+        :raises: RunbookTraitNotFound if the trait is not found.
+        """
+
+    @abc.abstractmethod
+    def runbook_trait_exists(self, runbook_id, trait):
+        """Check if the specified trait exists on the runbook.
+
+        :param runbook_id: The id of a runbook.
+        :param trait: A trait string.
+        :returns: True if the trait exists otherwise False.
+        :raises: RunbookNotFound if the runbook is not found.
+        """
+
+    @abc.abstractmethod
     def create_node_history(self, values):
         """Create a new history record.
 
@@ -1413,17 +1619,20 @@ class Connection(object, metaclass=abc.ABCMeta):
     def bulk_delete_node_history_records(self, node_id, limit):
         """Utility method to bulk delete node history entries.
 
-        :param entires: A list of node history entriy id's to be
+        :param entries: A list of node history entry id's to be
                         queried for deletion.
         """
 
     @abc.abstractmethod
-    def count_nodes_in_provision_state(self, state):
+    def count_nodes_in_provision_state(self, state, conductor_group=None):
         """Count the number of nodes in given provision state.
 
         :param state: A provision_state value to match for the
                       count operation. This can be a single provision
                       state value or a list of values.
+        :param conductor_group: Optional conductor group to filter by.
+                                If provided, only nodes in this conductor
+                                group will be counted.
         """
 
     @abc.abstractmethod
@@ -1434,18 +1643,10 @@ class Connection(object, metaclass=abc.ABCMeta):
         """
 
     @abc.abstractmethod
-    def destroy_node_inventory_by_node_id(self, inventory_node_id):
+    def destroy_node_inventory_by_node_id(self, node_id):
         """Destroy a inventory record.
 
-        :param inventory_uuid: The uuid of a inventory record
-        """
-
-    @abc.abstractmethod
-    def get_node_inventory_by_id(self, inventory_id):
-        """Return a node inventory representation.
-
-        :param inventory_id: The id of a inventory record.
-        :returns: An inventory of a node.
+        :param node_id: The node id value for records to be removed.
         """
 
     @abc.abstractmethod
@@ -1454,4 +1655,150 @@ class Connection(object, metaclass=abc.ABCMeta):
 
         :param node_id: The integer node ID.
         :returns: An inventory of a node.
+        """
+
+    @abc.abstractmethod
+    def get_shard_list(self):
+        """Retrieve a list of shards.
+
+        :returns: list of dicts containing shard names and count
+        """
+
+    @abc.abstractmethod
+    def create_firmware_component(self, values):
+        """Create a FirmwareComponent record for a given node.
+
+        :param values: a dictionary with the necessary information to create
+            a FirmwareComponent.
+
+                     ::
+
+                      {
+                        'component': String,
+                        'initial_version': String,
+                        'current_version': String,
+                        'last_version_flashed': String
+                      }
+        :returns: A FirmwareComponent object.
+        :raises: FirmwareComponentAlreadyExists if any  of the component
+            records already exists.
+        """
+
+    @abc.abstractmethod
+    def update_firmware_component(self, node_id, component, values):
+        """Update a FirmwareComponent record.
+
+        :param node_id: The node id.
+        :param component: The component of the node to update.
+        :param values: A dictionary with the new information about the
+            FirmwareComponent.
+
+                     ::
+
+                      {
+                        'current_version': String,
+                        'last_version_flashed': String
+                      }
+        :returns: A FirmwareComponent object.
+        :raises: FirmwareComponentNotFound the component
+            is not found.
+        """
+
+    @abc.abstractmethod
+    def get_firmware_component(self, node_id, name):
+        """Retrieve Firmware Component.
+
+        :param node_id: The node id.
+        :param name: name of Firmware component.
+        :returns: The FirmwareComponent object.
+        :raises: NodeNotFound if the node is not found.
+        :raises: FirmwareComponentNotFound if the Firmware component
+            is not found.
+        """
+
+    @abc.abstractmethod
+    def get_firmware_component_list(self, node_id):
+        """Retrieve a list Firmware Components of a given node.
+
+        :param node_id: The node id.
+        :returns: A list of FirmwareComponent objects.
+        :raises: NodeNotFound if the node is not found.
+        """
+
+    @abc.abstractmethod
+    def get_child_node_ids_by_parent_uuid(self, node_uuid,
+                                          exclude_dedicated_power=False):
+        """Retrieve a list of child node IDs for a given parent UUID.
+
+        This is an "internal" method, intended for use with power
+        management logic to facilitate power actions upon nodes,
+        where we obtain a list of nodes which requires additional
+        actions, and return *only* the required node IDs in order
+        to launch new tasks for power management activities.
+
+        :param node_uuid: The uuid of the parent node, in order to
+            directly match the "parent_node" field.
+        :param exclude_dedicated_power: Boolean, False, if the list
+            should include child nodes with their own power supplies.
+        :returns: A list of tuples.
+        """
+
+    @abc.abstractmethod
+    def create_inspection_rule(self, values):
+        """Create an inspection rule.
+
+        :param values: A dict describing the rule.
+        :raises: InspectionRuleAlreadyExists if an inspection rule with the
+            same UUID exists.
+        :returns: A rule.
+        """
+
+    @abc.abstractmethod
+    def update_inspection_rule(self, inspection_rule_id, values):
+        """Update an inspection rule.
+
+        :param inspection_rule_id: The id or uuid of an inspection rule.
+        :param values: Dict of values to update.
+        :raises: InspectionRuleNotFound if the rule does not exist.
+        :returns: A rule.
+        """
+
+    @abc.abstractmethod
+    def get_inspection_rule_by_uuid(self, inspection_rule_uuid):
+        """Retrieve an inspection rule by UUID.
+
+        :param inspection_rule_uuid: UUID of the rule to retrieve.
+        :raises: InspectionRuleNotFound if the rule does not exist.
+        :returns: A rule.
+        """
+
+    @abc.abstractmethod
+    def get_inspection_rule_by_id(self, inspection_rule_id):
+        """Retrieve an inspection rule by id.
+
+        :param inspection_rule_id: id of the rule to retrieve.
+        :raises: InspectionRuleNotFound if the rule does not exist.
+        :returns: A rule.
+        """
+
+    @abc.abstractmethod
+    def get_inspection_rule_list(self, limit=None, marker=None, filters=None,
+                                 sort_key=None, sort_dir=None):
+        """Retrieve a list of inspection rules.
+
+        :param limit: Maximum number of rules to return.
+        :param marker: The last item of the previous page; we return the next
+                       result set.
+        :param sort_key: Attribute by which results should be sorted.
+        :param sort_dir: Direction in which results should be sorted.
+                         (asc, desc)
+        :returns: A list of inspection rules.
+        """
+
+    @abc.abstractmethod
+    def destroy_inspection_rule(self, inspection_rule_id):
+        """Destroy an inspection rule.
+
+        :param inspection_rule_id: ID of the inspection_rule to destroy.
+        :raises: inspection_ruleNotFound if the inspection_rule does not exist.
         """

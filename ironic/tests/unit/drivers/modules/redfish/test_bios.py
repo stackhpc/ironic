@@ -14,8 +14,9 @@
 
 from unittest import mock
 
-from oslo_utils import importutils
+import sushy
 
+from ironic.common import async_steps
 from ironic.common import exception
 from ironic.common import states
 from ironic.conductor import task_manager
@@ -29,8 +30,6 @@ from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.db import utils as db_utils
 from ironic.tests.unit.objects import utils as obj_utils
 
-sushy = importutils.try_import('sushy')
-
 INFO_DICT = db_utils.get_test_redfish_info()
 
 
@@ -43,8 +42,6 @@ class NoBiosSystem(object):
                                                      resource=self)
 
 
-@mock.patch('oslo_utils.eventletutils.EventletEvent.wait',
-            lambda *args, **kwargs: None)
 class RedfishBiosTestCase(db_base.DbTestCase):
 
     def setUp(self):
@@ -56,13 +53,6 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                     enabled_management_interfaces=['redfish'])
         self.node = obj_utils.create_test_node(
             self.context, driver='redfish', driver_info=INFO_DICT)
-
-    @mock.patch.object(redfish_bios, 'sushy', None)
-    def test_loading_error(self):
-        self.assertRaisesRegex(
-            exception.DriverLoadError,
-            'Unable to import the sushy library',
-            redfish_bios.RedfishBIOS)
 
     def test_get_properties(self):
         with task_manager.acquire(self.context, self.node.uuid,
@@ -185,10 +175,8 @@ class RedfishBiosTestCase(db_base.DbTestCase):
             expected_ret = states.DEPLOYWAIT
         data = step_data['argsinfo'].get('settings', None)
         step = step_data['step']
-        if step == 'factory_reset':
-            check_fields.append('post_factory_reset_reboot_requested')
-        elif step == 'apply_configuration':
-            check_fields.append('post_config_reboot_requested')
+        check_fields.append('redfish_bios_state')
+        if step == 'apply_configuration':
             attributes = {s['name']: s['value'] for s in data}
         mock_build_agent_options.return_value = {'a': 'b'}
         with task_manager.acquire(self.context, self.node.uuid,
@@ -206,7 +194,8 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                     mock.call(task, states.REBOOT),
                 ])
             else:
-                mock_power_action.assert_called_once_with(task, states.REBOOT)
+                mock_power_action.assert_called_once_with(
+                    task, states.REBOOT)
             if step == 'factory_reset':
                 bios.reset_bios.assert_called_once()
             if step == 'apply_configuration':
@@ -216,6 +205,11 @@ class RedfishBiosTestCase(db_base.DbTestCase):
             mock_prepare.assert_called_once_with(mock.ANY, task, {'a': 'b'})
             for field in check_fields:
                 self.assertIn(field, task.node.driver_internal_info)
+            bios_state = task.node.driver_internal_info['redfish_bios_state']
+            self.assertTrue(bios_state.get('reboot_requested'))
+            if step == 'apply_configuration':
+                self.assertEqual(
+                    attributes, bios_state.get('requested_bios_attrs'))
             self.assertEqual(expected_ret, ret)
 
     def test_factory_reset_step_pre_reboot_cleaning(self):
@@ -263,6 +257,39 @@ class RedfishBiosTestCase(db_base.DbTestCase):
         self.node.save()
         self._test_step_pre_reboot(fast_track=True)
 
+    @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
+                       spec_set=True, autospec=True)
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_conf_step_pre_reboot_disable_ramdisk(
+            self, mock_power_action, mock_get_system, mock_build_agent_options,
+            mock_prepare):
+        data = [{'name': 'ProcTurboMode', 'value': 'Disabled'},
+                {'name': 'NicBoot1', 'value': 'NetworkBoot'}]
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': data}}
+        self.node.provision_state = states.CLEANING
+        self.node.set_driver_internal_info('cleaning_disable_ramdisk', True)
+        self.node.save()
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            bios = mock_get_system(task.node).bios
+            bios.supported_apply_times = []
+
+            ret = task.driver.bios.apply_configuration(task, data)
+
+            self.assertEqual(states.CLEANWAIT, ret)
+            bios.set_attributes.assert_called_once_with(
+                {s['name']: s['value'] for s in data}, apply_time=None)
+            mock_power_action.assert_called_once_with(task, states.REBOOT)
+            mock_build_agent_options.assert_not_called()
+            mock_prepare.assert_not_called()
+            self.assertTrue(task.node.driver_internal_info.get(
+                async_steps.CLEANING_POLLING))
+
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     def _test_step_post_reboot(self, mock_get_system,
                                attributes_after_reboot=None):
@@ -272,20 +299,19 @@ class RedfishBiosTestCase(db_base.DbTestCase):
             step_data = self.node.clean_step
         data = step_data['argsinfo'].get('settings', None)
         step = step_data['step']
-        if step == 'factory_reset':
-            check_fields = ['post_factory_reset_reboot_requested']
+        check_fields = ['redfish_bios_state']
         if step == 'apply_configuration':
             mock_bios = mock.Mock()
             # if attributes after reboot not provided then mimic success
             # by returning the same as requested
             mock_bios.attributes = attributes_after_reboot \
-                or self.node.driver_internal_info['requested_bios_attrs']
+                or self.node.driver_internal_info[
+                    'redfish_bios_state']['requested_bios_attrs']
+            mock_bios.pending_attributes = {}
             mock_bios.get_attribute_registry = []
             mock_system = mock.Mock()
             mock_system.bios = mock_bios
             mock_get_system.return_value = mock_system
-            check_fields = ['post_config_reboot_requested',
-                            'requested_bios_attrs']
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
             if step == 'factory_reset':
@@ -302,7 +328,9 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                                 'step': 'factory_reset', 'argsinfo': {}}
         node = self.node
         driver_internal_info = node.driver_internal_info
-        driver_internal_info['post_factory_reset_reboot_requested'] = True
+        driver_internal_info['redfish_bios_state'] = {
+            'reboot_requested': True
+        }
         node.driver_internal_info = driver_internal_info
         node.save()
         self._test_step_post_reboot()
@@ -312,7 +340,9 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                                  'step': 'factory_reset', 'argsinfo': {}}
         node = self.node
         driver_internal_info = node.driver_internal_info
-        driver_internal_info['post_factory_reset_reboot_requested'] = True
+        driver_internal_info['redfish_bios_state'] = {
+            'reboot_requested': True
+        }
         node.driver_internal_info = driver_internal_info
         node.save()
         self._test_step_post_reboot()
@@ -331,8 +361,10 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                            'NicBoot1': 'NetworkBoot'}
         node = self.node
         driver_internal_info = node.driver_internal_info
-        driver_internal_info['post_config_reboot_requested'] = True
-        driver_internal_info['requested_bios_attrs'] = requested_attrs
+        driver_internal_info['redfish_bios_state'] = {
+            'reboot_requested': True,
+            'requested_bios_attrs': requested_attrs
+        }
         self.node.driver_internal_info = driver_internal_info
         self.node.save()
         self._test_step_post_reboot()
@@ -351,8 +383,10 @@ class RedfishBiosTestCase(db_base.DbTestCase):
         attributes_after_reboot = {'ProcTurboMode': 'Disabled'}
         node = self.node
         driver_internal_info = node.driver_internal_info
-        driver_internal_info['post_config_reboot_requested'] = True
-        driver_internal_info['requested_bios_attrs'] = requested_attrs
+        driver_internal_info['redfish_bios_state'] = {
+            'reboot_requested': True,
+            'requested_bios_attrs': requested_attrs
+        }
         self.node.driver_internal_info = driver_internal_info
         self.node.provision_state = states.CLEANING
         self.node.save()
@@ -372,8 +406,10 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                            'NicBoot1': 'NetworkBoot'}
         node = self.node
         driver_internal_info = node.driver_internal_info
-        driver_internal_info['post_config_reboot_requested'] = True
-        driver_internal_info['requested_bios_attrs'] = requested_attrs
+        driver_internal_info['redfish_bios_state'] = {
+            'reboot_requested': True,
+            'requested_bios_attrs': requested_attrs
+        }
         self.node.driver_internal_info = driver_internal_info
         self.node.save()
         self._test_step_post_reboot()
@@ -390,8 +426,10 @@ class RedfishBiosTestCase(db_base.DbTestCase):
         attributes_after_reboot = {'ProcTurboMode': 'Disabled'}
         node = self.node
         driver_internal_info = node.driver_internal_info
-        driver_internal_info['post_config_reboot_requested'] = True
-        driver_internal_info['requested_bios_attrs'] = requested_attrs
+        driver_internal_info['redfish_bios_state'] = {
+            'reboot_requested': True,
+            'requested_bios_attrs': requested_attrs
+        }
         self.node.driver_internal_info = driver_internal_info
         self.node.provision_state = states.DEPLOYWAIT
         self.node.save()
@@ -432,22 +470,92 @@ class RedfishBiosTestCase(db_base.DbTestCase):
             mock_get_system.assert_called_once_with(task.node)
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
-    def test_check_bios_attrs(self, mock_get_system):
+    def test_get_unapplied_bios_attrs(self, mock_get_system):
         settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'},
                     {'name': 'NicBoot1', 'value': 'NetworkBoot'}]
         requested_attrs = {'ProcTurboMode': 'Enabled',
                            'NicBoot1': 'NetworkBoot'}
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
-            attributes = mock_get_system(task.node).bios.attributes
             task.node.driver_internal_info[
-                'post_config_reboot_requested'] = True
-            task.node.driver_internal_info[
-                'requested_bios_attrs'] = requested_attrs
-            task.driver.bios._check_bios_attrs = mock.MagicMock()
+                'redfish_bios_state'] = {
+                    'reboot_requested': True,
+                    'requested_bios_attrs': requested_attrs
+                }
+            task.driver.bios._get_unapplied_bios_attrs = mock.MagicMock()
+            task.driver.bios._get_unapplied_bios_attrs.return_value = {}
             task.driver.bios.apply_configuration(task, settings)
-            task.driver.bios._check_bios_attrs \
-                .assert_called_once_with(task, attributes, requested_attrs)
+            bios = mock_get_system(task.node).bios
+            task.driver.bios._get_unapplied_bios_attrs \
+                .assert_called_once_with(task, requested_attrs, bios)
+
+    @mock.patch.object(manager_utils, 'cleaning_error_handler', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_apply_conf_post_reboot_cleaning_success_pending(
+            self, mock_get_system, mock_cleaning_error_handler):
+        data = [{'name': 'ProcTurboMode', 'value': 'Enabled'}]
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': data}}
+        other_attrs = {'Other': 'Value'}
+        requested_attrs = {'ProcTurboMode': 'Enabled'}
+        node = self.node
+        driver_internal_info = node.driver_internal_info
+        driver_internal_info['redfish_bios_state'] = {
+            'reboot_requested': True,
+            'requested_bios_attrs': requested_attrs,
+        }
+        self.node.driver_internal_info = driver_internal_info
+        self.node.provision_state = states.CLEANING
+        self.node.save()
+
+        mock_bios = mock.Mock()
+        mock_bios.attributes = {**requested_attrs, **other_attrs}
+        mock_bios.pending_attributes = {**requested_attrs, **other_attrs}
+        mock_bios.get_attribute_registry = []
+        mock_system = mock.Mock()
+        mock_system.bios = mock_bios
+        mock_get_system.return_value = mock_system
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios.apply_configuration(task, data)
+
+        mock_cleaning_error_handler.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'cleaning_error_handler', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_apply_conf_post_reboot_cleaning_failed_pending(
+            self, mock_get_system, mock_cleaning_error_handler):
+        data = [{'name': 'ProcTurboMode', 'value': 'Enabled'}]
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': data}}
+        requested_attrs = {'ProcTurboMode': 'Enabled'}
+        other_attrs = {'Other': 'Value'}
+        node = self.node
+        driver_internal_info = node.driver_internal_info
+        driver_internal_info['redfish_bios_state'] = {
+            'reboot_requested': True,
+            'requested_bios_attrs': requested_attrs,
+        }
+        self.node.driver_internal_info = driver_internal_info
+        self.node.provision_state = states.CLEANING
+        self.node.save()
+
+        mock_bios = mock.Mock()
+        mock_bios.attributes = {'ProcTurboMode': 'Disabled', **other_attrs}
+        mock_bios.pending_attributes = {**requested_attrs, **other_attrs}
+        mock_bios.get_attribute_registry = []
+        mock_system = mock.Mock()
+        mock_system.bios = mock_bios
+        mock_get_system.return_value = mock_system
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios.apply_configuration(task, data)
+
+        mock_cleaning_error_handler.assert_called_once()
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     def test_apply_configuration_fail(self, mock_get_system):
@@ -487,12 +595,297 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                                   shared=False) as task:
             bios = mock_get_system(task.node).bios
             bios.supported_apply_times = ['immediate']
+            task.node.deploy_step = {
+                'step': 'apply_configuration',
+                'interface': 'bios'}
 
             task.driver.bios.apply_configuration(task, settings)
 
             bios.set_attributes.assert_called_once_with(
                 {s['name']: s['value'] for s in settings},
                 apply_time=None)
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(objects.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(redfish_bios.RedfishBIOS, '_get_unapplied_bios_attrs',
+                       autospec=True)
+    def test_check_node_redfish_bios_apply_attrs_not_applied(
+            self, mock_check_attrs, mock_get_system, mock_touch, mock_notify):
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': []}}
+        self.node.provision_state = states.CLEANWAIT
+        self.node.set_driver_internal_info('cleaning_disable_ramdisk', True)
+        self.node.set_driver_internal_info(
+            'redfish_bios_state',
+            {'reboot_requested': True,
+             'requested_bios_attrs': {'ProcTurboMode': 'Enabled'}})
+        self.node.save()
+
+        boot_progress = mock.Mock()
+        boot_progress.last_state = sushy.BootProgressStates.OS_BOOT_STARTED
+        mock_get_system.return_value.boot_progress = boot_progress
+        mock_check_attrs.return_value = {'ProcTurboMode': 'Enabled'}
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._check_node_redfish_bios_apply(task)
+
+            mock_touch.assert_called_once_with(task.node)
+            mock_notify.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(objects.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_check_node_redfish_bios_apply_reboot_complete(
+            self, mock_get_system, mock_touch, mock_notify):
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': []}}
+        self.node.provision_state = states.CLEANWAIT
+        self.node.set_driver_internal_info('cleaning_disable_ramdisk', True)
+        self.node.set_driver_internal_info(
+            'redfish_bios_state', {'reboot_requested': True})
+        self.node.save()
+
+        boot_progress = mock.Mock()
+        boot_progress.last_state = sushy.BootProgressStates.OS_BOOT_STARTED
+        mock_get_system.return_value.boot_progress = boot_progress
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._check_node_redfish_bios_apply(task)
+
+            mock_touch.assert_called_once_with(task.node)
+            mock_notify.assert_called_once_with(task)
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(objects.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_check_node_redfish_bios_apply_still_rebooting(
+            self, mock_get_system, mock_touch, mock_notify):
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': []}}
+        self.node.provision_state = states.CLEANWAIT
+        self.node.set_driver_internal_info('cleaning_disable_ramdisk', True)
+        self.node.set_driver_internal_info(
+            'redfish_bios_state', {'reboot_requested': True})
+        self.node.save()
+
+        boot_progress = mock.Mock()
+        boot_progress.last_state = sushy.BootProgressStates.MEMORY
+        mock_get_system.return_value.boot_progress = boot_progress
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._check_node_redfish_bios_apply(task)
+
+            mock_touch.assert_called_once_with(task.node)
+            mock_notify.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
+                       autospec=True)
+    @mock.patch.object(objects.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_check_node_redfish_bios_apply_reboot_complete_service(
+            self, mock_get_system, mock_touch, mock_notify):
+        self.node.service_step = {'priority': 100, 'interface': 'bios',
+                                  'step': 'apply_configuration',
+                                  'argsinfo': {'settings': []}}
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.set_driver_internal_info('service_disable_ramdisk', True)
+        self.node.set_driver_internal_info(
+            'redfish_bios_state', {'reboot_requested': True})
+        self.node.save()
+
+        boot_progress = mock.Mock()
+        boot_progress.last_state = sushy.BootProgressStates.OS_BOOT_STARTED
+        mock_get_system.return_value.boot_progress = boot_progress
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._check_node_redfish_bios_apply(task)
+
+            mock_touch.assert_called_once_with(task.node)
+            mock_notify.assert_called_once_with(task)
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_deploy',
+                       autospec=True)
+    @mock.patch.object(objects.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_check_node_redfish_bios_apply_reboot_complete_deploy(
+            self, mock_get_system, mock_touch, mock_notify):
+        self.node.deploy_step = {'priority': 100, 'interface': 'bios',
+                                 'step': 'apply_configuration',
+                                 'argsinfo': {'settings': []}}
+        self.node.provision_state = states.DEPLOYWAIT
+        self.node.set_driver_internal_info(
+            'redfish_bios_state', {'reboot_requested': True})
+        self.node.save()
+
+        boot_progress = mock.Mock()
+        boot_progress.last_state = sushy.BootProgressStates.OS_BOOT_STARTED
+        mock_get_system.return_value.boot_progress = boot_progress
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._check_node_redfish_bios_apply(task)
+
+            mock_touch.assert_called_once_with(task.node)
+            mock_notify.assert_called_once_with(task)
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(objects.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_check_node_redfish_bios_apply_get_system_error(
+            self, mock_get_system, mock_touch, mock_notify):
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': []}}
+        self.node.provision_state = states.CLEANWAIT
+        self.node.set_driver_internal_info('cleaning_disable_ramdisk', True)
+        self.node.set_driver_internal_info(
+            'redfish_bios_state', {'reboot_requested': True})
+        self.node.save()
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            for exc in [exception.RedfishError(error='boom'),
+                        sushy.exceptions.SushyError()]:
+                mock_get_system.side_effect = exc
+                task.driver.bios._check_node_redfish_bios_apply(task)
+
+            mock_touch.assert_not_called()
+            mock_notify.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(objects.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_check_bios_apply_no_boot_progress_still_pending(
+            self, mock_get_system, mock_touch, mock_notify):
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': []}}
+        self.node.provision_state = states.CLEANWAIT
+        self.node.set_driver_internal_info('cleaning_disable_ramdisk', True)
+        self.node.set_driver_internal_info(
+            'redfish_bios_state',
+            {'reboot_requested': True,
+             'requested_bios_attrs': {'ProcTurboMode': 'Enabled'}})
+        self.node.save()
+
+        mock_system = mock_get_system.return_value
+        mock_system.boot_progress = None
+        mock_bios = mock.Mock()
+        mock_bios.attributes = {'ProcTurboMode': 'Disabled'}
+        mock_bios.pending_attributes = {'ProcTurboMode': 'Enabled'}
+        mock_system.bios = mock_bios
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._check_node_redfish_bios_apply(task)
+
+            mock_touch.assert_not_called()
+            mock_notify.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(objects.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_check_bios_apply_no_last_state_pending_cleared(
+            self, mock_get_system, mock_touch, mock_notify):
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': []}}
+        self.node.provision_state = states.CLEANWAIT
+        self.node.set_driver_internal_info('cleaning_disable_ramdisk', True)
+        self.node.set_driver_internal_info(
+            'redfish_bios_state',
+            {'reboot_requested': True,
+             'requested_bios_attrs': {'ProcTurboMode': 'Enabled'}})
+        self.node.save()
+
+        boot_progress = mock.Mock()
+        boot_progress.last_state = None
+        mock_system = mock_get_system.return_value
+        mock_system.boot_progress = boot_progress
+        mock_bios = mock.Mock()
+        mock_bios.attributes = {'ProcTurboMode': 'Enabled'}
+        mock_bios.pending_attributes = {}
+        mock_system.bios = mock_bios
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._check_node_redfish_bios_apply(task)
+
+            mock_touch.assert_not_called()
+            mock_notify.assert_called_once_with(task)
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(objects.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_check_bios_apply_no_boot_progress_pending_cleared(
+            self, mock_get_system, mock_touch, mock_notify):
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': []}}
+        self.node.provision_state = states.CLEANWAIT
+        self.node.set_driver_internal_info('cleaning_disable_ramdisk', True)
+        self.node.set_driver_internal_info(
+            'redfish_bios_state',
+            {'reboot_requested': True,
+             'requested_bios_attrs': {'ProcTurboMode': 'Enabled'}})
+        self.node.save()
+
+        boot_progress = mock.Mock()
+        boot_progress.last_state = None
+        mock_system = mock_get_system.return_value
+        mock_system.boot_progress = boot_progress
+        mock_bios = mock.Mock()
+        mock_bios.attributes = {'ProcTurboMode': 'Enabled'}
+        mock_bios.pending_attributes = {}
+        mock_system.bios = mock_bios
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._check_node_redfish_bios_apply(task)
+
+            mock_touch.assert_not_called()
+            mock_notify.assert_called_once_with(task)
+
+    @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
+                       spec_set=True, autospec=True)
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_conf_step_pre_reboot_polling_not_set_with_ramdisk(
+            self, mock_power_action, mock_get_system, mock_build_agent_options,
+            mock_prepare):
+        data = [{'name': 'ProcTurboMode', 'value': 'Disabled'},
+                {'name': 'NicBoot1', 'value': 'NetworkBoot'}]
+        self.node.clean_step = {'priority': 100, 'interface': 'bios',
+                                'step': 'apply_configuration',
+                                'argsinfo': {'settings': data}}
+        self.node.provision_state = states.CLEANING
+        self.node.save()
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            bios = mock_get_system(task.node).bios
+            bios.supported_apply_times = []
+
+            task.driver.bios.apply_configuration(task, data)
+
+            self.assertFalse(task.node.driver_internal_info.get(
+                async_steps.CLEANING_POLLING))
 
     @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
                        spec_set=True, autospec=True)
@@ -509,6 +902,9 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                                   shared=False) as task:
             bios = mock_get_system(task.node).bios
             bios.supported_apply_times = [sushy.APPLY_TIME_ON_RESET]
+            task.node.deploy_step = {
+                'step': 'apply_configuration',
+                'interface': 'bios'}
 
             task.driver.bios.apply_configuration(task, settings)
 
@@ -530,6 +926,33 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                                   shared=False) as task:
             bios = mock_get_system(task.node).bios
             bios.supported_apply_times = None
+            task.node.deploy_step = {
+                'step': 'apply_configuration',
+                'interface': 'bios'}
+
+            task.driver.bios.apply_configuration(task, settings)
+
+            bios.set_attributes.assert_called_once_with(
+                {s['name']: s['value'] for s in settings},
+                apply_time=None)
+
+    @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
+                       spec_set=True, autospec=True)
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_configuration_no_apply_time_attr(
+            self, mock_power_action, mock_get_system, mock_build_agent_options,
+            mock_prepare):
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'},
+                    {'name': 'NicBoot1', 'value': 'NetworkBoot'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            bios = mock_get_system(task.node).bios
+            del bios.supported_apply_times
+            task.node.deploy_step = {
+                'step': 'apply_configuration',
+                'interface': 'bios'}
 
             task.driver.bios.apply_configuration(task, settings)
 
@@ -538,8 +961,471 @@ class RedfishBiosTestCase(db_base.DbTestCase):
                 apply_time=None)
 
 
-@mock.patch('oslo_utils.eventletutils.EventletEvent.wait',
-            lambda *args, **kwargs: None)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_apply_configuration_skip_when_all_match(self, mock_get_system):
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'},
+                    {'name': 'NicBoot1', 'value': 'NetworkBoot'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            mock_bios = mock.Mock()
+            mock_bios.attributes = {'ProcTurboMode': 'Disabled',
+                                    'NicBoot1': 'NetworkBoot'}
+            mock_bios.pending_attributes = {}
+            mock_bios.get_attribute_registry.return_value = None
+            mock_get_system.return_value.bios = mock_bios
+
+            result = task.driver.bios.apply_configuration(task, settings)
+
+            self.assertIsNone(result)
+            mock_bios.set_attributes.assert_not_called()
+
+    @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
+                       spec_set=True, autospec=True)
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_configuration_proceed_when_mismatch(self,
+                                                       mock_power_action,
+                                                       mock_get_system,
+                                                       mock_build_agent_options,
+                                                       mock_prepare):
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'},
+                    {'name': 'NicBoot1', 'value': 'NetworkBoot'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            mock_bios = mock.Mock()
+            mock_bios.attributes = {'ProcTurboMode': 'Enabled',
+                                    'NicBoot1': 'NetworkBoot'}
+            mock_bios.pending_attributes = {}
+            mock_bios.supported_apply_times = []
+            mock_bios.get_attribute_registry.return_value = None
+            mock_get_system.return_value.bios = mock_bios
+            task.node.deploy_step = {
+                'step': 'apply_configuration',
+                'interface': 'bios'}
+
+            task.driver.bios.apply_configuration(task, settings)
+
+            mock_bios.set_attributes.assert_called_once()
+
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_apply_configuration_skip_when_pending_attrs_match(
+            self, mock_get_system):
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            mock_bios = mock.Mock()
+            mock_bios.attributes = {'ProcTurboMode': 'Disabled'}
+            mock_bios.pending_attributes = {'ProcTurboMode': 'Disabled'}
+            mock_bios.get_attribute_registry.return_value = None
+            mock_get_system.return_value.bios = mock_bios
+
+            result = task.driver.bios.apply_configuration(task, settings)
+
+            self.assertIsNone(result)
+            mock_bios.set_attributes.assert_not_called()
+
+    @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
+                       spec_set=True, autospec=True)
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test_apply_configuration_proceed_when_pending_attrs_conflict(
+            self, mock_power_action, mock_get_system,
+            mock_build_agent_options, mock_prepare):
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            mock_bios = mock.Mock()
+            mock_bios.attributes = {'ProcTurboMode': 'Disabled'}
+            mock_bios.pending_attributes = {'ProcTurboMode': 'Enabled'}
+            mock_bios.supported_apply_times = []
+            mock_bios.get_attribute_registry.return_value = None
+            mock_get_system.return_value.bios = mock_bios
+            task.node.deploy_step = {
+                'step': 'apply_configuration',
+                'interface': 'bios'}
+
+            task.driver.bios.apply_configuration(task, settings)
+
+            mock_bios.set_attributes.assert_called_once()
+
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_apply_configuration_skip_when_pending_attrs_sushy_error(
+            self, mock_get_system):
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            mock_bios = mock.Mock()
+            mock_bios.attributes = {'ProcTurboMode': 'Disabled'}
+            type(mock_bios).pending_attributes = mock.PropertyMock(
+                side_effect=sushy.exceptions.SushyError)
+            mock_bios.get_attribute_registry.return_value = None
+            mock_get_system.return_value.bios = mock_bios
+
+            result = task.driver.bios.apply_configuration(task, settings)
+
+            self.assertIsNone(result)
+            mock_bios.set_attributes.assert_not_called()
+
+
+class RedfishBiosValidateSettingsTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super(RedfishBiosValidateSettingsTestCase, self).setUp()
+        self.config(enabled_bios_interfaces=['redfish'],
+                    enabled_hardware_types=['redfish'],
+                    enabled_power_interfaces=['redfish'],
+                    enabled_boot_interfaces=['redfish-virtual-media'],
+                    enabled_management_interfaces=['redfish'])
+        self.node = obj_utils.create_test_node(
+            self.context, driver='redfish', driver_info=INFO_DICT)
+
+    def _make_cached(self, name, attribute_type, allowable_values,
+                     read_only=False):
+        cached = mock.Mock()
+        cached.name = name
+        cached.attribute_type = attribute_type
+        cached.allowable_values = allowable_values
+        cached.read_only = read_only
+        cached.lower_bound = None
+        cached.upper_bound = None
+        cached.min_length = None
+        cached.max_length = None
+        return cached
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_valid_enumeration(self, mock_setting_list):
+        mock_setting_list.get_by_node_id.return_value = [
+            self._make_cached('HttpDev2EnDis', 'Enumeration',
+                              ['Enabled', 'Disabled']),
+        ]
+        settings = [{'name': 'HttpDev2EnDis', 'value': 'Enabled'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            # Should not raise
+            task.driver.bios._validate_and_convert_settings(task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_invalid_enumeration(self, mock_setting_list):
+        mock_setting_list.get_by_node_id.return_value = [
+            self._make_cached('HttpDev2EnDis', 'Enumeration',
+                              ['Enabled', 'Disabled']),
+        ]
+        settings = [{'name': 'HttpDev2EnDis', 'value': 'disabled'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.assertRaisesRegex(
+                exception.InvalidParameterValue,
+                'HttpDev2EnDis',
+                task.driver.bios._validate_and_convert_settings,
+                task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_multiple_invalid(self, mock_setting_list):
+        mock_setting_list.get_by_node_id.return_value = [
+            self._make_cached('HttpDev1EnDis', 'Enumeration',
+                              ['Enabled', 'Disabled']),
+            self._make_cached('HttpDev2EnDis', 'Enumeration',
+                              ['Enabled', 'Disabled']),
+        ]
+        settings = [
+            {'name': 'HttpDev1EnDis', 'value': 'enabled'},
+            {'name': 'HttpDev2EnDis', 'value': 'disabled'},
+        ]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            exc = self.assertRaises(
+                exception.InvalidParameterValue,
+                task.driver.bios._validate_and_convert_settings,
+                task, settings)
+            self.assertIn('HttpDev1EnDis', str(exc))
+            self.assertIn('HttpDev2EnDis', str(exc))
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_non_enumeration_skipped(
+            self, mock_setting_list):
+        mock_setting_list.get_by_node_id.return_value = [
+            self._make_cached('SomeSetting', 'String', None),
+        ]
+        settings = [{'name': 'SomeSetting', 'value': 'anything'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            # Should not raise - String type is not validated
+            task.driver.bios._validate_and_convert_settings(task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_no_allowable_values_skipped(
+            self, mock_setting_list):
+        mock_setting_list.get_by_node_id.return_value = [
+            self._make_cached('SomeEnumSetting', 'Enumeration', None),
+        ]
+        settings = [{'name': 'SomeEnumSetting', 'value': 'anything'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            # Should not raise - no allowable_values cached to check against
+            task.driver.bios._validate_and_convert_settings(task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_unknown_setting_skipped(
+            self, mock_setting_list):
+        mock_setting_list.get_by_node_id.return_value = []
+        settings = [{'name': 'UnknownSetting', 'value': 'anything'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            # Should not raise - can't validate what's not in the cache
+            task.driver.bios._validate_and_convert_settings(task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_read_only_rejected(self, mock_setting_list):
+        mock_setting_list.get_by_node_id.return_value = [
+            self._make_cached('SystemModelName', 'String', None,
+                              read_only=True),
+        ]
+        settings = [{'name': 'SystemModelName', 'value': 'NewModel'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.assertRaisesRegex(
+                exception.InvalidParameterValue,
+                'SystemModelName',
+                task.driver.bios._validate_and_convert_settings,
+                task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_integer_valid(self, mock_setting_list):
+        cached = self._make_cached('BootDelay', 'Integer', None)
+        cached.lower_bound = 5
+        cached.upper_bound = 30
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'BootDelay', 'value': 10}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            # Should not raise
+            task.driver.bios._validate_and_convert_settings(task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_integer_below_lower_bound(
+            self, mock_setting_list):
+        cached = self._make_cached('BootDelay', 'Integer', None)
+        cached.lower_bound = 5
+        cached.upper_bound = 30
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'BootDelay', 'value': 1}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.assertRaisesRegex(
+                exception.InvalidParameterValue,
+                'BootDelay',
+                task.driver.bios._validate_and_convert_settings,
+                task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_integer_above_upper_bound(
+            self, mock_setting_list):
+        cached = self._make_cached('BootDelay', 'Integer', None)
+        cached.lower_bound = 5
+        cached.upper_bound = 30
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'BootDelay', 'value': 60}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.assertRaisesRegex(
+                exception.InvalidParameterValue,
+                'BootDelay',
+                task.driver.bios._validate_and_convert_settings,
+                task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_integer_not_a_number(self, mock_setting_list):
+        cached = self._make_cached('BootDelay', 'Integer', None)
+        cached.lower_bound = 5
+        cached.upper_bound = 30
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'BootDelay', 'value': 'fast'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.assertRaisesRegex(
+                exception.InvalidParameterValue,
+                'BootDelay',
+                task.driver.bios._validate_and_convert_settings,
+                task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_integer_no_bounds(self, mock_setting_list):
+        cached = self._make_cached('BootDelay', 'Integer', None)
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'BootDelay', 'value': 999}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            # Should not raise - no bounds to enforce
+            task.driver.bios._validate_and_convert_settings(task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_integer_string_converted(
+            self, mock_setting_list):
+        cached = self._make_cached('BootDelay', 'Integer', None)
+        cached.lower_bound = 5
+        cached.upper_bound = 30
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'BootDelay', 'value': '10'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._validate_and_convert_settings(task, settings)
+        self.assertEqual(10, settings[0]['value'])
+        self.assertIsInstance(settings[0]['value'], int)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_string_valid(self, mock_setting_list):
+        cached = self._make_cached('AdminName', 'String', None)
+        cached.min_length = 2
+        cached.max_length = 10
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'AdminName', 'value': 'Alice'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            # Should not raise
+            task.driver.bios._validate_and_convert_settings(task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_string_too_short(self, mock_setting_list):
+        cached = self._make_cached('AdminName', 'String', None)
+        cached.min_length = 2
+        cached.max_length = 10
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'AdminName', 'value': 'A'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.assertRaisesRegex(
+                exception.InvalidParameterValue,
+                'AdminName',
+                task.driver.bios._validate_and_convert_settings,
+                task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_string_too_long(self, mock_setting_list):
+        cached = self._make_cached('AdminName', 'String', None)
+        cached.min_length = 2
+        cached.max_length = 10
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'AdminName', 'value': 'A' * 11}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.assertRaisesRegex(
+                exception.InvalidParameterValue,
+                'AdminName',
+                task.driver.bios._validate_and_convert_settings,
+                task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_validate_settings_string_no_length_bounds(
+            self, mock_setting_list):
+        cached = self._make_cached('AdminName', 'String', None)
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'AdminName', 'value': 'A' * 100}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            # Should not raise - no length bounds to enforce
+            task.driver.bios._validate_and_convert_settings(task, settings)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_convert_setting_types_integer_from_string(
+            self, mock_setting_list):
+        cached = self._make_cached('SnoopResponseHoldOff', 'Integer', None)
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'SnoopResponseHoldOff', 'value': '0'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._validate_and_convert_settings(task, settings)
+        self.assertEqual(0, settings[0]['value'])
+        self.assertIsInstance(settings[0]['value'], int)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_convert_setting_types_integer_already_int(
+            self, mock_setting_list):
+        cached = self._make_cached('SnoopResponseHoldOff', 'Integer', None)
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'SnoopResponseHoldOff', 'value': 17}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._validate_and_convert_settings(task, settings)
+        self.assertEqual(17, settings[0]['value'])
+        self.assertIsInstance(settings[0]['value'], int)
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_convert_setting_types_boolean_true(self, mock_setting_list):
+        cached = self._make_cached('SomeBoolSetting', 'Boolean', None)
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'SomeBoolSetting', 'value': 'True'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._validate_and_convert_settings(task, settings)
+        self.assertIs(True, settings[0]['value'])
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_convert_setting_types_boolean_false(self, mock_setting_list):
+        cached = self._make_cached('SomeBoolSetting', 'Boolean', None)
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'SomeBoolSetting', 'value': 'false'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._validate_and_convert_settings(task, settings)
+        self.assertIs(False, settings[0]['value'])
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_convert_setting_types_enumeration_unchanged(
+            self, mock_setting_list):
+        cached = self._make_cached('ProcTurboMode', 'Enumeration',
+                                   ['Enabled', 'Disabled'])
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'ProcTurboMode', 'value': 'Disabled'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._validate_and_convert_settings(task, settings)
+        self.assertEqual('Disabled', settings[0]['value'])
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_convert_setting_types_string_unchanged(
+            self, mock_setting_list):
+        cached = self._make_cached('AdminName', 'String', None)
+        mock_setting_list.get_by_node_id.return_value = [cached]
+        settings = [{'name': 'AdminName', 'value': 'admin'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._validate_and_convert_settings(task, settings)
+        self.assertEqual('admin', settings[0]['value'])
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_convert_setting_types_unknown_setting_unchanged(
+            self, mock_setting_list):
+        mock_setting_list.get_by_node_id.return_value = []
+        settings = [{'name': 'UnknownSetting', 'value': '42'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._validate_and_convert_settings(task, settings)
+        self.assertEqual('42', settings[0]['value'])
+
+    @mock.patch.object(objects, 'BIOSSettingList', autospec=True)
+    def test_convert_setting_types_mixed(self, mock_setting_list):
+        cached_int = self._make_cached('UncoreFreqMAX', 'Integer', None)
+        cached_enum = self._make_cached('ProcTurboMode', 'Enumeration',
+                                        ['Enabled', 'Disabled'])
+        cached_str = self._make_cached('AdminName', 'String', None)
+        mock_setting_list.get_by_node_id.return_value = [
+            cached_int, cached_enum, cached_str]
+        settings = [
+            {'name': 'UncoreFreqMAX', 'value': '17'},
+            {'name': 'ProcTurboMode', 'value': 'Disabled'},
+            {'name': 'AdminName', 'value': 'admin'},
+        ]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.driver.bios._validate_and_convert_settings(task, settings)
+        self.assertEqual(17, settings[0]['value'])
+        self.assertIsInstance(settings[0]['value'], int)
+        self.assertEqual('Disabled', settings[1]['value'])
+        self.assertEqual('admin', settings[2]['value'])
+
+
 class RedfishBiosRegistryTestCase(db_base.DbTestCase):
 
     def setUp(self):

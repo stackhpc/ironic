@@ -69,22 +69,6 @@ class TestNeutronClient(base.TestCase):
         client_mock.assert_called_once_with(oslo_conf=mock.ANY,
                                             session=mock.sentinel.session)
 
-    @mock.patch('ironic.common.context.RequestContext', autospec=True)
-    def test_get_neutron_client_with_token(self, mock_ctxt, mock_client_init,
-                                           mock_session, mock_adapter,
-                                           mock_auth, mock_sauth):
-        mock_ctxt.return_value = ctxt = mock.Mock()
-        ctxt.auth_token = 'test-token-123'
-        neutron.get_client(token='test-token-123')
-        mock_ctxt.assert_called_once_with(auth_token='test-token-123')
-        mock_client_init.assert_called_once_with(oslo_conf=mock.ANY,
-                                                 session=mock.sentinel.session)
-
-        # testing handling of default url_timeout
-        mock_session.assert_has_calls(
-            [mock.call('neutron', timeout=10),
-             mock.call('neutron', auth=mock.sentinel.sauth, timeout=10)])
-
     def test_get_neutron_client_with_context(self, mock_client_init,
                                              mock_session, mock_adapter,
                                              mock_auth, mock_sauth):
@@ -131,6 +115,38 @@ class TestNeutronClient(base.TestCase):
         mock_session.assert_has_calls(
             [mock.call('neutron', timeout=10),
              mock.call('neutron', auth=mock.sentinel.auth, timeout=10)])
+
+    def test_get_client_returns_wrapper(self, mock_client_init,
+                                        mock_session, mock_adapter,
+                                        mock_auth, mock_sauth):
+        client = neutron.get_client(context=self.context)
+        self.assertIsInstance(client, neutron.NeutronNetworkClient)
+        mock_client_init.assert_called_once()
+
+    def test_client_wrapper_close(self, mock_client_init,
+                                  mock_session, mock_adapter,
+                                  mock_auth, mock_sauth):
+        client = neutron.get_client(context=self.context)
+        client.close()
+        mock_client_init.return_value.close.assert_called_once()
+
+    def test_client_wrapper_context_manager(self, mock_client_init,
+                                            mock_session, mock_adapter,
+                                            mock_auth, mock_sauth):
+        with neutron.get_client(context=self.context) as client:
+            self.assertIsInstance(client, neutron.NeutronNetworkClient)
+        mock_client_init.return_value.close.assert_called_once()
+
+    def test_client_wrapper_delegates_to_network(self, mock_client_init,
+                                                 mock_session, mock_adapter,
+                                                 mock_auth, mock_sauth):
+        mock_network = mock.Mock()
+        mock_client_init.return_value.global_request.return_value.network = (
+            mock_network)
+        client = neutron.get_client(context=self.context)
+        # Test that methods are delegated to the network proxy
+        client.get_port('port-id')
+        mock_network.get_port.assert_called_once_with('port-id')
 
 
 class TestUpdateNeutronPort(base.TestCase):
@@ -240,7 +256,8 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
     @mock.patch.object(neutron, 'update_neutron_port', autospec=True)
     def _test_add_ports_to_network(self, update_mock, is_client_id,
                                    security_groups=None,
-                                   add_all_ports=False):
+                                   add_all_ports=False,
+                                   boot_not_pxe=False):
         # Ports will be created only if pxe_enabled is True
         self.node.network_interface = 'neutron'
         self.node.save()
@@ -279,7 +296,7 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
             expected_create_attrs['extra_dhcp_opts'] = (
                 [{'opt_name': '61', 'opt_value': self._CLIENT_ID}])
 
-        if add_all_ports:
+        if add_all_ports or boot_not_pxe:
             expected_create_attrs2 = copy.deepcopy(expected_create_attrs)
             expected_update_attrs2 = copy.deepcopy(expected_update_attrs)
             expected_update_attrs2['mac_address'] = port2.address
@@ -300,10 +317,13 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
             expected = {port.uuid: self.neutron_port['id']}
 
         with task_manager.acquire(self.context, self.node.uuid) as task:
+            if boot_not_pxe:
+                # force override of driver properties, just to keep it simple.
+                task.driver.boot.capabilities = ['not_pxe']
             ports = neutron.add_ports_to_network(
                 task, self.network_uuid, security_groups=security_groups)
             self.assertEqual(expected, ports)
-            if add_all_ports:
+            if add_all_ports or boot_not_pxe:
                 create_calls = [mock.call(**expected_create_attrs),
                                 mock.call(**expected_create_attrs2)]
                 update_calls = [
@@ -329,6 +349,10 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
                                         security_groups=None,
                                         add_all_ports=True)
 
+    def test_add_ports_to_network_all_ports_via_not_pxe(self):
+        self._test_add_ports_to_network(is_client_id=False,
+                                        boot_not_pxe=True)
+
     @mock.patch.object(neutron, '_verify_security_groups', autospec=True)
     def test_add_ports_to_network_with_sg(self, verify_mock):
         sg_ids = []
@@ -336,6 +360,44 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
             sg_ids.append(uuidutils.generate_uuid())
         self._test_add_ports_to_network(is_client_id=False,
                                         security_groups=sg_ids)
+
+    @mock.patch.object(neutron, 'update_neutron_port', autospec=True)
+    def test_add_ports_to_network_with_physical_network(self, update_mock):
+        # Test that physical_network is included in binding:profile
+        self.node.network_interface = 'neutron'
+        self.node.save()
+        port = self.ports[0]
+        port.physical_network = 'physnet1'
+        port.save()
+
+        expected_create_attrs = {
+            'network_id': self.network_uuid,
+            'admin_state_up': True,
+            'binding:vnic_type': 'baremetal',
+            'device_id': self.node.uuid
+        }
+        expected_update_attrs = {
+            'device_owner': 'baremetal:none',
+            'binding:host_id': self.node.uuid,
+            'mac_address': port.address,
+            'binding:profile': {
+                'local_link_information': [port.local_link_connection],
+                'physical_network': 'physnet1'
+            }
+        }
+
+        self.client_mock.create_port.return_value = self.neutron_port
+        update_mock.return_value = self.neutron_port
+        expected = {port.uuid: self.neutron_port['id']}
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            ports = neutron.add_ports_to_network(task, self.network_uuid)
+            self.assertEqual(expected, ports)
+            self.client_mock.create_port.assert_called_once_with(
+                **expected_create_attrs)
+            update_mock.assert_called_once_with(
+                self.context, self.neutron_port['id'],
+                expected_update_attrs)
 
     @mock.patch.object(neutron, 'update_neutron_port', autospec=True)
     def test__add_ip_addresses_for_ipv6_stateful(self, mock_update):
@@ -472,6 +534,19 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
                                                 expected_update_body)
         self.assertTrue(vpi_mock.called)
 
+    @mock.patch.object(neutron, 'update_neutron_port', autospec=True)
+    def test_add_ports_to_network_closes_client(self, update_mock):
+        # Verify that client.close() is called after add_ports_to_network
+        self.node.network_interface = 'neutron'
+        self.node.save()
+        self.client_mock.create_port.return_value = self.neutron_port
+        update_mock.return_value = self.neutron_port
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            neutron.add_ports_to_network(task, self.network_uuid)
+
+        self.client_mock.close.assert_called_once()
+
     @mock.patch.object(neutron, 'rollback_ports', autospec=True)
     def test_add_network_all_ports_fail(self, rollback_mock):
         # Check that if creating a port fails, the ports are cleaned up
@@ -575,6 +650,7 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
             neutron.remove_neutron_ports(task, {'param': 'value'})
         self.client_mock.ports.assert_called_once_with(**{'param': 'value'})
         self.client_mock.delete_port.assert_called_once_with(self.neutron_port)
+        self.client_mock.close.assert_called_once()
 
     def test_remove_neutron_ports_list_fail(self):
         with task_manager.acquire(self.context, self.node.uuid) as task:
@@ -584,6 +660,7 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
                 exception.NetworkError, 'Could not get given network VIF',
                 neutron.remove_neutron_ports, task, {'param': 'value'})
         self.client_mock.ports.assert_called_once_with(**{'param': 'value'})
+        self.client_mock.close.assert_called_once()
 
     def test_remove_neutron_ports_delete_fail(self):
         with task_manager.acquire(self.context, self.node.uuid) as task:
@@ -595,6 +672,7 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
                 neutron.remove_neutron_ports, task, {'param': 'value'})
         self.client_mock.ports.assert_called_once_with(**{'param': 'value'})
         self.client_mock.delete_port.assert_called_once_with(self.neutron_port)
+        self.client_mock.close.assert_called_once()
 
     def test_remove_neutron_ports_delete_race(self):
         with task_manager.acquire(self.context, self.node.uuid) as task:
@@ -604,6 +682,7 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
             neutron.remove_neutron_ports(task, {'param': 'value'})
         self.client_mock.ports.assert_called_once_with(**{'param': 'value'})
         self.client_mock.delete_port.assert_called_once_with(self.neutron_port)
+        self.client_mock.close.assert_called_once()
 
     def test__uncidr_ipv4(self):
         network, netmask = neutron._uncidr('10.0.0.0/24')
@@ -611,7 +690,7 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
         self.assertEqual('255.255.255.0', netmask)
 
     def test__uncidr_ipv6(self):
-        network, netmask = neutron._uncidr('::1/64', ipv6=True)
+        network, netmask = neutron._uncidr('::1/64')
         self.assertEqual('::', network)
         self.assertEqual('ffff:ffff:ffff:ffff::', netmask)
 
@@ -644,6 +723,96 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
         }
 
         self.assertEqual(expected_network, network_data['networks'][0])
+
+        expected_services = [
+            {
+                'type': 'dns',
+                'address': '192.0.2.253'
+            },
+            {
+                'type': 'dns',
+                'address': '192.0.2.254'
+            }
+        ]
+
+        self.assertEqual(expected_services, network_data['services'])
+
+    def test_get_neutron_port_data_with_overrides(self):
+
+        mac_addr = "00:11:22:33:44:55"
+        network_data = neutron.get_neutron_port_data('port0', 'vif0',
+                                                     mac_address=mac_addr,
+                                                     iface_type='phy')
+        expected_port = {
+            'id': 'port0',
+            'type': 'phy',
+            'ethernet_mac_address': '00:11:22:33:44:55',
+            'vif_id': '46d4bfb9-b26e-41f3-bd2e-e6dcc1ccedb2',
+            'mtu': 1500
+        }
+
+        self.assertEqual(expected_port, network_data['links'][0])
+
+    def test_get_neutron_port_data_with_bond_links(self):
+        vif_id = 'df5ff3e5-545a-4bb4-91b2-59f96559543e'
+        pg = object_utils.create_test_portgroup(
+            self.context, node_id=self.node.id,
+            uuid='cbc1d358-b19c-4e8e-91a1-6f7a768ca468',
+            extra={'vif_port_id': vif_id})
+        mac_addr = "00:11:22:33:44:55"
+        bond_port_1 = object_utils.create_test_port(
+            self.context, node_id=self.node.id,
+            uuid='f99544f6-1aa2-43db-b41f-c63eb431e559',
+            address=mac_addr,
+            portgroup_id=pg.id)
+        bond_port_2 = object_utils.create_test_port(
+            self.context, node_id=self.node.id,
+            uuid='6fc5ac99-6919-4789-a6bf-4906baca5da4',
+            address='aa:bb:cc:dd:ee:ff',
+            portgroup_id=pg.id)
+        # Bond links in this case are supplied by the caller, but
+        # we need to pass something through and validate data is
+        # injected in to the result.
+        bond_links = [
+            {
+                'id': str(bond_port_1.id),
+                'type': 'phy',
+                'ethernet_mac_address': bond_port_1.address,
+            },
+            {
+                'id': str(bond_port_2.id),
+                'type': 'phy',
+                'ethernet_mac_address': bond_port_2.address,
+            }
+        ]
+
+        network_data = neutron.get_neutron_port_data('port0', 'vif0',
+                                                     mac_address=mac_addr,
+                                                     iface_type='phy',
+                                                     bond_links=bond_links)
+
+        expected_links = [
+            {
+                'bond_links': ["2", "3"],
+                'ethernet_mac_address': '00:11:22:33:44:55',
+                'id': 'port0',
+                'mtu': 1500,
+                'type': 'bond',
+                'vif_id': '46d4bfb9-b26e-41f3-bd2e-e6dcc1ccedb2'
+            },
+            {
+                'ethernet_mac_address': '00:11:22:33:44:55',
+                'id': "2",
+                'type': 'phy'
+            },
+            {
+                'ethernet_mac_address': 'aa:bb:cc:dd:ee:ff',
+                'id': "3",
+                'type': 'phy'
+            }
+        ]
+
+        self.assertEqual(expected_links, network_data['links'])
 
     def load_ipv6_files(self):
         port_show_file = os.path.join(
@@ -678,7 +847,6 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
 
         network_data = neutron.get_neutron_port_data('port1', 'vif1')
 
-        print(network_data)
         expected_port = {
             'id': 'port1',
             'type': 'vif',
@@ -704,6 +872,13 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
         }
 
         self.assertEqual(expected_network, network_data['networks'][0])
+
+        expected_service = {
+            'type': 'dns',
+            'address': '2001:db8::ffff:c000:2fe'
+        }
+
+        self.assertEqual(expected_service, network_data['services'][0])
 
     def test_get_node_portmap(self):
         with task_manager.acquire(self.context, self.node.uuid) as task:
@@ -1015,7 +1190,8 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
             wait_agent_mock.assert_called_once_with(
                 self.client_mock, 'hostname')
             wait_port_mock.assert_called_once_with(
-                self.client_mock, self.neutron_port.id, 'ACTIVE')
+                self.client_mock, self.neutron_port.id, 'ACTIVE',
+                fail_on_binding_failure=True)
 
     @mock.patch.object(neutron, 'is_smartnic_port', autospec=True)
     @mock.patch.object(neutron, 'wait_for_host_agent', autospec=True)
@@ -1243,6 +1419,78 @@ class TestUnbindPort(base.TestCase):
         mock_log.info.assert_called_once_with('Port %s was not found while '
                                               'unbinding.', port_id)
 
+    @mock.patch.object(neutron, 'get_client', autospec=True)
+    def test_unbind_neutron_port_if_bound(self, mock_client, mock_unp):
+        fake_client = mock.Mock()
+        fake_client.get_port.return_value.binding_host_id = 'foo'
+        mock_client.return_value = fake_client
+        port_id = 'fake-port-id'
+        neutron.unbind_neutron_port_if_bound(port_id, context=self.context)
+        mock_client.assert_called_once_with(context=self.context)
+        fake_client.get_port.assert_called_once_with(port_id)
+        mock_unp.assert_has_calls([
+            mock.call(None, 'fake-port-id',
+                      {'binding:host_id': '', 'binding:profile': {}},
+                      None),
+            mock.call(None, 'fake-port-id',
+                      {'mac_address': None},
+                      None)
+        ])
+
+    @mock.patch.object(neutron, 'get_client', autospec=True)
+    def test_unbind_neutron_port_if_bound_not_bound(self, mock_client,
+                                                    mock_unp):
+        fake_client = mock.Mock()
+        fake_client.get_port.return_value.binding_host_id = None
+        mock_client.return_value = fake_client
+        port_id = 'fake-port-id'
+        neutron.unbind_neutron_port_if_bound(port_id, context=self.context)
+        mock_client.assert_called_once_with(context=self.context)
+        fake_client.get_port.assert_called_once_with(port_id)
+        mock_unp.assert_not_called()
+
+    @mock.patch.object(neutron, 'get_client', autospec=True)
+    def test_unbind_neutron_port_if_bound_not_bound_empty(self, mock_client,
+                                                          mock_unp):
+        fake_client = mock.Mock()
+        # While it should be none, it can be set to empty value.
+        fake_client.get_port.return_value.binding_host_id = ''
+        mock_client.return_value = fake_client
+        port_id = 'fake-port-id'
+        neutron.unbind_neutron_port_if_bound(port_id, context=self.context)
+        mock_client.assert_called_once_with(context=self.context)
+        fake_client.get_port.assert_called_once_with(port_id)
+        mock_unp.assert_not_called()
+
+    @mock.patch.object(neutron, 'get_client', autospec=True)
+    def test_unbind_neutron_port_if_bound_port_not_found(self, mock_client,
+                                                         mock_unp):
+        fake_client = mock.Mock()
+        fake_client.get_port.side_effect = openstack_exc.ResourceNotFound()
+        mock_client.return_value = fake_client
+        port_id = 'fake-port-id'
+        self.assertRaises(exception.NetworkError,
+                          neutron.unbind_neutron_port_if_bound,
+                          port_id, context=self.context)
+        mock_client.assert_called_once_with(context=self.context)
+        fake_client.get_port.assert_called_once_with(port_id)
+        mock_unp.assert_not_called()
+
+    @mock.patch.object(neutron, 'get_client', autospec=True)
+    def test_unbind_neutron_port_if_bound_port_osc_error(self, mock_client,
+                                                         mock_unp):
+        fake_client = mock.Mock()
+        fake_client.get_port.side_effect = (
+            openstack_exc.OpenStackCloudException())
+        mock_client.return_value = fake_client
+        port_id = 'fake-port-id'
+        self.assertRaises(exception.NetworkError,
+                          neutron.unbind_neutron_port_if_bound,
+                          port_id, context=self.context)
+        mock_client.assert_called_once_with(context=self.context)
+        fake_client.get_port.assert_called_once_with(port_id)
+        mock_unp.assert_not_called()
+
 
 class TestGetNetworkByUUIDOrName(base.TestCase):
 
@@ -1301,22 +1549,65 @@ class TestGetNetworkByUUIDOrName(base.TestCase):
             network_name, ignore_missing=False)
 
 
+class TestGetSegmentBySubnetUUID(base.TestCase):
+
+    def setUp(self):
+        super(TestGetSegmentBySubnetUUID, self).setUp()
+        self.client = mock.MagicMock()
+
+    def test__get_segment_by_subnet_uuid(self):
+        segment_uuid = '9acb0256-2c1b-420a-b9d7-62bee90b6ed7'
+        subnet_uuid = 'ce9bd3d9-dfb2-40e0-8a96-91431af2759d'
+        subnet = stubs.FakeNeutronSubnet(segment_id=segment_uuid)
+        self.client.get_subnet.return_value = subnet
+        segment = stubs.FakeNeutronSegment(id=segment_uuid)
+        self.client.get_segment.return_value = segment
+        result = neutron._get_segment_by_subnet_uuid(
+            self.client, subnet_uuid)
+        self.client.get_subnet.assert_called_once_with(subnet_uuid)
+        self.client.get_segment.assert_called_once_with(segment_uuid)
+        self.assertEqual(segment, result)
+
+    def test__get_segment_by_subnet_uuid_failure(self):
+        subnet_uuid = 'ce9bd3d9-dfb2-40e0-8a96-91431af2759d'
+        self.client.get_subnet.side_effect = (
+            openstack_exc.OpenStackCloudException())
+        self.assertRaises(exception.NetworkError,
+                          neutron._get_segment_by_subnet_uuid,
+                          self.client, subnet_uuid)
+        self.client.get_subnet.assert_called_once_with(subnet_uuid)
+
+    def test__get_segment_by_subnet_uuid_missing_segment(self):
+        subnet_uuid = 'ce9bd3d9-dfb2-40e0-8a96-91431af2759d'
+        subnet = stubs.FakeNeutronSubnet(segment_id=None)
+        self.client.get_subnet.return_value = subnet
+        result = neutron._get_segment_by_subnet_uuid(
+            self.client, subnet_uuid)
+        self.client.get_subnet.assert_called_once_with(subnet_uuid)
+        self.assertIsNone(result)
+
+
+@mock.patch.object(neutron, '_get_segment_by_subnet_uuid', autospec=True)
 @mock.patch.object(neutron, '_get_network_by_uuid_or_name', autospec=True)
 @mock.patch.object(neutron, '_get_port_by_uuid', autospec=True)
 class TestGetPhysnetsByPortUUID(base.TestCase):
 
-    PORT_FIELDS = ['network_id']
+    PORT_FIELDS = ['network_id', 'fixed_ips']
     NETWORK_FIELDS = ['provider:physical_network', 'segments']
+    SUBNET_FIELDS = ['segment_id']
+    SEGMENT_FIELDS = ['physical_network']
 
     def setUp(self):
         super(TestGetPhysnetsByPortUUID, self).setUp()
         self.client = mock.MagicMock()
 
-    def test_get_physnets_by_port_uuid_single_segment(self, mock_gp, mock_gn):
+    def test_get_physnets_by_port_uuid_single_segment(
+            self, mock_gp, mock_gn, mock_gs):
         port_uuid = 'fake-port-uuid'
         network_uuid = 'fake-network-uuid'
         physnet = 'fake-physnet'
-        mock_gp.return_value = stubs.FakeNeutronPort(network_id=network_uuid)
+        mock_gp.return_value = stubs.FakeNeutronPort(network_id=network_uuid,
+                                                     fixed_ips=[])
         mock_gn.return_value = stubs.FakeNeutronNetwork(
             **{'segments': [
                 {'provider:physical_network': physnet}
@@ -1327,7 +1618,7 @@ class TestGetPhysnetsByPortUUID(base.TestCase):
         self.assertEqual({physnet}, result)
 
     def test_get_physnets_by_port_uuid_no_segment_no_physnet(
-            self, mock_gp, mock_gn):
+            self, mock_gp, mock_gn, mock_gs):
         port_uuid = 'fake-port-uuid'
         network_uuid = 'fake-network-uuid'
         mock_gp.return_value = stubs.FakeNeutronPort(network_id=network_uuid)
@@ -1340,7 +1631,7 @@ class TestGetPhysnetsByPortUUID(base.TestCase):
         self.assertEqual(set(), result)
 
     def test_get_physnets_by_port_uuid_no_segment(
-            self, mock_gp, mock_gn):
+            self, mock_gp, mock_gn, mock_gs):
         port_uuid = 'fake-port-uuid'
         network_uuid = 'fake-network-uuid'
         physnet = 'fake-physnet'
@@ -1353,13 +1644,14 @@ class TestGetPhysnetsByPortUUID(base.TestCase):
         mock_gn.assert_called_once_with(self.client, network_uuid)
         self.assertEqual({physnet}, result)
 
-    def test_get_physnets_by_port_uuid_multiple_segments(self, mock_gp,
-                                                         mock_gn):
+    def test_get_physnets_by_port_uuid_multiple_segments(
+            self, mock_gp, mock_gn, mock_gs):
         port_uuid = 'fake-port-uuid'
         network_uuid = 'fake-network-uuid'
         physnet1 = 'fake-physnet-1'
         physnet2 = 'fake-physnet-2'
-        mock_gp.return_value = stubs.FakeNeutronPort(network_id=network_uuid)
+        mock_gp.return_value = stubs.FakeNeutronPort(network_id=network_uuid,
+                                                     fixed_ips=[])
         mock_gn.return_value = stubs.FakeNeutronNetwork(
             **{'segments': [{'provider:physical_network': physnet1},
                             {'provider:physical_network': physnet2}]})
@@ -1368,11 +1660,49 @@ class TestGetPhysnetsByPortUUID(base.TestCase):
         mock_gn.assert_called_once_with(self.client, network_uuid)
         self.assertEqual({physnet1, physnet2}, result)
 
-    def test_get_physnets_by_port_uuid_multiple_segments_no_physnet(
-            self, mock_gp, mock_gn):
+    def test_get_physnets_by_port_uuid_multiple_segments_fixed_ip_l3(
+            self, mock_gp, mock_gn, mock_gs):
         port_uuid = 'fake-port-uuid'
         network_uuid = 'fake-network-uuid'
-        mock_gp.return_value = stubs.FakeNeutronPort(network_id=network_uuid)
+        subnet_uuid = 'fake-subnet-uuid'
+        physnet1 = 'fake-physnet-1'
+        mock_gp.return_value = stubs.FakeNeutronPort(
+            network_id=network_uuid,
+            fixed_ips=[{'subnet_id': subnet_uuid}])
+        mock_gs.return_value = stubs.FakeNeutronSegment(
+            physical_network=physnet1)
+        result = neutron.get_physnets_by_port_uuid(self.client, port_uuid)
+        mock_gs.assert_called_once_with(self.client, subnet_uuid)
+        mock_gp.assert_called_once_with(self.client, port_uuid)
+        self.assertEqual({physnet1}, result)
+
+    def test_get_physnets_by_port_uuid_multiple_segments_fixed_ip_l2(
+            self, mock_gp, mock_gn, mock_gs):
+        port_uuid = 'fake-port-uuid'
+        network_uuid = 'fake-network-uuid'
+        subnet_uuid = 'fake-subnet-uuid'
+        physnet1 = 'fake-physnet-1'
+        physnet2 = 'fake-physnet-2'
+        mock_gp.return_value = stubs.FakeNeutronPort(
+            network_id=network_uuid,
+            fixed_ips=[{'subnet_id': subnet_uuid}])
+        mock_gs.return_value = None
+        mock_gn.return_value = stubs.FakeNeutronNetwork(
+            **{'segments': [{'provider:physical_network': physnet1},
+                            {'provider:physical_network': physnet2}]})
+        result = neutron.get_physnets_by_port_uuid(self.client, port_uuid)
+        mock_gs.assert_called_once_with(self.client, subnet_uuid)
+        mock_gp.assert_called_once_with(self.client, port_uuid)
+        mock_gn.assert_called_once_with(self.client, network_uuid)
+        self.assertEqual({physnet1, physnet2}, result)
+
+    def test_get_physnets_by_port_uuid_multiple_segments_no_physnet(
+            self, mock_gp, mock_gn, mock_gs):
+        port_uuid = 'fake-port-uuid'
+        network_uuid = 'fake-network-uuid'
+        mock_gp.return_value = stubs.FakeNeutronPort(
+            network_id=network_uuid,
+            fixed_ips=[])
         mock_gn.return_value = stubs.FakeNeutronNetwork(
             **{'segments': [{'provider:physical_network': None},
                             {'provider:physical_network': None}]})
@@ -1381,7 +1711,8 @@ class TestGetPhysnetsByPortUUID(base.TestCase):
         mock_gn.assert_called_once_with(self.client, network_uuid)
         self.assertEqual(set(), result)
 
-    def test_get_physnets_by_port_uuid_port_missing(self, mock_gp, mock_gn):
+    def test_get_physnets_by_port_uuid_port_missing(
+            self, mock_gp, mock_gn, mock_gs):
         port_uuid = 'fake-port-uuid'
         mock_gp.side_effect = exception.InvalidParameterValue('error')
         self.assertRaises(exception.InvalidParameterValue,
@@ -1390,7 +1721,8 @@ class TestGetPhysnetsByPortUUID(base.TestCase):
         mock_gp.assert_called_once_with(self.client, port_uuid)
         self.assertFalse(mock_gn.called)
 
-    def test_get_physnets_by_port_uuid_port_failure(self, mock_gp, mock_gn):
+    def test_get_physnets_by_port_uuid_port_failure(
+            self, mock_gp, mock_gn, mock_gs):
         port_uuid = 'fake-port-uuid'
         mock_gp.side_effect = exception.NetworkError
         self.assertRaises(exception.NetworkError,
@@ -1400,7 +1732,7 @@ class TestGetPhysnetsByPortUUID(base.TestCase):
         self.assertFalse(mock_gn.called)
 
     def test_get_physnets_by_port_uuid_network_missing(
-            self, mock_gp, mock_gn):
+            self, mock_gp, mock_gn, mock_gs):
         port_uuid = 'fake-port-uuid'
         network_uuid = 'fake-network-uuid'
         mock_gp.return_value = stubs.FakeNeutronPort(network_id=network_uuid)
@@ -1412,7 +1744,7 @@ class TestGetPhysnetsByPortUUID(base.TestCase):
         mock_gn.assert_called_once_with(self.client, network_uuid)
 
     def test_get_physnets_by_port_uuid_network_failure(
-            self, mock_gp, mock_gn):
+            self, mock_gp, mock_gn, mock_gs):
         port_uuid = 'fake-port-uuid'
         network_uuid = 'fake-network-uuid'
         mock_gp.return_value = stubs.FakeNeutronPort(network_id=network_uuid)
@@ -1422,3 +1754,28 @@ class TestGetPhysnetsByPortUUID(base.TestCase):
                           self.client, port_uuid)
         mock_gp.assert_called_once_with(self.client, port_uuid)
         mock_gn.assert_called_once_with(self.client, network_uuid)
+
+
+class TestNeutronNetworkInterfaceMixin(db_base.DbTestCase):
+
+    def setUp(self):
+        super(TestNeutronNetworkInterfaceMixin, self).setUp()
+        self.node = object_utils.create_test_node(self.context)
+
+    def test_get_network_names_and_uuids(self):
+        """A test to validate configured overrides work."""
+        for name in ['cleaning', 'provisioning', 'rescuing', 'inspection',
+                     'servicing']:
+            method_name = 'get_{}_network_uuid'.format(name)
+            method_to_call = getattr(neutron.NeutronNetworkInterfaceMixin,
+                                     method_name)
+            network_uuid = uuidutils.generate_uuid()
+            self.node.driver_info = {'%s_network' % name: network_uuid}
+            self.node.save()
+            with mock.patch.object(neutron, 'validate_network',
+                                   autospec=True) as mock_validate:
+                with task_manager.acquire(self.context,
+                                          self.node.uuid) as task:
+                    method_to_call(self, task)
+                    mock_validate.assert_called_once_with(
+                        network_uuid, mock.ANY, context=task.context)

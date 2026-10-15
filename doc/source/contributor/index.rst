@@ -8,45 +8,80 @@ If you are new to ironic, this section contains information that should help
 you get started as a developer working on the project or contributing to the
 project.
 
+This guide assumes you have read the
+`OpenDev getting started documentation <https://docs.opendev.org/opendev/infra-manual/latest/gettingstarted.html>`_.
+It will also be helpful to be familiar with
+`OpenStack contributors documentation <https://docs.openstack.org/contributors/code-and-documentation/>`_,
+which contains basic information about how to use many of the community tools
+and OpenStack practices.
+
+Basic information about setting up development environments with devstack
+or bifrost, or getting unit tests running can be found here:
+
 .. toctree::
-  :maxdepth: 1
+   :maxdepth: 2
+
+   dev-quickstart
+   devstack-guide
+   bifrost-dev-guide
+   local-dev-guide
+
+.. toctree::
+   :hidden:
+
+   states
+
+Bugs
+----
+Information about how ironic projects handle bugs can be found below.
+
+.. toctree::
+  :maxdepth: 2
+
+  Bugs Reporting and Triaging Guide <bugs>
+  Bug Deputy Guide <bug-deputy>
+
+Community and Policies
+----------------------
+
+.. toctree::
+  :maxdepth: 2
 
   Bare Metal Community <community>
   Developer Contribution Guide <contributing>
-  Bugs Reporting and Triaging Guide <bugs>
-  Setting Up Your Development Environment <dev-quickstart>
-  Priorities <https://specs.openstack.org/openstack/ironic-specs/#priorities>
   Specifications <https://specs.openstack.org/openstack/ironic-specs/>
   Frequently Asked Questions <faq>
   Contributor Vision <vision>
   OpenStack Vision <vision-reflection>
+
+Architecture and Implementation Details
+---------------------------------------
 
 The following pages describe the architecture of the Bare Metal service
 and may be helpful to anyone working on or with the service, but are written
 primarily for developers.
 
 .. toctree::
-  :maxdepth: 1
+  :maxdepth: 2
 
   Ironic System Architecture <architecture>
   Developing New Notifications <notifications>
   OSProfiler Tracing <osprofiler-support>
   Rolling Upgrades <rolling-upgrades>
   Role Based Access Control Testing <rbac-testing>
+  Metrics <metrics>
+
+Governance and Processes
+------------------------
 
 These pages contain information for PTLs, cross-project liaisons, and core
 reviewers.
 
 .. toctree::
-  :maxdepth: 1
+  :maxdepth: 2
 
   Releasing Ironic Projects <releasing>
   Ironic Governance Structure <governance>
-
-.. toctree::
-   :hidden:
-
-   states
 
 Writing Drivers
 ---------------
@@ -66,45 +101,21 @@ this are provided below. Driver authors are strongly encouraged to talk with
 the developer community about any implementation using this functionality.
 
 .. toctree::
-  :maxdepth: 1
+  :maxdepth: 2
 
   Driver Overview <drivers>
-  Writing "vendor_passthru" methods <vendor-passthru>
-  Creating new BIOS interfaces <bios_develop>
-  Third party continuous integration testing <third-party-ci>
+  Writing "vendor_passthru" Methods <vendor-passthru>
+  Creating New BIOS Interfaces <bios_develop>
+  Third Party Continuous Integration Testing <third-party-ci>
   Writing Deploy or Clean Steps <deploy-steps>
-
-Testing Network Integration
----------------------------
-
-In order to test the integration between the Bare Metal and Networking
-services, support has been added to `devstack <https://docs.openstack.org/devstack/latest/>`_
-to mimic an external physical switch.  Here we include a recommended
-configuration for devstack to bring up this environment.
-
-.. toctree::
-  :maxdepth: 1
-
-  Configuring Devstack for multitenant network testing <ironic-multitenant-networking>
-
-Testing Boot-from-Volume
-------------------------
-
-Starting with the Pike release, it is also possible to use DevStack for testing
-booting from Cinder volumes with VMs.
-
-.. toctree::
-  :maxdepth: 1
-
-  Configuring Devstack for boot-from-volume testing <ironic-boot-from-volume>
 
 Full Ironic Server Python API Reference
 ---------------------------------------
 
 .. toctree::
-  :maxdepth: 1
+  :maxdepth: 2
 
-  api/modules
+  Python Modules Index <api/modules>
 
 Understanding the Ironic's CI
 -----------------------------
@@ -114,30 +125,9 @@ and how to debug failures that may arise. To facilitate that, we have created
 the documentation below.
 
 .. toctree::
-  :maxdepth: 1
+  :maxdepth: 2
 
-  Job roles in the CI <jobs-description>
-  How to add a new job? <adding-new-job>
-  How to debug failures in CI jobs <debug-ci-failures>
-
-Our policy for stable branches
-------------------------------
-
-Stable branches that are on `Extended Maintenance`_ and haven't received
-backports in a while, can be tagged as ``Unmaintained``, after discussions
-within the ironic community. If such a decision is taken, an email will
-be sent to the OpenStack mailing list.
-
-What does ``Unmaintained`` mean? The branch still exists, but the ironic
-upstream community will not actively backport patches from maintained
-branches. Fixes can still be merged, though, if pushed into review by
-operators or other downstream developers. It also means that branchless
-projects (e.g.: ironic-tempest-plugin), may not have configurations that are
-compatible with those branches.
-
-As of 09 March 2020, the list of ``Unmaintained`` branches includes:
-
-* Ocata (Last commit - Jun 28, 2019)
-* Pike (Last commit - Oct 2, 2019)
-
-.. _Extended Maintenance: https://docs.openstack.org/project-team-guide/stable-branches.html#maintenance-phases
+  Job Roles in the CI <jobs-description>
+  How to Add a New Job? <adding-new-job>
+  How to Debug Failures in CI Jobs <debug-ci-failures>
+  Metal3 Continuous Integration <metal3-integration>

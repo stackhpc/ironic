@@ -107,14 +107,15 @@ import traceback
 import futurist
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import excutils
 from oslo_utils import timeutils
 import tenacity
 
 from ironic.common import driver_factory
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import state_machine
 from ironic.common import states
+from ironic.common.trait_based_networking.loader import tbn_config_file_traits
 from ironic.conductor import notification_utils as notify
 from ironic import objects
 from ironic.objects import fields
@@ -219,8 +220,9 @@ class TaskManager(object):
         self.shared = shared
         self._retry = retry
         self._patient = patient
+        self._tbn_traits = None
 
-        self.fsm = states.machine.copy()
+        self.fsm = state_machine.machine.copy()
         self._purpose = purpose
         self._debug_timer = timeutils.StopWatch()
 
@@ -248,8 +250,8 @@ class TaskManager(object):
                 self.driver = None
 
         except Exception:
-            with excutils.save_and_reraise_exception():
-                self.release_resources()
+            self.release_resources()
+            raise
 
     @property
     def node(self):
@@ -269,8 +271,8 @@ class TaskManager(object):
                 self._ports = objects.Port.list_by_node_id(self.context,
                                                            self.node.id)
         except Exception:
-            with excutils.save_and_reraise_exception():
-                self.release_resources()
+            self.release_resources()
+            raise
         return self._ports
 
     @ports.setter
@@ -284,8 +286,8 @@ class TaskManager(object):
                 self._portgroups = objects.Portgroup.list_by_node_id(
                     self.context, self.node.id)
         except Exception:
-            with excutils.save_and_reraise_exception():
-                self.release_resources()
+            self.release_resources()
+            raise
         return self._portgroups
 
     @portgroups.setter
@@ -300,13 +302,24 @@ class TaskManager(object):
                     objects.VolumeConnector.list_by_node_id(
                         self.context, self.node.id)
         except Exception:
-            with excutils.save_and_reraise_exception():
-                self.release_resources()
+            self.release_resources()
+            raise
         return self._volume_connectors
 
     @volume_connectors.setter
     def volume_connectors(self, volume_connectors):
         self._volume_connectors = volume_connectors
+
+    @property
+    def tbn_traits(self):
+        try:
+            if self._tbn_traits is None:
+                self._tbn_traits = tbn_config_file_traits()
+        except Exception:
+            self.release_resources()
+            raise
+
+        return self._tbn_traits
 
     @property
     def volume_targets(self):
@@ -315,8 +328,8 @@ class TaskManager(object):
                 self._volume_targets = objects.VolumeTarget.list_by_node_id(
                     self.context, self.node.id)
         except Exception:
-            with excutils.save_and_reraise_exception():
-                self.release_resources()
+            self.release_resources()
+            raise
         return self._volume_targets
 
     @volume_targets.setter
@@ -338,6 +351,10 @@ class TaskManager(object):
         else:
             stop_after = tenacity.stop_after_attempt(1)
 
+        max_lock_time = \
+            CONF.conductor.node_locked_retry_interval * \
+            CONF.conductor.node_locked_retry_attempts
+
         # NodeLocked exceptions can be annoying. Let's try to alleviate
         # some of that pain by retrying our lock attempts.
         @tenacity.retry(
@@ -347,6 +364,13 @@ class TaskManager(object):
                 CONF.conductor.node_locked_retry_interval),
             reraise=True)
         def reserve_node():
+            if self._debug_timer.elapsed() > max_lock_time:
+                LOG.warning('We have exceeded the normal maximum time window '
+                            'to complete a node lock attempting to reserve '
+                            'node %(node)s for purpose %(purpose)s. At '
+                            '%(time).2f seconds.',
+                            {'node': self.node_id, 'purpose': self._purpose,
+                             'time': self._debug_timer.elapsed()})
             self.node = objects.Node.reserve(self.context, CONF.host,
                                              self.node_id)
             LOG.debug("Node %(node)s successfully reserved for %(purpose)s "
@@ -489,7 +513,7 @@ class TaskManager(object):
         if self.node is None:
             # Rare case if resource released before notification
             task = copy.copy(self)
-            task.fsm = states.machine.copy()
+            task.fsm = state_machine.machine.copy()
             task.node = self._saved_node
         else:
             task = self
@@ -527,7 +551,8 @@ class TaskManager(object):
             self.release_resources()
 
     def process_event(self, event, callback=None, call_args=None,
-                      call_kwargs=None, err_handler=None, target_state=None):
+                      call_kwargs=None, err_handler=None, target_state=None,
+                      last_error=None):
         """Process the given event for the task's current state.
 
         :param event: the name of the event to process
@@ -540,6 +565,8 @@ class TaskManager(object):
                 prev_target_state)
         :param target_state: if specified, the target provision state for the
                node. Otherwise, use the target state from the fsm
+        :param last_error: last error to set on the node together with
+               the state transition.
         :raises: InvalidState if the event is not allowed by the associated
                  state machine
         """
@@ -572,13 +599,15 @@ class TaskManager(object):
 
         # set up the async worker
         if callback:
-            # clear the error if we're going to start work in a callback
-            self.node.last_error = None
+            # update the error if we're going to start work in a callback
+            self.node.last_error = last_error
             if call_args is None:
                 call_args = ()
             if call_kwargs is None:
                 call_kwargs = {}
             self.spawn_after(callback, *call_args, **call_kwargs)
+        elif last_error is not None:
+            self.node.last_error = last_error
 
         # publish the state transition by saving the Node
         self.node.save()
@@ -622,11 +651,9 @@ class TaskManager(object):
             #   - background task finished with no errors.
             #   - background task has crashed with exception.
             #   - callback was added after the background task has
-            #     finished or crashed. While eventlet currently doesn't
-            #     schedule the new thread until the current thread blocks
-            #     for some reason, this is true.
+            #     finished or crashed.
             # All of the above are asserted in tests such that we'll
-            # catch if eventlet ever changes this behavior.
+            # catch if the behavior changes.
             fut = None
             try:
                 fut = self._spawn_method(*self._spawn_args,
@@ -639,7 +666,7 @@ class TaskManager(object):
                 # Don't unlock! The unlock will occur when the
                 # thread finishes.
                 # NOTE(yuriyz): A race condition with process_event()
-                # in callback is possible here if eventlet changes behavior.
+                # in callback is possible here.
                 # E.g., if the execution of the new thread (that handles the
                 # event processing) finishes before we get here, that new
                 # thread may emit the "end" notification before we emit the
@@ -647,21 +674,21 @@ class TaskManager(object):
                 self._notify_provision_state_change()
                 return
             except Exception as e:
-                with excutils.save_and_reraise_exception():
-                    try:
-                        # Execute the on_error hook if set
-                        if self._on_error_method:
-                            self._on_error_method(e, *self._on_error_args,
-                                                  **self._on_error_kwargs)
-                    except Exception:
-                        LOG.warning("Task's on_error hook failed to "
-                                    "call %(method)s on node %(node)s",
-                                    {'method': self._on_error_method.__name__,
-                                     'node': self.node.uuid})
+                try:
+                    # Execute the on_error hook if set
+                    if self._on_error_method:
+                        self._on_error_method(e, *self._on_error_args,
+                                              **self._on_error_kwargs)
+                except Exception:
+                    LOG.warning("Task's on_error hook failed to "
+                                "call %(method)s on node %(node)s",
+                                {'method': self._on_error_method.__name__,
+                                 'node': self.node.uuid})
 
-                    if fut is not None:
-                        # This means the add_done_callback() failed for some
-                        # reason. Nuke the thread.
-                        fut.cancel()
-                    self.release_resources()
+                if fut is not None:
+                    # This means the add_done_callback() failed for some
+                    # reason. Nuke the thread.
+                    fut.cancel()
+                self.release_resources()
+                raise
         self.release_resources()

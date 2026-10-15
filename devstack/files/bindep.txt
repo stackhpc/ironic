@@ -1,7 +1,7 @@
 # NOTE(TheJulia): This is a special bindep file which is independent of the
 # project bindep file which is for general usage. This binde pfile is
-# intended for execution from Devstack. 
-# The *primary* purpose being, devstack manages sql dependency mangement
+# intended for execution from Devstack.
+# The *primary* purpose being, devstack manages sql dependency management
 # and credential setup, so they can't be included here or it is installed
 # prematurely.
 
@@ -10,7 +10,7 @@ ipmitool [default]
 ipxe [platform:dpkg default]
 ipxe-bootimgs [platform:rpm default]
 socat [default]
-xinetd [default]
+xinetd [default !platform:centos-9 !platform:rhel-9]
 tftpd-hpa [platform:dpkg]
 tftp-server [platform:rpm]
 # Starting with Debian Jessie (and thus in Ubuntu Xenial too),
@@ -21,6 +21,9 @@ tftp-server [platform:rpm]
 pxelinux [platform:dpkg]
 syslinux
 syslinux-common [platform:dpkg]
+# On CentOS Stream pxelinux.0 boot loader is in the syslinux-nonlinux
+# package.
+syslinux-nonlinux [platform:rpm]
 isolinux [platform:dpkg]
 socat [default]
 # Grub2 files for boot loadingusing PXE/GRUB2
@@ -31,7 +34,7 @@ libvirt-clients [platform:dpkg]
 libvirt [platform:rpm]
 libvirt-dev [platform:dpkg]
 libvirt-devel [platform:rpm]
-qemu [platform:dpkg]
+qemu-system [platform:dpkg]
 qemu-kvm [platform:dpkg platform:rpm]
 qemu-utils [platform:dpkg]
 qemu-system-data [platform:dpkg]
@@ -43,6 +46,8 @@ ipxe-roms-qemu [platform:rpm]
 openvswitch [platform:rpm]
 iptables [default]
 net-tools [platform:rpm]
+# web assets for ironic-novncproxy
+novnc [default]
 
 # these are needed to compile Python dependencies from sources
 python-dev [platform:dpkg test]
@@ -53,12 +58,6 @@ libssl-dev [platform:dpkg test]
 libffi-dev [platform:dpkg test]
 libffi-devel [platform:rpm test]
 # these are needed by infra for python-* jobs
-libpq-dev [platform:dpkg test]
-libpq-devel [platform:rpm test]
-postgresql
-postgresql-client [platform:dpkg]
-# postgresql-devel [platform:rpm]
-postgresql-server [platform:rpm]
 mariadb [platform:rpm]
 mariadb-server [platform:rpm]
 # mariadb-devel [platform:rpm]
@@ -81,9 +80,6 @@ gdisk [platform:dpkg]
 
 # these are needed to build a deploy ramdisk
 
-# NOTE apparmor is an undeclared dependency for docker on ubuntu,
-# see https://github.com/docker/docker/issues/9745
-apparmor [platform:dpkg imagebuild]
 gnupg [imagebuild]
 squashfs-tools [platform:dpkg platform:redhat imagebuild]
 squashfs [platform:suse imagebuild]
@@ -92,6 +88,7 @@ kpartx
 libguestfs0 [platform:dpkg imagebuild]
 libguestfs [platform:rpm imagebuild]
 libguestfs-tools [platform:dpkg]
+guestfs-tools [platform:rpm imagebuild]
 python-guestfs [platform:dpkg imagebuild]
 qemu-img [platform:rpm]
 # for TinyIPA build

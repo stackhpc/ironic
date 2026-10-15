@@ -10,23 +10,160 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import socket
+import os
+import threading
 
-from ironic_lib import utils as il_utils
+from cheroot.ssl import builtin as cheroot_ssl
+from cheroot import wsgi
 from oslo_concurrency import processutils
+from oslo_log import log as logging
 from oslo_service import service
-from oslo_service import wsgi
+from oslo_service import sslutils
 
 from ironic.api import app
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import tls_utils
+from ironic.common import utils
 from ironic.conf import CONF
 
 
+LOG = logging.getLogger(__name__)
 _MAX_DEFAULT_WORKERS = 4
 
 
-class WSGIService(service.ServiceBase):
+def validate_cert_paths(cert_file, key_file):
+    if cert_file and not os.path.exists(cert_file):
+        raise RuntimeError(_("Unable to find cert_file: %s") % cert_file)
+    if key_file and not os.path.exists(key_file):
+        raise RuntimeError(_("Unable to find key_file: %s") % key_file)
+
+    if not cert_file or not key_file:
+        raise RuntimeError(_("When running server in SSL mode, you must "
+                             "specify a valid cert_file and key_file "
+                             "paths in your configuration file"))
+
+
+class BaseWSGIService(service.ServiceBase):
+
+    def __init__(self, name, app, conf, use_ssl=None):
+        """Initialize, but do not start the WSGI server.
+
+        :param name: The name of the WSGI server given to the loader.
+        :param app: WSGI application to run.
+        :param conf: Object to load configuration from.
+        :param use_ssl: Whether to use TLS on the socker.
+        :returns: None
+        """
+        self.name = name
+        self._conf = conf
+        if use_ssl is None:
+            use_ssl = conf.use_ssl
+
+        socket_mode = None
+        bind_addr = (conf.host_ip, conf.port)
+        if conf.unix_socket:
+            utils.unlink_without_raise(conf.unix_socket)
+            bind_addr = conf.unix_socket
+            socket_mode = conf.unix_socket_mode
+
+        self.server = wsgi.Server(
+            bind_addr=bind_addr,
+            wsgi_app=app,
+            server_name=name)
+
+        if use_ssl:
+            cert_file = conf.cert_file
+            key_file = conf.key_file
+
+            if not (cert_file and key_file):
+                LOG.warning(
+                    "Falling back to deprecated [ssl] group for TLS "
+                    "credentials: the global [ssl] configuration block is "
+                    "deprecated and will be removed in 2026.1"
+                )
+
+                # Register global SSL config options and validate the
+                # existence of configured certificate/private key file paths,
+                # when in secure mode.
+                sslutils.is_enabled(CONF)
+                cert_file = CONF.ssl.cert_file
+                key_file = CONF.ssl.key_file
+
+            validate_cert_paths(cert_file, key_file)
+
+            tls_ciphers = conf.server_tls_ciphers
+            self.server.ssl_adapter = cheroot_ssl.BuiltinSSLAdapter(
+                certificate=cert_file,
+                private_key=key_file,
+                ciphers=tls_ciphers,
+            )
+
+            tls_min = conf.server_tls_minimum_version
+            if tls_min:
+                tls_utils.check_tls_version_supported(tls_min)
+                version = tls_utils.TLS_VERSION_MAP[tls_min]
+                self.server.ssl_adapter.context.minimum_version = (
+                    version
+                )
+                LOG.info(
+                    "TLS minimum version set to %s for %s",
+                    tls_min, name
+                )
+
+            if tls_ciphers:
+                LOG.info(
+                    "TLS ciphers configured for %s", name
+                )
+
+        self._unix_socket = conf.unix_socket
+        self._socket_mode = socket_mode
+        self._thread = None
+
+    def start(self):
+        """Start serving this service using loaded configuration.
+
+        :returns: None
+        """
+        self.server.prepare()
+
+        if self._unix_socket and self._socket_mode is not None:
+            os.chmod(self._unix_socket, self._socket_mode)
+
+        self._thread = threading.Thread(
+            target=self.server.serve,
+            daemon=True
+        )
+
+        self._thread.start()
+
+    def stop(self):
+        """Stop serving this API.
+
+        :returns: None
+        """
+        if self.server:
+            self.server.stop()
+            if self._thread:
+                self._thread.join(timeout=2)
+
+        if self._unix_socket:
+            utils.unlink_without_raise(self._unix_socket)
+
+    def wait(self):
+        """Wait for the service to stop serving this API.
+
+        :returns: None
+        """
+        if self._thread:
+            self._thread.join()
+
+    def reset(self):
+        """No server greenpools to resize."""
+        pass
+
+
+class WSGIService(BaseWSGIService):
     """Provides ability to launch ironic API from wsgi app."""
 
     def __init__(self, name, use_ssl=False):
@@ -36,7 +173,6 @@ class WSGIService(service.ServiceBase):
         :param use_ssl: Wraps the socket in an SSL context if True.
         :returns: None
         """
-        self.name = name
         self.app = app.VersionSelectorApplication()
         self.workers = (
             CONF.api.api_workers
@@ -49,45 +185,4 @@ class WSGIService(service.ServiceBase):
                 _("api_workers value of %d is invalid, "
                   "must be greater than 0.") % self.workers)
 
-        if CONF.api.unix_socket:
-            il_utils.unlink_without_raise(CONF.api.unix_socket)
-            self.server = wsgi.Server(CONF, name, self.app,
-                                      socket_family=socket.AF_UNIX,
-                                      socket_file=CONF.api.unix_socket,
-                                      socket_mode=CONF.api.unix_socket_mode,
-                                      use_ssl=use_ssl)
-        else:
-            self.server = wsgi.Server(CONF, name, self.app,
-                                      host=CONF.api.host_ip,
-                                      port=CONF.api.port,
-                                      use_ssl=use_ssl)
-
-    def start(self):
-        """Start serving this service using loaded configuration.
-
-        :returns: None
-        """
-        self.server.start()
-
-    def stop(self):
-        """Stop serving this API.
-
-        :returns: None
-        """
-        self.server.stop()
-        if CONF.api.unix_socket:
-            il_utils.unlink_without_raise(CONF.unix_socket)
-
-    def wait(self):
-        """Wait for the service to stop serving this API.
-
-        :returns: None
-        """
-        self.server.wait()
-
-    def reset(self):
-        """Reset server greenpool size to default.
-
-        :returns: None
-        """
-        self.server.reset()
+        super().__init__(name, self.app, CONF.api, use_ssl=use_ssl)

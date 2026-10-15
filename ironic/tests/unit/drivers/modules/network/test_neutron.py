@@ -21,6 +21,7 @@ from ironic.common import exception
 from ironic.common import neutron as neutron_common
 from ironic.conductor import task_manager
 from ironic.drivers import base as drivers_base
+from ironic.drivers.modules.network import common
 from ironic.drivers.modules.network import neutron
 from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.objects import utils
@@ -52,7 +53,9 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
         self.port = utils.create_test_port(
             self.context, node_id=self.node.id,
             address='52:54:00:cf:2d:32',
-            internal_info={'tenant_vif_port_id': uuidutils.generate_uuid()})
+            internal_info={
+                common.NetType.TENANT.vif_key: uuidutils.generate_uuid()
+            })
         self.neutron_port = stubs.FakeNeutronPort(
             id='132f871f-eaec-4fed-9475-0d54465e0f00',
             mac_address='52:54:00:cf:2d:32')
@@ -85,25 +88,33 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.interface.port_changed(task, port)
             mock_p_changed.assert_called_once_with(self.interface, task, port)
 
-    def test_init_incorrect_provisioning_net(self):
-        self.config(provisioning_network=None, group='neutron')
-        self.assertRaises(exception.DriverLoadError, neutron.NeutronNetwork)
-        self.config(provisioning_network=uuidutils.generate_uuid(),
-                    group='neutron')
-        self.config(cleaning_network=None, group='neutron')
-        self.assertRaises(exception.DriverLoadError, neutron.NeutronNetwork)
-
     @mock.patch.object(neutron_common, 'validate_network', autospec=True)
     def test_validate(self, validate_mock):
+        self.context.roles = ['admin', 'member', 'reader']
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.validate(task)
+            # NOTE(TheJulia): This tests validates the calls are made.
+            # When not mocked out completely, since Neutron is consulted
+            # on validity of the name or UUID as well, the validate_network
+            # method gets called which raises a validate parsable error.
             self.assertEqual([mock.call(CONF.neutron.cleaning_network,
-                                        'cleaning network',
+                                        'cleaning_network',
                                         context=task.context),
                               mock.call(CONF.neutron.provisioning_network,
-                                        'provisioning network',
+                                        'provisioning_network',
                                         context=task.context)],
                              validate_mock.call_args_list)
+
+    @mock.patch.object(neutron_common, 'validate_network', autospec=True)
+    def test_validate_with_disable_power_off(self, validate_mock):
+        with task_manager.acquire(self.context, self.node.id) as task:
+            task.node.disable_power_off = True
+            self.assertRaises(exception.InvalidParameterValue,
+                              self.interface.validate, task)
+
+            CONF.set_override('allow_disabling_power_off', True,
+                              group='neutron')
+            self.interface.validate(task)
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -111,7 +122,9 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
     @mock.patch.object(neutron_common, 'add_ports_to_network', autospec=True)
     def test_add_provisioning_network(self, add_ports_mock, rollback_mock,
                                       validate_mock):
-        self.port.internal_info = {'provisioning_vif_port_id': 'vif-port-id'}
+        self.port.internal_info = {
+            common.NetType.PROVISIONING.vif_key: 'vif-port-id'
+        }
         self.port.save()
         add_ports_mock.return_value = {self.port.uuid: self.neutron_port.id}
         with task_manager.acquire(self.context, self.node.id) as task:
@@ -123,10 +136,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                 security_groups=[])
             validate_mock.assert_called_once_with(
                 CONF.neutron.provisioning_network,
-                'provisioning network', context=task.context)
+                'provisioning_network', context=task.context)
         self.port.refresh()
         self.assertEqual(self.neutron_port.id,
-                         self.port.internal_info['provisioning_vif_port_id'])
+                         self.port.internal_info[common.NetType.PROVISIONING.vif_key])
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -134,7 +147,9 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
     @mock.patch.object(neutron_common, 'add_ports_to_network', autospec=True)
     def test_add_provisioning_network_from_node(self, add_ports_mock,
                                                 rollback_mock, validate_mock):
-        self.port.internal_info = {'provisioning_vif_port_id': 'vif-port-id'}
+        self.port.internal_info = {
+            common.NetType.PROVISIONING.vif_key: 'vif-port-id'
+        }
         self.port.save()
         add_ports_mock.return_value = {self.port.uuid: self.neutron_port.id}
         # Make sure that changing the network UUID works
@@ -155,10 +170,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                     security_groups=[])
                 validate_mock.assert_called_once_with(
                     provisioning_network_uuid,
-                    'provisioning network', context=task.context)
+                    'provisioning_network', context=task.context)
         self.port.refresh()
         self.assertEqual(self.neutron_port.id,
-                         self.port.internal_info['provisioning_vif_port_id'])
+                         self.port.internal_info[common.NetType.PROVISIONING.vif_key])
 
     @mock.patch.object(neutron_common, 'validate_network',
                        lambda n, t, context=None: n)
@@ -183,7 +198,7 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                     CONF.neutron.provisioning_network_security_groups))
         self.port.refresh()
         self.assertEqual(self.neutron_port.id,
-                         self.port.internal_info['provisioning_vif_port_id'])
+                         self.port.internal_info[common.NetType.PROVISIONING.vif_key])
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -191,7 +206,9 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                        autospec=True)
     def test_remove_provisioning_network(self, remove_ports_mock,
                                          validate_mock):
-        self.port.internal_info = {'provisioning_vif_port_id': 'vif-port-id'}
+        self.port.internal_info = {
+            common.NetType.PROVISIONING.vif_key: 'vif-port-id'
+        }
         self.port.save()
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.remove_provisioning_network(task)
@@ -199,9 +216,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                 task, CONF.neutron.provisioning_network)
             validate_mock.assert_called_once_with(
                 CONF.neutron.provisioning_network,
-                'provisioning network', context=task.context)
+                'provisioning_network', context=task.context)
         self.port.refresh()
-        self.assertNotIn('provisioning_vif_port_id', self.port.internal_info)
+        self.assertNotIn(common.NetType.PROVISIONING.vif_key,
+                         self.port.internal_info)
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -209,7 +227,9 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                        autospec=True)
     def test_remove_provisioning_network_from_node(self, remove_ports_mock,
                                                    validate_mock):
-        self.port.internal_info = {'provisioning_vif_port_id': 'vif-port-id'}
+        self.port.internal_info = {
+            common.NetType.PROVISIONING.vif_key: 'vif-port-id'
+        }
         self.port.save()
         provisioning_network_uuid = '3aea0de6-4b92-44da-9aa0-52d134c83f9c'
         driver_info = self.node.driver_info
@@ -222,9 +242,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                 task, provisioning_network_uuid)
             validate_mock.assert_called_once_with(
                 provisioning_network_uuid,
-                'provisioning network', context=task.context)
+                'provisioning_network', context=task.context)
         self.port.refresh()
-        self.assertNotIn('provisioning_vif_port_id', self.port.internal_info)
+        self.assertNotIn(common.NetType.PROVISIONING.vif_key,
+                         self.port.internal_info)
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -240,10 +261,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.assertEqual(res, add_ports_mock.return_value)
             validate_mock.assert_called_once_with(
                 CONF.neutron.cleaning_network,
-                'cleaning network', context=task.context)
+                'cleaning_network', context=task.context)
         self.port.refresh()
         self.assertEqual(self.neutron_port.id,
-                         self.port.internal_info['cleaning_vif_port_id'])
+                         self.port.internal_info[common.NetType.CLEANING.vif_key])
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -266,10 +287,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                 self.assertEqual(res, add_ports_mock.return_value)
                 validate_mock.assert_called_once_with(
                     cleaning_network_uuid,
-                    'cleaning network', context=task.context)
+                    'cleaning_network', context=task.context)
         self.port.refresh()
         self.assertEqual(self.neutron_port.id,
-                         self.port.internal_info['cleaning_vif_port_id'])
+                         self.port.internal_info[common.NetType.CLEANING.vif_key])
 
     @mock.patch.object(neutron_common, 'validate_network',
                        lambda n, t, context=None: n)
@@ -291,7 +312,7 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.assertEqual(res, add_ports_mock.return_value)
         self.port.refresh()
         self.assertEqual(self.neutron_port.id,
-                         self.port.internal_info['cleaning_vif_port_id'])
+                         self.port.internal_info[common.NetType.CLEANING.vif_key])
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -299,7 +320,9 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                        autospec=True)
     def test_remove_cleaning_network(self, remove_ports_mock,
                                      validate_mock):
-        self.port.internal_info = {'cleaning_vif_port_id': 'vif-port-id'}
+        self.port.internal_info = {
+            common.NetType.CLEANING.vif_key: 'vif-port-id'
+        }
         self.port.save()
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.remove_cleaning_network(task)
@@ -307,9 +330,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                 task, CONF.neutron.cleaning_network)
             validate_mock.assert_called_once_with(
                 CONF.neutron.cleaning_network,
-                'cleaning network', context=task.context)
+                'cleaning_network', context=task.context)
         self.port.refresh()
-        self.assertNotIn('cleaning_vif_port_id', self.port.internal_info)
+        self.assertNotIn(common.NetType.CLEANING.vif_key,
+                         self.port.internal_info)
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -317,7 +341,9 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                        autospec=True)
     def test_remove_cleaning_network_from_node(self, remove_ports_mock,
                                                validate_mock):
-        self.port.internal_info = {'cleaning_vif_port_id': 'vif-port-id'}
+        self.port.internal_info = {
+            common.NetType.CLEANING.vif_key: 'vif-port-id'
+        }
         self.port.save()
         cleaning_network_uuid = '3aea0de6-4b92-44da-9aa0-52d134c83fdf'
         driver_info = self.node.driver_info
@@ -330,9 +356,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                 task, cleaning_network_uuid)
             validate_mock.assert_called_once_with(
                 cleaning_network_uuid,
-                'cleaning network', context=task.context)
+                'cleaning_network', context=task.context)
         self.port.refresh()
-        self.assertNotIn('cleaning_vif_port_id', self.port.internal_info)
+        self.assertNotIn(common.NetType.CLEANING.vif_key,
+                         self.port.internal_info)
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -345,14 +372,14 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.validate_rescue(task)
             validate_mock.assert_called_once_with(
-                rescuing_network_uuid, 'rescuing network',
+                rescuing_network_uuid, 'rescuing_network',
                 context=task.context),
 
     def test_validate_rescue_exc(self):
         self.config(rescuing_network="", group='neutron')
         with task_manager.acquire(self.context, self.node.id) as task:
             self.assertRaisesRegex(exception.MissingParameterValue,
-                                   'rescuing network is not set',
+                                   'rescuing_network is not set',
                                    self.interface.validate_rescue, task)
 
     @mock.patch.object(neutron_common, 'validate_network',
@@ -365,7 +392,8 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.context, node_id=self.node.id,
             address='52:54:00:cf:2d:33',
             uuid=uuidutils.generate_uuid(),
-            internal_info={'tenant_vif_port_id': uuidutils.generate_uuid()})
+            internal_info={
+                common.NetType.TENANT.vif_key: uuidutils.generate_uuid()})
         neutron_other_port = {'id': uuidutils.generate_uuid(),
                               'mac_address': '52:54:00:cf:2d:33'}
         add_ports_mock.return_value = {
@@ -380,11 +408,12 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.assertEqual(add_ports_mock.return_value, res)
             validate_mock.assert_called_once_with(
                 CONF.neutron.rescuing_network,
-                'rescuing network', context=task.context)
+                'rescuing_network', context=task.context)
         other_port.refresh()
         self.assertEqual(neutron_other_port['id'],
-                         other_port.internal_info['rescuing_vif_port_id'])
-        self.assertNotIn('rescuing_vif_port_id', self.port.internal_info)
+                         other_port.internal_info[common.NetType.RESCUING.vif_key])
+        self.assertNotIn(common.NetType.RESCUING.vif_key,
+                         self.port.internal_info)
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -396,7 +425,8 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.context, node_id=self.node.id,
             address='52:54:00:cf:2d:33',
             uuid=uuidutils.generate_uuid(),
-            internal_info={'tenant_vif_port_id': uuidutils.generate_uuid()})
+            internal_info={
+                common.NetType.TENANT.vif_key: uuidutils.generate_uuid()})
         neutron_other_port = {'id': uuidutils.generate_uuid(),
                               'mac_address': '52:54:00:cf:2d:33'}
         add_ports_mock.return_value = {
@@ -416,11 +446,12 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.assertEqual(add_ports_mock.return_value, res)
             validate_mock.assert_called_once_with(
                 rescuing_network_uuid,
-                'rescuing network', context=task.context)
+                'rescuing_network', context=task.context)
         other_port.refresh()
         self.assertEqual(neutron_other_port['id'],
-                         other_port.internal_info['rescuing_vif_port_id'])
-        self.assertNotIn('rescuing_vif_port_id', self.port.internal_info)
+                         other_port.internal_info[common.NetType.RESCUING.vif_key])
+        self.assertNotIn(common.NetType.RESCUING.vif_key,
+                         self.port.internal_info)
 
     @mock.patch.object(neutron_common, 'validate_network',
                        lambda n, t, context=None: n)
@@ -442,7 +473,7 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.assertEqual(add_ports_mock.return_value, res)
         self.port.refresh()
         self.assertEqual(self.neutron_port.id,
-                         self.port.internal_info['rescuing_vif_port_id'])
+                         self.port.internal_info[common.NetType.RESCUING.vif_key])
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -454,8 +485,11 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.context, node_id=self.node.id,
             address='52:54:00:cf:2d:33',
             uuid=uuidutils.generate_uuid(),
-            internal_info={'tenant_vif_port_id': uuidutils.generate_uuid()})
-        other_port.internal_info = {'rescuing_vif_port_id': 'vif-port-id'}
+            internal_info={
+                common.NetType.TENANT.vif_key: uuidutils.generate_uuid()})
+        other_port.internal_info = {
+            common.NetType.RESCUING.vif_key: 'vif-port-id'
+        }
         other_port.save()
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.remove_rescuing_network(task)
@@ -463,17 +497,19 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                 task, CONF.neutron.rescuing_network)
             validate_mock.assert_called_once_with(
                 CONF.neutron.rescuing_network,
-                'rescuing network', context=task.context)
+                'rescuing_network', context=task.context)
         other_port.refresh()
-        self.assertNotIn('rescuing_vif_port_id', self.port.internal_info)
-        self.assertNotIn('rescuing_vif_port_id', other_port.internal_info)
+        self.assertNotIn(common.NetType.RESCUING.vif_key,
+                         self.port.internal_info)
+        self.assertNotIn(common.NetType.RESCUING.vif_key,
+                         other_port.internal_info)
 
     @mock.patch.object(neutron_common, 'unbind_neutron_port', autospec=True)
     def test_unconfigure_tenant_networks(self, mock_unbind_port):
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.unconfigure_tenant_networks(task)
             mock_unbind_port.assert_called_once_with(
-                self.port.internal_info['tenant_vif_port_id'],
+                self.port.internal_info[common.NetType.TENANT.vif_key],
                 context=task.context,
                 reset_mac=True)
 
@@ -492,38 +528,56 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.unconfigure_tenant_networks(task)
             mock_unbind_port.assert_called_once_with(
-                self.port.internal_info['tenant_vif_port_id'],
+                self.port.internal_info[common.NetType.TENANT.vif_key],
                 context=task.context,
                 reset_mac=True)
             wait_agent_mock.assert_called_once_with(nclient, 'hostname')
+            client_mock.return_value.close.assert_called_once()
 
     @mock.patch.object(neutron_common, 'unbind_neutron_port', autospec=True)
     def test_unconfigure_tenant_networks_portgroup_1(self, mock_unbind_port):
         pg = utils.create_test_portgroup(
             self.context, node_id=self.node.id, address='ff:54:00:cf:2d:32',
-            internal_info={'tenant_vif_port_id': uuidutils.generate_uuid()})
+            internal_info={
+                common.NetType.TENANT.vif_key: uuidutils.generate_uuid()
+            })
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.unconfigure_tenant_networks(task)
             mock_unbind_port.assert_has_calls([
-                mock.call(self.port.internal_info['tenant_vif_port_id'],
+                mock.call(self.port.internal_info[common.NetType.TENANT.vif_key],
                           context=task.context,
                           reset_mac=True),
-                mock.call(pg.internal_info['tenant_vif_port_id'],
+                mock.call(pg.internal_info[common.NetType.TENANT.vif_key],
                           context=task.context, reset_mac=True)])
 
     @mock.patch.object(neutron_common, 'unbind_neutron_port', autospec=True)
     def test_unconfigure_tenant_networks_portgroup_2(self, mock_unbind_port):
         pg = utils.create_test_portgroup(
             self.context, node_id=self.node.id, address=None,
-            internal_info={'tenant_vif_port_id': uuidutils.generate_uuid()})
+            internal_info={
+                common.NetType.TENANT.vif_key: uuidutils.generate_uuid()
+            })
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.unconfigure_tenant_networks(task)
             mock_unbind_port.assert_has_calls([
-                mock.call(self.port.internal_info['tenant_vif_port_id'],
+                mock.call(self.port.internal_info[common.NetType.TENANT.vif_key],
                           context=task.context,
                           reset_mac=True),
-                mock.call(pg.internal_info['tenant_vif_port_id'],
+                mock.call(pg.internal_info[common.NetType.TENANT.vif_key],
                           context=task.context, reset_mac=False)])
+
+    @mock.patch.object(neutron_common, 'unbind_neutron_port', autospec=True)
+    def test_unconfigure_tenant_networks_portgroup_member_port(
+            self, mock_unbind_port):
+        pg = utils.create_test_portgroup(
+            self.context, node_id=self.node.id, address='ff:54:00:cf:2d:32')
+        self.port.portgroup_id = pg.id
+        self.port.save()
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.interface.unconfigure_tenant_networks(task)
+            mock_unbind_port.assert_called_once_with(
+                self.port.internal_info[common.NetType.TENANT.vif_key],
+                context=task.context, reset_mac=True)
 
     def test_configure_tenant_networks_no_ports_for_node(self):
         n = utils.create_test_node(self.context, network_interface='neutron',
@@ -546,17 +600,19 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                                    'associated with node',
                                    self.interface.configure_tenant_networks,
                                    task)
-            client_mock.assert_called_once_with(context=task.context)
+            client_mock.assert_not_called()
         upd_mock.assert_not_called()
         self.assertIn('No neutron ports or portgroups are associated with',
                       log_mock.error.call_args[0][0])
 
     @mock.patch.object(neutron_common, 'wait_for_host_agent', autospec=True)
     @mock.patch.object(neutron_common, 'update_neutron_port', autospec=True)
+    @mock.patch.object(neutron_common, 'wait_for_port_status', autospec=True)
     @mock.patch.object(neutron_common, 'get_client', autospec=True)
     @mock.patch.object(neutron, 'LOG', autospec=True)
     def test_configure_tenant_networks_multiple_ports_one_vif_id(
-            self, log_mock, client_mock, update_mock, wait_agent_mock):
+            self, log_mock, client_mock, wait_mock_status, update_mock,
+            wait_agent_mock):
         expected_attrs = {
             'binding:vnic_type': 'baremetal',
             'binding:host_id': self.node.uuid,
@@ -570,13 +626,15 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             client_mock.assert_called_once_with(context=task.context)
         update_mock.assert_called_once_with(
             self.context,
-            self.port.internal_info['tenant_vif_port_id'],
+            self.port.internal_info[common.NetType.TENANT.vif_key],
             expected_attrs)
 
     @mock.patch.object(neutron_common, 'wait_for_host_agent', autospec=True)
     @mock.patch.object(neutron_common, 'update_neutron_port', autospec=True)
+    @mock.patch.object(neutron_common, 'wait_for_port_status', autospec=True)
     @mock.patch.object(neutron_common, 'get_client', autospec=True)
     def test_configure_tenant_networks_update_fail(self, client_mock,
+                                                   wait_mock_status,
                                                    update_mock,
                                                    wait_agent_mock):
         update_mock.side_effect = openstack_exc.OpenStackCloudException(
@@ -587,22 +645,94 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                 self.interface.configure_tenant_networks, task)
             client_mock.assert_called_once_with(context=task.context)
 
+    @mock.patch.object(neutron_common, '_get_port_by_uuid', autospec=True)
+    @mock.patch.object(neutron_common, 'get_client', autospec=True)
+    def test_configure_tenant_networks_update_binding_fail(self, client_mock,
+                                                           mock_get_port):
+        self.config(fail_on_port_binding_failure=True, group='neutron')
+        port = mock.MagicMock()
+        port.get.return_value = 'binding_failed'
+        mock_get_port.return_value = port
+
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.assertRaisesRegex(
+                exception.NetworkError, 'Binding failed',
+                self.interface.configure_tenant_networks, task)
+
     @mock.patch.object(neutron_common, 'wait_for_host_agent', autospec=True)
     @mock.patch.object(neutron_common, 'update_neutron_port', autospec=True)
+    @mock.patch.object(neutron_common, 'wait_for_port_status', autospec=True)
     @mock.patch.object(neutron_common, 'get_client', autospec=True)
-    def _test_configure_tenant_networks(self, client_mock, update_mock,
-                                        wait_agent_mock,
+    def test_configure_tenant_networks_skips_port_without_vif(
+            self, client_mock, wait_mock_status, update_mock,
+            wait_agent_mock):
+        utils.create_test_port(
+            self.context, node_id=self.node.id, address='52:54:00:cf:2d:33',
+            uuid=uuidutils.generate_uuid(), internal_info={})
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.interface.configure_tenant_networks(task)
+        update_mock.assert_called_once_with(
+            self.context,
+            self.port.internal_info[common.NetType.TENANT.vif_key],
+            mock.ANY)
+        client_mock.return_value.close.assert_called_once()
+
+    @mock.patch.object(neutron_common, 'wait_for_host_agent', autospec=True)
+    @mock.patch.object(neutron_common, 'update_neutron_port', autospec=True)
+    @mock.patch.object(neutron_common, 'wait_for_port_status', autospec=True)
+    @mock.patch.object(neutron_common, 'get_client', autospec=True)
+    def test_configure_tenant_networks_portgroup_member_port(
+            self, client_mock, wait_mock_status, update_mock,
+            wait_agent_mock):
+        pg = utils.create_test_portgroup(
+            self.context, node_id=self.node.id, address='ff:54:00:cf:2d:32')
+        self.port.portgroup_id = pg.id
+        self.port.save()
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.interface.configure_tenant_networks(task)
+        update_mock.assert_called_once_with(
+            self.context,
+            self.port.internal_info[common.NetType.TENANT.vif_key],
+            mock.ANY)
+
+    @mock.patch.object(neutron_common, 'wait_for_host_agent', autospec=True)
+    @mock.patch.object(neutron_common, 'update_neutron_port', autospec=True)
+    @mock.patch.object(neutron_common, 'wait_for_port_status', autospec=True)
+    @mock.patch.object(neutron_common, 'get_client', autospec=True)
+    def test_configure_tenant_networks_second_port_update_fail(
+            self, client_mock, wait_mock_status, update_mock,
+            wait_agent_mock):
+        utils.create_test_port(
+            self.context, node_id=self.node.id, address='52:54:00:cf:2d:33',
+            uuid=uuidutils.generate_uuid(),
+            internal_info={
+                common.NetType.TENANT.vif_key: uuidutils.generate_uuid()})
+        update_mock.side_effect = [
+            None, openstack_exc.OpenStackCloudException(message='meow')]
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.assertRaisesRegex(
+                exception.NetworkError, 'Could not add',
+                self.interface.configure_tenant_networks, task)
+        self.assertEqual(2, update_mock.call_count)
+        client_mock.return_value.close.assert_called_once()
+
+    @mock.patch.object(neutron_common, 'wait_for_host_agent', autospec=True)
+    @mock.patch.object(neutron_common, 'update_neutron_port', autospec=True)
+    @mock.patch.object(neutron_common, 'wait_for_port_status', autospec=True)
+    @mock.patch.object(neutron_common, 'get_client', autospec=True)
+    def _test_configure_tenant_networks(self, client_mock, wait_mock_status,
+                                        update_mock, wait_agent_mock,
                                         is_client_id=False):
         # NOTE(TheJulia): Until we have a replacement for infiniband client-id
         # storage, extra has to stay put. On a plus side, this would be
         # pointless/difficult to abuse other than just break dhcp for the node.
         extra = {}
-        tenant_vif = self.port.internal_info['tenant_vif_port_id']
+        tenant_vif = self.port.internal_info[common.NetType.TENANT.vif_key]
         kwargs = {
             'internal_info': {
-                'tenant_vif_port_id': uuidutils.generate_uuid()}}
+                common.NetType.TENANT.vif_key: uuidutils.generate_uuid()}}
         self.port.internal_info = {
-            'tenant_vif_port_id': tenant_vif}
+            common.NetType.TENANT.vif_key: tenant_vif}
         self.port.extra = {}
         second_port = utils.create_test_port(
             self.context, node_id=self.node.id, address='52:54:00:cf:2d:33',
@@ -640,8 +770,9 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.configure_tenant_networks(task)
             client_mock.assert_called_once_with(context=task.context)
-        portid1 = self.port.internal_info['tenant_vif_port_id']
-        portid2 = second_port.internal_info['tenant_vif_port_id']
+        client_mock.return_value.close.assert_called_once()
+        portid1 = self.port.internal_info[common.NetType.TENANT.vif_key]
+        portid2 = second_port.internal_info[common.NetType.TENANT.vif_key]
         update_mock.assert_has_calls(
             [mock.call(self.context, portid1, port1_attrs),
              mock.call(self.context, portid2, port2_attrs)],
@@ -661,15 +792,18 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
     @mock.patch.object(neutron_common, 'get_neutron_port_data', autospec=True)
     @mock.patch.object(neutron_common, 'wait_for_host_agent', autospec=True)
     @mock.patch.object(neutron_common, 'update_neutron_port', autospec=True)
+    @mock.patch.object(neutron_common, 'wait_for_port_status', autospec=True)
     @mock.patch.object(neutron_common, 'get_client', autospec=True)
     @mock.patch.object(neutron_common, 'get_local_group_information',
                        autospec=True)
     def test_configure_tenant_networks_with_portgroups(
-            self, glgi_mock, client_mock, update_mock, wait_agent_mock,
-            port_data_mock):
+            self, glgi_mock, client_mock, wait_mock_status, update_mock,
+            wait_agent_mock, port_data_mock):
         pg = utils.create_test_portgroup(
             self.context, node_id=self.node.id, address='ff:54:00:cf:2d:32',
-            internal_info={'tenant_vif_port_id': uuidutils.generate_uuid()})
+            internal_info={
+                common.NetType.TENANT.vif_key: uuidutils.generate_uuid()
+            })
         port1 = utils.create_test_port(
             self.context, node_id=self.node.id, address='ff:54:00:cf:2d:33',
             uuid=uuidutils.generate_uuid(),
@@ -712,25 +846,28 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             glgi_mock.assert_called_once_with(task, pg)
         update_mock.assert_has_calls(
             [mock.call(self.context,
-                       self.port.internal_info['tenant_vif_port_id'],
+                       self.port.internal_info[common.NetType.TENANT.vif_key],
                        call1_attrs),
              mock.call(self.context,
-                       pg.internal_info['tenant_vif_port_id'],
+                       pg.internal_info[common.NetType.TENANT.vif_key],
                        call2_attrs)]
         )
 
     @mock.patch.object(neutron_common, 'get_neutron_port_data', autospec=True)
     @mock.patch.object(neutron_common, 'wait_for_host_agent', autospec=True)
     @mock.patch.object(neutron_common, 'update_neutron_port', autospec=True)
+    @mock.patch.object(neutron_common, 'wait_for_port_status', autospec=True)
     @mock.patch.object(neutron_common, 'get_client', autospec=True)
     @mock.patch.object(neutron_common, 'get_local_group_information',
                        autospec=True)
     def test_configure_tenant_networks_with_portgroups_no_address(
-            self, glgi_mock, client_mock, update_mock, wait_agent_mock,
-            port_data_mock):
+            self, glgi_mock, client_mock, wait_mock_status, update_mock,
+            wait_agent_mock, port_data_mock):
         pg = utils.create_test_portgroup(
             self.context, node_id=self.node.id, address=None,
-            internal_info={'tenant_vif_port_id': uuidutils.generate_uuid()})
+            internal_info={
+                common.NetType.TENANT.vif_key: uuidutils.generate_uuid()
+            })
         port1 = utils.create_test_port(
             self.context, node_id=self.node.id, address='ff:54:00:cf:2d:33',
             uuid=uuidutils.generate_uuid(),
@@ -772,10 +909,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             glgi_mock.assert_called_once_with(task, pg)
         update_mock.assert_has_calls(
             [mock.call(self.context,
-                       self.port.internal_info['tenant_vif_port_id'],
+                       self.port.internal_info[common.NetType.TENANT.vif_key],
                        call1_attrs),
              mock.call(self.context,
-                       pg.internal_info['tenant_vif_port_id'],
+                       pg.internal_info[common.NetType.TENANT.vif_key],
                        call2_attrs)]
         )
 
@@ -803,10 +940,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.assertEqual(res, add_ports_mock.return_value)
             validate_mock.assert_called_once_with(
                 CONF.neutron.inspection_network,
-                'inspection network', context=task.context)
+                'inspection_network', context=task.context)
         self.port.refresh()
         self.assertEqual(self.neutron_port.id,
-                         self.port.internal_info['inspection_vif_port_id'])
+                         self.port.internal_info[common.NetType.INSPECTION.vif_key])
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -830,10 +967,10 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
                 self.assertEqual(res, add_ports_mock.return_value)
                 validate_mock.assert_called_once_with(
                     inspection_network_uuid,
-                    'inspection network', context=task.context)
+                    'inspection_network', context=task.context)
         self.port.refresh()
         self.assertEqual(self.neutron_port.id,
-                         self.port.internal_info['inspection_vif_port_id'])
+                         self.port.internal_info[common.NetType.INSPECTION.vif_key])
 
     @mock.patch.object(neutron_common, 'validate_network',
                        lambda n, t, context=None: n)
@@ -857,7 +994,7 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             self.assertEqual(res, add_ports_mock.return_value)
         self.port.refresh()
         self.assertEqual(self.neutron_port.id,
-                         self.port.internal_info['inspection_vif_port_id'])
+                         self.port.internal_info[common.NetType.INSPECTION.vif_key])
 
     @mock.patch.object(neutron_common, 'validate_network',
                        side_effect=lambda n, t, context=None: n, autospec=True)
@@ -870,7 +1007,7 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
         with task_manager.acquire(self.context, self.node.id) as task:
             self.interface.validate_inspection(task)
             validate_mock.assert_called_once_with(
-                inspection_network_uuid, 'inspection network',
+                inspection_network_uuid, 'inspection_network',
                 context=task.context),
 
     def test_validate_inspection_exc(self):
@@ -887,3 +1024,55 @@ class NeutronInterfaceTestCase(db_base.DbTestCase):
             network_data = self.interface.get_node_network_data(task)
 
         self.assertEqual({}, network_data)
+        self.assertIn('metadata', self.interface.capabilities)
+
+    @mock.patch.object(neutron.NeutronNetwork, 'configure_tenant_networks',
+                       autospec=True)
+    @mock.patch.object(neutron.NeutronNetwork, 'unconfigure_tenant_networks',
+                       autospec=True)
+    def test_reattach_networking(self, mock_unconfigure, mock_configure):
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.interface.reattach_networking(task)
+            mock_unconfigure.assert_called_once_with(self.interface, task)
+            mock_configure.assert_called_once_with(self.interface, task)
+
+    @mock.patch.object(neutron.NeutronNetwork, 'configure_tenant_networks',
+                       autospec=True)
+    @mock.patch.object(neutron.NeutronNetwork, 'unconfigure_tenant_networks',
+                       autospec=True)
+    def test_reattach_networking_unconfigure_fails(
+            self, mock_unconfigure, mock_configure):
+        mock_unconfigure.side_effect = exception.NetworkError('test error')
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.assertRaises(exception.NetworkError,
+                              self.interface.reattach_networking, task)
+            mock_unconfigure.assert_called_once_with(self.interface, task)
+            # configure should not be called if unconfigure fails
+            mock_configure.assert_not_called()
+
+    @mock.patch.object(neutron.NeutronNetwork, 'configure_tenant_networks',
+                       autospec=True)
+    @mock.patch.object(neutron.NeutronNetwork, 'unconfigure_tenant_networks',
+                       autospec=True)
+    def test_reattach_networking_configure_fails(
+            self, mock_unconfigure, mock_configure):
+        mock_configure.side_effect = exception.NetworkError('test error')
+        with task_manager.acquire(self.context, self.node.id) as task:
+            self.assertRaises(exception.NetworkError,
+                              self.interface.reattach_networking, task)
+            mock_unconfigure.assert_called_once_with(self.interface, task)
+            mock_configure.assert_called_once_with(self.interface, task)
+
+    def test_reattach_networking_is_service_step(self):
+        # Verify reattach_networking is registered as a service step
+        with task_manager.acquire(self.context, self.node.id) as task:
+            steps = self.interface.get_service_steps(task)
+            step_names = [s['step'] for s in steps]
+            self.assertIn('reattach_networking', step_names)
+            # Find the reattach_networking step
+            reattach_step = [s for s in steps
+                             if s['step'] == 'reattach_networking'][0]
+            # Verify it doesn't require ramdisk
+            self.assertFalse(reattach_step.get('requires_ramdisk', True))
+            # Verify priority is 0 (manual only)
+            self.assertEqual(0, reattach_step['priority'])

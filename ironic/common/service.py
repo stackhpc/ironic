@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Copyright © 2012 eNovance <licensing@enovance.com>
 #
@@ -14,12 +13,14 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from oslo_config import cfg
 from oslo_log import log
 try:
     from oslo_reports import guru_meditation_report as gmr
     from oslo_reports import opts as gmr_opts
 except ImportError:
     gmr = None
+from oslo_service import opts as oslo_service_opts
 from oslo_service import service
 
 from ironic.common import config
@@ -31,6 +32,39 @@ from ironic import version
 
 
 LOG = log.getLogger(__name__)
+
+
+def _get_global_conf():
+    """Return the process-local CONF singleton when CONF is unpickled.
+
+    In the parent process this is the fully-configured CONF (the spawn probe
+    never actually unpickles it). In a spawned child process it returns the
+    initially-empty CONF that ``BaseRPCService.__setstate__`` will have
+    already populated via ``prepare_command()``.
+    """
+    from oslo_config import cfg as _cfg
+    return _cfg.CONF
+
+
+def _make_conf_spawn_safe():
+    """Make oslo.config's CONF picklable for oslo.service's spawn probe.
+
+    oslo.service calls ``ForkingPickler.dumps(conf)`` to decide between the
+    spawn and fork multiprocessing contexts.  After ``parse_args()``,
+    ConfigOpts internals are unpicklable (argparse lambdas per CPython
+    gh-144782, oslo.config ``_ConfigFileOpt`` lambdas, stevedore objects).
+
+    ``__reduce__`` returns the module-level CONF singleton so that:
+
+    * The probe succeeds → oslo.service uses spawn (no fork-fallback warning).
+    * In an actual spawned child, ``_get_global_conf()`` returns the child's
+      own CONF, which ``BaseRPCService.__setstate__`` re-configures via
+      ``prepare_command()`` before ``start()`` is called.
+    """
+    if getattr(cfg.ConfigOpts, '_ironic_spawn_safe', False):
+        return
+    cfg.ConfigOpts.__reduce__ = lambda self: (_get_global_conf, ())
+    cfg.ConfigOpts._ironic_spawn_safe = True
 
 
 def prepare_command(argv=None):
@@ -46,6 +80,11 @@ def prepare_command(argv=None):
     # it does not properly parse the options from config file and uses defaults
     # from oslo_log
     log.setup(CONF, 'ironic')
+    # Register oslo.service's service opts (including log_options and
+    # graceful_shutdown_timeout). These are needed by cotyledon's
+    # oslo_config_glue in spawned child processes where the parent's
+    # option registrations are not inherited.
+    oslo_service_opts.register_service_opts(CONF)
     objects.register_all()
 
 
@@ -56,6 +95,7 @@ def prepare_service(name, argv=None, conf=CONF):
     reporting and profiling.
     """
     prepare_command(argv)
+    _make_conf_spawn_safe()
 
     if gmr is not None:
         gmr_opts.set_defaults(CONF)
@@ -67,8 +107,8 @@ def prepare_service(name, argv=None, conf=CONF):
     profiler.setup(name, CONF.host)
 
 
-def process_launcher():
-    return service.ProcessLauncher(CONF, restart_method='mutate')
+def process_launcher(**kwargs):
+    return service.ProcessLauncher(CONF, restart_method='mutate', **kwargs)
 
 
 def ensure_rpc_transport(conf=CONF):

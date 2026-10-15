@@ -12,6 +12,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import contextlib
 import os
 import tempfile
 
@@ -23,6 +24,7 @@ from oslo_utils import timeutils
 
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import kernel_parameters
 from ironic.common import states
 from ironic.common import swift
 from ironic.conductor import utils
@@ -184,6 +186,27 @@ def add_node_capability(task, capability, value):
     node.save()
 
 
+def remove_node_capability(task, name):
+    """Remove 'capability' from node's 'capabilities' property.
+
+    If 'capability' is empty, do nothing.
+
+    :param task: Task object.
+    :param capability: Capability key.
+
+    """
+    node = task.node
+    properties = node.properties
+    capabilities = properties.get('capabilities', '').split(',')
+    if not capabilities:
+        return
+    updated_capabilities = [cap for cap in capabilities
+                            if not cap.startswith("%s:" % name)]
+    properties['capabilities'] = ','.join(updated_capabilities or [])
+    node.properties = properties
+    node.save()
+
+
 def ensure_next_boot_device(task, driver_info):
     """Ensure boot from correct device if persistent is True
 
@@ -252,15 +275,6 @@ def capabilities_to_dict(capabilities):
     return capabilities_dict
 
 
-def normalize_mac(mac):
-    """Remove '-' and ':' characters and lowercase the MAC string.
-
-    :param mac: MAC address to normalize.
-    :return: Normalized MAC address string.
-    """
-    return mac.replace('-', '').replace(':', '').lower()
-
-
 def get_ramdisk_logs_file_name(node, label=None):
     """Construct the log file name.
 
@@ -298,6 +312,11 @@ def store_ramdisk_logs(node, logs, label=None):
     :raises: SwiftOperationError, if any operation with Swift fails.
 
     """
+    if CONF.agent.deploy_logs_collect == 'never':
+        LOG.info('Ramdisk logs will not be stored as the configuration '
+                 'option `agent.deploy_logs_collect` is set to `never`.')
+        return
+
     logs_file_name = get_ramdisk_logs_file_name(node, label=label)
     data = base64.decode_as_bytes(logs)
 
@@ -309,6 +328,8 @@ def store_ramdisk_logs(node, logs, label=None):
                                 logs_file_name)
         with open(log_path, 'wb') as f:
             f.write(data)
+        LOG.info('Ramdisk logs were stored in local storage for node %(node)s',
+                 {'node': node.uuid})
 
     elif CONF.agent.deploy_logs_storage_backend == 'swift':
         with tempfile.NamedTemporaryFile(dir=CONF.tempdir) as f:
@@ -318,10 +339,12 @@ def store_ramdisk_logs(node, logs, label=None):
             # convert days to seconds
             timeout = CONF.agent.deploy_logs_swift_days_to_expire * 86400
             object_headers = {'X-Delete-After': str(timeout)}
-            swift_api = swift.SwiftAPI()
-            swift_api.create_object(
-                CONF.agent.deploy_logs_swift_container, logs_file_name,
-                f.name, object_headers=object_headers)
+            with swift.SwiftAPI() as swift_api:
+                swift_api.create_object(
+                    CONF.agent.deploy_logs_swift_container, logs_file_name,
+                    f.name, object_headers=object_headers)
+        LOG.info('Ramdisk logs were stored in swift for node %(node)s',
+                 {'node': node.uuid})
 
 
 def collect_ramdisk_logs(node, label=None):
@@ -406,11 +429,30 @@ def get_kernel_append_params(node, default):
 
     :param node: Node object.
     :param default: Default value.
+
+    :raises: InvalidParameterValue if kernel_append_params is an invalid
+             string to append to a kernel command line.
     """
     for location in ('instance_info', 'driver_info'):
         result = getattr(node, location).get('kernel_append_params')
         if result is not None:
-            return result.replace('%default%', default or '')
+            result = result.replace('%default%', default or '')
+
+            if not CONF.conductor.disable_kernel_parameter_parsing:
+                # NOTE(clif) Attempt to parse the append params. Failure to
+                # parse indicates malformed kernel parameters and should be
+                # rejected. parse() will raise if parsing fails.
+                try:
+                    kernel_parameters.KernelCommandLine.parse(result)
+                except exception.InvalidParameterValue:
+                    raise exception.InvalidParameterValue(
+                        _('node\'s %s[\'kernel_append_params\'] contains '
+                          'malformed kernel command line') % location)
+
+            # NOTE(clif) Always run basic sanitization on kernel_append_params
+            result = kernel_parameters.sanitize_kernel_command_line(result)
+
+            return result
 
     return default
 
@@ -420,42 +462,114 @@ def get_field(node, name, deprecated_prefix=None, use_conf=False,
     """Get a driver_info field with deprecated prefix."""
     node_coll = getattr(node, collection)
     value = node_coll.get(name)
-    if value or not deprecated_prefix:
+    if value:
         return value
 
-    deprecated_name = f'{deprecated_prefix}_{name}'
-    value = node_coll.get(deprecated_name)
-    if value:
-        LOG.warning("The %s field %s of node %s is deprecated, "
-                    "please use %s instead",
-                    collection, deprecated_name, node.uuid, name)
-        return value
+    if deprecated_prefix:
+        deprecated_name = f'{deprecated_prefix}_{name}'
+        value = node_coll.get(deprecated_name)
+        if value:
+            LOG.warning("The %s field %s of node %s is deprecated, "
+                        "please use %s instead",
+                        collection, deprecated_name, node.uuid, name)
+            return value
 
     if use_conf:
+        if name == 'bootloader':
+            cpu_arch = node.properties.get('cpu_arch')
+            if cpu_arch:
+                bootloader_by_arch = getattr(
+                    CONF.conductor, 'bootloader_by_arch', {})
+                bootloader_href = bootloader_by_arch.get(cpu_arch)
+                if bootloader_href:
+                    return bootloader_href
         return getattr(CONF.conductor, name)
 
 
-def get_agent_kernel_ramdisk(node, mode='deploy', deprecated_prefix=None):
-    """Get the agent kernel/ramdisk as a dictionary."""
+def _handle_inconsistent_ramdisk_config(msg):
+    LOG.warning(msg)
+    if CONF.conductor.error_on_ramdisk_config_inconsistency:
+        raise exception.MissingParameterValue(msg)
+
+
+def _get_kernel_ramdisk_from_node(node, mode='deploy', deprecated_prefix=None):
     kernel_name = f'{mode}_kernel'
     ramdisk_name = f'{mode}_ramdisk'
     kernel, ramdisk = (
         get_field(node, kernel_name, deprecated_prefix),
         get_field(node, ramdisk_name, deprecated_prefix),
     )
-    # NOTE(dtantsur): avoid situation when e.g. deploy_kernel comes
-    # from driver_info but deploy_ramdisk comes from configuration,
-    # since it's a sign of a potential operator's mistake.
     if not kernel or not ramdisk:
-        return {
-            kernel_name: getattr(CONF.conductor, kernel_name),
-            ramdisk_name: getattr(CONF.conductor, ramdisk_name),
-        }
+        if ramdisk or kernel:
+            solo = 'unknown'
+            missing = 'unknown'
+            if kernel:
+                solo = kernel_name
+                missing = ramdisk_name
+            if ramdisk:
+                solo = ramdisk_name
+                missing = kernel_name
+            msg = _("Node %(node)s driver_info has an override for %(solo)s, "
+                    "but not for %(missing)s. This configuration is "
+                    "ambiguous. Node %(node)s cannot boot a ramdisk.") % {
+                        'node': node.uuid, 'solo': solo, 'missing': missing}
+            _handle_inconsistent_ramdisk_config(msg)
+        return None
+
+    return {kernel_name: kernel, ramdisk_name: ramdisk}
+
+
+def _get_kernel_ramdisk_by_arch(node, mode='deploy', deprecated_prefix=None):
+    kernel_name = f'{mode}_kernel'
+    ramdisk_name = f'{mode}_ramdisk'
+    kernel_dict_param_name = f'{mode}_kernel_by_arch'
+    ramdisk_dict_param_name = f'{mode}_ramdisk_by_arch'
+    kernel_dict = getattr(CONF.conductor, kernel_dict_param_name)
+    ramdisk_dict = getattr(CONF.conductor, ramdisk_dict_param_name)
+    cpu_arch = node.properties.get('cpu_arch')
+    kernel = kernel_dict.get(cpu_arch) if cpu_arch else None
+    ramdisk = ramdisk_dict.get(cpu_arch) if cpu_arch else None
+    if not kernel or not ramdisk:
+        solo = 'unknown'
+        missing = 'unknown'
+        if ramdisk or kernel:
+            if kernel:
+                solo = kernel_dict_param_name
+                missing = ramdisk_dict_param_name
+            if ramdisk:
+                solo = ramdisk_dict_param_name
+                missing = kernel_dict_param_name
+            msg = _("CONF.conductor.%(solo)s has a value for %(cpu_arch)s "
+                    "servers, but doesn't have one in "
+                    "CONF.conductor.%(missing)s. This configuration is "
+                    "ambiguous. Node %(node)s cannot boot a ramdisk.") % {
+                        'solo': solo, 'cpu_arch': cpu_arch,
+                        'missing': missing, 'node': node.uuid}
+            _handle_inconsistent_ramdisk_config(msg)
+        return None
     else:
-        return {
-            kernel_name: kernel,
-            ramdisk_name: ramdisk
-        }
+        return {kernel_name: kernel, ramdisk_name: ramdisk}
+
+
+def get_agent_kernel_ramdisk(node, mode='deploy', deprecated_prefix=None):
+    """Get the agent kernel/ramdisk as a dictionary.
+
+    Get the agent kernel/ramdisk for a given $mode. This code enforces
+    """
+    from_node = _get_kernel_ramdisk_from_node(node, mode, deprecated_prefix)
+    if from_node:
+        return from_node
+
+    from_by_arch = _get_kernel_ramdisk_by_arch(node, mode, deprecated_prefix)
+    if from_by_arch:
+        return from_by_arch
+
+    kernel_name = f'{mode}_kernel'
+    ramdisk_name = f'{mode}_ramdisk'
+    return {
+        kernel_name: getattr(CONF.conductor, kernel_name),
+        ramdisk_name: getattr(CONF.conductor, ramdisk_name),
+    }
 
 
 def get_agent_iso(node, mode='deploy', deprecated_prefix=None):
@@ -480,4 +594,45 @@ def need_prepare_ramdisk(node):
                                     states.RESCUING,
                                     states.RESCUEWAIT,
                                     states.INSPECTING,
-                                    states.INSPECTWAIT)
+                                    states.INSPECTWAIT,
+                                    states.SERVICING,
+                                    states.SERVICEWAIT)
+
+
+@contextlib.contextmanager
+def power_off_and_on(task):
+    """A context manager that handles a reboot.
+
+    If disable_power_off is False, the node is powered off before yielding and
+    powered back on afterwards. Otherwise, one reboot is issued in the end.
+    """
+    if not task.node.disable_power_off:
+        utils.node_power_action(task, states.POWER_OFF)
+    yield
+    next_state = (states.REBOOT if task.node.disable_power_off
+                  else states.POWER_ON)
+    utils.node_power_action(task, next_state)
+
+
+def get_verify_ca(node, verify_ca):
+    """Add verify_ca setting to driver_info if needed.
+
+    This function checks if verify_ca needs to be set based on
+    configuration values and existing driver_info settings.
+
+    :param node: The node object
+    :param verify_ca: The verify_ca settings in driver_info
+    :return: Updated verify_ca setting if needed
+    """
+    config_group = node.driver
+
+    if node.driver == 'idrac':
+        config_group = 'redfish'
+
+    if verify_ca is not None and verify_ca is not True:
+        return verify_ca
+
+    if CONF.get(config_group, {}).get('verify_ca'):
+        verify_ca = CONF[config_group]['verify_ca']
+
+    return verify_ca

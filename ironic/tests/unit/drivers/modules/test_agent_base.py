@@ -13,18 +13,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import time
 import types
 from unittest import mock
 
 from oslo_config import cfg
 from testtools import matchers
 
-from ironic.common import boot_devices
 from ironic.common import exception
-from ironic.common import image_service
+from ironic.common import state_machine
 from ironic.common import states
 from ironic.conductor import cleaning
+from ironic.conductor import servicing
 from ironic.conductor import steps as conductor_steps
 from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
@@ -32,7 +31,6 @@ from ironic.drivers import base as drivers_base
 from ironic.drivers.modules import agent
 from ironic.drivers.modules import agent_base
 from ironic.drivers.modules import agent_client
-from ironic.drivers.modules import boot_mode_utils
 from ironic.drivers.modules import deploy_utils
 from ironic.drivers.modules import fake
 from ironic.drivers.modules import pxe
@@ -49,7 +47,9 @@ DRIVER_INFO = db_utils.get_test_agent_driver_info()
 DRIVER_INTERNAL_INFO = db_utils.get_test_agent_driver_internal_info()
 
 
-class FakeAgentDeploy(agent_base.AgentBaseMixin, agent_base.AgentDeployMixin,
+class FakeAgentDeploy(agent_base.AgentBaseMixin,
+                      agent_base.HeartbeatMixin,
+                      agent_base.AgentOobStepsMixin,
                       fake.FakeDeploy):
     pass
 
@@ -159,7 +159,8 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                        autospec=True)
     def test_heartbeat_in_maintenance(self, next_step_mock):
         # NOTE(pas-ha) checking only for states that are not noop
-        for state in (states.DEPLOYWAIT, states.CLEANWAIT):
+        for state in (states.DEPLOYWAIT, states.CLEANWAIT,
+                      states.SERVICEWAIT):
             next_step_mock.reset_mock()
             self.node.provision_state = state
             self.node.maintenance = True
@@ -186,7 +187,8 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                           group='conductor')
         for state, expected in [(states.DEPLOYWAIT, states.DEPLOYFAIL),
                                 (states.CLEANWAIT, states.CLEANFAIL),
-                                (states.RESCUEWAIT, states.RESCUEFAIL)]:
+                                (states.RESCUEWAIT, states.RESCUEFAIL),
+                                (states.SERVICEWAIT, states.SERVICEFAIL)]:
             next_step_mock.reset_mock()
             self.node.provision_state = state
             self.node.maintenance = True
@@ -211,7 +213,8 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                        autospec=True)
     def test_heartbeat_with_reservation(self, next_step_mock):
         # NOTE(pas-ha) checking only for states that are not noop
-        for state in (states.DEPLOYWAIT, states.CLEANWAIT):
+        for state in (states.DEPLOYWAIT, states.CLEANWAIT,
+                      states.SERVICEWAIT):
             next_step_mock.reset_mock()
             self.node.provision_state = state
             self.node.reservation = 'localhost'
@@ -231,8 +234,10 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                        autospec=True)
     def test_heartbeat_noops_in_wrong_state(self, next_step_mock, log_mock):
         allowed = {states.DEPLOYWAIT, states.CLEANWAIT, states.RESCUEWAIT,
-                   states.DEPLOYING, states.CLEANING, states.RESCUING}
-        for state in set(states.machine.states) - allowed:
+                   states.DEPLOYING, states.CLEANING, states.RESCUING,
+                   states.DEPLOYHOLD, states.CLEANHOLD, states.SERVICEHOLD,
+                   states.SERVICING, states.SERVICEWAIT}
+        for state in set(state_machine.machine.states) - allowed:
             for m in (next_step_mock, log_mock):
                 m.reset_mock()
             with task_manager.acquire(self.context, self.node.uuid,
@@ -252,8 +257,9 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
     def test_heartbeat_noops_in_wrong_state2(self, next_step_mock):
         CONF.set_override('allow_provisioning_in_maintenance', False,
                           group='conductor')
-        allowed = {states.DEPLOYWAIT, states.CLEANWAIT}
-        for state in set(states.machine.states) - allowed:
+        allowed = {states.DEPLOYWAIT, states.CLEANWAIT,
+                   states.SERVICEWAIT}
+        for state in set(state_machine.machine.states) - allowed:
             next_step_mock.reset_mock()
             with task_manager.acquire(self.context, self.node.uuid,
                                       shared=True) as task:
@@ -302,7 +308,7 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
             next_step_mock.side_effect = driver_failure
             self.deploy.heartbeat(task, 'http://127.0.0.1:8080', '1.0.0')
             # task.node.provision_state being set to DEPLOYFAIL
-            # within the driver_failue, hearbeat should not call
+            # within the driver_failue, heartbeat should not call
             # deploy_utils.set_failed_state anymore
             self.assertFalse(failed_mock.called)
             log_mock.assert_called_once_with(
@@ -329,7 +335,32 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
         mock_touch.assert_called_once_with(mock.ANY)
         mock_refresh.assert_called_once_with(mock.ANY, task, 'clean')
         mock_clean.assert_called_once_with(task)
-        mock_set_steps.assert_called_once_with(task)
+        mock_set_steps.assert_called_once_with(task, use_existing_steps=False)
+
+    @mock.patch.object(objects.node.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(agent_base.HeartbeatMixin,
+                       'refresh_steps', autospec=True)
+    @mock.patch.object(conductor_steps, 'set_node_cleaning_steps',
+                       autospec=True)
+    @mock.patch.object(cleaning, 'continue_node_clean', autospec=True)
+    def test_heartbeat_resume_clean_declarative(self, mock_clean,
+                                                mock_set_steps,
+                                                mock_refresh, mock_touch):
+        # Test declarative cleaning case where use_existing_steps=True
+        self.node.clean_step = {}
+        self.node.provision_state = states.CLEANWAIT
+        info = self.node.driver_internal_info
+        info['declarative_cleaning'] = True
+        self.node.driver_internal_info = info
+        self.node.save()
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            self.deploy.heartbeat(task, 'http://127.0.0.1:8080', '1.0.0')
+
+        mock_touch.assert_called_once_with(mock.ANY)
+        mock_refresh.assert_called_once_with(mock.ANY, task, 'clean')
+        mock_clean.assert_called_once_with(task)
+        mock_set_steps.assert_called_once_with(task, use_existing_steps=True)
 
     @mock.patch.object(manager_utils, 'cleaning_error_handler', autospec=True)
     @mock.patch.object(objects.node.Node, 'touch_provisioning', autospec=True)
@@ -463,8 +494,10 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
             task, 'Node failed to perform rescue operation: some failure')
 
     @mock.patch.object(agent_base.LOG, 'error', autospec=True)
-    def test_heartbeat_records_cleaning_deploying(self, log_mock):
-        for provision_state in (states.CLEANING, states.DEPLOYING):
+    def test_heartbeat_records_when_appropriate(self, log_mock):
+        for provision_state in (states.CLEANING, states.DEPLOYING,
+                                states.CLEANHOLD, states.DEPLOYHOLD,
+                                states.SERVICEHOLD, states.SERVICING):
             self.node.driver_internal_info = {}
             self.node.provision_state = provision_state
             self.node.save()
@@ -518,6 +551,68 @@ class HeartbeatMixinTest(AgentDeployMixinBaseTest):
                 self.assertIsNotNone(
                     task.node.driver_internal_info['agent_last_heartbeat'])
                 self.assertEqual(provision_state, task.node.provision_state)
+
+    @mock.patch.object(objects.node.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(agent_base.HeartbeatMixin,
+                       'refresh_steps', autospec=True)
+    @mock.patch.object(conductor_steps, 'set_node_service_steps',
+                       autospec=True)
+    @mock.patch.object(servicing, 'continue_node_service', autospec=True)
+    def test_heartbeat_resume_service(self, mock_service, mock_set_steps,
+                                      mock_refresh, mock_touch):
+        self.node.clean_step = {}
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.save()
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            self.deploy.heartbeat(task, 'http://127.0.0.1:8080', '1.0.0')
+
+        mock_touch.assert_called_once_with(mock.ANY)
+        mock_refresh.assert_called_once_with(mock.ANY, task, 'service')
+        mock_service.assert_called_once_with(task)
+        mock_set_steps.assert_called_once_with(task)
+
+    @mock.patch.object(objects.node.Node, 'touch_provisioning', autospec=True)
+    @mock.patch.object(agent_base.HeartbeatMixin,
+                       'continue_servicing', autospec=True)
+    def test_heartbeat_continue_servicing(self, mock_continue, mock_touch):
+        self.node.service_step = {
+            'priority': 10,
+            'interface': 'deploy',
+            'step': 'foo',
+            'reboot_requested': False
+        }
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.save()
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            self.deploy.heartbeat(task, 'http://127.0.0.1:8080', '1.0.0')
+
+        mock_touch.assert_called_once_with(mock.ANY)
+        mock_continue.assert_called_once_with(mock.ANY, task)
+
+    @mock.patch.object(manager_utils, 'servicing_error_handler', autospec=True)
+    @mock.patch.object(agent_base.HeartbeatMixin,
+                       'continue_servicing', autospec=True)
+    def test_heartbeat_continue_servicing_fails(self, mock_continue,
+                                                mock_handler):
+        self.node.service_step = {
+            'priority': 10,
+            'interface': 'deploy',
+            'step': 'foo',
+            'reboot_requested': False
+        }
+
+        mock_continue.side_effect = Exception()
+
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.save()
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            self.deploy.heartbeat(task, 'http://127.0.0.1:8080', '1.0.0')
+
+        mock_continue.assert_called_once_with(mock.ANY, task)
+        mock_handler.assert_called_once_with(task, mock.ANY, mock.ANY)
 
 
 class AgentRescueTests(AgentDeployMixinBaseTest):
@@ -616,288 +711,7 @@ class AgentRescueTests(AgentDeployMixinBaseTest):
                 task, states.POWER_OFF)
 
 
-class AgentDeployMixinTest(AgentDeployMixinBaseTest):
-    @mock.patch.object(manager_utils, 'power_on_node_if_needed', autospec=True)
-    @mock.patch.object(time, 'sleep', lambda seconds: None)
-    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(fake.FakePower, 'get_power_state',
-                       spec=types.FunctionType)
-    @mock.patch.object(agent_client.AgentClient, 'power_off',
-                       spec=types.FunctionType)
-    def test_tear_down_agent(
-            self, power_off_mock, get_power_state_mock,
-            node_power_action_mock, collect_mock,
-            power_on_node_if_needed_mock):
-        cfg.CONF.set_override('deploy_logs_collect', 'always', 'agent')
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            get_power_state_mock.side_effect = [states.POWER_ON,
-                                                states.POWER_OFF]
-
-            power_on_node_if_needed_mock.return_value = None
-            self.deploy.tear_down_agent(task)
-            power_off_mock.assert_called_once_with(task.node)
-            self.assertEqual(2, get_power_state_mock.call_count)
-            self.assertFalse(node_power_action_mock.called)
-            self.assertEqual(states.DEPLOYING, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-            collect_mock.assert_called_once_with(task.node)
-
-    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
-    @mock.patch.object(time, 'sleep', lambda seconds: None)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(fake.FakePower, 'get_power_state',
-                       spec=types.FunctionType)
-    @mock.patch.object(agent_client.AgentClient, 'power_off',
-                       spec=types.FunctionType)
-    def test_tear_down_agent_soft_poweroff_doesnt_complete(
-            self, power_off_mock, get_power_state_mock,
-            node_power_action_mock, mock_collect):
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            get_power_state_mock.return_value = states.POWER_ON
-            self.deploy.tear_down_agent(task)
-            power_off_mock.assert_called_once_with(task.node)
-            self.assertEqual(7, get_power_state_mock.call_count)
-            node_power_action_mock.assert_called_once_with(task,
-                                                           states.POWER_OFF)
-            self.assertEqual(states.DEPLOYING, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-            self.assertFalse(mock_collect.called)
-
-    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
-    @mock.patch.object(time, 'sleep', lambda seconds: None)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(fake.FakePower, 'get_power_state',
-                       spec=types.FunctionType)
-    @mock.patch.object(agent_client.AgentClient, 'power_off',
-                       spec=types.FunctionType)
-    def test_tear_down_agent_soft_poweroff_fails(
-            self, power_off_mock, get_power_state_mock, node_power_action_mock,
-            mock_collect):
-        power_off_mock.side_effect = RuntimeError("boom")
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            get_power_state_mock.return_value = states.POWER_ON
-            self.deploy.tear_down_agent(task)
-            power_off_mock.assert_called_once_with(task.node)
-            node_power_action_mock.assert_called_once_with(task,
-                                                           states.POWER_OFF)
-            self.assertEqual(states.DEPLOYING, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-            self.assertFalse(mock_collect.called)
-
-    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
-    @mock.patch.object(time, 'sleep', lambda seconds: None)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(fake.FakePower, 'get_power_state',
-                       spec=types.FunctionType)
-    @mock.patch.object(agent_client.AgentClient, 'power_off',
-                       spec=types.FunctionType)
-    def test_tear_down_agent_soft_poweroff_race(
-            self, power_off_mock, get_power_state_mock, node_power_action_mock,
-            mock_collect):
-        # Test the situation when soft power off works, but ironic doesn't
-        # learn about it.
-        power_off_mock.side_effect = RuntimeError("boom")
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            get_power_state_mock.side_effect = [states.POWER_ON,
-                                                states.POWER_OFF]
-            self.deploy.tear_down_agent(task)
-            power_off_mock.assert_called_once_with(task.node)
-            self.assertFalse(node_power_action_mock.called)
-            self.assertEqual(states.DEPLOYING, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-            self.assertFalse(mock_collect.called)
-
-    @mock.patch.object(manager_utils, 'power_on_node_if_needed', autospec=True)
-    @mock.patch.object(time, 'sleep', lambda seconds: None)
-    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(fake.FakePower, 'get_power_state',
-                       spec=types.FunctionType)
-    @mock.patch.object(agent_client.AgentClient, 'power_off',
-                       spec=types.FunctionType)
-    def test_tear_down_agent_get_power_state_fails(
-            self, power_off_mock, get_power_state_mock, node_power_action_mock,
-            mock_collect, power_on_node_if_needed_mock):
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            get_power_state_mock.return_value = RuntimeError("boom")
-            power_on_node_if_needed_mock.return_value = None
-            self.deploy.tear_down_agent(task)
-            power_off_mock.assert_called_once_with(task.node)
-            self.assertEqual(7, get_power_state_mock.call_count)
-            node_power_action_mock.assert_called_once_with(task,
-                                                           states.POWER_OFF)
-            self.assertEqual(states.DEPLOYING, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-            self.assertFalse(mock_collect.called)
-
-    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
-    @mock.patch.object(time, 'sleep', lambda seconds: None)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(fake.FakePower, 'get_power_state',
-                       spec=types.FunctionType)
-    @mock.patch.object(agent_client.AgentClient, 'power_off',
-                       spec=types.FunctionType)
-    def test_tear_down_agent_power_off_fails(
-            self, power_off_mock, get_power_state_mock,
-            node_power_action_mock, mock_collect):
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            get_power_state_mock.return_value = states.POWER_ON
-            node_power_action_mock.side_effect = RuntimeError("boom")
-            self.assertRaises(exception.InstanceDeployFailure,
-                              self.deploy.tear_down_agent,
-                              task)
-            power_off_mock.assert_called_once_with(task.node)
-            self.assertEqual(7, get_power_state_mock.call_count)
-            node_power_action_mock.assert_called_with(task, states.POWER_OFF)
-            self.assertEqual(states.DEPLOYFAIL, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-            mock_collect.assert_called_once_with(task.node)
-
-    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'sync',
-                       spec=types.FunctionType)
-    def test_tear_down_agent_power_action_oob_power_off(
-            self, sync_mock, node_power_action_mock, mock_collect):
-        # Enable force power off
-        driver_info = self.node.driver_info
-        driver_info['deploy_forces_oob_reboot'] = True
-        self.node.driver_info = driver_info
-
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            self.deploy.tear_down_agent(task)
-
-            sync_mock.assert_called_once_with(task.node)
-            node_power_action_mock.assert_called_once_with(task,
-                                                           states.POWER_OFF)
-            self.assertEqual(states.DEPLOYING, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-            self.assertFalse(mock_collect.called)
-
-    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
-    @mock.patch.object(agent_base.LOG, 'warning', autospec=True)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'sync',
-                       spec=types.FunctionType)
-    def test_tear_down_agent_power_action_oob_power_off_failed(
-            self, sync_mock, node_power_action_mock, log_mock, mock_collect):
-        # Enable force power off
-        driver_info = self.node.driver_info
-        driver_info['deploy_forces_oob_reboot'] = True
-        self.node.driver_info = driver_info
-
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            log_mock.reset_mock()
-
-            sync_mock.return_value = {'faultstring': 'Unknown command: blah'}
-            self.deploy.tear_down_agent(task)
-
-            sync_mock.assert_called_once_with(task.node)
-            node_power_action_mock.assert_called_once_with(task,
-                                                           states.POWER_OFF)
-            self.assertEqual(states.DEPLOYING, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-            log_error = ('The version of the IPA ramdisk used in the '
-                         'deployment do not support the command "sync"')
-            log_mock.assert_called_once_with(
-                'Failed to flush the file system prior to hard rebooting the '
-                'node %(node)s: %(error)s',
-                {'node': task.node.uuid, 'error': log_error})
-            self.assertFalse(mock_collect.called)
-
-    @mock.patch.object(manager_utils, 'power_on_node_if_needed', autospec=True)
-    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
-    @mock.patch.object(time, 'sleep', lambda seconds: None)
-    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(fake.FakePower, 'get_supported_power_states',
-                       lambda self, task: [states.REBOOT])
-    @mock.patch.object(agent_client.AgentClient, 'sync', autospec=True)
-    def test_tear_down_agent_no_power_on_support(
-            self, sync_mock, node_power_action_mock, collect_mock,
-            power_on_node_if_needed_mock):
-        cfg.CONF.set_override('deploy_logs_collect', 'always', 'agent')
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            self.deploy.tear_down_agent(task)
-            node_power_action_mock.assert_called_once_with(task, states.REBOOT)
-            self.assertEqual(states.DEPLOYING, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-            collect_mock.assert_called_once_with(task.node)
-            self.assertFalse(power_on_node_if_needed_mock.called)
-            sync_mock.assert_called_once_with(agent_client.get_client(task),
-                                              task.node)
-
-    @mock.patch.object(manager_utils, 'restore_power_state_if_needed',
-                       autospec=True)
-    @mock.patch.object(manager_utils, 'power_on_node_if_needed', autospec=True)
-    @mock.patch('ironic.drivers.modules.network.noop.NoopNetwork.'
-                'remove_provisioning_network', spec_set=True, autospec=True)
-    @mock.patch('ironic.drivers.modules.network.noop.NoopNetwork.'
-                'configure_tenant_networks', spec_set=True, autospec=True)
-    def test_switch_to_tenant_network(self, configure_tenant_net_mock,
-                                      remove_provisioning_net_mock,
-                                      power_on_node_if_needed_mock,
-                                      restore_power_state_mock):
-        power_on_node_if_needed_mock.return_value = states.POWER_OFF
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            self.deploy.switch_to_tenant_network(task)
-            remove_provisioning_net_mock.assert_called_once_with(mock.ANY,
-                                                                 task)
-            configure_tenant_net_mock.assert_called_once_with(mock.ANY, task)
-            power_on_node_if_needed_mock.assert_called_once_with(task)
-            restore_power_state_mock.assert_called_once_with(
-                task, states.POWER_OFF)
-
-    @mock.patch.object(driver_utils, 'collect_ramdisk_logs', autospec=True)
-    @mock.patch('ironic.drivers.modules.network.noop.NoopNetwork.'
-                'remove_provisioning_network', spec_set=True, autospec=True)
-    @mock.patch('ironic.drivers.modules.network.noop.NoopNetwork.'
-                'configure_tenant_networks', spec_set=True, autospec=True)
-    def test_switch_to_tenant_network_fails(self, configure_tenant_net_mock,
-                                            remove_provisioning_net_mock,
-                                            mock_collect):
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node.uuid) as task:
-            configure_tenant_net_mock.side_effect = exception.NetworkError(
-                "boom")
-            self.assertRaises(exception.InstanceDeployFailure,
-                              self.deploy.switch_to_tenant_network, task)
-            remove_provisioning_net_mock.assert_called_once_with(mock.ANY,
-                                                                 task)
-            configure_tenant_net_mock.assert_called_once_with(mock.ANY, task)
-            self.assertFalse(mock_collect.called)
+class BootInstanceTest(AgentDeployMixinBaseTest):
 
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
     def test_boot_instance(self, node_power_action_mock):
@@ -920,593 +734,8 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
             self.deploy.boot_instance(task)
             self.assertFalse(node_power_action_mock.called)
 
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(boot_mode_utils, 'get_boot_mode', autospec=True,
-                       return_value='whatever')
-    def test_configure_local_boot(self, boot_mode_mock,
-                                  try_set_boot_device_mock,
-                                  install_bootloader_mock):
-        install_bootloader_mock.return_value = {
-            'command_status': 'SUCCESS', 'command_error': None}
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = False
-            self.deploy.configure_local_boot(task, root_uuid='some-root-uuid')
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-            boot_mode_mock.assert_called_once_with(task.node)
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node, root_uuid='some-root-uuid',
-                efi_system_part_uuid=None, prep_boot_part_uuid=None,
-                target_boot_mode='whatever', software_raid=False
-            )
 
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(boot_mode_utils, 'get_boot_mode', autospec=True,
-                       return_value='whatever')
-    def test_configure_local_boot_with_prep(self, boot_mode_mock,
-                                            try_set_boot_device_mock,
-                                            install_bootloader_mock):
-        install_bootloader_mock.return_value = {
-            'command_status': 'SUCCESS', 'command_error': None}
-
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = False
-            self.deploy.configure_local_boot(task, root_uuid='some-root-uuid',
-                                             prep_boot_part_uuid='fake-prep')
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-            boot_mode_mock.assert_called_once_with(task.node)
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node, root_uuid='some-root-uuid',
-                efi_system_part_uuid=None, prep_boot_part_uuid='fake-prep',
-                target_boot_mode='whatever', software_raid=False
-            )
-
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(boot_mode_utils, 'get_boot_mode', autospec=True,
-                       return_value='uefi')
-    def test_configure_local_boot_uefi(self, boot_mode_mock,
-                                       try_set_boot_device_mock,
-                                       install_bootloader_mock):
-        install_bootloader_mock.return_value = {
-            'command_status': 'SUCCESS', 'command_error': None}
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = False
-            self.deploy.configure_local_boot(
-                task, root_uuid='some-root-uuid',
-                efi_system_part_uuid='efi-system-part-uuid')
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-            boot_mode_mock.assert_called_once_with(task.node)
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node, root_uuid='some-root-uuid',
-                efi_system_part_uuid='efi-system-part-uuid',
-                prep_boot_part_uuid=None,
-                target_boot_mode='uefi', software_raid=False
-            )
-
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_whole_disk_image(
-            self, install_bootloader_mock, try_set_boot_device_mock):
-
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            self.deploy.configure_local_boot(task)
-            # NOTE(TheJulia): We explicitly call install_bootloader when
-            # we have a whole disk image *and* are in UEFI mode as setting
-            # the internal NVRAM helps negate need to know a root device
-            # hint if the boot order is weird.
-            self.assertTrue(install_bootloader_mock.called)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_whole_disk_image_bios(
-            self, install_bootloader_mock, try_set_boot_device_mock):
-        self.config(default_boot_mode='bios', group='deploy')
-
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            self.deploy.configure_local_boot(task)
-            self.assertFalse(install_bootloader_mock.called)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_no_root_uuid(
-            self, install_bootloader_mock, try_set_boot_device_mock):
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = False
-            self.deploy.configure_local_boot(task)
-            self.assertFalse(install_bootloader_mock.called)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(boot_mode_utils, 'get_boot_mode',
-                       autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_no_root_uuid_whole_disk(
-            self, install_bootloader_mock, try_set_boot_device_mock,
-            boot_mode_mock):
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = True
-            boot_mode_mock.return_value = 'uefi'
-            self.deploy.configure_local_boot(
-                task, root_uuid=None,
-                efi_system_part_uuid='efi-system-part-uuid')
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node, root_uuid=None,
-                efi_system_part_uuid='efi-system-part-uuid',
-                prep_boot_part_uuid=None, target_boot_mode='uefi',
-                software_raid=False)
-
-    @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_on_software_raid(
-            self, install_bootloader_mock, try_set_boot_device_mock,
-            GlanceImageService_mock):
-        image = GlanceImageService_mock.return_value.show.return_value
-        image.get.return_value = {'rootfs_uuid': 'rootfs'}
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = True
-            task.node.target_raid_config = {
-                "logical_disks": [
-                    {
-                        "size_gb": 100,
-                        "raid_level": "1",
-                        "controller": "software",
-                    },
-                    {
-                        "size_gb": 'MAX',
-                        "raid_level": "0",
-                        "controller": "software",
-                    }
-                ]
-            }
-            self.deploy.configure_local_boot(task)
-            self.assertTrue(GlanceImageService_mock.called)
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node,
-                root_uuid='rootfs',
-                efi_system_part_uuid=None,
-                prep_boot_part_uuid=None,
-                target_boot_mode='uefi',
-                software_raid=True)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_on_software_raid_bios(
-            self, install_bootloader_mock, try_set_boot_device_mock,
-            GlanceImageService_mock):
-        self.config(default_boot_mode='bios', group='deploy')
-        image = GlanceImageService_mock.return_value.show.return_value
-        image.get.return_value = {'rootfs_uuid': 'rootfs'}
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = True
-            task.node.target_raid_config = {
-                "logical_disks": [
-                    {
-                        "size_gb": 100,
-                        "raid_level": "1",
-                        "controller": "software",
-                    },
-                    {
-                        "size_gb": 'MAX',
-                        "raid_level": "0",
-                        "controller": "software",
-                    }
-                ]
-            }
-            self.deploy.configure_local_boot(task)
-            self.assertTrue(GlanceImageService_mock.called)
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node,
-                root_uuid='rootfs',
-                efi_system_part_uuid=None,
-                prep_boot_part_uuid=None,
-                target_boot_mode='bios',
-                software_raid=True)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_on_software_raid_explicit_uuid(
-            self, install_bootloader_mock, try_set_boot_device_mock,
-            GlanceImageService_mock):
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = True
-            task.node.instance_info['image_rootfs_uuid'] = 'rootfs'
-            task.node.target_raid_config = {
-                "logical_disks": [
-                    {
-                        "size_gb": 100,
-                        "raid_level": "1",
-                        "controller": "software",
-                    },
-                    {
-                        "size_gb": 'MAX',
-                        "raid_level": "0",
-                        "controller": "software",
-                    }
-                ]
-            }
-            self.deploy.configure_local_boot(task)
-            self.assertFalse(GlanceImageService_mock.called)
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node,
-                root_uuid='rootfs',
-                efi_system_part_uuid=None,
-                prep_boot_part_uuid=None,
-                target_boot_mode='uefi',
-                software_raid=True)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_on_software_raid_explicit_uuid_bios(
-            self, install_bootloader_mock, try_set_boot_device_mock,
-            GlanceImageService_mock):
-        self.config(default_boot_mode='bios', group='deploy')
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = True
-            task.node.instance_info['image_rootfs_uuid'] = 'rootfs'
-            task.node.target_raid_config = {
-                "logical_disks": [
-                    {
-                        "size_gb": 100,
-                        "raid_level": "1",
-                        "controller": "software",
-                    },
-                    {
-                        "size_gb": 'MAX',
-                        "raid_level": "0",
-                        "controller": "software",
-                    }
-                ]
-            }
-            self.deploy.configure_local_boot(task)
-            self.assertFalse(GlanceImageService_mock.called)
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node,
-                root_uuid='rootfs',
-                efi_system_part_uuid=None,
-                prep_boot_part_uuid=None,
-                target_boot_mode='bios',
-                software_raid=True)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_on_software_raid_exception_uefi(
-            self, install_bootloader_mock, try_set_boot_device_mock,
-            GlanceImageService_mock):
-        GlanceImageService_mock.side_effect = Exception('Glance not found')
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = True
-            root_uuid = "1efecf88-2b58-4d4e-8fbd-7bef1a40a1b0"
-            task.node.driver_internal_info['root_uuid_or_disk_id'] = root_uuid
-            task.node.target_raid_config = {
-                "logical_disks": [
-                    {
-                        "size_gb": 100,
-                        "raid_level": "1",
-                        "controller": "software",
-                    },
-                    {
-                        "size_gb": 'MAX',
-                        "raid_level": "0",
-                        "controller": "software",
-                    }
-                ]
-            }
-            self.deploy.configure_local_boot(task)
-            self.assertTrue(GlanceImageService_mock.called)
-            # check if the root_uuid comes from the driver_internal_info
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node, root_uuid=root_uuid,
-                efi_system_part_uuid=None, prep_boot_part_uuid=None,
-                target_boot_mode='uefi', software_raid=True)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(image_service, 'GlanceImageService', autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_on_software_raid_exception_bios(
-            self, install_bootloader_mock, try_set_boot_device_mock,
-            GlanceImageService_mock):
-        self.config(default_boot_mode='bios', group='deploy')
-        GlanceImageService_mock.side_effect = Exception('Glance not found')
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = True
-            root_uuid = "1efecf88-2b58-4d4e-8fbd-7bef1a40a1b0"
-            task.node.driver_internal_info['root_uuid_or_disk_id'] = root_uuid
-            task.node.target_raid_config = {
-                "logical_disks": [
-                    {
-                        "size_gb": 100,
-                        "raid_level": "1",
-                        "controller": "software",
-                    },
-                    {
-                        "size_gb": 'MAX',
-                        "raid_level": "0",
-                        "controller": "software",
-                    }
-                ]
-            }
-            self.deploy.configure_local_boot(task)
-            self.assertTrue(GlanceImageService_mock.called)
-            # check if the root_uuid comes from the driver_internal_info
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node, root_uuid=root_uuid,
-                efi_system_part_uuid=None, prep_boot_part_uuid=None,
-                target_boot_mode='bios', software_raid=True)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_on_non_software_raid(
-            self, install_bootloader_mock, try_set_boot_device_mock):
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = False
-            task.node.target_raid_config = {
-                "logical_disks": [
-                    {
-                        "size_gb": 100,
-                        "raid_level": "1",
-                    },
-                    {
-                        "size_gb": 'MAX',
-                        "raid_level": "0",
-                    }
-                ]
-            }
-            self.deploy.configure_local_boot(task)
-            self.assertFalse(install_bootloader_mock.called)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_enforce_persistent_boot_device_default(
-            self, install_bootloader_mock, try_set_boot_device_mock):
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            driver_info = task.node.driver_info
-            driver_info['force_persistent_boot_device'] = 'Default'
-            task.node.driver_info = driver_info
-            driver_info['force_persistent_boot_device'] = 'Always'
-            task.node.driver_internal_info['is_whole_disk_image'] = False
-            self.deploy.configure_local_boot(task)
-            self.assertFalse(install_bootloader_mock.called)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_enforce_persistent_boot_device_always(
-            self, install_bootloader_mock, try_set_boot_device_mock):
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            driver_info = task.node.driver_info
-            driver_info['force_persistent_boot_device'] = 'Always'
-            task.node.driver_info = driver_info
-            task.node.driver_internal_info['is_whole_disk_image'] = False
-            self.deploy.configure_local_boot(task)
-            self.assertFalse(install_bootloader_mock.called)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    def test_configure_local_boot_enforce_persistent_boot_device_never(
-            self, install_bootloader_mock, try_set_boot_device_mock):
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            driver_info = task.node.driver_info
-            driver_info['force_persistent_boot_device'] = 'Never'
-            task.node.driver_info = driver_info
-            task.node.driver_internal_info['is_whole_disk_image'] = False
-            self.deploy.configure_local_boot(task)
-            self.assertFalse(install_bootloader_mock.called)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=False)
-
-    @mock.patch.object(agent_client.AgentClient, 'collect_system_logs',
-                       autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    @mock.patch.object(boot_mode_utils, 'get_boot_mode', autospec=True,
-                       return_value='whatever')
-    def test_configure_local_boot_boot_loader_install_fail(
-            self, boot_mode_mock, install_bootloader_mock,
-            collect_logs_mock):
-        install_bootloader_mock.return_value = {
-            'command_status': 'FAILED', 'command_error': 'boom'}
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = False
-            self.assertRaises(exception.InstanceDeployFailure,
-                              self.deploy.configure_local_boot,
-                              task, root_uuid='some-root-uuid')
-            boot_mode_mock.assert_called_once_with(task.node)
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node, root_uuid='some-root-uuid',
-                efi_system_part_uuid=None, prep_boot_part_uuid=None,
-                target_boot_mode='whatever', software_raid=False
-            )
-            collect_logs_mock.assert_called_once_with(mock.ANY, task.node)
-            self.assertEqual(states.DEPLOYFAIL, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-
-    @mock.patch.object(agent_client.AgentClient, 'collect_system_logs',
-                       autospec=True)
-    @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)
-    @mock.patch.object(agent_client.AgentClient, 'install_bootloader',
-                       autospec=True)
-    @mock.patch.object(boot_mode_utils, 'get_boot_mode', autospec=True,
-                       return_value='whatever')
-    def test_configure_local_boot_set_boot_device_fail(
-            self, boot_mode_mock, install_bootloader_mock,
-            try_set_boot_device_mock, collect_logs_mock):
-        install_bootloader_mock.return_value = {
-            'command_status': 'SUCCESS', 'command_error': None}
-        try_set_boot_device_mock.side_effect = RuntimeError('error')
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            task.node.driver_internal_info['is_whole_disk_image'] = False
-            self.assertRaises(exception.InstanceDeployFailure,
-                              self.deploy.configure_local_boot,
-                              task, root_uuid='some-root-uuid',
-                              prep_boot_part_uuid=None)
-            boot_mode_mock.assert_called_once_with(task.node)
-            install_bootloader_mock.assert_called_once_with(
-                mock.ANY, task.node, root_uuid='some-root-uuid',
-                efi_system_part_uuid=None, prep_boot_part_uuid=None,
-                target_boot_mode='whatever', software_raid=False)
-            try_set_boot_device_mock.assert_called_once_with(
-                task, boot_devices.DISK, persistent=True)
-            collect_logs_mock.assert_called_once_with(mock.ANY, task.node)
-            self.assertEqual(states.DEPLOYFAIL, task.node.provision_state)
-            self.assertEqual(states.ACTIVE, task.node.target_provision_state)
-
-    @mock.patch.object(deploy_utils, 'set_failed_state', autospec=True)
-    @mock.patch.object(pxe.PXEBoot, 'prepare_instance', autospec=True)
-    @mock.patch.object(agent_base.AgentDeployMixin,
-                       'configure_local_boot', autospec=True)
-    def test_prepare_instance_to_boot(self, configure_mock,
-                                      prepare_instance_mock,
-                                      failed_state_mock):
-        prepare_instance_mock.return_value = None
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        root_uuid = 'root_uuid'
-        efi_system_part_uuid = 'efi_sys_uuid'
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            self.deploy.prepare_instance_to_boot(task, root_uuid,
-                                                 efi_system_part_uuid)
-            configure_mock.assert_called_once_with(
-                self.deploy, task,
-                root_uuid=root_uuid,
-                efi_system_part_uuid=efi_system_part_uuid,
-                prep_boot_part_uuid=None)
-            prepare_instance_mock.assert_called_once_with(task.driver.boot,
-                                                          task)
-            self.assertFalse(failed_state_mock.called)
-
-    @mock.patch.object(deploy_utils, 'set_failed_state', autospec=True)
-    @mock.patch.object(pxe.PXEBoot, 'prepare_instance', autospec=True)
-    @mock.patch.object(agent_base.AgentDeployMixin,
-                       'configure_local_boot', autospec=True)
-    def test_prepare_instance_to_boot_localboot_prep_partition(
-            self, configure_mock, prepare_instance_mock, failed_state_mock):
-        prepare_instance_mock.return_value = None
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        root_uuid = 'root_uuid'
-        efi_system_part_uuid = 'efi_sys_uuid'
-        prep_boot_part_uuid = 'prep_boot_part_uuid'
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            self.deploy.prepare_instance_to_boot(task, root_uuid,
-                                                 efi_system_part_uuid,
-                                                 prep_boot_part_uuid)
-            configure_mock.assert_called_once_with(
-                self.deploy, task,
-                root_uuid=root_uuid,
-                efi_system_part_uuid=efi_system_part_uuid,
-                prep_boot_part_uuid=prep_boot_part_uuid)
-            prepare_instance_mock.assert_called_once_with(task.driver.boot,
-                                                          task)
-            self.assertFalse(failed_state_mock.called)
-
-    @mock.patch.object(deploy_utils, 'set_failed_state', autospec=True)
-    @mock.patch.object(pxe.PXEBoot, 'prepare_instance', autospec=True)
-    @mock.patch.object(agent_base.AgentDeployMixin,
-                       'configure_local_boot', autospec=True)
-    def test_prepare_instance_to_boot_configure_fails(self, configure_mock,
-                                                      prepare_mock,
-                                                      failed_state_mock):
-        self.node.provision_state = states.DEPLOYING
-        self.node.target_provision_state = states.ACTIVE
-        self.node.save()
-        root_uuid = 'root_uuid'
-        efi_system_part_uuid = 'efi_sys_uuid'
-        reason = 'reason'
-        configure_mock.side_effect = (
-            exception.InstanceDeployFailure(reason=reason))
-        prepare_mock.side_effect = (
-            exception.InstanceDeployFailure(reason=reason))
-
-        with task_manager.acquire(self.context, self.node['uuid'],
-                                  shared=False) as task:
-            self.assertRaises(exception.InstanceDeployFailure,
-                              self.deploy.prepare_instance_to_boot, task,
-                              root_uuid, efi_system_part_uuid)
-            configure_mock.assert_called_once_with(
-                self.deploy, task,
-                root_uuid=root_uuid,
-                efi_system_part_uuid=efi_system_part_uuid,
-                prep_boot_part_uuid=None)
-            self.assertFalse(prepare_mock.called)
-            self.assertFalse(failed_state_mock.called)
+class PostStepHooksTest(AgentDeployMixinBaseTest):
 
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(pxe.PXEBoot, 'prepare_ramdisk', spec_set=True,
@@ -1519,6 +748,8 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
             i_info = task.node.driver_internal_info
             i_info['agent_secret_token'] = 'magicvalue01'
             task.node.driver_internal_info = i_info
+            task.node.clean_step = {'step': 'test_step',
+                                    'interface': 'test'}
             agent_base._post_step_reboot(task, 'clean')
             self.assertTrue(mock_build_opt.called)
             self.assertTrue(mock_prepare.called)
@@ -1538,6 +769,8 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
             i_info = task.node.driver_internal_info
             i_info['agent_secret_token'] = 'magicvalue01'
             task.node.driver_internal_info = i_info
+            task.node.deploy_step = {'step': 'test_step',
+                                     'interface': 'test'}
             agent_base._post_step_reboot(task, 'deploy')
             self.assertTrue(mock_build_opt.called)
             self.assertTrue(mock_prepare.called)
@@ -1559,6 +792,8 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
             i_info['agent_secret_token'] = 'magicvalue01'
             i_info['agent_secret_token_pregenerated'] = True
             task.node.driver_internal_info = i_info
+            task.node.clean_step = {'step': 'test_step',
+                                    'interface': 'test'}
             agent_base._post_step_reboot(task, 'clean')
             self.assertTrue(mock_build_opt.called)
             self.assertTrue(mock_prepare.called)
@@ -1600,6 +835,25 @@ class AgentDeployMixinTest(AgentDeployMixinBaseTest):
             mock_handler.assert_called_once_with(task, mock.ANY,
                                                  traceback=True)
             self.assertNotIn('deployment_reboot',
+                             task.node.driver_internal_info)
+
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(pxe.PXEBoot, 'prepare_ramdisk', spec_set=True,
+                       autospec=True)
+    @mock.patch.object(manager_utils, 'servicing_error_handler', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    def test__post_step_reboot_fail_servicing(self, mock_reboot, mock_handler,
+                                              mock_prepare, mock_build_opt):
+        mock_reboot.side_effect = RuntimeError("broken")
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.save()
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            agent_base._post_step_reboot(task, 'service')
+            mock_reboot.assert_called_once_with(task, states.REBOOT)
+            mock_handler.assert_called_once_with(task, mock.ANY,
+                                                 traceback=True)
+            self.assertNotIn('servicing_reboot',
                              task.node.driver_internal_info)
 
     def _test_clean_step_hook(self):
@@ -1995,6 +1249,147 @@ class ContinueCleaningTest(AgentDeployMixinBaseTest):
             self.deploy.continue_cleaning(task)
             error_mock.assert_called_once_with(task, mock.ANY, traceback=False)
 
+    @mock.patch.object(cleaning, 'continue_node_clean', autospec=True)
+    @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
+                       autospec=True)
+    def test_continue_cleaning_declarative_flag_preserved(self, status_mock,
+                                                          clean_mock):
+        # Test that declarative_cleaning flag is preserved during cleaning
+        self.node.clean_step = {
+            'priority': 10,
+            'interface': 'deploy',
+            'step': 'erase_devices',
+            'reboot_requested': False
+        }
+        info = self.node.driver_internal_info
+        info['declarative_cleaning'] = True
+        self.node.driver_internal_info = info
+        self.node.save()
+        status_mock.return_value = [{
+            'command_status': 'SUCCEEDED',
+            'command_name': 'execute_clean_step',
+            'command_result': {
+                'clean_step': self.node.clean_step
+            }
+        }]
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            self.deploy.continue_cleaning(task)
+            clean_mock.assert_called_once_with(task)
+            self.assertEqual(states.CLEANING, task.node.provision_state)
+            self.assertEqual(states.AVAILABLE,
+                             task.node.target_provision_state)
+            # Verify the flag is still present during cleaning
+            self.assertIn('declarative_cleaning',
+                          task.node.driver_internal_info)
+            self.assertTrue(
+                task.node.driver_internal_info['declarative_cleaning'])
+
+
+class ContinueServiceTest(AgentDeployMixinBaseTest):
+
+    def setUp(self):
+        super().setUp()
+        self.node.provision_state = states.SERVICEWAIT
+        self.node.target_provision_state = states.ACTIVE
+        self.node.save()
+
+    @mock.patch.object(servicing, 'continue_node_service', autospec=True)
+    @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
+                       autospec=True)
+    def test_continue_servicing(self, status_mock, service_mock):
+        # Test a successful execute clean step on the agent
+        self.node.service_step = {
+            'priority': 10,
+            'interface': 'deploy',
+            'step': 'erase_devices',
+            'reboot_requested': False
+        }
+        self.node.save()
+        status_mock.return_value = [{
+            'command_status': 'SUCCEEDED',
+            'command_name': 'execute_service_step',
+            'command_result': {
+                'service_step': self.node.service_step
+            }
+        }]
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            self.deploy.continue_servicing(task)
+            service_mock.assert_called_once_with(task)
+            self.assertEqual(states.SERVICING, task.node.provision_state)
+            self.assertEqual(states.ACTIVE,
+                             task.node.target_provision_state)
+
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(pxe.PXEBoot, 'prepare_ramdisk', spec_set=True,
+                       autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
+                       autospec=True)
+    def test_continue_servicing_reboot(
+            self, status_mock, reboot_mock, mock_prepare, mock_build_opt):
+        # Test a successful execute clean step on the agent, with reboot
+        self.node.service_step = {
+            'priority': 42,
+            'interface': 'deploy',
+            'step': 'reboot_me_afterwards',
+            'reboot_requested': True
+        }
+        self.node.save()
+        status_mock.return_value = [{
+            'command_status': 'SUCCEEDED',
+            'command_name': 'execute_service_step',
+            'command_result': {
+                'service_step': self.node.service_step
+            }
+        }]
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            self.deploy.continue_servicing(task)
+            reboot_mock.assert_called_once_with(task, states.REBOOT)
+
+    @mock.patch.object(servicing, 'continue_node_service', autospec=True)
+    @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
+                       autospec=True)
+    def test_continue_servicing_after_reboot(self, status_mock, service_mock):
+        # Test a successful execute clean step on the agent, with reboot
+        self.node.service_step = {
+            'priority': 42,
+            'interface': 'deploy',
+            'step': 'reboot_me_afterwards',
+            'reboot_requested': True
+        }
+        driver_internal_info = self.node.driver_internal_info
+        driver_internal_info['servicing_reboot'] = True
+        self.node.driver_internal_info = driver_internal_info
+        self.node.save()
+        # Represents a freshly booted agent with no commands
+        status_mock.return_value = []
+
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            self.deploy.continue_servicing(task)
+            service_mock.assert_called_once_with(task)
+            self.assertEqual(states.SERVICING, task.node.provision_state)
+            self.assertNotIn('servicing_reboot',
+                             task.node.driver_internal_info)
+
+    @mock.patch.object(servicing, 'continue_node_service', autospec=True)
+    @mock.patch.object(agent_client.AgentClient, 'get_commands_status',
+                       autospec=True)
+    def test_continue_servicing_running(self, status_mock, service_mock):
+        # Test that no action is taken while a clean step is executing
+        status_mock.return_value = [{
+            'command_status': 'RUNNING',
+            'command_name': 'execute_service_step',
+            'command_result': None
+        }]
+        with task_manager.acquire(self.context, self.node['uuid'],
+                                  shared=False) as task:
+            self.deploy.continue_servicing(task)
+            self.assertFalse(service_mock.called)
+
 
 class TestRefreshCleanSteps(AgentDeployMixinBaseTest):
 
@@ -2102,7 +1497,6 @@ class TestRefreshCleanSteps(AgentDeployMixinBaseTest):
                              task.node.driver_internal_info)
             self.assertIsNone(task.node.driver_internal_info.get(
                 'agent_cached_deploy_steps'))
-            log_mock.assert_not_called()
 
     @mock.patch.object(agent_client.AgentClient, 'get_clean_steps',
                        autospec=True)
@@ -2165,7 +1559,7 @@ class StepMethodsTestCase(db_base.DbTestCase):
         self.node = object_utils.create_test_node(self.context, **n)
         self.ports = [object_utils.create_test_port(self.context,
                                                     node_id=self.node.id)]
-        self.deploy = FakeAgentDeploy()
+        self.deploy = agent.CustomAgentDeploy()
 
     def test_agent_get_steps(self):
         with task_manager.acquire(
@@ -2255,14 +1649,16 @@ class StepMethodsTestCase(db_base.DbTestCase):
             steps = self.deploy.get_deploy_steps(task)
             # 2 in-band steps + 3 out-of-band
             expected = [
-                {'step': 'deploy', 'priority': 100, 'argsinfo': None,
-                 'interface': 'deploy'},
-                {'step': 'tear_down_agent', 'priority': 40, 'argsinfo': None,
-                 'interface': 'deploy'},
-                {'step': 'switch_to_tenant_network', 'priority': 30,
+                {'step': 'deploy', 'priority': 100, 'abortable': True,
                  'argsinfo': None, 'interface': 'deploy'},
-                {'step': 'boot_instance', 'priority': 20, 'argsinfo': None,
-                 'interface': 'deploy'},
+                {'step': 'prepare_instance_boot', 'priority': 60,
+                 'abortable': True, 'argsinfo': None, 'interface': 'deploy'},
+                {'step': 'tear_down_agent', 'priority': 40, 'abortable': True,
+                 'argsinfo': None, 'interface': 'deploy'},
+                {'step': 'switch_to_tenant_network', 'priority': 30,
+                 'abortable': True, 'argsinfo': None, 'interface': 'deploy'},
+                {'step': 'boot_instance', 'priority': 20, 'abortable': True,
+                 'argsinfo': None, 'interface': 'deploy'},
             ] + self.clean_steps['deploy']
             self.assertCountEqual(expected, steps)
 
@@ -2272,14 +1668,16 @@ class StepMethodsTestCase(db_base.DbTestCase):
             steps = self.deploy.get_deploy_steps(task)
             # three base out-of-band steps
             expected = [
-                {'step': 'deploy', 'priority': 100, 'argsinfo': None,
-                 'interface': 'deploy'},
-                {'step': 'tear_down_agent', 'priority': 40, 'argsinfo': None,
-                 'interface': 'deploy'},
-                {'step': 'switch_to_tenant_network', 'priority': 30,
+                {'step': 'deploy', 'priority': 100, 'abortable': True,
                  'argsinfo': None, 'interface': 'deploy'},
-                {'step': 'boot_instance', 'priority': 20, 'argsinfo': None,
-                 'interface': 'deploy'},
+                {'step': 'prepare_instance_boot', 'priority': 60,
+                 'abortable': True, 'argsinfo': None, 'interface': 'deploy'},
+                {'step': 'tear_down_agent', 'priority': 40, 'abortable': True,
+                 'argsinfo': None, 'interface': 'deploy'},
+                {'step': 'switch_to_tenant_network', 'priority': 30,
+                 'abortable': True, 'argsinfo': None, 'interface': 'deploy'},
+                {'step': 'boot_instance', 'priority': 20, 'abortable': True,
+                 'argsinfo': None, 'interface': 'deploy'},
             ]
             self.assertCountEqual(expected, steps)
 
@@ -2297,6 +1695,21 @@ class StepMethodsTestCase(db_base.DbTestCase):
             response = agent_base.execute_step(
                 task, self.clean_steps['deploy'][0], 'clean')
             self.assertEqual(states.CLEANWAIT, response)
+
+    @mock.patch('ironic.objects.Port.list_by_node_id',
+                spec_set=types.FunctionType)
+    @mock.patch.object(agent_client.AgentClient, 'execute_service_step',
+                       autospec=True)
+    def test_execute_service_step(self, client_mock, list_ports_mock):
+        client_mock.return_value = {
+            'command_status': 'SUCCEEDED'}
+        list_ports_mock.return_value = self.ports
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            response = agent_base.execute_step(
+                task, self.clean_steps['deploy'][0], 'service')
+            self.assertEqual(states.SERVICEWAIT, response)
 
     @mock.patch('ironic.objects.Port.list_by_node_id',
                 spec_set=types.FunctionType)
@@ -2343,3 +1756,80 @@ class StepMethodsTestCase(db_base.DbTestCase):
             response = agent_base.execute_step(
                 task, self.clean_steps['deploy'][0], 'clean')
             self.assertEqual(states.CLEANWAIT, response)
+
+
+class FreshlyBootedTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super(FreshlyBootedTestCase, self).setUp()
+
+    def test__freshly_booted_empty_result(self):
+        commands = []
+        self.assertTrue(agent_base._freshly_booted(commands, 'deploy'))
+
+    def test__freshly_booted_single_command(self):
+        commands = [{'command_name': 'get_deploy_steps'}]
+        self.assertTrue(agent_base._freshly_booted(commands, 'deploy'))
+
+    def test__freshly_booted_single_command_mismatch(self):
+        commands = [{'command_name': 'get_service_steps'}]
+        self.assertFalse(agent_base._freshly_booted(commands, 'deploy'))
+
+    def test__freshly_booted_has_retries(self):
+        # NOTE(TheJulia): this is just an arbitrary number
+        # of retires to account for lossy/problematic networks
+        commands = [
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'}]
+        self.assertTrue(agent_base._freshly_booted(commands, 'deploy'))
+
+    def test__freshly_booted_multi_command(self):
+        commands = [
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_deploy_steps'},
+            {'command_name': 'get_service_steps'}]
+        self.assertFalse(agent_base._freshly_booted(commands, 'deploy'))
+
+
+class RestoreDeployInterfaceTestCase(AgentDeployMixinBaseTest):
+
+    def setUp(self):
+        super(RestoreDeployInterfaceTestCase, self).setUp()
+        self.config(enabled_deploy_interfaces=['bootc', 'direct'])
+
+    def test_restore_interface_with_original(self):
+        """Test restore_interface when original exists."""
+        self.node.driver_internal_info = {
+            'original_deploy_interface': 'direct'
+        }
+        self.node.deploy_interface = 'bootc'
+        self.node.save()
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            self.deploy.restore_interface(task)
+
+        self.node.refresh()
+        self.assertEqual('direct', self.node.deploy_interface)
+        self.assertNotIn('original_deploy_interface',
+                         self.node.driver_internal_info)
+
+    def test_restore_interface_without_original(self):
+        """Test restore_interface when original doesn't exist."""
+        original_interface = self.node.deploy_interface
+        self.node.save()
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            self.deploy.restore_interface(task)
+
+        self.node.refresh()
+        # Deploy interface should remain unchanged
+        self.assertEqual(original_interface, self.node.deploy_interface)
+        self.assertNotIn('original_deploy_interface',
+                         self.node.driver_internal_info)

@@ -81,6 +81,124 @@ accessible from HTTP service. Please refer to configuration option
 ``FollowSymLinks`` if you are using Apache HTTP server, or
 ``disable_symlinks`` if Nginx HTTP server is in use.
 
+.. _stream_raw_images:
+
+Streaming raw images
+--------------------
+
+The Bare Metal service is capable of streaming raw images directly to the
+target disk of a node, without caching them in the node's RAM. When the source
+image is not already raw, the conductor will convert the image and calculate
+the new checksum.
+
+.. note::
+   If no algorithm is specified via the ``image_os_hash_algo`` field, or if
+   this field is set to ``md5``, SHA256 is used for the updated checksum.
+
+For HTTP or local file images that are already raw, you need to explicitly set
+the disk format to prevent the checksum from being unnecessarily re-calculated.
+For example:
+
+.. code-block:: shell
+
+    baremetal node set <node> \
+        --instance-info image_source=http://server/myimage.img \
+        --instance-info image_os_hash_algo=sha512 \
+        --instance-info image_os_hash_value=<SHA512 of the raw image> \
+        --instance-info image_disk_format=raw
+
+To disable this feature and cache images in the node's RAM, set
+
+.. code-block:: ini
+
+   [agent]
+   stream_raw_images = False
+
+To disable the conductor-side conversion completely, set
+
+.. code-block:: ini
+
+   [DEFAULT]
+   force_raw_images = False
+
+Autodetect support
+------------------
+
+The ``direct`` deploy interface supports being auto-detected by the
+``autodetect`` deploy interface (see :ref:`autodetect-deploy` for details).
+The ``direct`` interface will always claim to support switching to it for
+deployment regardless of the supplied node information. This makes it
+appropriate to use as the last fallback value in the
+``autodetect_deploy_interfaces`` configuration option.
+
+.. _autodetect-deploy:
+
+Autodetect deploy
+=================
+
+The ``autodetect`` deploy interface automatically selects the most appropriate
+concrete deploy interface based on image metadata and node configuration. This
+simplifies node configuration by eliminating the need to manually specify
+different deploy interfaces for different image types.
+
+When a deployment begins, the autodetect interface inspects the image and node
+configuration, then switches to the most appropriate deploy interface from the
+configured list. The detection logic checks interfaces in priority order using
+each interface's ``supports_deploy()`` method. The first interface that
+returns ``True`` is selected. If no interfaces are detected as supported, the
+last interface in the configured list is used as a fallback.
+
+You can specify this deploy interface when creating or updating a node::
+
+    baremetal node create --driver ipmi --deploy-interface autodetect
+    baremetal node set <NODE> --deploy-interface autodetect
+
+Configuration
+-------------
+
+The autodetect interface uses the ``autodetect_deploy_interfaces``
+configuration option to control which interfaces can be auto-selected and
+their priority order. The default configuration is:
+
+.. code-block:: ini
+
+   [DEFAULT]
+   autodetect_deploy_interfaces = ramdisk,bootc,direct
+
+This example configuration checks :doc:`Ramdisk deploy </admin/ramdisk-boot>` first
+(for nodes with ``kernel``/``ramdisk`` or ``boot_iso`` in ``instance_info``),
+then :ref:`Bootc deploy <bootc-deploy>` (for OCI container images), and falls
+back to :ref:`Direct deploy <direct-deploy>` for standard disk images.
+
+.. note::
+   The order of interfaces in the configuration list matters. Interfaces are
+   checked in the order listed, and the first supported interface is selected.
+   The last interface in the list serves as the fallback if no other interface
+   is detected as supported.
+
+Interface switching and restoration
+-----------------------------------
+
+The switch is recorded on the node, not just held in memory: while the node is
+deployed, ``deploy_interface`` reads back as the concrete interface which was
+selected (for example ``direct``), not as ``autodetect``. Operators and tooling
+inspecting the field should expect this. The interface which was switched away
+from is stashed in ``driver_internal_info`` and restored automatically:
+
+* On every exit from cleaning and servicing -- success, abort, failure, and the
+  case where automated cleaning is disabled and skipped. A normal undeploy ->
+  clean -> ``available`` cycle therefore returns the node to ``autodetect``.
+
+* Nodes left in ``deploy failed`` or ``delete failed`` deliberately keep the
+  concrete interface, so that a retried deployment or teardown runs against the
+  interface which actually did the work. They are restored once the node is
+  successfully torn down and cleaned.
+
+Explicitly setting ``deploy_interface`` on a node discards the stashed value,
+so an interface chosen by an operator is never reverted::
+
+    baremetal node set <NODE> --deploy-interface direct
+
 .. _ansible-deploy:
 
 Ansible deploy
@@ -119,6 +237,15 @@ a node:
 For more information about this deploy interface, its features and how to use
 it, see :doc:`Ansible deploy interface <../drivers/ansible>`.
 
+Autodetect support
+------------------
+
+The ``ansible`` deploy interface supports being auto-detected by the
+``autodetect`` deploy interface (see :ref:`autodetect-deploy` for details).
+It checks whether the node's ``driver_info`` contains any key starting with
+``ansible_`` (for example ``ansible_username``, ``ansible_key_file``, or
+``ansible_deploy_playbook``). When at least one such key is present,
+autodetect will select the ``ansible`` deploy interface.
 
 .. toctree::
    :hidden:
@@ -138,6 +265,16 @@ The ramdisk interface is intended to provide a mechanism to "deploy" an
 instance where the item to be deployed is in reality a ramdisk. It is
 documented separately, see :doc:`/admin/ramdisk-boot`.
 
+Autodetect support
+------------------
+
+The ``ramdisk`` deploy interface supports being auto-detected by the
+``autodetect`` deploy interface (see :ref:`autodetect-deploy` for details).
+It checks whether the node's ``instance_info`` contains ``kernel`` and
+``ramdisk`` (without an ``image_source``), or whether ``boot_iso`` is set.
+When either condition is met, autodetect will select the ``ramdisk`` deploy
+interface.
+
 .. _custom-agent-deploy:
 
 Custom agent deploy
@@ -150,3 +287,183 @@ completely orchestrate writing the instance image using
 responsible to provide all necessary deploy steps with priorities between
 61 and 99 (see :ref:`node-deployment-core-steps` for information on
 priorities).
+
+.. _bootc-deploy:
+
+Bootc Agent Deploy
+==================
+
+The ``bootc`` deploy interface is designed to enable operators to deploy
+containers directly from a container image registry without intermediate
+conversion steps, such as creating custom disk images for modifications.
+This deployment interface utilizes the
+`bootc project <https://containers.github.io/bootc/>`_. Usage context of
+this deployment interface is **not** intended for the traditional OpenStack
+integrated instance flow.
+
+Ultimately this enables a streamlined flow, where a user of the deployment
+interface *can* create updated containers rapidly and the deployment interface
+will deploy that container image in a streamlined fashion without the need
+to create intermediate disk images and post the disk images in a location
+where they can be accessed for deployment.
+
+Ultimately this interface enables a streamlined flow, and offers
+limited flexibility in the model of deployment. As a result, this
+interface consumes the entire target disk on the host being deployed
+and offers no customization in terms of partitioning. This is largely
+because the overall security model of a bootc deployment, which leverages
+os-tree, is also fundamentally different than the model to leverage
+partition separation.
+
+.. NOTE::
+   This interface should be considered experimental and may evolve
+   to include additional features as the Ironic project maintainers
+   receive additional feedback.
+
+.. NOTE::
+   This interface is dependent upon the existence of ``bootc`` within a
+   container image along with sufficient memory on the baremetal
+   node being deployed to enable a complete download and extraction of image
+   contents within system memory. It is this memory constraint which is
+   why this interface is not actively tested in upstream CI.
+   The possible failure modes of this interface are mainly focused upon
+   the ability of the ramdisk being able to download, launch, and
+   run bootc to trigger the installation which also isolates most risk
+   to the actual bootc process execution.
+
+.. NOTE::
+   Operators who are using Ironic in purely in an OpenStack integrated
+   context should likely consider disabling the ``bootc`` interface as
+   this interface does not leverage other OpenStack integrations.
+
+Features
+--------
+
+While this ``deploy_interface`` supports deploying configuration drives
+like most other Ironic supplied deploy interfaces, some additional
+parameters can be supplied via ``instance_info`` to enable
+tuning of deploy-time behavior by the user which cannot be modified
+post-deployment.
+
+* ``bootc_authorized_keys`` - This option allows injection of a
+  root user authorized keys file which is preserved inside of the deployed
+  container on the host. This option is for actual key file content and can
+  be one or more keys with a new line character.
+* ``bootc_tpm2_luks`` - A boolean option, default False, enabling bootc
+  to attempt to utilize auto-encryption of the deployed host filesystem
+  upon which the container is deployed. This is not enabled by default
+  due to a lack of software TPMs in Ironic CI. If operators would like
+  this setting default changed, please discuss with Ironic developers.
+
+Additionally, this interface also supports the passing of a pull secret
+to enable download from the remote image registry, which is part of the
+support for retrieval of artifacts from OCI Container registires.
+This parameter is ``image_pull_secret``.
+
+Autodetect support
+------------------
+
+The ``bootc`` deploy interface supports being auto-detected by the
+``autodetect`` deploy interface (see :ref:`autodetect-deploy` for details). It
+checks whether the image source URL is an OCI container image (``oci://``
+URL), then introspects the image registry to confirm the artifact is a
+container image (OCI artifacts are handled by the ``direct`` deploy
+interface).
+
+Caveats
+-------
+
+* This deployment interface was not designed to be compatible with the
+  OpenStack Compute service. This is because OpenStack focuses on
+  disk images from Glance as to what to deploy, where as this interface
+  is modeled to utilize a container image registry.
+* Performance wise, this deployment interface performs many smaller actions,
+  which at some times need to performed in a specific sequence, such as
+  when unpacking layers. As a result, when comparing similar size
+  containers to disk images, this interface is slower than the ``direct``
+  deploy interface.
+* Container Images *must* have the bootc command present along with
+  the applicable bootloader and artifacts required for whatever platform
+  is being deployed.
+* Because of how `bootc <https://containers.github.io/bootc/>`_ works,
+  there is no concept of "image streaming" directly to disk. This is because
+  the way this interface works, `podman <https://podman.io/>`_ is used to
+  download all container image layer artifacts, along with extracting the
+  layers. At which point ``bootc`` is executed and it begins to setup the
+  disk for the host. As a result, most of the time a deploy is in progress
+  will be observable as ``deploy wait`` while ``bootc`` executes.
+* The memory requirements of the ramdisk, due to the way this interface
+  works, requires the ability to download a container image, copy, and
+  ultimatley extract all layers into the in-memory filesystem. Due to the way
+  the kernel launches and allocates ramdisk memory for filesystem usage,
+  a 600MB container image may require upwards of 10GB of RAM to be available
+  on the overall host.
+* This deployment interface explicitly signals to ``bootc`` that it should
+  not execute it's internal post-deployment "fetch check" to ensure upgrades
+  are working. This is because this action may require authentication
+  to succeed, **and** thus require credentials in the container to
+  work. Configuration of credentials for **day-2** operations
+  such as the execution of ``bootc upgrade``, must be addressed
+  post-deployment.
+* If you intend SELinux to be enabled on the deployed host, it must also
+  be enabled inside of the ironic-python-agent ramdisk. This is a design
+  limitation of bootc outside of Ironic's control.
+
+Limitations
+-----------
+
+* At present, this interface does not support use of caching proxies. This
+  may be addressed in the future.
+* This deployment interface directly downloads artifacts from the requested
+  Container Registry. Caching the container artifacts on the
+  ``ironic-conductor`` host is not available. If you need the contaitainer
+  content localized to the conductor, consider utilizing your own container
+  registry.
+
+.. _noop-deploy:
+
+Noop deploy
+===========
+
+The ``noop`` deploy interface is a minimal deployment mechanism that performs
+no actual deployment operations. It is designed for scenarios where operators
+want to allocate nodes and mark them as ``active`` in Ironic without deploying
+an operating system.
+
+This is useful when nodes are being managed by external systems but tracked in
+Ironic's inventory.
+
+You can specify this deploy interface when creating or updating a node::
+
+    baremetal node create --driver manual-management --deploy-interface noop
+    baremetal node set <NODE> --deploy-interface noop
+
+Usage with Nova
+---------------
+
+For deployments using Ironic in conjunction with Nova, the ``noop`` deploy
+interface provides an alternative approach to adding production nodes that are
+already running workloads. Unlike the :doc:`node adoption </admin/adoption>`
+feature, which uses the ``adopt`` verb and is not suitable for Nova
+deployments, the ``noop`` deploy interface allows you to use the normal
+``deploy`` verb instead.
+
+With the ``noop`` deploy interface, nodes can be moved through the normal
+deployment workflow (from ``manageable`` to ``available`` to ``deploying`` to
+``active``) without any actual deployment operations taking place. This enables
+Nova to properly track the instances while Ironic skips all conductor-side
+deployment actions.
+
+Configuration
+-------------
+
+Enable the interface in ``ironic.conf``::
+
+    [DEFAULT]
+    enabled_deploy_interfaces = direct,ramdisk,noop
+
+.. warning::
+   The ``noop`` deploy interface completely bypasses cleaning operations.
+   Even if a user cannot update ``Node.automated_clean``, as long as they set
+   ``Node.instance_info[deploy_interface]`` to ``noop``, cleaning will be
+   skipped.

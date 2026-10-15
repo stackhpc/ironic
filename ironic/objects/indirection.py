@@ -15,6 +15,9 @@ from oslo_versionedobjects import base as object_base
 from ironic.conductor import rpcapi as conductor_api
 
 
+# NOTE(TheJulia): The whole purpose of the indirection API is to disjoint
+# the interactions to the conductor through a class based upon the
+# VersionedObjectIndirectionAPI class provided by oslo.versionedobjects.
 class IronicObjectIndirectionAPI(object_base.VersionedObjectIndirectionAPI):
     def __init__(self):
         super(IronicObjectIndirectionAPI, self).__init__()
@@ -23,15 +26,6 @@ class IronicObjectIndirectionAPI(object_base.VersionedObjectIndirectionAPI):
     def object_action(self, context, objinst, objmethod, args, kwargs):
         return self._conductor.object_action(context, objinst, objmethod,
                                              args, kwargs)
-
-    def object_class_action(self, context, objname, objmethod, objver,
-                            args, kwargs):
-        # NOTE(xek): This method is implemented for compatibility with
-        # oslo.versionedobjects 0.10.0 and older. It will be replaced by
-        # object_class_action_versions.
-        versions = object_base.obj_tree_get_versions(objname)
-        return self.object_class_action_versions(
-            context, objname, objmethod, versions, args, kwargs)
 
     def object_class_action_versions(self, context, objname, objmethod,
                                      object_versions, args, kwargs):

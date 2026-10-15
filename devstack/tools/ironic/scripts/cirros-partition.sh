@@ -9,7 +9,7 @@ if [[ "$VERBOSE" == True ]]; then
 fi
 
 CIRROS_VERSION=${CIRROS_VERSION:-0.6.1}
-CIRROS_ARCH=${CIRROS_ARCH:-x86_64}
+CIRROS_ARCH=${IRONIC_HW_ARCH:-x86_64}
 # TODO(dtantsur): use the image cached on infra images in the CI
 DISK_URL=http://download.cirros-cloud.net/${CIRROS_VERSION}/cirros-${CIRROS_VERSION}-${CIRROS_ARCH}-disk.img
 OUT=$(realpath ${1:-rootfs.img})
@@ -18,7 +18,7 @@ IRONIC_TTY_DEV=${IRONIC_TTY_DEV:-ttyS0,115200}
 # rdroot : boot from the ramdisk present on the root partition instead of
 #          mounting the root partition.
 # dslist : disable Nova metadata support, it takes a long time on boot.
-KARGS=${KARGS:-nofb nomodeset vga=normal console=${IRONIC_TTY_DEV} rdroot dslist=configdrive}
+KARGS=${KARGS:-nofb vga=normal console=${IRONIC_TTY_DEV} rdroot dslist=configdrive}
 
 workdir=$(mktemp -d)
 root_mp=$workdir/root
@@ -53,6 +53,11 @@ sudo mount $efidev $efi_mp
 
 sudo cp -aR $root_mp/* $dest/
 sudo cp -aR $efi_mp/EFI $dest/boot/efi/
+
+# Extract all of the stuffs from the disk image and write it out into
+# the dest folder. This is *normally* done on startup for Cirros, but
+# doesn't quite jive with the expected partition image model.
+sudo zcat $root_mp/boot/initrd.img* | sudo cpio -i --make-directories -D $dest
 
 # These locations are required by IPA even when it does not really run
 # grub-install.

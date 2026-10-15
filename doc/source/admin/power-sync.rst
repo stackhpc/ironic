@@ -25,7 +25,7 @@ misbehaving BMCs which may delay or even block the synchronization otherwise.
     logs). While Ironic automatically retries to get the power status
     for the affected nodes, the failure rate may be reduced by increasing
     the power sync cycle, e.g. to 300 seconds, and/or by reducing the number
-    of power sync workers, e.g. to 2. Pleae keep in mind, however, that
+    of power sync workers, e.g. to 2. Please keep in mind, however, that
     depending on the concrete setup increasing the power sync interval may
     have an impact on other components relying on up-to-date power states.
 
@@ -34,7 +34,7 @@ Compute-Baremetal Power Sync
 Each ``nova-compute`` process in the Compute service runs a periodic task which
 synchronizes the power state of servers between its database and the compute
 driver. If enabled, it runs at an interval defined by the
-`sync_power_state_interval` config option on the ``nova-compute`` process.
+``sync_power_state_interval`` config option on the ``nova-compute`` process.
 In case of the compute driver being baremetal driver, this sync will happen
 between the databases of the compute and baremetal services. Since the sync
 happens on the ``nova-compute`` process, the state in the compute database
@@ -96,10 +96,10 @@ Power fault and recovery
 ========================
 
 When `Baremetal Power Sync`_ is enabled, and the Bare Metal service loses
-access to a node (usually because of invalid credentials, BMC issues or
-networking interruptions), the node enters ``maintenance`` mode and its
-``fault`` field is set to ``power failure``. The exact reason is stored in the
-``maintenance_reason`` field.
+access to a node (usually because of invalid credentials due to rotation,
+BMC issues or networking interruptions), the node enters ``maintenance``
+mode and its ``fault`` field is set to ``power failure``. The exact reason
+is stored in the ``maintenance_reason`` field.
 
 As always with maintenance mode, only a subset of operations will work on such
 nodes, and both the Compute service and the Ironic's native allocation API will

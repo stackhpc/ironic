@@ -523,7 +523,8 @@ class TestAgentClient(base.TestCase):
         self.assertRaises(exception.InvalidParameterValue,
                           self.client._command, self.node, method, params)
 
-    def test__command_poll(self):
+    @mock.patch('time.sleep', autospec=True)
+    def test__command_poll(self, mock_sleep):
         response_data = {'status': 'ok'}
         final_status = MockCommandStatus('SUCCEEDED', name='run_image')
         self.client.session.post.return_value = MockResponse(response_data)
@@ -551,8 +552,9 @@ class TestAgentClient(base.TestCase):
             params={'wait': 'false'},
             timeout=60,
             verify=True)
-        self.client.session.get.assert_called_with(url, timeout=60,
+        self.client.session.get.assert_called_with(url, params={}, timeout=60,
                                                    verify=True)
+        mock_sleep.assert_called_with(CONF.agent.command_wait_interval)
 
     def test_get_commands_status(self):
         if not mock._is_instance_mock(self.client.session):
@@ -569,7 +571,7 @@ class TestAgentClient(base.TestCase):
             '%(agent_url)s/%(api_version)s/commands/' % {
                 'agent_url': agent_url,
                 'api_version': CONF.agent.agent_api_version},
-            verify=True, timeout=CONF.agent.command_timeout)
+            params={}, verify=True, timeout=CONF.agent.command_timeout)
 
     def test_get_commands_status_retries(self):
         res = mock.MagicMock(spec_set=['json'])
@@ -606,7 +608,7 @@ class TestAgentClient(base.TestCase):
             '%(agent_url)s/%(api_version)s/commands/' % {
                 'agent_url': agent_url,
                 'api_version': CONF.agent.agent_api_version},
-            verify='/path/to/agent.crt',
+            params={}, verify='/path/to/agent.crt',
             timeout=CONF.agent.command_timeout)
 
     def _test_install_bootloader(self, root_uuid, efi_system_part_uuid=None,
@@ -663,6 +665,53 @@ class TestAgentClient(base.TestCase):
                                        ports)
         self.client._command.assert_called_once_with(
             node=self.node, method='clean.execute_clean_step',
+            params=expected_params)
+
+    def test_get_service_steps(self):
+        self.client._command = mock.MagicMock(spec_set=[])
+        ports = []
+        expected_params = {
+            'node': self.node.as_dict(secure=True),
+            'ports': []
+        }
+
+        self.client.get_service_steps(self.node,
+                                      ports)
+        self.client._command.assert_called_once_with(
+            node=self.node, method='service.get_service_steps',
+            params=expected_params, wait=True)
+
+    def test_get_service_steps_older_client(self):
+        self.client._command = mock.MagicMock(spec_set=[])
+        self.client._command.side_effect = exception.AgentAPIError('meow')
+        ports = []
+        expected_params = {
+            'node': self.node.as_dict(secure=True),
+            'ports': []
+        }
+
+        self.client.get_service_steps(self.node,
+                                      ports)
+        self.client._command.assert_called_once_with(
+            node=self.node, method='service.get_service_steps',
+            params=expected_params, wait=True)
+
+    def test_execute_service_step(self):
+        self.client._command = mock.MagicMock(spec_set=[])
+        ports = []
+        step = {'priority': 10, 'step': 'erase_devices', 'interface': 'deploy'}
+        expected_params = {
+            'step': step,
+            'node': self.node.as_dict(secure=True),
+            'ports': [],
+            'service_version':
+                self.node.driver_internal_info['hardware_manager_version']
+        }
+        self.client.execute_service_step(step,
+                                         self.node,
+                                         ports)
+        self.client._command.assert_called_once_with(
+            node=self.node, method='service.execute_service_step',
             params=expected_params)
 
     def test_power_off(self):
@@ -845,3 +894,174 @@ class TestAgentClientAttempts(base.TestCase):
             params={'wait': 'false'},
             timeout=60,
             verify=True)
+
+
+@mock.patch('time.sleep', autospec=True)
+@mock.patch.object(agent_client.AgentClient, 'get_commands_status',
+                   autospec=True)
+@mock.patch.object(agent_client.AgentClient, '_command', autospec=True)
+class TestLockDown(base.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.client = agent_client.AgentClient()
+        self.node = MockNode()
+
+    def test_okay(self, mock_command, mock_status, mock_sleep):
+        mock_status.side_effect = [
+            {},
+            {},
+            exception.AgentConnectionFailed(reason=''),
+        ]
+
+        self.client.lockdown(self.node)
+
+        mock_command.assert_has_calls([
+            mock.call(self.client, node=self.node,
+                      method='standby.sync', params={}, wait=True),
+            mock.call(self.client, node=self.node,
+                      method='system.lockdown', params={}),
+        ])
+        mock_status.assert_called_with(self.client, self.node,
+                                       expect_errors=True)
+        self.assertEqual(3, mock_status.call_count)
+        mock_sleep.assert_called_with(5)
+
+    def test_okay_with_fail_if_unavailable(self, mock_command, mock_status,
+                                           mock_sleep):
+        mock_status.side_effect = [
+            {},
+            {},
+            exception.AgentConnectionFailed(reason=''),
+        ]
+
+        self.client.lockdown(self.node, fail_if_unavailable=False)
+
+        mock_command.assert_has_calls([
+            mock.call(self.client, node=self.node,
+                      method='standby.sync', params={}, wait=True),
+            mock.call(self.client, node=self.node,
+                      method='system.lockdown', params={}),
+        ])
+        mock_status.assert_called_with(self.client, self.node,
+                                       expect_errors=True)
+        self.assertEqual(3, mock_status.call_count)
+        mock_sleep.assert_called_with(5)
+
+    def test_agent_already_down(self, mock_command, mock_status, mock_sleep):
+        mock_status.side_effect = exception.AgentConnectionFailed(reason='')
+
+        self.client.lockdown(self.node, fail_if_unavailable=False)
+
+        mock_command.assert_not_called()
+        mock_status.assert_called_once_with(self.client, self.node,
+                                            expect_errors=True)
+
+    def test_timeout(self, mock_command, mock_status, mock_sleep):
+        self.assertRaises(exception.AgentCommandTimeout,
+                          self.client.lockdown, self.node)
+
+        mock_command.assert_has_calls([
+            mock.call(self.client, node=self.node,
+                      method='standby.sync', params={}, wait=True),
+            mock.call(self.client, node=self.node,
+                      method='system.lockdown', params={}),
+        ])
+        mock_status.assert_called_with(self.client, self.node,
+                                       expect_errors=True)
+        mock_sleep.assert_called_with(5)
+
+
+class TestAgentClientTLS(base.TestCase):
+
+    def test_build_ssl_context_defaults(self):
+        """Default config returns context with TLS 1.3."""
+        ctx = agent_client._build_ssl_context()
+        self.assertIsNotNone(ctx)
+        self.assertEqual(
+            ssl.TLSVersion.TLSv1_3,
+            ctx.minimum_version
+        )
+
+    def test_build_ssl_context_minimum_version_1_2(self):
+        self.config(tls_minimum_version='1.2', group='agent')
+        ctx = agent_client._build_ssl_context()
+        self.assertIsNotNone(ctx)
+        self.assertEqual(
+            ssl.TLSVersion.TLSv1_2,
+            ctx.minimum_version
+        )
+
+    def test_build_ssl_context_ciphers(self):
+        self.config(tls_ciphers='ECDHE+AESGCM',
+                    group='agent')
+        ctx = agent_client._build_ssl_context()
+        self.assertIsNotNone(ctx)
+
+    def test_build_ssl_context_all_options(self):
+        self.config(tls_minimum_version='1.3',
+                    group='agent')
+        self.config(tls_ciphers='ECDHE+AESGCM',
+                    group='agent')
+        ctx = agent_client._build_ssl_context()
+        self.assertIsNotNone(ctx)
+        self.assertEqual(
+            ssl.TLSVersion.TLSv1_3,
+            ctx.minimum_version
+        )
+
+    def test_build_ssl_context_verification_disabled(self):
+        """SSL context defers verification to requests lib."""
+        self.config(tls_minimum_version='1.2',
+                    group='agent')
+        ctx = agent_client._build_ssl_context()
+        self.assertFalse(ctx.check_hostname)
+        self.assertEqual(ssl.CERT_NONE, ctx.verify_mode)
+
+    def test_build_ssl_context_min_version_logged(self):
+        """LOG.info is emitted when TLS min version is set."""
+        self.config(tls_minimum_version='1.3',
+                    group='agent')
+        with mock.patch.object(
+            agent_client.LOG, 'info', autospec=True
+        ) as mock_log:
+            agent_client._build_ssl_context()
+            mock_log.assert_any_call(
+                "Agent client TLS minimum version set "
+                "to %s", '1.3'
+            )
+
+    def test_build_ssl_context_ciphers_logged(self):
+        """LOG.info is emitted when TLS ciphers are set."""
+        self.config(tls_ciphers='ECDHE+AESGCM',
+                    group='agent')
+        with mock.patch.object(
+            agent_client.LOG, 'info', autospec=True
+        ) as mock_log:
+            agent_client._build_ssl_context()
+            mock_log.assert_any_call(
+                "Agent client TLS ciphers configured"
+            )
+
+    @mock.patch.object(agent_client, '_build_ssl_context',
+                       autospec=True)
+    def test_agent_client_mounts_adapter(
+            self, mock_build_ctx):
+        mock_ctx = mock.Mock()
+        mock_build_ctx.return_value = mock_ctx
+        client = agent_client.AgentClient()
+        adapter = client.session.get_adapter('https://x')
+        self.assertIsInstance(
+            adapter, agent_client.TLSHTTPAdapter
+        )
+        self.assertEqual(mock_ctx, adapter._ssl_context)
+
+    @mock.patch.object(agent_client, '_build_ssl_context',
+                       autospec=True)
+    def test_agent_client_no_adapter_when_no_ctx(
+            self, mock_build_ctx):
+        mock_build_ctx.return_value = None
+        client = agent_client.AgentClient()
+        adapter = client.session.get_adapter('https://x')
+        self.assertNotIsInstance(
+            adapter, agent_client.TLSHTTPAdapter
+        )

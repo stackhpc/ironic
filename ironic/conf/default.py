@@ -63,11 +63,24 @@ api_opts = [
                  ('http_basic', _('HTTP basic authentication'))],
         help=_('Authentication strategy used by ironic-api. "noauth" should '
                'not be used in a production environment because all '
-               'authentication will be disabled.')),
+               'authentication will be disabled creating insecure '
+               'operating conditions.')),
     cfg.StrOpt('http_basic_auth_user_file',
                default='/etc/ironic/htpasswd',
                help=_('Path to Apache format user authentication file used '
                       'when auth_strategy=http_basic')),
+    cfg.BoolOpt('allow_image_access_via_auth_token',
+                default=False,
+                deprecated_for_removal=True,
+                help=_('If True, Ironic allows access to Glance images if an '
+                       'auth_token is present in the request context.')
+                ),
+    cfg.BoolOpt(
+        'ignore_project_check_for_admin_tasks',
+        default=True,
+        help=_('If True, allows admin tasks to access image without'
+               'matching project_id')
+    ),
     cfg.BoolOpt('debug_tracebacks_in_api',
                 default=False,
                 help=_('Return server tracebacks in the API response for any '
@@ -81,6 +94,17 @@ api_opts = [
                mutable=True,
                help=_('Resource class to use for new nodes when no resource '
                       'class is provided in the creation request.')),
+    cfg.StrOpt('default_conductor_group',
+               mutable=True,
+               default="",
+               help=_('The conductor_group to use for new nodes when no '
+                      'conductor_group was defined in the creation request.')),
+    cfg.BoolOpt('use_rpc_for_database',
+                default=False,
+                mutable=False,
+                help=_('If the Ironic API should utilize the RPC layer for '
+                       'database interactions as opposed to directly '
+                       'connecting to the database API endpoint.')),
 ]
 
 driver_opts = [
@@ -111,10 +135,28 @@ driver_opts = [
     cfg.StrOpt('default_console_interface',
                help=_DEFAULT_IFACE_HELP.format('console')),
     cfg.ListOpt('enabled_deploy_interfaces',
-                default=['direct', 'ramdisk'],
+                default=['autodetect', 'direct', 'ramdisk', 'bootc'],
                 help=_ENABLED_IFACE_HELP.format('deploy')),
     cfg.StrOpt('default_deploy_interface',
                help=_DEFAULT_IFACE_HELP.format('deploy')),
+    cfg.ListOpt('autodetect_deploy_interfaces',
+                default=['ramdisk', 'bootc', 'direct'],
+                help=_('List of deploy interfaces that the '
+                       'autodetect deploy interface is allowed to '
+                       'switch to. The order of interfaces in the list '
+                       'indicates the order support will be checked for,'
+                       'with the first interface having the highest '
+                       'priority. The last interface in the list will be '
+                       'chosen if no interfaces are detected as supported. '
+                       '"ramdisk" and "bootc" have detection support '
+                       'and "direct" is an appropriate fallback for '
+                       'most cases. All interfaces listed here must '
+                       'also be in "enabled_deploy_interfaces".')),
+    cfg.ListOpt('enabled_firmware_interfaces',
+                default=['no-firmware'],
+                help=_ENABLED_IFACE_HELP.format('firmware')),
+    cfg.StrOpt('default_firmware_interface',
+               help=_DEFAULT_IFACE_HELP.format('firmware')),
     cfg.ListOpt('enabled_inspect_interfaces',
                 default=['no-inspect', 'redfish'],
                 help=_ENABLED_IFACE_HELP.format('inspect')),
@@ -345,9 +387,7 @@ service_opts = [
                help=_('Name of this node. This can be an opaque identifier. '
                       'It is not necessarily a hostname, FQDN, or IP address. '
                       'However, the node name must be valid within '
-                      'an AMQP key, and if using ZeroMQ (will be removed in '
-                      'the Stein release), a valid hostname, FQDN, '
-                      'or IP address.')),
+                      'an AMQP key.')),
     cfg.StrOpt('pin_release_version',
                choices=versions.RELEASE_VERSIONS_DESCS,
                mutable=True,
@@ -392,13 +432,17 @@ service_opts = [
                help=_('Number of retries to hold onto the worker before '
                       'failing or returning the thread to the pool if '
                       'the conductor can automatically retry.')),
+    cfg.IntOpt('drain_shutdown_timeout',
+               mutable=True,
+               default=1800,
+               help=_('Timeout (seconds) after which a server will exit '
+                      'from a drain shutdown. Drain shutdowns are '
+                      'triggered by sending the signal SIGUSR2. '
+                      'Zero value means shutdown will never be triggered by '
+                      'a timeout.')),
 ]
 
 utils_opts = [
-    cfg.StrOpt('rootwrap_config',
-               default="/etc/ironic/rootwrap.conf",
-               help=_('Path to the rootwrap configuration file to use for '
-                      'running commands as root.')),
     cfg.StrOpt('tempdir',
                default=tempfile.gettempdir(),
                sample_default=tempfile.gettempdir(),
@@ -422,12 +466,81 @@ webserver_opts = [
                       'certificate for SSL verification. If the path does '
                       'not exist, the behavior is same as when this value '
                       'is set to True i.e the certificates present in the '
-                      'standard path are used for SSL verification.'
-                      'Defaults to True.')),
+                      'standard path are used for SSL verification.')),
     cfg.IntOpt('webserver_connection_timeout',
                default=60,
-               help=_('Connection timeout when accessing remote web servers '
-                      'with images.')),
+               help=_('Connection timeout when accessing/interacting with '
+                      'remote web servers with images or other artifacts '
+                      'being accessed. An excessive value here is not '
+                      'advisable as excessive requests to an unreachable '
+                      'endpoint can result in Ironic service resources '
+                      'being consumed waiting for the connection to '
+                      'timeout.')),
+    cfg.IntOpt('webserver_verify_timeout',
+               default=5,
+               help=_('Timeout for HTTP HEAD requests used to verify image '
+                      'sources and validate URLs during node validation and '
+                      'other verification operations. This timeout should be '
+                      'kept short to prevent resource exhaustion from '
+                      'malicious or misconfigured image URLs that point to '
+                      'unresponsive endpoints. A shorter timeout helps '
+                      'prevent conductor thread starvation when performing '
+                      'synchronous validation checks.')),
+    cfg.StrOpt(
+        'webserver_tls_minimum_version',
+        default='1.3',
+        choices=[
+            ('1.2', _('Require TLS 1.2 as the minimum version.')),
+            ('1.3', _('Require TLS 1.3 as the minimum version. '
+                      'Recommended for Post-Quantum Cryptography '
+                      'readiness.')),
+        ],
+        help=_('Set the minimum TLS protocol version for '
+               'outbound HTTPS connections to remote web '
+               'servers hosting images or other artifacts. '
+               'Defaults to TLS 1.3 since TLS 1.0 and 1.1 '
+               'are deprecated (RFC 8996).')),
+    cfg.StrOpt(
+        'webserver_tls_ciphers',
+        help=_('Set the list of available ciphers for '
+               'outbound HTTPS connections to remote web '
+               'servers hosting images or other artifacts '
+               'using OpenSSL cipher list format. When not '
+               'set, the system default ciphers are used.')),
+]
+
+rbac_opts = [
+    cfg.BoolOpt('rbac_service_role_elevated_access',
+                default=False,
+                help=_('Enable elevated access for users with service role '
+                       'belonging to the \'rbac_service_project_name\' '
+                       'project when using default policy. The default '
+                       'setting of disabled causes all service role '
+                       'requests to be scoped to the project the service '
+                       'account belongs to.')),
+    cfg.StrOpt('rbac_service_project_name',
+               default='service',
+               help=_('The project name utilized for Role Based Access '
+                      'Control checks for the reserved `service` project. '
+                      'This project is utilized for services to have '
+                      'accounts for cross-service communication. Often '
+                      'these accounts require higher levels of access, and '
+                      'effectively this permits accounts from the service '
+                      'to not be restricted to project scoping '
+                      'of responses. i.e. The service project user with a '
+                      '`service` role will be able to see nodes across all '
+                      'projects, similar to System scoped access. If not '
+                      'set to a value, and all service role access will '
+                      'be filtered matching an `owner` or `lessee`, if '
+                      'applicable. If an operator wishes to make behavior '
+                      'visible for all service role users across '
+                      'all projects, then a custom policy must be used '
+                      'to override the default "service_role" rule. '
+                      'It should be noted that the value of "service" '
+                      'is a default convention for OpenStack deployments, '
+                      'but the requisite access and details around '
+                      'end configuration are largely up to an operator '
+                      'if they are doing an OpenStack deployment manually.')),
 ]
 
 
@@ -446,6 +559,7 @@ def list_opts():
         service_opts,
         utils_opts,
         webserver_opts,
+        rbac_opts
     ]
     full_opt_list = []
     for options in _default_opt_lists:
@@ -467,3 +581,4 @@ def register_opts(conf):
     conf.register_opts(service_opts)
     conf.register_opts(utils_opts)
     conf.register_opts(webserver_opts)
+    conf.register_opts(rbac_opts)

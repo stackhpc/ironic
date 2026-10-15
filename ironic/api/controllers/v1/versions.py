@@ -94,7 +94,7 @@ BASE_VERSION = 1
 # v1.54: Add events support.
 # v1.55: Add deploy templates API.
 # v1.56: Add support for building configdrives.
-# v1.57: Add support for updating an exisiting allocation.
+# v1.57: Add support for updating an existing allocation.
 # v1.58: Add support for backfilling allocations.
 # v1.59: Add support vendor data in configdrives.
 # v1.60: Add owner to the allocation object.
@@ -119,6 +119,41 @@ BASE_VERSION = 1
 # v1.79: Change allocation behaviour to prefer node name match
 # v1.80: Marker to represent self service node creation/deletion
 # v1.81: Add node inventory
+# v1.82: Add node sharding capability
+# v1.83: Add child node modeling
+# v1.84: Add ramdisk callback to continue inspection.
+# v1.85: Add unhold verb
+# v1.86: Add firmware interface
+# v1.87: Add service verb
+# v1.88: Add name field to port.
+# v1.89: Add API for attaching/detaching virtual media
+# v1.90: Accept ovn vtep switch metadata schema to port.local_link_connection
+# v1.91: Remove special treatment of .json for API objects
+# v1.92: Add runbooks API
+# v1.93: Add GET API for virtual media
+# v1.94: Add node name support for port creation
+# v1.95: Add node support for disable_power_off
+# v1.96: Migrate inspection rules from Inspector
+# v1.97: Add description field to port.
+# v1.98: Add support for object attributes with keys containing ~ or /.
+# v1.99: Add conductor group filtering to port and portgroup list
+# v1.100: Add vendor field to port.
+# v1.101: Add category field to port.
+# v1.102: Add physical_network field to portgroup.
+# v1.103: Add category field to portgroup
+# v1.104: Add instance_name to node
+# v1.105: Remove broken ovn vtep metadata support
+# v1.106: Add shard filtering support for portgroups
+# v1.107: Add X-OpenStack-Request-Id header.
+# v1.108: Add disable_ramdisk support for servicing
+# v1.109: Add health field to node object.
+# v1.110: Add support for aborting deployment in DEPLOYWAIT state
+# v1.111: Add available_for_dynamic_portgroup to port,
+#          dynamic_portgroup to portgroup
+# v1.112: Add runbook traits: traits set on runbooks (replaces name-as-trait
+#          matching), relaxed runbook name validation, description field, and
+#          /v1/runbooks/{ident}/traits sub-resource endpoints.
+
 MINOR_0_JUNO = 0
 MINOR_1_INITIAL_VERSION = 1
 MINOR_2_AVAILABLE_STATE = 2
@@ -201,14 +236,56 @@ MINOR_78_NODE_HISTORY = 78
 MINOR_79_ALLOCATION_NODE_NAME = 79
 MINOR_80_PROJECT_CREATE_DELETE_NODE = 80
 MINOR_81_NODE_INVENTORY = 81
+MINOR_82_NODE_SHARD = 82
+MINOR_83_PARENT_CHILD_NODES = 83
+MINOR_84_CONTINUE_INSPECTION = 84
+MINOR_85_UNHOLD_VERB = 85
+MINOR_86_FIRMWARE_INTERFACE = 86
+MINOR_87_SERVICE = 87
+MINOR_88_PORT_NAME = 88
+MINOR_89_ATTACH_DETACH_VMEDIA = 89
+MINOR_90_OVN_VTEP = 90
+MINOR_91_DOT_JSON = 91
+MINOR_92_RUNBOOKS = 92
+MINOR_93_GET_VMEDIA = 93
+MINOR_94_PORT_NODENAME = 94
+MINOR_95_DISABLE_POWER_OFF = 95
+MINOR_96_INSPECTION_RULES = 96
+MINOR_97_PORT_DESCRIPTION = 97
+MINOR_98_SUPPORT_SPECIAL_CHAR_IN_ATTRIBUTES = 98
+MINOR_99_PORT_PORTGROUP_CONDUCTOR_GROUP_FILTER = 99
+MINOR_100_PORT_VENDOR = 100
+MINOR_101_PORT_CATEGORY = 101
+MINOR_102_PORTGROUP_PHYSICAL_NETWORK = 102
+MINOR_103_PORTGROUP_CATEGORY = 103
+MINOR_104_NODE_INSTANCE_NAME = 104
+MINOR_105_REMOVE_OVN_VTEP = 105
+MINOR_106_PORTGROUP_SHARD = 106
+MINOR_107_X_OPENSTACK_REQUEST_ID = 107
+MINOR_108_SERVICE_DISABLE_RAMDISK = 108
+MINOR_109_NODE_HEALTH = 109
+MINOR_110_DEPLOYWAIT_ABORT = 110
+MINOR_111_DYNAMIC_PORTGROUP = 111
+# v1.112: Add runbook traits support: traits set on runbooks, relaxed name
+#         validation, description field, and /v1/runbooks/{ident}/traits
+#         sub-resource.
+MINOR_112_RUNBOOK_TRAITS = 112
+MINOR_113_NODE_HISTORY_PROJECT = 113
+# v1.114: Add vendor, model, serial_number to firmware component response.
+MINOR_114_FIRMWARE_IDENTITY = 114
+# v1.115: Add state, target_provision_state, and
+# duration_seconds to node history.
+MINOR_115_NODE_HISTORY_FIELDS = 115
 
 # When adding another version, update:
 # - MINOR_MAX_VERSION
 # - doc/source/contributor/webapi-version-history.rst with a detailed
 #   explanation of what changed in the new version
 # - common/release_mappings.py, RELEASE_MAPPING['master']['api']
+# - Add a comment describing the change above the list of consts
 
-MINOR_MAX_VERSION = MINOR_81_NODE_INVENTORY
+
+MINOR_MAX_VERSION = MINOR_115_NODE_HISTORY_FIELDS
 
 # String representations of the minor and maximum versions
 _MIN_VERSION_STRING = '{}.{}'.format(BASE_VERSION, MINOR_1_INITIAL_VERSION)

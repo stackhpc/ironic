@@ -358,6 +358,41 @@ def get_payloads_with_schemas(from_module):
     return payloads
 
 
+def get_test_runbook(ctxt, **kw):
+    """Return a Runbook object with appropriate attributes.
+
+    NOTE: The object leaves the attributes marked as changed, such
+    that a create() could be used to commit it to the DB.
+    """
+    db_runbook = db_utils.get_test_runbook(**kw)
+    # Let DB generate ID if it isn't specified explicitly
+    if 'id' not in kw:
+        del db_runbook['id']
+    if 'steps' not in kw:
+        for step in db_runbook['steps']:
+            del step['id']
+            del step['runbook_id']
+    else:
+        for kw_step, runbook_step in zip(kw['steps'], db_runbook['steps']):
+            if 'id' not in kw_step and 'id' in runbook_step:
+                del runbook_step['id']
+    runbook = objects.Runbook(ctxt)
+    for key in db_runbook:
+        setattr(runbook, key, db_runbook[key])
+    return runbook
+
+
+def create_test_runbook(ctxt, **kw):
+    """Create and return a test runbook object.
+
+    NOTE: The object leaves the attributes marked as changed, such
+    that a create() could be used to commit it to the DB.
+    """
+    runbook = get_test_runbook(ctxt, **kw)
+    runbook.create()
+    return runbook
+
+
 class SchemasTestMixIn(object):
     def _check_payload_schemas(self, from_module, fields):
         """Assert that the Payload SCHEMAs have the expected properties.
@@ -380,3 +415,71 @@ class SchemasTestMixIn(object):
                               "for %s, schema key %s has invalid %s "
                               "field %s" % (payload, schema_key, resource,
                                             key))
+
+
+def create_test_inventory(ctxt, node, **kw):
+    """Create and return a test node inventory object."""
+    inv = objects.NodeInventory(ctxt)
+    if not isinstance(node, str):
+        node = node.id
+    kw['node_id'] = node
+    for key, value in kw.items():
+        setattr(inv, key, value)
+    inv.create()
+    return inv
+
+
+def get_test_firmware_component(ctxt, **kw):
+    """Return a FirmwareComponent object with appropriate attributes.
+
+    NOTE: The object leaves the attributes marked as changed, such
+    that a create() could be used to commit it to the DB.
+    """
+    kw['object_type'] = 'firmware'
+    get_db_fw_checked = check_keyword_arguments(
+        db_utils.get_test_firmware_component)
+    db_fw_cmp = get_db_fw_checked(**kw)
+
+    if 'id' not in kw:
+        del db_fw_cmp['id']
+
+    fw_cmp = objects.FirmwareComponent(ctxt)
+    for key in db_fw_cmp:
+        setattr(fw_cmp, key, db_fw_cmp[key])
+
+    return fw_cmp
+
+
+def create_test_firmware_component(ctxt, **kw):
+    """Create and return a test Firmware Component object.
+
+    Create a Firmware Component in the DB and return a FirmwareComponent
+    object with appropriate attributes.
+    """
+    fw_cmp = get_test_firmware_component(ctxt, **kw)
+    fw_cmp.create()
+    return fw_cmp
+
+
+def get_test_inspection_rule(ctxt, **kw):
+    """Return an InpsectionRule object with appropriate attributes.
+
+    NOTE: The object leaves the attributes marked as changed, such
+    that a create() could be used to commit it to the DB.
+    """
+    db_inspection_rule = db_utils.get_test_inspection_rule(**kw)
+    inspection_rule = objects.InspectionRule(ctxt)
+    for key in db_inspection_rule:
+        setattr(inspection_rule, key, db_inspection_rule[key])
+    return inspection_rule
+
+
+def create_test_inspection_rule(ctxt, **kw):
+    """Create and return a test inspection rule object.
+
+    NOTE: The object leaves the attributes marked as changed, such
+    that a create() could be used to commit it to the DB.
+    """
+    inspection_rule = get_test_inspection_rule(ctxt, **kw)
+    inspection_rule.create()
+    return inspection_rule

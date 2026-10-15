@@ -14,13 +14,17 @@
 #    under the License.
 
 from oslo_log import log
-from oslo_utils import importutils
+import sushy
 import tenacity
+import time
 
 from ironic.common import boot_devices
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import image_publisher
 from ironic.common import states
+from ironic.common import utils as common_utils
+from ironic.conductor import configdrive_utils
 from ironic.conductor import utils as manager_utils
 from ironic.conf import CONF
 from ironic.drivers import base
@@ -31,6 +35,11 @@ from ironic.drivers.modules.redfish import utils as redfish_utils
 from ironic.drivers import utils as driver_utils
 
 LOG = log.getLogger(__name__)
+
+# Transport protocol constants (matching Redfish specification values)
+TRANSPORT_HTTP = 'HTTP'
+TRANSPORT_NFS = 'NFS'
+TRANSPORT_CIFS = 'CIFS'
 
 REQUIRED_PROPERTIES = {
     'deploy_kernel': _("URL or Glance UUID of the deployment kernel. "
@@ -57,7 +66,13 @@ OPTIONAL_PROPERTIES = {
                            "be served outside of the provisioning network. "
                            "If set it will have priority over the following "
                            "configs: CONF.deploy.external_http_url and "
-                           "CONF.deploy.http_url. Defaults to None.")
+                           "CONF.deploy.http_url. Defaults to None."),
+    'vmedia_transport_protocol': _("Override transport protocol "
+                                   "selection. Valid values: 'HTTP', "
+                                   "'HTTPS', 'NFS' (NFSv3), 'CIFS'. If not "
+                                   "set, HTTP is used by default. NFS does "
+                                   "not send credentials; CIFS credentials "
+                                   "are configured via [cifs] options.")
 }
 
 RESCUE_PROPERTIES = {
@@ -77,8 +92,6 @@ COMMON_PROPERTIES.update(OPTIONAL_PROPERTIES)
 COMMON_PROPERTIES.update(RESCUE_PROPERTIES)
 
 IMAGE_SUBDIR = 'redfish'
-
-sushy = importutils.try_import('sushy')
 
 
 def _parse_driver_info(node):
@@ -123,6 +136,9 @@ def _parse_driver_info(node):
         {option: d_info.get(option, getattr(CONF.conductor, option, None))
          for option in OPTIONAL_PROPERTIES})
 
+    deploy_info['bootloader'] = driver_utils.get_field(
+        node, 'bootloader', use_conf=True)
+
     if (d_info.get('config_via_removable') is None
             and d_info.get('config_via_floppy') is not None):
         LOG.warning('The config_via_floppy driver_info option is deprecated, '
@@ -161,18 +177,100 @@ def _test_retry(exception):
     if isinstance(exception, sushy.exceptions.ServerSideError):
         # On some Dell hw, the eject media may still be in progress
         # https://storyboard.openstack.org/#!/story/2008504
-        LOG.warning("Boot media insert failed for node %(node)s, "
-                    "will retry after 3 seconds",
-                    {'node': exception.node_uuid})
+        # NOTE(cid): node_uuid is only set by the insert handler below, but
+        # _test_retry also guards _get_vmedia_resources, whose sushy errors
+        # have none, so read it defensively rather than raising AttributeError.
+        LOG.warning("Virtual media operation failed for node %(node)s, "
+                    "will retry after 3 seconds: %(error)s",
+                    {'node': getattr(exception, 'node_uuid', None),
+                     'error': exception})
         return True
     return False
 
 
-@tenacity.retry(retry=tenacity.retry_if_exception(_test_retry),
-                stop=tenacity.stop_after_attempt(3),
-                wait=tenacity.wait_fixed(3),
-                reraise=True)
-def _insert_vmedia(task, managers, boot_url, boot_device):
+def _has_vmedia_via_systems(system):
+    """Indicates if virtual media is available through Systems
+
+    :param system: A redfish System object
+    :return: True if the System has virtual media, else False
+    """
+    try:
+        system.virtual_media
+        return True
+    except sushy.exceptions.MissingAttributeError:
+        return False
+    except AttributeError:
+        # NOTE(wncslln): In case of older versions of sushy are
+        # used.
+        return False
+
+
+def _has_vmedia_via_manager(manager):
+    """Indicates if virtual media is available in the Manager
+
+    :param manager: A redfish System object
+    :return: True if the System has virtual media, else False
+    """
+    try:
+        manager.virtual_media
+        return True
+    except sushy.exceptions.MissingAttributeError:
+        return False
+
+
+def _get_vmedia(task, managers):
+    """GET virtual media details
+
+    :param task: A task from Task   Manager.
+    :param managers: A list of System managers.
+    :raises: InvalidParameterValue, if no suitable virtual CD or DVD is
+        found on the node.
+    """
+
+    err_msgs = []
+    vmedia_list = []
+    system = redfish_utils.get_system(task.node)
+    if _has_vmedia_via_systems(system):
+        vmedia_get = _get_vmedia_resources(task, system, err_msgs)
+        if vmedia_get:
+            for vmedia in vmedia_get:
+                media_type_list = []
+                for media_type in vmedia.media_types:
+                    media_type_list.append(media_type.value)
+
+                media = {
+                    "media_types": media_type_list,
+                    "inserted": vmedia.inserted,
+                    "image": vmedia.image
+                }
+                vmedia_list.append(media)
+            return vmedia_list
+    else:
+        for manager in managers:
+            vmedia_get = _get_vmedia_resources(task, manager, err_msgs)
+            if vmedia_get:
+                for vmedia in vmedia_get:
+                    media_type_list = []
+                    for media_type in vmedia.media_types:
+                        media_type_list.append(media_type.value)
+
+                    media = {
+                        "media_types": media_type_list,
+                        "inserted": vmedia.inserted,
+                        "image": vmedia.image
+                    }
+                    vmedia_list.append(media)
+                return vmedia_list
+    if err_msgs:
+        exc_msg = ("All virtual media GET attempts failed. "
+                   "Most recent error: ", err_msgs[-1])
+    else:
+        exc_msg = 'No suitable virtual media device found'
+    raise exception.InvalidParameterValue(exc_msg)
+
+
+def _insert_vmedia(task, managers, boot_url, boot_device,
+                   username=None, password=None, transfer_protocol=None):
     """Insert bootable ISO image into virtual CD or DVD
 
     :param task: A task from TaskManager.
@@ -180,41 +278,247 @@ def _insert_vmedia(task, managers, boot_url, boot_device):
     :param boot_url: URL to a bootable ISO image
     :param boot_device: sushy boot device e.g. `VIRTUAL_MEDIA_CD`,
         `VIRTUAL_MEDIA_DVD` or `VIRTUAL_MEDIA_FLOPPY`
+    :param username: Optional username for image access authentication.
+    :param password: Optional password for image access authentication.
+    :param transfer_protocol: Optional transfer protocol to include in the
+        initial Redfish InsertMedia request.
     :raises: InvalidParameterValue, if no suitable virtual CD or DVD is
         found on the node.
     """
-    for manager in managers:
-        for v_media in manager.virtual_media.get_members():
-            if boot_device not in v_media.media_types:
-                continue
-
-            if v_media.inserted:
-                if v_media.image == boot_url:
-                    LOG.debug("Boot media %(boot_url)s is already "
-                              "inserted into %(boot_device)s for node "
-                              "%(node)s", {'node': task.node.uuid,
-                                           'boot_url': boot_url,
-                                           'boot_device': boot_device})
-                    return
-
-                continue
-
+    err_msgs = []
+    insert_kwargs = {'username': username, 'password': password}
+    if transfer_protocol:
+        insert_kwargs['transfer_protocol'] = transfer_protocol
+    system = redfish_utils.get_system(task.node)
+    if _has_vmedia_via_systems(system):
+        # A ServerSideError surviving the retries means this resource failed;
+        # the error is already recorded in err_msgs.
+        try:
+            inserted = _insert_vmedia_in_resource(task, system, boot_url,
+                                                  boot_device, err_msgs,
+                                                  **insert_kwargs)
+        except sushy.exceptions.ServerSideError:
+            inserted = False
+        if inserted:
+            return
+    else:
+        for manager in managers:
+            # On a surviving ServerSideError, try the next manager.
             try:
-                v_media.insert_media(boot_url, inserted=True,
-                                     write_protected=True)
-            except sushy.exceptions.ServerSideError as e:
-                e.node_uuid = task.node.uuid
-                raise
+                inserted = _insert_vmedia_in_resource(task, manager, boot_url,
+                                                      boot_device, err_msgs,
+                                                      **insert_kwargs)
+            except sushy.exceptions.ServerSideError:
+                continue
+            if inserted:
+                return
 
-            LOG.info("Inserted boot media %(boot_url)s into "
-                     "%(boot_device)s for node "
-                     "%(node)s", {'node': task.node.uuid,
-                                  'boot_url': boot_url,
-                                  'boot_device': boot_device})
+    if err_msgs:
+        if len(err_msgs) == 1 or err_msgs[0] == err_msgs[-1]:
+            exc_msg = _("Virtual media mount failed for node %(node)s "
+                        "with image %(url)s. Error: %(error)s") % {
+                'node': task.node.uuid,
+                'url': boot_url,
+                'error': err_msgs[0]
+            }
+        else:
+            exc_msg = _("Virtual media mount failed for node %(node)s "
+                        "with image %(url)s after multiple attempts. "
+                        "First error: %(first)s. "
+                        "Last error: %(last)s") % {
+                'node': task.node.uuid,
+                'url': boot_url,
+                'first': err_msgs[0],
+                'last': err_msgs[-1]
+            }
+    else:
+        exc_msg = _('No suitable virtual media device found for node '
+                    '%(node)s to mount image %(url)s') % {
+            'node': task.node.uuid,
+            'url': boot_url
+        }
+    raise exception.InvalidParameterValue(exc_msg)
+
+
+@tenacity.retry(retry=tenacity.retry_if_exception(_test_retry),
+                stop=tenacity.stop_after_attempt(3),
+                wait=tenacity.wait_fixed(3),
+                reraise=True)
+def _insert_vmedia_in_resource(task, resource, boot_url, boot_device,
+                               err_msgs, username=None, password=None,
+                               transfer_protocol=None):
+    """Insert virtual media from a given redfish resource (System/Manager)
+
+    :param task: A task from TaskManager.
+    :param resource: A redfish resource either a System or Manager.
+    :param boot_url: URL to a bootable ISO image
+    :param boot_device: sushy boot device e.g. `VIRTUAL_MEDIA_CD`,
+        `VIRTUAL_MEDIA_DVD` or `VIRTUAL_MEDIA_FLOPPY`
+    :param err_msgs: A list that will contain all errors found
+    :param username: Optional username for image access authentication.
+    :param password: Optional password for image access authentication.
+    :param transfer_protocol: Optional transfer protocol to include in the
+        initial Redfish InsertMedia request.
+    :raises: InvalidParameterValue, if no suitable virtual CD or DVD is
+        found on the node.
+    """
+    # Get acceptable virtual media IDs from the boot interface
+    # This allows vendor-specific implementations to restrict which
+    # virtual media devices can be used
+    try:
+        acceptable_id = task.driver.boot._get_acceptable_media_id(task,
+                                                                  resource)
+    except AttributeError:
+        LOG.warning("Boot interface %s does not implement "
+                    "_get_acceptable_media_id method. This method should be "
+                    "implemented for compatibility.",
+                    task.driver.boot.__class__.__name__)
+        acceptable_id = None
+
+    # NOTE(cid): some BMCs (observed on Dell iDRAC) keep reporting media as
+    # inserted for a short window after a successful eject. Since the ISO URL
+    # is derived from the node UUID, that stale URL matches the one we are
+    # about to insert, so trusting it would skip the insert and the node would
+    # boot with nothing mounted. Eject any media from every usable slot of
+    # this device type and re-insert into the first slot; the retry below
+    # (story 2008504) covers an eject still in progress edge case.
+    try:
+        _eject_vmedia_from_resource(task, resource, boot_device)
+    except sushy.exceptions.SushyError as exc:
+        # Best effort; the insert below surfaces/retries real errors.
+        LOG.debug("Failed to eject existing boot media for node %(node)s: "
+                  "%(exc)s", {'node': task.node.uuid, 'exc': exc})
+
+    for v_media in resource.virtual_media.get_members():
+        # Skip virtual media if the ID is not in the acceptable set
+        if acceptable_id is not None and v_media.identity != acceptable_id:
+            LOG.debug("Boot Interface %(name)s returned %(acceptable_id)s as "
+                      "Virtual Media Slot ID, current slot is %(slot)s, "
+                      "skipping",
+                      {'name': task.driver.boot.__class__.__name__,
+                       'acceptable_id': acceptable_id,
+                       'slot': v_media.identity})
+            continue
+
+        if boot_device not in v_media.media_types:
+            # NOTE(janders): this conditional allows v_media that only
+            # support DVD MediaType and NOT CD to also be used.
+            # if v_media.media_types contains sushy.VIRTUAL_MEDIA_DVD
+            # we follow the usual steps of checking if v_media is inserted
+            # and if not, attempt to insert it. Otherwise we skip to the
+            # next v_media device, if any
+            # This is needed to add support to Cisco UCSB and UCSX blades
+            # reference: https://bugs.launchpad.net/ironic/+bug/2031595
+            if (boot_device == sushy.VIRTUAL_MEDIA_CD
+                and sushy.VIRTUAL_MEDIA_DVD in v_media.media_types):
+                LOG.debug("While looking for %(requested_device)s virtual "
+                          "media device, found %(available_device)s "
+                          "instead. Attempting to configure it.",
+                          {'requested_device': sushy.VIRTUAL_MEDIA_CD,
+                           'available_device': sushy.VIRTUAL_MEDIA_DVD})
+            else:
+                continue
+
+        try:
+            kwargs = dict(inserted=True, write_protected=True)
+            if username:
+                kwargs['username'] = username
+            if password:
+                kwargs['password'] = password
+            if transfer_protocol:
+                kwargs['transfer_protocol'] = transfer_protocol
+            v_media.insert_media(boot_url, **kwargs)
+            # Poll until the BMC confirms the media is actually attached,
+            # or fail fast on an Exception/Killed task state.
+            if CONF.redfish.enable_vmedia_insert_polling:
+                _wait_for_vmedia_inserted(task, v_media)
+        # NOTE(janders): On Cisco C845A M8 (and potentially other OpenBMC
+        # systems), some virtual media slots only support local/KVM access
+        # via WebSocket/NBD and do not have the InsertMedia action.
+        # Catch MissingActionError and try the next available device.
+        except sushy.exceptions.MissingActionError:
+            LOG.info("Virtual media device %(slot)s on node %(node)s does "
+                     "not support InsertMedia action, skipping.",
+                     {'slot': v_media.identity, 'node': task.node.uuid})
+            continue
+        # NOTE(janders): On Cisco UCSB and UCSX blades there are several
+        # vMedia devices. Some of those are only meant for internal use
+        # by CIMC vKVM - attempts to InsertMedia into those will result
+        # in BadRequestError. We catch the exception here so that we don't
+        # fail out and try the next available device instead, if available.
+        except sushy.exceptions.BadRequestError as exc:
+            err_msg = ("Inserting virtual media into %(boot_device)s "
+                       "failed for node %(node)s, moving to next virtual "
+                       "media device, if available. %(exc)s" %
+                       {'node': task.node.uuid, 'exc': exc,
+                        'boot_device': boot_device})
+            err_msgs.append(err_msg)
+            LOG.warning(err_msg)
+            continue
+        except sushy.exceptions.ServerSideError as e:
+            # On some Dell hw a just-issued eject may still be in progress, so
+            # re-raise (stashing node_uuid for _test_retry) so the decorator
+            # retries the insert.
+            # https://storyboard.openstack.org/#!/story/2008504
+            err_msg = str(e)
+            if err_msg not in err_msgs:
+                err_msgs.append(err_msg)
+
+            e.node_uuid = task.node.uuid
+            raise
+        # NOTE(janders): On Cisco C845A M8 (and potentially other systems),
+        # attempting to use a virtual media slot that doesn't support remote
+        # media insertion may result in HTTP 405 (Method Not Allowed).
+        # Catch this and try the next available device.
+        # This must come after ServerSideError since it is a subclass of
+        # HTTPError.
+        except sushy.exceptions.HTTPError as exc:
+            if exc.status_code == 405:
+                err_msg = ("Inserting virtual media into %(boot_device)s "
+                           "failed for node %(node)s, moving to next "
+                           "virtual media device, if available. "
+                           "%(exc)s" %
+                           {'node': task.node.uuid, 'exc': exc,
+                            'boot_device': boot_device})
+                err_msgs.append(err_msg)
+                LOG.warning(err_msg)
+                continue
+            raise
+
+        LOG.info("Inserted boot media %(boot_url)s into "
+                 "%(boot_device)s for node "
+                 "%(node)s", {'node': task.node.uuid,
+                              'boot_url': boot_url,
+                              'boot_device': boot_device})
+        return True
+
+    return False
+
+
+def _wait_for_vmedia_inserted(task, v_media):
+    """Poll a VirtualMedia resource until the BMC confirms it is inserted.
+
+    :param task: A task from TaskManager.
+    :param v_media: The sushy VirtualMedia resource InsertMedia was just
+        called against.
+    :raises: IronicException if the mount does not complete successfully
+        within the timeout, naming the failure instead of leaving it to
+        surface later as a generic inspection/deploy timeout.
+    """
+    timeout = CONF.redfish.vmedia_insert_timeout
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        v_media.refresh(force=True)
+        if v_media.inserted:
             return
 
-    raise exception.InvalidParameterValue(
-        _('No suitable virtual media device found'))
+        time.sleep(CONF.redfish.vmedia_insert_poll_interval)
+
+    raise exception.IronicException(
+        _('Timed out after %(timeout)ss waiting for virtual media to '
+          'be mounted on node %(node)s.') %
+        {'timeout': timeout, 'node': task.node.uuid})
 
 
 def _eject_vmedia(task, managers, boot_device=None):
@@ -230,23 +534,113 @@ def _eject_vmedia(task, managers, boot_device=None):
         found on the node.
     """
     found = False
+    system = redfish_utils.get_system(task.node)
+    # NOTE(wncslln): we will attempt to eject virtual media in Systems
+    # and in Managers.
+    if _has_vmedia_via_systems(system):
+        ejected = _eject_vmedia_from_resource(task, resource=system,
+                                              boot_device=boot_device)
+        if ejected:
+            found = True
+
     for manager in managers:
-        for v_media in manager.virtual_media.get_members():
-            if boot_device and boot_device not in v_media.media_types:
-                continue
-
-            inserted = v_media.inserted
-
-            if inserted:
-                v_media.eject_media()
+        if _has_vmedia_via_manager(manager):
+            ejected = _eject_vmedia_from_resource(task, resource=manager,
+                                                  boot_device=boot_device)
+            if ejected:
                 found = True
+        continue
 
-            LOG.info("Boot media is%(already)s ejected from "
-                     "%(boot_device)s for node %(node)s"
-                     "", {'node': task.node.uuid,
-                          'already': '' if inserted else ' already',
-                          'boot_device': v_media.name})
     return found
+
+
+@tenacity.retry(retry=tenacity.retry_if_exception(_test_retry),
+                stop=tenacity.stop_after_attempt(3),
+                wait=tenacity.wait_fixed(3),
+                reraise=True)
+def _get_vmedia_resources(task, resource, err_msgs):
+    """Get virtual media for a given redfish resource (System/Manager)
+
+    :param task: A task from TaskManager.
+    :param resource: A redfish resource either a System or Manager.
+    :param err_msgs: A list that will contain all errors found
+    """
+    LOG.info("Get virtual media details for node=%(node)s",
+             {'node': task.node.uuid})
+
+    return resource.virtual_media.get_members()
+
+
+def _eject_vmedia_from_resource(task, resource, boot_device=None):
+    """Eject virtual media from a given redfish resource (System/Manager)
+
+    :param task: A task from TaskManager.
+    :param resource: A redfish resource either a System or Manager.
+    :param boot_device: sushy boot device e.g. `VIRTUAL_MEDIA_CD`,
+        `VIRTUAL_MEDIA_DVD` or `VIRTUAL_MEDIA_FLOPPY` or `None` to
+        eject everything (default).
+    :return: True if any device was ejected, else False
+    """
+    found = False
+    for v_media in resource.virtual_media.get_members():
+        if boot_device and boot_device not in v_media.media_types:
+            # NOTE(iurygregory): this conditional allows v_media that only
+            # support DVD MediaType and NOT CD to also be used.
+            # if v_media.media_types contains sushy.VIRTUAL_MEDIA_DVD
+            # we follow the usual steps of checking if v_media is inserted
+            # and eject it. Otherwise we skip to the
+            # next v_media device, if any.
+            # This is needed to add support to Cisco UCSB and UCSX blades
+            # reference: https://bugs.launchpad.net/ironic/+bug/2039042
+            if (boot_device == sushy.VIRTUAL_MEDIA_CD
+                and sushy.VIRTUAL_MEDIA_DVD in v_media.media_types):
+                LOG.debug('While looking for %(requested_device)s virtual '
+                          'media device, found %(available_device)s '
+                          'instead. Attempting to use it to eject media.',
+                          {'requested_device': sushy.VIRTUAL_MEDIA_CD,
+                           'available_device': sushy.VIRTUAL_MEDIA_DVD})
+            else:
+                continue
+        inserted = v_media.inserted
+        if inserted:
+            v_media.eject_media()
+            found = True
+
+        LOG.info("Boot media is%(already)s ejected from "
+                 "%(boot_device)s for node %(node)s"
+                 "", {'node': task.node.uuid,
+                      'already': '' if inserted else ' already',
+                      'boot_device': v_media.name})
+    return found
+
+
+def get_vmedia(task):
+    """Get the attached virtual CDs and DVDs for a node
+
+        :param task: A task from TaskManager.
+        :raises: InvalidParameterValue, if no suitable virtual CD or DVD is
+            found on the node.
+        """
+    LOG.info('Called redfish.boot.get_vmedia, for '
+             'node=%(node)s',
+             {'node': task.node.uuid})
+    system = redfish_utils.get_system(task.node)
+    return _get_vmedia(task, system.managers)
+
+
+def insert_vmedia(task, image_url, device_type):
+    """Insert virtual CDs and DVDs
+
+        :param task: A task from TaskManager.
+        :param image_url:
+        :param device_type: sushy boot device e.g. `VIRTUAL_MEDIA_CD`,
+            `VIRTUAL_MEDIA_DVD` or `VIRTUAL_MEDIA_FLOPPY` or `None` to
+            eject everything (default).
+        :raises: InvalidParameterValue, if no suitable virtual CD or DVD is
+            found on the node.
+        """
+    system = redfish_utils.get_system(task.node)
+    _insert_vmedia(task, system.managers, image_url, device_type)
 
 
 def eject_vmedia(task, boot_device=None):
@@ -271,8 +665,8 @@ def eject_vmedia(task, boot_device=None):
             image_utils.cleanup_iso_image(task)
 
 
-def _has_vmedia_device(managers, boot_device, inserted=None):
-    """Indicate if device exists at any of the managers
+def _has_vmedia_device(managers, boot_device, inserted=None, system=None):
+    """Indicate if device exists at any of the managers or system
 
     :param managers: A list of System managers.
     :param boot_device: One or more sushy boot device e.g. `VIRTUAL_MEDIA_CD`,
@@ -286,14 +680,23 @@ def _has_vmedia_device(managers, boot_device, inserted=None):
         boot_device = [boot_device]
 
     for dev in boot_device:
-        for manager in managers:
-            for v_media in manager.virtual_media.get_members():
+        if _has_vmedia_via_systems(system):
+            for v_media in system.virtual_media.get_members():
                 if dev not in v_media.media_types:
                     continue
                 if (inserted is not None
                         and bool(v_media.inserted) is not inserted):
                     continue
                 return dev
+        else:
+            for manager in managers:
+                for v_media in manager.virtual_media.get_members():
+                    if dev not in v_media.media_types:
+                        continue
+                    if (inserted is not None
+                            and bool(v_media.inserted) is not inserted):
+                        continue
+                    return dev
     return False
 
 
@@ -317,6 +720,165 @@ def _parse_deploy_info(node):
     deploy_info.update(_parse_instance_info(node))
 
     return deploy_info
+
+
+def _detect_supported_transport_protocols(task, managers, boot_device):
+    """Detect supported transport protocols from VirtualMedia resources.
+
+    Queries Redfish VirtualMedia resources to determine what transport
+    protocols the BMC supports.
+
+    .. note::
+       This function attempts to predict which virtual media device will
+       be used by matching boot_device type (including CD/DVD fallback),
+       which mirrors the logic in _insert_vmedia_in_resource. However,
+       _insert_vmedia_in_resource has additional complexity (retries,
+       acceptable_id filtering) that this function does not replicate.
+       In practice, the risk of mismatch is low because both functions
+       filter on the same device types.
+
+    :param task: A task from TaskManager.
+    :param managers: A list of System managers.
+    :param boot_device: sushy boot device
+    :returns: List of supported protocol strings.
+    """
+    supported_protocols = set()
+    system = redfish_utils.get_system(task.node)
+    resource = None
+
+    if _has_vmedia_via_systems(system):
+        resource = system
+    else:
+        for manager in managers:
+            if _has_vmedia_via_manager(manager):
+                resource = manager
+                break
+
+    if not resource:
+        LOG.debug("No virtual media resource found for node %s, "
+                  "defaulting to HTTP", task.node.uuid)
+        return ['HTTP']
+
+    try:
+        for v_media in resource.virtual_media.get_members():
+            # Skip devices that don't match the requested boot_device,
+            # unless a CD request can be satisfied by a DVD.
+            media_types = getattr(v_media, 'media_types', [])
+            if (boot_device not in media_types
+                and not (boot_device == sushy.VIRTUAL_MEDIA_CD
+                         and sushy.VIRTUAL_MEDIA_DVD in media_types)):
+                continue
+
+            protocols = getattr(v_media, 'transfer_protocol_type', None)
+            if protocols:
+                if isinstance(protocols, list):
+                    supported_protocols.update(protocols)
+                else:
+                    supported_protocols.add(protocols)
+                continue
+
+            raw_data = getattr(v_media, 'json', None)
+            if not isinstance(raw_data, dict):
+                raw_data = getattr(v_media, 'raw', None)
+            if isinstance(raw_data, dict):
+                actions = raw_data.get('Actions', {})
+                insert_media = actions.get('#VirtualMedia.InsertMedia', {})
+                transfer_protocols = insert_media.get(
+                    'TransferProtocolType@Redfish.AllowableValues', [])
+                if transfer_protocols:
+                    supported_protocols.update(transfer_protocols)
+
+                if 'TransferProtocolType' in raw_data:
+                    protocols = raw_data['TransferProtocolType']
+                    if isinstance(protocols, list):
+                        supported_protocols.update(protocols)
+                    elif protocols:
+                        supported_protocols.add(protocols)
+    except (sushy.exceptions.MissingAttributeError,
+            sushy.exceptions.InvalidAttributeError) as e:
+        LOG.debug("Could not detect transport protocols from VirtualMedia "
+                  "for node %(node)s: %(error)s. Defaulting to HTTP.",
+                  {'node': task.node.uuid, 'error': e})
+    except (AttributeError, KeyError, TypeError) as e:
+        LOG.warning("Unexpected error detecting transport protocols from "
+                    "VirtualMedia for node %(node)s: %(error)s. "
+                    "Defaulting to HTTP.",
+                    {'node': task.node.uuid, 'error': e},
+                    exc_info=True)
+
+    normalized = {p.upper() if isinstance(p, str) else str(p).upper()
+                  for p in supported_protocols}
+
+    # Always include HTTP as a supported protocol fallback.
+    normalized.add(TRANSPORT_HTTP)
+
+    return sorted(list(normalized))
+
+
+def _select_transport_protocol(task, supported_protocols):
+    """Select the transport protocol for virtual media.
+
+    Returns the explicitly configured protocol from driver_info, or
+    defaults to HTTP. HTTPS, NFS, and CIFS are only used when explicitly set
+    via driver_info[vmedia_transport_protocol].
+
+    :param task: A task from TaskManager.
+    :param supported_protocols: List of protocols supported by the BMC.
+    :returns: Selected protocol string ('HTTP', 'HTTPS', 'NFS', or 'CIFS').
+    :raises: InvalidParameterValue if driver_info override is not
+        supported by the BMC or required configuration is missing.
+    """
+    node = task.node
+    supported_upper = [p.upper() for p in supported_protocols]
+
+    override = node.driver_info.get('vmedia_transport_protocol')
+    if override:
+        override_upper = override.upper()
+        if override_upper not in supported_upper:
+            raise exception.InvalidParameterValue(
+                _("Node %(node)s requested transport protocol %(proto)s "
+                  "via driver_info, but BMC only supports %(supported)s.")
+                % {'node': node.uuid, 'proto': override_upper,
+                   'supported': supported_upper})
+
+        # Validate that required configuration exists for the protocol
+        if override_upper == TRANSPORT_NFS:
+            if not CONF.nfs.base_url or not CONF.nfs.share_path:
+                raise exception.InvalidParameterValue(
+                    _("NFS transport protocol requested for node %(node)s "
+                      "but [nfs]base_url and [nfs]share_path are not both "
+                      "configured.") % {'node': node.uuid})
+        elif override_upper in (TRANSPORT_CIFS, 'SMB'):
+            if not CONF.cifs.base_url or not CONF.cifs.share_path:
+                raise exception.InvalidParameterValue(
+                    _("CIFS transport protocol requested for node %(node)s "
+                      "but [cifs]base_url and [cifs]share_path are not both "
+                      "configured.") % {'node': node.uuid})
+
+        LOG.debug("Using driver_info transport protocol %s for node %s",
+                  override_upper, node.uuid)
+        return override_upper
+
+    LOG.debug("Using HTTP transport protocol (default) for node %s",
+              node.uuid)
+    return TRANSPORT_HTTP
+
+
+def _image_publisher_settings():
+    """Image publisher settings shared by the Redfish boot interfaces.
+
+    Resolved on access so that mutable ``[redfish]`` configuration is
+    honored. Consumed via ``BootInterface.image_publisher_settings`` by
+    :class:`ironic.drivers.modules.image_utils.ImageHandler`.
+    """
+    return base.ImagePublisherSettings(
+        swift_enabled=CONF.redfish.use_swift,
+        container=CONF.redfish.swift_container,
+        timeout=CONF.redfish.swift_object_expiry_timeout,
+        image_subdir="redfish",
+        file_permission=CONF.redfish.file_permission,
+        kernel_params=CONF.redfish.kernel_append_params,
+    )
 
 
 class RedfishVirtualMediaBoot(base.BootInterface):
@@ -352,17 +914,9 @@ class RedfishVirtualMediaBoot(base.BootInterface):
     capabilities = ['iscsi_volume_boot', 'ramdisk_boot',
                     'ramdisk_boot_configdrive']
 
-    def __init__(self):
-        """Initialize the Redfish virtual media boot interface.
-
-        :raises: DriverLoadError if the driver can't be loaded due to
-            missing dependencies
-        """
-        super(RedfishVirtualMediaBoot, self).__init__()
-        if not sushy:
-            raise exception.DriverLoadError(
-                driver='redfish',
-                reason=_('Unable to import the sushy library'))
+    @property
+    def image_publisher_settings(self):
+        return _image_publisher_settings()
 
     def get_properties(self):
         """Return the properties of the interface.
@@ -429,16 +983,36 @@ class RedfishVirtualMediaBoot(base.BootInterface):
                            if m.manager_type == sushy.MANAGER_TYPE_BMC]
             if bmc_manager:
                 fwv = bmc_manager[0].firmware_version.split('.')
-                if int(fwv[0]) >= 6:
+                if int(fwv[0]) in [6, 7]:
                     return
+            # NOTE(TheJulia) Dell iDRAC10 reverted to 2.x.x.x for versioning
+            # and is also incompatible with the stock virtual media code.
+            # This may be fixed one day, but in the mean time, but the error
+            # provides specific guidance now.
             raise exception.InvalidParameterValue(
                 _("The %(iface)s boot interface is not suitable for node "
                   "%(node)s with vendor %(vendor)s and BMC version %(fwv)s, "
-                  "upgrade to 6.00.00.00 or newer or use "
-                  "idrac-redfish-virtual-media instead")
+                  "the interface only supports iDRAC9 versions between "
+                  "6.0.0.0 and 7.x.x.x. Other versions are incompatible by "
+                  "default and you should use the idrac-redfish-virtual"
+                  "-media boot interface instead")
                 % {'iface': task.node.get_interface('boot'),
                    'node': task.node.uuid, 'vendor': vendor,
                    'fwv': bmc_manager[0].firmware_version})
+
+    def _get_acceptable_media_id(self, task, resource):
+        """Get acceptable virtual media IDs for the resource.
+
+        This method can be overridden by vendor-specific implementations
+        to return specific virtual media IDs that should be used.
+
+        :param task: A TaskManager instance containing the node to act on.
+        :param resource: A redfish resource (System or Manager) containing
+            virtual media.
+        :returns: An acceptable virtual media ID, or None if any ID
+            is acceptable.
+        """
+        return None
 
     def validate(self, task):
         """Validate the deployment information for the task's node.
@@ -460,14 +1034,9 @@ class RedfishVirtualMediaBoot(base.BootInterface):
         :param task: A TaskManager instance with the node being checked
         :raises: MissingParameterValue if node is missing one or more required
             parameters
-        :raises: UnsupportedDriverExtension
         """
-        try:
-            self._validate_driver_info(task)
-        except exception.MissingParameterValue:
-            # Fall back to non-managed in-band inspection
-            raise exception.UnsupportedDriverExtension(
-                driver=task.node.driver, extension='inspection')
+        # No unmanaged fallback for virtual media
+        self._validate_driver_info(task)
 
     def prepare_ramdisk(self, task, ramdisk_params):
         """Prepares the boot of deploy or rescue ramdisk over virtual media.
@@ -491,13 +1060,14 @@ class RedfishVirtualMediaBoot(base.BootInterface):
             return
 
         d_info = _parse_driver_info(node)
-        managers = redfish_utils.get_system(task.node).managers
+        system = redfish_utils.get_system(task.node)
+        managers = system.managers
 
         self._validate_vendor(task, managers)
 
         if manager_utils.is_fast_track(task):
             if _has_vmedia_device(managers, sushy.VIRTUAL_MEDIA_CD,
-                                  inserted=True):
+                                  inserted=True, system=system):
                 LOG.debug('Fast track operation for node %s, not inserting '
                           'any devices', node.uuid)
                 return
@@ -535,7 +1105,8 @@ class RedfishVirtualMediaBoot(base.BootInterface):
             removable = _has_vmedia_device(
                 managers,
                 # Prefer USB devices since floppies are outdated
-                [sushy.VIRTUAL_MEDIA_USBSTICK, sushy.VIRTUAL_MEDIA_FLOPPY])
+                [sushy.VIRTUAL_MEDIA_USBSTICK, sushy.VIRTUAL_MEDIA_FLOPPY],
+                system=system)
             if removable:
                 floppy_ref = image_utils.prepare_floppy_image(
                     task, params=ramdisk_params)
@@ -555,19 +1126,40 @@ class RedfishVirtualMediaBoot(base.BootInterface):
 
         mode = deploy_utils.rescue_or_deploy_mode(node)
 
+        supported_protocols = _detect_supported_transport_protocols(
+            task, managers, sushy.VIRTUAL_MEDIA_CD)
+        selected_protocol = _select_transport_protocol(
+            task, supported_protocols)
+
+        common_utils.set_node_nested_field(
+            task.node, 'driver_internal_info',
+            'vmedia_transport_protocol', selected_protocol)
+        task.node.save()
+
         iso_ref = image_utils.prepare_deploy_iso(task, ramdisk_params,
                                                  mode, d_info)
 
+        username = None
+        password = None
+        if selected_protocol.upper() in ('CIFS', 'SMB'):
+            cifs_pub = image_publisher.CIFSPublisher()
+            username, password = cifs_pub.get_credentials()
+
+        insert_kwargs = {'username': username, 'password': password}
+        if node.driver_info.get('vmedia_transport_protocol'):
+            insert_kwargs['transfer_protocol'] = selected_protocol
+
         _eject_vmedia(task, managers, sushy.VIRTUAL_MEDIA_CD)
-        _insert_vmedia(task, managers, iso_ref, sushy.VIRTUAL_MEDIA_CD)
+        _insert_vmedia(task, managers, iso_ref, sushy.VIRTUAL_MEDIA_CD,
+                       **insert_kwargs)
 
         del managers
 
         boot_mode_utils.sync_boot_mode(task)
 
-        self._set_boot_device(task, boot_devices.CDROM)
+        self._apply_boot_device(task, boot_devices.CDROM)
 
-        LOG.debug("Node %(node)s is set to one time boot from "
+        LOG.debug("Node %(node)s is set to boot from "
                   "%(device)s", {'node': task.node.uuid,
                                  'device': boot_devices.CDROM})
 
@@ -587,6 +1179,7 @@ class RedfishVirtualMediaBoot(base.BootInterface):
 
         LOG.debug("Cleaning up deploy boot for "
                   "%(node)s", {'node': task.node.uuid})
+        manager_utils.node_power_action(task, states.POWER_OFF)
         self._eject_all(task)
 
     def prepare_instance(self, task):
@@ -619,11 +1212,12 @@ class RedfishVirtualMediaBoot(base.BootInterface):
         boot_option = deploy_utils.get_boot_option(node)
         iwdi = node.driver_internal_info.get('is_whole_disk_image')
         if boot_option == "local" or iwdi:
-            self._set_boot_device(task, boot_devices.DISK, persistent=True)
+            self._apply_boot_device(
+                task, boot_devices.DISK, persistent=True)
 
-            LOG.debug("Node %(node)s is set to permanently boot from local "
-                      "%(device)s", {'node': task.node.uuid,
-                                     'device': boot_devices.DISK})
+            LOG.debug("Node %(node)s set to boot from local %(device)s",
+                      {'node': task.node.uuid,
+                       'device': boot_devices.DISK})
             return
 
         params = {}
@@ -635,7 +1229,8 @@ class RedfishVirtualMediaBoot(base.BootInterface):
                     "The UUID of the root partition could not be found for "
                     "node %s. Booting instance from disk anyway.", node.uuid)
 
-                self._set_boot_device(task, boot_devices.DISK, persistent=True)
+                self._apply_boot_device(
+                    task, boot_devices.DISK, persistent=True)
 
                 return
 
@@ -643,10 +1238,32 @@ class RedfishVirtualMediaBoot(base.BootInterface):
 
         managers = redfish_utils.get_system(task.node).managers
 
+        supported_protocols = _detect_supported_transport_protocols(
+            task, managers, sushy.VIRTUAL_MEDIA_CD)
+        selected_protocol = _select_transport_protocol(
+            task, supported_protocols)
+
+        common_utils.set_node_nested_field(
+            task.node, 'driver_internal_info',
+            'vmedia_transport_protocol', selected_protocol)
+        task.node.save()
+
         deploy_info = _parse_deploy_info(node)
         iso_ref = image_utils.prepare_boot_iso(task, deploy_info, **params)
+
+        username = None
+        password = None
+        if selected_protocol.upper() in ('CIFS', 'SMB'):
+            cifs_pub = image_publisher.CIFSPublisher()
+            username, password = cifs_pub.get_credentials()
+
+        insert_kwargs = {'username': username, 'password': password}
+        if node.driver_info.get('vmedia_transport_protocol'):
+            insert_kwargs['transfer_protocol'] = selected_protocol
+
         _eject_vmedia(task, managers, sushy.VIRTUAL_MEDIA_CD)
-        _insert_vmedia(task, managers, iso_ref, sushy.VIRTUAL_MEDIA_CD)
+        _insert_vmedia(task, managers, iso_ref, sushy.VIRTUAL_MEDIA_CD,
+                       **insert_kwargs)
 
         if boot_option == 'ramdisk':
             self._attach_configdrive(task, managers)
@@ -660,9 +1277,14 @@ class RedfishVirtualMediaBoot(base.BootInterface):
                                  'device': boot_devices.CDROM})
 
     def _attach_configdrive(self, task, managers):
-        configdrive = manager_utils.get_configdrive_image(task.node)
+        configdrive = configdrive_utils.get_configdrive_image(task.node)
         if not configdrive:
             return
+
+        if 'ramdisk_boot_configdrive' not in self.capabilities:
+            raise exception.InstanceDeployFailure(
+                _('Cannot attach a configdrive to node %s, as it is not '
+                  'supported in the driver.') % task.node.uuid)
 
         _eject_vmedia(task, managers, sushy.VIRTUAL_MEDIA_USBSTICK)
         cd_ref = image_utils.prepare_configdrive_image(task, configdrive)
@@ -711,6 +1333,40 @@ class RedfishVirtualMediaBoot(base.BootInterface):
         boot_mode_utils.deconfigure_secure_boot_if_needed(task)
 
     @classmethod
+    def _apply_boot_device(cls, task, device, persistent=False):
+        """Set boot device with vendor-specific handling.
+
+        Lenovo UEFI systems use an NVRAM-based boot model where
+        setting BootSourceOverrideTarget=Hdd maps to a generic
+        "Hard Disk" entry that bypasses the shim bootloader's pointer,
+        causing a "Boot Option Restoration" loop.  Skip the DISK
+        override entirely and let the UEFI boot order (which already
+        contains the shim entry) take effect.
+
+        See https://bugs.launchpad.net/ironic/+bug/2053064
+
+        :param task: a TaskManager instance.
+        :param device: the boot device, one of
+                       :mod:`ironic.common.boot_devices`.
+        :param persistent: Whether to set next-boot, or make the change
+            permanent. Default: False.
+        :raises: InvalidParameterValue if the validation of the
+            ManagementInterface fails.
+        """
+        vendor = task.node.properties.get('vendor')
+        target_boot_mode = boot_mode_utils.get_boot_mode(task.node)
+        if (vendor and vendor.lower() == 'lenovo'
+                and target_boot_mode == 'uefi'
+                and device == boot_devices.DISK and persistent):
+            LOG.debug('Skipping persistent boot device setting for '
+                      'Lenovo UEFI node %s to allow UEFI boot order '
+                      '(with shim bootloader) to take effect',
+                      task.node.uuid)
+            return
+
+        cls._set_boot_device(task, device, persistent)
+
+    @classmethod
     def _set_boot_device(cls, task, device, persistent=False):
         """Set the boot device for a node.
 
@@ -726,4 +1382,310 @@ class RedfishVirtualMediaBoot(base.BootInterface):
         :raises: InvalidParameterValue if the validation of the
             ManagementInterface fails.
         """
+        manager_utils.node_set_boot_device(task, device, persistent)
+
+    def validate_rescue(self, task):
+        """Validate that the node has required properties for rescue.
+
+        :param task: a TaskManager instance with the node being checked
+        :raises: MissingParameterValue if node is missing one or more required
+            parameters
+        """
+        _parse_driver_info(task.node)
+
+
+class RedfishHttpsBoot(base.BootInterface):
+    """A driver which utilizes UefiHttp like virtual media.
+
+    Utilizes the virtual media image build to craft a ISO image to
+    signal to remote BMC to boot.
+
+    This interface comes with some constraints. For example, this
+    interface is built under the operating assumption that DHCP is
+    used. The UEFI Firmware needs to load some base configuration,
+    regardless. Also depending on UEFI Firmware, and how it handles
+    UefiHttp Boot, additional ISO contents, such as "configuration drive"
+    materials might be unavailable. A similar constraint exists with
+    ``ramdisk`` deployment.
+    """
+
+    capabilities = ['ramdisk_boot']
+
+    @property
+    def image_publisher_settings(self):
+        return _image_publisher_settings()
+
+    def get_properties(self):
+        """Return the properties of the interface.
+
+        :returns: dictionary of <property name>:<property description> entries.
+        """
+        return REQUIRED_PROPERTIES
+
+    def _validate_driver_info(self, task):
+        """Validate the prerequisites for Redfish HTTPS based boot.
+
+        This method validates whether the 'driver_info' property of the
+        supplied node contains the required information for this driver.
+
+        :param task: a TaskManager instance containing the node to act on.
+        :raises: InvalidParameterValue if any parameters are incorrect
+        :raises: MissingParameterValue if some mandatory information
+            is missing on the node
+        """
+        node = task.node
+
+        _parse_driver_info(node)
+        # Issue the deprecation warning if needed
+        driver_utils.get_agent_iso(node, deprecated_prefix='redfish')
+
+    def _validate_instance_info(self, task):
+        """Validate instance image information for the task's node.
+
+        This method validates whether the 'instance_info' property of the
+        supplied node contains the required information for this driver.
+
+        :param task: a TaskManager instance containing the node to act on.
+        :raises: InvalidParameterValue if any parameters are incorrect
+        :raises: MissingParameterValue if some mandatory information
+            is missing on the node
+        """
+        node = task.node
+
+        # NOTE(dtantsur): if we're are writing an image with local boot
+        # the boot interface does not care about image parameters and
+        # must not validate them.
+        if (not task.driver.storage.should_write_image(task)
+                or deploy_utils.get_boot_option(node) == 'local'):
+            return
+
+        d_info = _parse_deploy_info(node)
+        deploy_utils.validate_image_properties(task, d_info)
+
+    def _validate_hardware(self, task):
+        """Validates hardware support.
+
+        :param task: a TaskManager instance containing the node to act on.
+        :raises: InvalidParameterValue if vendor not supported
+        """
+        system = redfish_utils.get_system(task.node)
+        if "UefiHttp" not in system.boot.allowed_values:
+            raise exception.UnsupportedHardwareFeature(
+                node=task.node.uuid,
+                feature="UefiHttp boot")
+
+    def validate(self, task):
+        """Validate the deployment information for the task's node.
+
+        This method validates whether the 'driver_info' and/or 'instance_info'
+        properties of the task's node contains the required information for
+        this interface to function.
+
+        :param task: A TaskManager instance containing the node to act on.
+        :raises: InvalidParameterValue on malformed parameter(s)
+        :raises: MissingParameterValue on missing parameter(s)
+        """
+        self._validate_hardware(task)
+        self._validate_driver_info(task)
+        self._validate_instance_info(task)
+
+    def validate_inspection(self, task):
+        """Validate that the node has required properties for inspection.
+
+        :param task: A TaskManager instance with the node being checked
+        :raises: MissingParameterValue if node is missing one or more required
+            parameters
+        """
+        self._validate_driver_info(task)
+
+    def prepare_ramdisk(self, task, ramdisk_params):
+        """Prepares the boot of the agent ramdisk.
+
+        This method prepares the boot of the deploy or rescue ramdisk after
+        reading relevant information from the node's driver_info and
+        instance_info.
+
+        :param task: A task from TaskManager.
+        :param ramdisk_params: the parameters to be passed to the ramdisk.
+        :returns: None
+        :raises: MissingParameterValue, if some information is missing in
+            node's driver_info or instance_info.
+        :raises: InvalidParameterValue, if some information provided is
+            invalid.
+        :raises: IronicException, if some power or set boot boot device
+            operation failed on the node.
+        """
+        node = task.node
+        if not driver_utils.need_prepare_ramdisk(node):
+            return
+
+        d_info = _parse_driver_info(node)
+
+        if manager_utils.is_fast_track(task):
+            LOG.debug('Fast track operation for node %s, not setting up '
+                      'a HTTP Boot url', node.uuid)
+            return
+
+        can_config = d_info.pop('can_provide_config', True)
+        if can_config:
+            manager_utils.add_secret_token(node, pregenerated=True)
+            node.save()
+            ramdisk_params['ipa-agent-token'] = \
+                node.driver_internal_info['agent_secret_token']
+
+        manager_utils.node_power_action(task, states.POWER_OFF)
+
+        deploy_nic_mac = deploy_utils.get_single_nic_with_vif_port_id(task)
+        if deploy_nic_mac is not None:
+            ramdisk_params['BOOTIF'] = deploy_nic_mac
+        if CONF.debug and 'ipa-debug' not in ramdisk_params:
+            ramdisk_params['ipa-debug'] = '1'
+
+        # NOTE(TheJulia): This is a mandatory setting for virtual media
+        # based deployment operations and boot modes similar where we
+        # want the ramdisk to consider embedded configuration.
+        ramdisk_params['boot_method'] = 'vmedia'
+
+        mode = deploy_utils.rescue_or_deploy_mode(node)
+
+        iso_ref = image_utils.prepare_deploy_iso(task, ramdisk_params,
+                                                 mode, d_info)
+        boot_mode_utils.sync_boot_mode(task)
+
+        self._set_boot_device(task, boot_devices.UEFIHTTP,
+                              http_boot_url=iso_ref)
+
+        LOG.debug("Node %(node)s is set to one time boot from "
+                  "%(device)s", {'node': task.node.uuid,
+                                 'device': boot_devices.UEFIHTTP})
+
+    def clean_up_ramdisk(self, task):
+        """Cleans up the boot of ironic ramdisk.
+
+        This method cleans up the environment that was setup for booting the
+        deploy ramdisk.
+
+        :param task: A task from TaskManager.
+        :returns: None
+        """
+        if manager_utils.is_fast_track(task):
+            LOG.debug('Fast track operation for node %s, not ejecting '
+                      'any devices', task.node.uuid)
+            return
+
+        LOG.debug("Cleaning up deploy boot for "
+                  "%(node)s", {'node': task.node.uuid})
+        self._clean_up(task)
+
+    def prepare_instance(self, task):
+        """Prepares the boot of instance over virtual media.
+
+        This method prepares the boot of the instance after reading
+        relevant information from the node's instance_info.
+
+        The internal logic is as follows:
+
+        - Cleanup any related files
+        - Sync the boot mode with the machine.
+        - Configure Secure boot, if required.
+        - If local boot, or a whole disk image was deployed,
+          set the next boot device as disk.
+        - If "ramdisk" is the desired, then the UefiHttp boot
+          option is set to the BMC with a request for this to
+          be persistent.
+
+        :param task: a task from TaskManager.
+        :returns: None
+        :raises: InstanceDeployFailure, if its try to boot iSCSI volume in
+                 'BIOS' boot mode.
+        """
+        node = task.node
+
+        self._clean_up(task)
+
+        boot_mode_utils.sync_boot_mode(task)
+        boot_mode_utils.configure_secure_boot_if_needed(task)
+
+        boot_option = deploy_utils.get_boot_option(node)
+        iwdi = node.driver_internal_info.get('is_whole_disk_image')
+        if boot_option == "local" or iwdi:
+            RedfishVirtualMediaBoot._apply_boot_device(
+                task, boot_devices.DISK, persistent=True)
+
+            LOG.debug("Node %(node)s set to boot from local %(device)s",
+                      {'node': task.node.uuid,
+                       'device': boot_devices.DISK})
+            return
+
+        params = {}
+
+        if boot_option != 'ramdisk':
+            root_uuid = node.driver_internal_info.get('root_uuid_or_disk_id')
+            if not root_uuid and task.driver.storage.should_write_image(task):
+                LOG.warning(
+                    "The UUID of the root partition could not be found for "
+                    "node %s. Booting instance from disk anyway.", node.uuid)
+
+                RedfishVirtualMediaBoot._apply_boot_device(
+                    task, boot_devices.DISK, persistent=True)
+
+                return
+
+            params.update(root_uuid=root_uuid)
+
+        deploy_info = _parse_deploy_info(node)
+
+        iso_ref = image_utils.prepare_boot_iso(task, deploy_info, **params)
+        self._set_boot_device(task, boot_devices.UEFIHTTP, persistent=True,
+                              http_boot_url=iso_ref)
+
+        LOG.debug("Node %(node)s is set to permanently boot from "
+                  "%(device)s", {'node': task.node.uuid,
+                                 'device': boot_devices.UEFIHTTP})
+
+    def _clean_up(self, task):
+        image_utils.cleanup_iso_image(task)
+
+    def clean_up_instance(self, task):
+        """Cleans up the boot of instance.
+
+        This method cleans up the environment that was setup for booting
+        the instance.
+
+        :param task: A task from TaskManager.
+        :returns: None
+        """
+        LOG.debug("Cleaning up instance boot for "
+                  "%(node)s", {'node': task.node.uuid})
+        self._clean_up(task)
+        boot_mode_utils.deconfigure_secure_boot_if_needed(task)
+
+    @classmethod
+    def _set_boot_device(cls, task, device, persistent=False,
+                         http_boot_url=None):
+        """Set the boot device for a node.
+
+        This is a hook method which can be used by other drivers based upon
+        this class, in order to facilitate vendor specific logic,
+        if needed.
+
+        Furthermore, we are not considering a *lack* of a URL as fatal.
+        A driver could easily update DHCP and send the message to the BMC.
+
+        :param task: a TaskManager instance.
+        :param device: the boot device, one of
+                       :mod:`ironic.common.boot_devices`.
+        :param persistent: Whether to set next-boot, or make the change
+            permanent. Default: False.
+        :param http_boot_url: The URL to send to the BMC in order to boot
+            the node via UEFIHTTP.
+        :raises: InvalidParameterValue if the validation of the
+            ManagementInterface fails.
+        """
+
+        if http_boot_url:
+            common_utils.set_node_nested_field(
+                task.node, 'driver_internal_info',
+                'redfish_uefi_http_url', http_boot_url)
+            task.node.save()
         manager_utils.node_set_boot_device(task, device, persistent)

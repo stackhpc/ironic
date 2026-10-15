@@ -26,6 +26,10 @@ opts = [
                mutable=True,
                help=_('Delay value to wait for Neutron agents to setup '
                       'sufficient DHCP configuration for port.')),
+    cfg.BoolOpt('fail_on_port_binding_failure',
+                default=True,
+                help=_('Whether to fail or continue deployment if neutron '
+                       'port binding fails.')),
     cfg.IntOpt('retries',
                default=3,
                mutable=True,
@@ -128,7 +132,30 @@ opts = [
                       'different CLID/IAID. Due to non-identical identifiers '
                       'multiple addresses must be reserved for the host to '
                       'ensure each step of the boot process can successfully '
-                      'lease addresses.'))
+                      'lease addresses.')),
+    cfg.StrOpt('servicing_network',
+               mutable=True,
+               help=_('Neutron network UUID or name for booting the ramdisk '
+                      'for service mode. Required for "neutron" '
+                      'network interface, if service mode will be used. It '
+                      'is not used for the "flat" or "noop" network '
+                      'interfaces. If a name is provided, it must be unique '
+                      'among all networks or service will fail.')),
+    cfg.ListOpt('servicing_network_security_groups',
+                default=[],
+                mutable=True,
+                help=_('List of Neutron Security Group UUIDs to be applied '
+                       'during the node service process. Optional for the '
+                       '"neutron" network interface and not used for the '
+                       '"flat" or "noop" network interfaces. If not '
+                       'specified, the default security group is used.')),
+    cfg.BoolOpt('allow_disabling_power_off',
+                default=False,
+                help=_('By default, nodes with disable_power_off set to True '
+                       'cannot be used with the Neutron network interface '
+                       'because during tear-down they will be left with the '
+                       'instance image still running. Set this option to '
+                       'True to disable this validation.')),
 ]
 
 

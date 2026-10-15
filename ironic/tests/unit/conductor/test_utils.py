@@ -10,18 +10,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import datetime
 import os
 import tempfile
 import time
 from unittest import mock
 
 from oslo_config import cfg
+from oslo_context import context as oslo_context
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
 
 from ironic.common import boot_devices
 from ironic.common import boot_modes
 from ironic.common import exception
+from ironic.common import health_states
 from ironic.common import network
 from ironic.common import neutron
 from ironic.common import nova
@@ -196,7 +199,8 @@ class NodePowerActionTestCase(db_base.DbTestCase):
         node = obj_utils.create_test_node(self.context,
                                           uuid=uuidutils.generate_uuid(),
                                           driver='fake-hardware',
-                                          power_state=states.POWER_OFF)
+                                          power_state=states.POWER_OFF,
+                                          last_error='failed before')
         task = task_manager.TaskManager(self.context, node.uuid)
 
         get_power_mock.return_value = states.POWER_OFF
@@ -208,6 +212,27 @@ class NodePowerActionTestCase(db_base.DbTestCase):
         self.assertEqual(states.POWER_ON, node['power_state'])
         self.assertIsNone(node['target_power_state'])
         self.assertIsNone(node['last_error'])
+
+    @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
+    def test_node_power_action_keep_last_error(self, get_power_mock):
+        """Test node_power_action to keep last_error for failed states."""
+        node = obj_utils.create_test_node(self.context,
+                                          uuid=uuidutils.generate_uuid(),
+                                          driver='fake-hardware',
+                                          power_state=states.POWER_OFF,
+                                          provision_state=states.CLEANFAIL,
+                                          last_error='failed before')
+        task = task_manager.TaskManager(self.context, node.uuid)
+
+        get_power_mock.return_value = states.POWER_OFF
+
+        conductor_utils.node_power_action(task, states.POWER_ON)
+
+        node.refresh()
+        get_power_mock.assert_called_once_with(mock.ANY, mock.ANY)
+        self.assertEqual(states.POWER_ON, node['power_state'])
+        self.assertIsNone(node['target_power_state'])
+        self.assertEqual('failed before', node['last_error'])
 
     @mock.patch('ironic.objects.node.NodeSetPowerStateNotification',
                 autospec=True)
@@ -221,11 +246,12 @@ class NodePowerActionTestCase(db_base.DbTestCase):
         self.config(host='my-host')
         # Required for exception handling
         mock_notif.__name__ = 'NodeSetPowerStateNotification'
-        node = obj_utils.create_test_node(self.context,
-                                          uuid=uuidutils.generate_uuid(),
-                                          driver='fake-hardware',
-                                          instance_uuid=uuidutils.uuid,
-                                          power_state=states.POWER_OFF)
+        node = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            instance_uuid=uuidutils.generate_uuid(),
+            power_state=states.POWER_OFF)
         task = task_manager.TaskManager(self.context, node.uuid)
 
         get_power_mock.return_value = states.POWER_OFF
@@ -282,6 +308,31 @@ class NodePowerActionTestCase(db_base.DbTestCase):
                          node['driver_internal_info'])
 
     @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
+    def test_node_power_action_power_off_already(self, get_power_mock):
+        """Test node_power_action to turn node power off, but already off."""
+        dii = {'agent_secret_token': 'token',
+               'agent_cached_deploy_steps': ['steps']}
+        node = obj_utils.create_test_node(self.context,
+                                          uuid=uuidutils.generate_uuid(),
+                                          driver='fake-hardware',
+                                          power_state=states.POWER_ON,
+                                          driver_internal_info=dii)
+        task = task_manager.TaskManager(self.context, node.uuid)
+
+        get_power_mock.return_value = states.POWER_OFF
+
+        conductor_utils.node_power_action(task, states.POWER_OFF)
+
+        node.refresh()
+        get_power_mock.assert_called_once_with(mock.ANY, mock.ANY)
+        self.assertEqual(states.POWER_OFF, node['power_state'])
+        self.assertIsNone(node['target_power_state'])
+        self.assertIsNone(node['last_error'])
+        self.assertNotIn('agent_secret_token', node['driver_internal_info'])
+        self.assertNotIn('agent_cached_deploy_steps',
+                         node['driver_internal_info'])
+
+    @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
     def test_node_power_action_power_off_pregenerated_token(self,
                                                             get_power_mock):
         dii = {'agent_secret_token': 'token',
@@ -307,7 +358,8 @@ class NodePowerActionTestCase(db_base.DbTestCase):
 
     @mock.patch.object(fake.FakePower, 'reboot', autospec=True)
     @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
-    def test_node_power_action_power_reboot(self, get_power_mock, reboot_mock):
+    def _test_node_power_action_power_reboot(self, get_power_mock, reboot_mock,
+                                             disable_power_off=False):
         """Test for reboot a node."""
         dii = {'agent_secret_token': 'token',
                'agent_cached_deploy_steps': ['steps']}
@@ -315,7 +367,8 @@ class NodePowerActionTestCase(db_base.DbTestCase):
                                           uuid=uuidutils.generate_uuid(),
                                           driver='fake-hardware',
                                           power_state=states.POWER_ON,
-                                          driver_internal_info=dii)
+                                          driver_internal_info=dii,
+                                          disable_power_off=disable_power_off)
         task = task_manager.TaskManager(self.context, node.uuid)
 
         conductor_utils.node_power_action(task, states.REBOOT)
@@ -327,6 +380,12 @@ class NodePowerActionTestCase(db_base.DbTestCase):
         self.assertIsNone(node['target_power_state'])
         self.assertIsNone(node['last_error'])
         self.assertNotIn('agent_secret_token', node['driver_internal_info'])
+
+    def test_node_power_action_power_reboot(self):
+        self._test_node_power_action_power_reboot()
+
+    def test_node_power_action_power_reboot_with_disable_power_off(self):
+        self._test_node_power_action_power_reboot(disable_power_off=True)
 
     @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
     def test_node_power_action_invalid_state(self, get_power_mock):
@@ -355,6 +414,30 @@ class NodePowerActionTestCase(db_base.DbTestCase):
         node.refresh()
         self.assertEqual(states.POWER_OFF, node['power_state'])
         self.assertIsNone(node['target_power_state'])
+        self.assertIsNone(node['last_error'])
+
+    @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
+    def test_node_power_action_disable_power_off(self, get_power_mock):
+        """Test for exception when power off is disabled."""
+        node = obj_utils.create_test_node(self.context,
+                                          uuid=uuidutils.generate_uuid(),
+                                          driver='fake-hardware',
+                                          power_state=states.POWER_ON,
+                                          disable_power_off=True)
+        task = task_manager.TaskManager(self.context, node.uuid)
+
+        get_power_mock.return_value = states.POWER_ON
+
+        self.assertRaises(exception.PowerStateFailure,
+                          conductor_utils.node_power_action,
+                          task, states.POWER_OFF)
+
+        node.refresh()
+        get_power_mock.assert_not_called()
+        self.assertEqual(states.POWER_ON, node['power_state'])
+        self.assertIsNone(node['target_power_state'])
+        # Not updating last_error - this condition should be caught on the API
+        # level and reported immediately.
         self.assertIsNone(node['last_error'])
 
     @mock.patch('ironic.objects.node.NodeSetPowerStateNotification',
@@ -694,6 +777,238 @@ class NodePowerActionTestCase(db_base.DbTestCase):
         self.assertIsNone(node['target_power_state'])
         self.assertIsNone(node['last_error'])
 
+    @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
+    def test_node_power_action_power_on_with_parent(self, get_power_mock):
+        """Test node_power_action to turns on a parent node"""
+        parent = obj_utils.create_test_node(self.context,
+                                            uuid=uuidutils.generate_uuid(),
+                                            driver='fake-hardware',
+                                            power_state=states.POWER_OFF)
+
+        node = obj_utils.create_test_node(self.context,
+                                          uuid=uuidutils.generate_uuid(),
+                                          driver='fake-hardware',
+                                          power_state=states.POWER_OFF,
+                                          last_error='failed before',
+                                          parent_node=parent.uuid)
+        task = task_manager.TaskManager(self.context, node.uuid)
+
+        get_power_mock.side_effect = states.POWER_OFF
+
+        conductor_utils.node_power_action(task, states.POWER_ON)
+
+        node.refresh()
+        parent.refresh()
+        # NOTE(TheJulia): We independently check power state
+        # in this code path so we end up with 3 calls, parent,
+        # parent as part of node_power_action, and then child.
+        self.assertEqual(3, get_power_mock.call_count)
+        self.assertEqual(states.POWER_ON, parent['power_state'])
+        self.assertEqual(states.POWER_ON, node['power_state'])
+        self.assertIsNone(parent['target_power_state'])
+        self.assertIsNone(parent['last_error'])
+        self.assertIsNone(node['target_power_state'])
+        self.assertIsNone(node['last_error'])
+
+    @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
+    def test_node_power_action_power_on_parent_off(self, get_power_mock):
+        """Test node_power_action to turns on a parent node"""
+        parent = obj_utils.create_test_node(
+            self.context,
+            name="parent_node",
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_OFF)
+
+        node = obj_utils.create_test_node(
+            self.context,
+            name='child_node',
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_OFF,
+            last_error='failed before',
+            parent_node=parent.uuid,
+            driver_info={'has_dedicated_power_supply': True})
+
+        task = task_manager.TaskManager(self.context, node.uuid)
+
+        get_power_mock.side_effect = states.POWER_OFF
+
+        conductor_utils.node_power_action(task, states.POWER_ON)
+
+        node.refresh()
+        parent.refresh()
+        self.assertEqual(1, get_power_mock.call_count)
+        self.assertEqual(states.POWER_OFF, parent['power_state'])
+        self.assertEqual(states.POWER_ON, node['power_state'])
+        self.assertIsNone(parent['target_power_state'])
+        self.assertIsNone(parent['last_error'])
+        self.assertIsNone(node['target_power_state'])
+        self.assertIsNone(node['last_error'])
+
+    @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
+    def test_node_power_action_power_off_parent(self, get_power_mock):
+        """Test node_power_action to turns on a parent node"""
+        parent = obj_utils.create_test_node(
+            self.context,
+            name="parent",
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_ON)
+
+        node = obj_utils.create_test_node(
+            self.context,
+            name="child",
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_ON,
+            last_error='failed before',
+            parent_node=parent.uuid,
+            driver_info={'has_dedicated_power_supply': False})
+
+        task = task_manager.TaskManager(self.context, parent.uuid)
+
+        get_power_mock.side_effect = states.POWER_ON
+
+        conductor_utils.node_power_action(task, states.POWER_OFF)
+
+        node.refresh()
+        parent.refresh()
+        self.assertEqual(3, get_power_mock.call_count)
+        self.assertEqual(states.POWER_OFF, parent['power_state'])
+        self.assertEqual(states.POWER_OFF, node['power_state'])
+        self.assertIsNone(parent['target_power_state'])
+        self.assertIsNone(parent['last_error'])
+        self.assertIsNone(node['target_power_state'])
+        self.assertIsNone(node['last_error'])
+
+    @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
+    def test_node_power_action_power_off_parent_child_remains(
+            self, get_power_mock):
+        """Test node_power_action to turns on a parent node"""
+        parent = obj_utils.create_test_node(
+            self.context,
+            name="parent",
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_ON)
+
+        node = obj_utils.create_test_node(
+            self.context,
+            name="child",
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_ON,
+            last_error='failed before',
+            parent_node=parent.uuid,
+            driver_info={'has_dedicated_power_supply': True})
+
+        task = task_manager.TaskManager(self.context, parent.uuid)
+
+        get_power_mock.side_effect = states.POWER_ON
+
+        conductor_utils.node_power_action(task, states.POWER_OFF)
+
+        node.refresh()
+        parent.refresh()
+        self.assertEqual(1, get_power_mock.call_count)
+        self.assertEqual(states.POWER_OFF, parent['power_state'])
+        self.assertEqual(states.POWER_ON, node['power_state'])
+        self.assertIsNone(parent['target_power_state'])
+        self.assertIsNone(parent['last_error'])
+        self.assertIsNone(node['target_power_state'])
+        self.assertIsNotNone(node['last_error'])
+
+    @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
+    def test_node_power_action_power_on_exception_if_parent_locked(
+            self,
+            get_power_mock):
+        """Test node_power_action to turns on a parent node"""
+        parent = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_OFF,
+            reservation='meow')
+
+        node = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_OFF,
+            last_error='failed before',
+            parent_node=parent.uuid)
+
+        task = task_manager.TaskManager(self.context, node.uuid)
+
+        get_power_mock.side_effect = states.POWER_OFF
+
+        self.assertRaises(exception.ParentNodeLocked,
+                          conductor_utils.node_power_action,
+                          task, states.POWER_ON)
+        node.refresh()
+        parent.refresh()
+        self.assertEqual(2, get_power_mock.call_count)
+        self.assertEqual(states.POWER_OFF, parent['power_state'])
+        self.assertEqual(states.POWER_OFF, node['power_state'])
+        self.assertIsNone(parent['target_power_state'])
+        self.assertIsNone(parent['last_error'])
+        self.assertIn('is presently locked', node['last_error'])
+        self.assertIsNone(node['target_power_state'])
+
+    @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
+    def test_node_power_action_power_off_exception_if_child_locked(
+            self,
+            get_power_mock):
+        """Test node_power_action to turns on a parent node"""
+        parent = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_ON)
+
+        node = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_ON,
+            last_error='failed before',
+            parent_node=parent.uuid)
+
+        locked_node = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_state=states.POWER_ON,
+            last_error='failed before',
+            parent_node=parent.uuid,
+            reservation='foo')
+
+        task = task_manager.TaskManager(self.context, parent.uuid)
+
+        get_power_mock.side_effect = states.POWER_ON
+
+        self.assertRaises(exception.ChildNodeLocked,
+                          conductor_utils.node_power_action,
+                          task, states.POWER_OFF)
+        # Since we launched the task this way, we need to explicitly
+        # release it.
+        task.release_resources()
+        node.refresh()
+        parent.refresh()
+        self.assertEqual(3, get_power_mock.call_count)
+        self.assertEqual(states.POWER_ON, parent['power_state'])
+        self.assertEqual(states.POWER_ON, locked_node['power_state'])
+        self.assertEqual(states.POWER_ON, node['power_state'])
+        self.assertIsNone(parent['target_power_state'])
+        self.assertEqual('failed before', node['last_error'])
+        self.assertIn('is presently locked', parent['last_error'])
+        self.assertIsNone(node['target_power_state'])
+        self.assertIsNone(parent['target_power_state'])
+        self.assertIsNone(locked_node['target_power_state'])
+        self.assertIsNone(node['reservation'])
+        self.assertIsNone(parent['reservation'])
+
     def test__calculate_target_state(self):
         for new_state in (states.POWER_ON, states.REBOOT, states.SOFT_REBOOT):
             self.assertEqual(
@@ -969,6 +1284,10 @@ class DeployingErrorHandlerTestCase(db_base.DbTestCase):
         self.task.node = mock.Mock(spec_set=objects.Node)
         self.node = self.task.node
         self.node.provision_state = states.DEPLOYING
+        # NOTE(edomfeh): node_history_record() records the target provision
+        # state. We must mock it as a string to prevent oslo_versionedobjects
+        # from throwing a ValueError on an unconfigured Mock object.
+        self.node.target_provision_state = states.DEPLOYING
         self.node.last_error = None
         self.node.deploy_step = None
         self.node.driver_info = {}
@@ -1046,6 +1365,41 @@ class DeployingErrorHandlerTestCase(db_base.DbTestCase):
         self.assertNotIn('deploy_step_index', self.node.driver_internal_info)
         self.task.process_event.assert_called_once_with('fail')
 
+    @mock.patch.object(conductor_utils.deploy_utils, 'destroy_images',
+                       autospec=True)
+    @mock.patch.object(conductor_utils, 'LOG', autospec=True)
+    def test_deploying_error_handler_clears_img_cache(self,
+                                                      mock_log, mock_destroy):
+        """Test that instance images are cleaned up even when clean_up=False.
+
+        """
+        self.config(clear_image_cache_on_deploy_failure=True,
+                    group='conductor')
+        mock_destroy.side_effect = exception.IronicException('moocow')
+        conductor_utils.deploying_error_handler(
+            self.task, self.logmsg, self.errmsg, clean_up=False)
+
+        self.assertFalse(self.task.driver.deploy.clean_up.called)
+        mock_log.warning.assert_called_once()
+        mock_destroy.assert_called_once_with(self.node.uuid)
+        self.assertEqual([mock.call()] * 2, self.node.save.call_args_list)
+        self.assertEqual(self.errmsg, self.node.last_error)
+        self.assertEqual({}, self.node.deploy_step)
+        self.assertNotIn('deploy_step_index', self.node.driver_internal_info)
+        self.task.process_event.assert_called_once_with('fail')
+
+    def test_deploying_error_handler_skips_img_cache_cleanup(self):
+        """Test skip instance images clean up when disabled via config."""
+        conductor_utils.deploying_error_handler(
+            self.task, self.logmsg, self.errmsg, clean_up=False)
+
+        self.assertFalse(self.task.driver.deploy.clean_up.called)
+        self.assertEqual([mock.call()] * 2, self.node.save.call_args_list)
+        self.assertEqual(self.errmsg, self.node.last_error)
+        self.assertEqual({}, self.node.deploy_step)
+        self.assertNotIn('deploy_step_index', self.node.driver_internal_info)
+        self.task.process_event.assert_called_once_with('fail')
+
     def test_deploying_error_handler_not_deploy(self):
         # Not in a deploy state
         self.node.provision_state = states.AVAILABLE
@@ -1078,6 +1432,8 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
 
         self.node.configure_mock(power_state=states.POWER_OFF,
                                  target_power_state=states.POWER_ON,
+                                 provision_state=states.AVAILABLE,
+                                 target_provision_state=states.NOSTATE,
                                  maintenance=False, maintenance_reason=None,
                                  id=fake_node.id)
         self.task.context = self.context
@@ -1138,6 +1494,45 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
         self.assertEqual(clean_error, self.node.maintenance_reason)
         self.assertEqual('clean failure', self.node.fault)
 
+    @mock.patch.object(conductor_utils, 'servicing_error_handler',
+                       autospec=True)
+    def test_cleanup_servicewait_timeout_handler_call(self,
+                                                      mock_error_handler):
+        self.task.node.uuid = '18c95393-b775-4887-a274-c45be47509d5'
+        self.node.service_step = {}
+        conductor_utils.cleanup_servicewait_timeout(self.task)
+
+        mock_error_handler.assert_called_once_with(
+            self.task,
+            logmsg="Servicing for node 18c95393-b775-4887-a274-c45be47509d5 "
+                   "failed. Timeout reached while servicing the node. Please "
+                   "check if the ramdisk responsible for the servicing is "
+                   "running on the node. Failed on step {}.",
+            errmsg="Timeout reached while servicing the node. Please "
+                   "check if the ramdisk responsible for the servicing is "
+                   "running on the node. Failed on step {}.",
+            set_fail_state=False)
+
+    def test_cleanup_servicewait_timeout(self):
+        self.node.provision_state = states.SERVICEFAIL
+        target = 'baz'
+        self.node.target_provision_state = target
+        self.node.driver_internal_info = {}
+        self.node.service_step = {'key': 'val'}
+        service_error = ("Timeout reached while servicing the node. Please "
+                         "check if the ramdisk responsible for the servicing "
+                         "is running on the node. Failed on step "
+                         "{'key': 'val'}.")
+        self.node.set_driver_internal_info('servicing_reboot', True)
+        self.node.set_driver_internal_info('service_step_index', 0)
+        conductor_utils.cleanup_servicewait_timeout(self.task)
+        self.assertEqual({}, self.node.service_step)
+        self.assertNotIn('service_step_index', self.node.driver_internal_info)
+        self.assertFalse(self.task.process_event.called)
+        self.assertTrue(self.node.maintenance)
+        self.assertEqual(service_error, self.node.maintenance_reason)
+        self.assertEqual('service failure', self.node.fault)
+
     @mock.patch.object(conductor_utils.LOG, 'error', autospec=True)
     def _test_cleaning_error_handler(self, mock_log_error,
                                      prov_state=states.CLEANING):
@@ -1150,6 +1545,9 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
         self.node.set_driver_internal_info('skip_current_clean_step', True)
         self.node.set_driver_internal_info('clean_step_index', 0)
         self.node.set_driver_internal_info('agent_url', 'url')
+        self.node.set_driver_internal_info('agent_secret_token', 'foo')
+        self.node.set_driver_internal_info('agent_secret_token_pregenerated',
+                                           False)
 
         msg = 'error bar'
         last_error = "last error"
@@ -1161,6 +1559,9 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
         self.assertNotIn('cleaning_reboot', self.node.driver_internal_info)
         self.assertNotIn('cleaning_polling', self.node.driver_internal_info)
         self.assertNotIn('skip_current_clean_step',
+                         self.node.driver_internal_info)
+        self.assertNotIn('agent_secret_token', self.node.driver_internal_info)
+        self.assertNotIn('agent_secret_token_pregenerated',
                          self.node.driver_internal_info)
         self.assertEqual(last_error, self.node.last_error)
         self.assertTrue(self.node.maintenance)
@@ -1270,6 +1671,21 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
     def test_spawn_deploying_error_handler_other_error(self, log_mock):
         exc = Exception('foo')
         conductor_utils.spawn_deploying_error_handler(exc, self.node)
+        self.assertFalse(self.node.save.called)
+        self.assertFalse(log_mock.warning.called)
+
+    @mock.patch.object(conductor_utils, 'LOG', autospec=True)
+    def test_spawn_servicing_error_handler_no_worker(self, log_mock):
+        exc = exception.NoFreeConductorWorker()
+        conductor_utils.spawn_servicing_error_handler(exc, self.node)
+        self.node.save.assert_called_once_with()
+        self.assertIn('No free conductor workers', self.node.last_error)
+        self.assertTrue(log_mock.warning.called)
+
+    @mock.patch.object(conductor_utils, 'LOG', autospec=True)
+    def test_spawn_servicing_error_handler_other_error(self, log_mock):
+        exc = Exception('foo')
+        conductor_utils.spawn_servicing_error_handler(exc, self.node)
         self.assertFalse(self.node.save.called)
         self.assertFalse(log_mock.warning.called)
 
@@ -1435,6 +1851,174 @@ class ErrorHandlersTestCase(db_base.DbTestCase):
                                 'state': self.node.provision_state})]
         log_mock.assert_has_calls(log_calls)
         self.node.save.assert_called_once_with()
+
+    @mock.patch.object(conductor_utils.LOG, 'error', autospec=True)
+    def _test_servicing_error_handler(self, mock_log_error,
+                                      prov_state=states.SERVICING):
+        self.node.provision_state = prov_state
+        target = 'baz'
+        self.node.target_provision_state = target
+        self.node.service_step = {'key': 'val'}
+        self.node.set_driver_internal_info('servicing_reboot', True)
+        self.node.set_driver_internal_info('servicing_polling', True)
+        self.node.set_driver_internal_info('skip_current_service_step', True)
+        self.node.set_driver_internal_info('service_step_index', 0)
+        self.node.set_driver_internal_info('agent_url', 'url')
+        self.node.set_driver_internal_info('agent_secret_token', 'foo')
+        self.node.set_driver_internal_info('agent_secret_token_pregenerated',
+                                           False)
+
+        msg = 'error bar'
+        last_error = "last error"
+        conductor_utils.servicing_error_handler(self.task, msg,
+                                                errmsg=last_error)
+        self.node.save.assert_called_once_with()
+        self.assertEqual({}, self.node.service_step)
+        self.assertNotIn('service_step_index', self.node.driver_internal_info)
+        self.assertNotIn('servicing_reboot', self.node.driver_internal_info)
+        self.assertNotIn('servicing_polling', self.node.driver_internal_info)
+        self.assertNotIn('skip_current_service_step',
+                         self.node.driver_internal_info)
+        self.assertNotIn('agent_secret_token', self.node.driver_internal_info)
+        self.assertNotIn('agent_secret_token_pregenerated',
+                         self.node.driver_internal_info)
+        self.assertEqual(last_error, self.node.last_error)
+        self.assertTrue(self.node.maintenance)
+        self.assertEqual(last_error, self.node.maintenance_reason)
+        self.assertEqual('service failure', self.node.fault)
+        driver = self.task.driver.deploy
+        driver.tear_down_service.assert_called_once_with(self.task)
+        if prov_state == states.SERVICEFAIL:
+            self.assertFalse(self.task.process_event.called)
+        else:
+            self.task.process_event.assert_called_once_with('fail')
+        self.assertNotIn('agent_url', self.node.driver_internal_info)
+        mock_log_error.assert_called_once_with(msg, exc_info=False)
+
+    def test_servicing_error_handler(self):
+        self._test_servicing_error_handler()
+
+    def test_servicing_error_handler_servicewait(self):
+        self._test_servicing_error_handler(prov_state=states.SERVICEWAIT)
+
+    def test_servicing_error_handler_servicefail(self):
+        self._test_servicing_error_handler(prov_state=states.SERVICEFAIL)
+
+    def test_servicing_error_handler_no_teardown(self):
+        target = states.MANAGEABLE
+        self.node.target_provision_state = target
+        conductor_utils.servicing_error_handler(self.task, 'foo',
+                                                tear_down_service=False)
+        self.assertFalse(self.task.driver.deploy.tear_down_service.called)
+        self.task.process_event.assert_called_once_with('fail')
+
+    def test_servicing_error_handler_no_fail(self):
+        conductor_utils.servicing_error_handler(self.task, 'foo',
+                                                set_fail_state=False)
+        driver = self.task.driver.deploy
+        driver.tear_down_service.assert_called_once_with(self.task)
+        self.assertFalse(self.task.process_event.called)
+
+    @mock.patch.object(conductor_utils, 'LOG', autospec=True)
+    def test_servicing_error_handler_tear_down_error(self, log_mock):
+        def _side_effect(task):
+            # simulate overwriting last error by another operation (e.g. power)
+            task.node.last_error = None
+            raise Exception('bar')
+
+        driver = self.task.driver.deploy
+        msg = 'foo'
+        driver.tear_down_service.side_effect = _side_effect
+        conductor_utils.servicing_error_handler(self.task, msg)
+        log_mock.error.assert_called_once_with(msg, exc_info=False)
+        self.assertTrue(log_mock.exception.called)
+        self.assertIn(msg, self.node.last_error)
+        self.assertIn(msg, self.node.maintenance_reason)
+        self.assertEqual('service failure', self.node.fault)
+
+
+
+class InspectingErrorHandlerTestCase(db_base.DbTestCase):
+    def setUp(self):
+        super(InspectingErrorHandlerTestCase, self).setUp()
+        self.node = obj_utils.create_test_node(
+            self.context,
+            driver='fake-hardware',
+            driver_internal_info={'agent_url': 'url',
+                                  'agent_secret_token': 'token'})
+
+    @mock.patch.object(conductor_utils, 'power_on_node_if_needed',
+                       autospec=True)
+    @mock.patch.object(conductor_utils, 'restore_power_state_if_needed',
+                       autospec=True)
+    @mock.patch.object(conductor_utils, 'LOG', autospec=True)
+    def test_inspecting_error_handler(self, log_mock, mock_restore,
+                                      mock_power_on):
+        mock_power_on.return_value = None
+        msg = 'foo'
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            conductor_utils.inspecting_error_handler(task, msg)
+        log_mock.error.assert_called_once_with(msg, exc_info=False)
+        mock_power_on.assert_called_once()
+        mock_restore.assert_called_once()
+        self.node.refresh()
+        self.assertIn(msg, self.node.last_error)
+        self.assertNotIn('agent_url', self.node.driver_internal_info)
+        self.assertNotIn('agent_secret_token', self.node.driver_internal_info)
+
+    @mock.patch.object(conductor_utils, 'power_on_node_if_needed',
+                       autospec=True)
+    @mock.patch.object(conductor_utils, 'restore_power_state_if_needed',
+                       autospec=True)
+    def test_inspecting_error_handler_no_teardown(self, mock_restore,
+                                                  mock_power_on):
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            conductor_utils.inspecting_error_handler(task, 'foo',
+                                                     tear_down_inspection=False)
+        self.assertFalse(mock_power_on.called)
+        self.assertFalse(mock_restore.called)
+        self.node.refresh()
+        # Token should still be cleared even without teardown
+        self.assertNotIn('agent_url', self.node.driver_internal_info)
+
+    @mock.patch.object(conductor_utils, 'power_on_node_if_needed',
+                       autospec=True)
+    @mock.patch.object(conductor_utils, 'restore_power_state_if_needed',
+                       autospec=True)
+    @mock.patch.object(conductor_utils, 'LOG', autospec=True)
+    def test_inspecting_error_handler_network_error(self, log_mock,
+                                                    mock_restore,
+                                                    mock_power_on):
+        mock_power_on.return_value = None
+        msg = 'foo'
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            # Simulate network cleanup failure
+            task.driver.network.remove_inspection_network = mock.Mock(
+                side_effect=Exception('network error'))
+            conductor_utils.inspecting_error_handler(task, msg)
+        log_mock.error.assert_called_once_with(msg, exc_info=False)
+        self.assertTrue(log_mock.exception.called)
+        # Should still attempt power restore even if network cleanup fails
+        mock_power_on.assert_called_once()
+        mock_restore.assert_called_once()
+        self.node.refresh()
+        self.assertIn(msg, self.node.last_error)
+
+    @mock.patch.object(conductor_utils, 'inspecting_error_handler',
+                       autospec=True)
+    def test_cleanup_inspectwait_timeout(self, mock_error_handler):
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            conductor_utils.cleanup_inspectwait_timeout(task)
+
+        mock_error_handler.assert_called_once_with(
+            mock.ANY,
+            logmsg="Inspection for node %s "
+                   "failed. Timeout reached while inspecting the node. "
+                   "Please check if the ramdisk responsible for the "
+                   "inspection is running on the node." % self.node.uuid,
+            errmsg="Timeout reached while inspecting the node. Please check "
+                   "if the ramdisk responsible for the inspection is running "
+                   "on the node.")
 
 
 class ValidatePortPhysnetTestCase(db_base.DbTestCase):
@@ -1612,6 +2196,86 @@ class ValidatePortPhysnetTestCase(db_base.DbTestCase):
             num_current_ports=0,
             current_physnet=None,
             new_physnet='physnet1')
+
+    def test_validate_port_physnet_empty_portgroup_with_physnet_mismatch(self):
+        portgroup = obj_utils.create_test_portgroup(
+            self.context, node_id=self.node.id,
+            physical_network='physnet1')
+        port = db_utils.get_test_port(
+            node_id=self.node.id, portgroup_id=portgroup.id,
+            address='00:11:22:33:44:01', uuid=uuidutils.generate_uuid(),
+            physical_network='physnet2')
+        port = objects.Port(self.context, **port)
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertRaises(exception.Conflict,
+                              conductor_utils.validate_port_physnet,
+                              task, port)
+
+    def test_validate_port_physnet_empty_portgroup_create_adopts_physnet(self):
+        # Creating a port with a physical network as the first member of a
+        # portgroup that has no physical network of its own should cause the
+        # portgroup to adopt the port's physical network.
+        portgroup = obj_utils.create_test_portgroup(self.context,
+                                                    node_id=self.node.id)
+        self.assertIsNone(portgroup.physical_network)
+        port = db_utils.get_test_port(
+            node_id=self.node.id, portgroup_id=portgroup.id,
+            address='00:11:22:33:44:01', uuid=uuidutils.generate_uuid(),
+            physical_network='physnet1')
+        port = objects.Port(self.context, **port)
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            conductor_utils.validate_port_physnet(task, port)
+
+        portgroup.refresh()
+        self.assertEqual('physnet1', portgroup.physical_network)
+
+    def test_validate_port_physnet_empty_portgroup_update_adopts_physnet(self):
+        # Adding an existing port that has a physical network to a portgroup
+        # that has no physical network of its own should cause the portgroup
+        # to adopt the port's physical network.
+        portgroup = obj_utils.create_test_portgroup(self.context,
+                                                    node_id=self.node.id)
+        self.assertIsNone(portgroup.physical_network)
+        port = obj_utils.create_test_port(
+            self.context, node_id=self.node.id, portgroup_id=None,
+            address='00:11:22:33:44:01', physical_network='physnet1',
+            uuid=uuidutils.generate_uuid())
+        port.portgroup_id = portgroup.id
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            conductor_utils.validate_port_physnet(task, port)
+
+        portgroup.refresh()
+        self.assertEqual('physnet1', portgroup.physical_network)
+
+    def test_validate_port_physnet_adopt_physnet_from_ports_added_serially(
+            self):
+        # Reproduces the scenario where ports were created with a physical
+        # network (e.g. by an older client), a portgroup was then created
+        # without a physical network, and the ports were added to it one at a
+        # time. The portgroup should end up with the ports' physical network
+        # rather than remaining on physical network None.
+        port1 = obj_utils.create_test_port(
+            self.context, node_id=self.node.id, portgroup_id=None,
+            address='00:11:22:33:44:01', physical_network='physnet1',
+            uuid=uuidutils.generate_uuid())
+        port2 = obj_utils.create_test_port(
+            self.context, node_id=self.node.id, portgroup_id=None,
+            address='00:11:22:33:44:02', physical_network='physnet1',
+            uuid=uuidutils.generate_uuid())
+        portgroup = obj_utils.create_test_portgroup(self.context,
+                                                    node_id=self.node.id)
+        self.assertIsNone(portgroup.physical_network)
+
+        for port in (port1, port2):
+            port.portgroup_id = portgroup.id
+            with task_manager.acquire(self.context, self.node.uuid) as task:
+                conductor_utils.validate_port_physnet(task, port)
+            port.save()
+
+        portgroup.refresh()
+        self.assertEqual('physnet1', portgroup.physical_network)
+        self.assertEqual('physnet1', port1.physical_network)
+        self.assertEqual('physnet1', port2.physical_network)
 
     # 1-port portgroup, no physnet.
 
@@ -2046,6 +2710,18 @@ class FastTrackTestCase(db_base.DbTestCase):
                 self.context, self.node.uuid, shared=False) as task:
             self.assertFalse(conductor_utils.is_fast_track(task))
 
+    def test_is_fast_track_inspected_no_heartbeat(self, mock_get_power):
+        mock_get_power.return_value = states.POWER_ON
+        self.node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            uuid=uuidutils.generate_uuid(),
+            inspection_finished_at=timeutils.utcnow(),
+            power_state=states.POWER_ON
+        )
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            self.assertTrue(conductor_utils.is_fast_track(task))
+
     def test_is_fast_track_powered_after_heartbeat(self, mock_get_power):
         mock_get_power.return_value = states.POWER_ON
         with task_manager.acquire(
@@ -2061,6 +2737,38 @@ class FastTrackTestCase(db_base.DbTestCase):
         with task_manager.acquire(
                 self.context, self.node.uuid, shared=False) as task:
             self.assertFalse(conductor_utils.is_fast_track(task))
+
+    def test_is_fast_track_not_in_servicing(self, mock_get_power):
+        mock_get_power.return_value = states.POWER_ON
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            task.node.provision_state = states.SERVICING
+            self.assertFalse(conductor_utils.is_fast_track(task))
+
+    def test_is_fast_track_redfish_fw_updates(self, mock_get_power):
+        mock_get_power.return_value = states.POWER_ON
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            task.node.set_driver_internal_info('redfish_fw_updates',
+                                               [{'url': 'http://test'}])
+            self.assertFalse(conductor_utils.is_fast_track(task))
+
+    def test_is_fast_track_firmware_updates(self, mock_get_power):
+        mock_get_power.return_value = states.POWER_ON
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            task.node.set_driver_internal_info('firmware_updates',
+                                               [{'url': 'http://test'}])
+            self.assertFalse(conductor_utils.is_fast_track(task))
+
+    def test_is_fast_track_no_agent_url_during_inspection(
+            self, mock_get_power):
+        mock_get_power.return_value = states.POWER_ON
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+            task.node.driver_internal_info.pop('agent_url')
+            task.node.provision_state = states.INSPECTING
+            self.assertTrue(conductor_utils.is_fast_track(task))
 
 
 class GetNodeNextStepsTestCase(db_base.DbTestCase):
@@ -2180,60 +2888,22 @@ class AgentTokenUtilsTestCase(tests_base.TestCase):
 
     def test_wipe_deploy_internal_info(self):
         conductor_utils.add_secret_token(self.node)
-        self.assertIn('agent_secret_token', self.node.driver_internal_info)
+        self.node.set_driver_internal_info('agent_start_attempted', True)
+        dii = self.node.driver_internal_info
+        self.assertIn('agent_secret_token', dii)
+        self.assertIn('agent_start_attempted', dii)
+
         conductor_utils.wipe_deploy_internal_info(mock.Mock(node=self.node))
-        self.assertNotIn('agent_secret_token', self.node.driver_internal_info)
+
+        dii = self.node.driver_internal_info
+        self.assertNotIn('agent_secret_token', dii)
+        self.assertNotIn('agent_start_attempted', dii)
 
     def test_is_agent_token_present(self):
         # This should always be False as the token has not been added yet.
         self.assertFalse(conductor_utils.is_agent_token_present(self.node))
         conductor_utils.add_secret_token(self.node)
         self.assertTrue(conductor_utils.is_agent_token_present(self.node))
-
-
-class GetAttachedVifTestCase(db_base.DbTestCase):
-
-    def setUp(self):
-        super(GetAttachedVifTestCase, self).setUp()
-        self.node = obj_utils.create_test_node(self.context,
-                                               driver='fake-hardware')
-        self.port = obj_utils.get_test_port(self.context,
-                                            node_id=self.node.id)
-
-    def test_get_attached_vif_none(self):
-        vif, use = conductor_utils.get_attached_vif(self.port)
-        self.assertIsNone(vif)
-        self.assertIsNone(use)
-
-    def test_get_attached_vif_tenant(self):
-        self.port.internal_info = {'tenant_vif_port_id': '1'}
-        vif, use = conductor_utils.get_attached_vif(self.port)
-        self.assertEqual('1', vif)
-        self.assertEqual('tenant', use)
-
-    def test_get_attached_vif_provisioning(self):
-        self.port.internal_info = {'provisioning_vif_port_id': '1'}
-        vif, use = conductor_utils.get_attached_vif(self.port)
-        self.assertEqual('1', vif)
-        self.assertEqual('provisioning', use)
-
-    def test_get_attached_vif_cleaning(self):
-        self.port.internal_info = {'cleaning_vif_port_id': '1'}
-        vif, use = conductor_utils.get_attached_vif(self.port)
-        self.assertEqual('1', vif)
-        self.assertEqual('cleaning', use)
-
-    def test_get_attached_vif_rescuing(self):
-        self.port.internal_info = {'rescuing_vif_port_id': '1'}
-        vif, use = conductor_utils.get_attached_vif(self.port)
-        self.assertEqual('1', vif)
-        self.assertEqual('rescuing', use)
-
-    def test_get_attached_vif_inspecting(self):
-        self.port.internal_info = {'inspection_vif_port_id': '1'}
-        vif, use = conductor_utils.get_attached_vif(self.port)
-        self.assertEqual('1', vif)
-        self.assertEqual('inspecting', use)
 
 
 class StoreAgentCertificateTestCase(db_base.DbTestCase):
@@ -2544,74 +3214,6 @@ class CacheBootModeTestCase(db_base.DbTestCase):
         self.assertTrue(self.node.secure_boot)
 
 
-class GetConfigDriveImageTestCase(db_base.DbTestCase):
-
-    def setUp(self):
-        super(GetConfigDriveImageTestCase, self).setUp()
-        self.node = obj_utils.create_test_node(
-            self.context,
-            uuid=uuidutils.generate_uuid(),
-            instance_info={})
-
-    def test_no_configdrive(self):
-        self.assertIsNone(conductor_utils.get_configdrive_image(self.node))
-
-    def test_string(self):
-        self.node.instance_info['configdrive'] = 'data'
-        self.assertEqual('data',
-                         conductor_utils.get_configdrive_image(self.node))
-
-    @mock.patch('openstack.baremetal.configdrive.build', autospec=True)
-    def test_build_empty(self, mock_cd):
-        self.node.instance_info['configdrive'] = {}
-        self.assertEqual(mock_cd.return_value,
-                         conductor_utils.get_configdrive_image(self.node))
-        mock_cd.assert_called_once_with({'uuid': self.node.uuid},
-                                        network_data=None,
-                                        user_data=None,
-                                        vendor_data=None)
-
-    @mock.patch('openstack.baremetal.configdrive.build', autospec=True)
-    def test_build_populated(self, mock_cd):
-        configdrive = {
-            'meta_data': {'uuid': uuidutils.generate_uuid(),
-                          'name': 'new-name',
-                          'hostname': 'example.com'},
-            'network_data': {'links': []},
-            'vendor_data': {'foo': 'bar'},
-        }
-        self.node.instance_info['configdrive'] = configdrive
-        self.assertEqual(mock_cd.return_value,
-                         conductor_utils.get_configdrive_image(self.node))
-        mock_cd.assert_called_once_with(
-            configdrive['meta_data'],
-            network_data=configdrive['network_data'],
-            user_data=None,
-            vendor_data=configdrive['vendor_data'])
-
-    @mock.patch('openstack.baremetal.configdrive.build', autospec=True)
-    def test_build_user_data_as_string(self, mock_cd):
-        self.node.instance_info['configdrive'] = {'user_data': 'abcd'}
-        self.assertEqual(mock_cd.return_value,
-                         conductor_utils.get_configdrive_image(self.node))
-        mock_cd.assert_called_once_with({'uuid': self.node.uuid},
-                                        network_data=None,
-                                        user_data=b'abcd',
-                                        vendor_data=None)
-
-    @mock.patch('openstack.baremetal.configdrive.build', autospec=True)
-    def test_build_user_data_as_dict(self, mock_cd):
-        self.node.instance_info['configdrive'] = {
-            'user_data': {'user': 'data'}
-        }
-        self.assertEqual(mock_cd.return_value,
-                         conductor_utils.get_configdrive_image(self.node))
-        mock_cd.assert_called_once_with({'uuid': self.node.uuid},
-                                        network_data=None,
-                                        user_data=b'{"user": "data"}',
-                                        vendor_data=None)
-
-
 class NodeHistoryRecordTestCase(db_base.DbTestCase):
 
     def setUp(self):
@@ -2619,8 +3221,15 @@ class NodeHistoryRecordTestCase(db_base.DbTestCase):
         self.node = obj_utils.create_test_node(
             self.context,
             uuid=uuidutils.generate_uuid())
+        self.steps = [
+            {
+                'step': 'erase_devices',
+                'interface': 'deploy',
+                'args': {'token': 'secret'},
+                'priority': 99}]
 
     def test_record_node_history(self):
+        oslo_context.get_current().user_id = None
         conductor_utils.node_history_record(self.node, event='meow')
         entries = objects.NodeHistory.list_by_node_id(self.context,
                                                       self.node.id)
@@ -2668,6 +3277,182 @@ class NodeHistoryRecordTestCase(db_base.DbTestCase):
         mock_history.assert_not_called()
         mock_create.assert_not_called()
 
+    @mock.patch('ironic.conductor.utils.LOG', autospec=True)
+    @mock.patch('ironic.conductor.utils.node_history_record', autospec=True)
+    def test_logs_to_history_and_syslog(self, mock_history, mock_log):
+        self.config(record_step_flows_in_history=True, group='conductor')
+        self.config(log_step_flows_to_syslog=True, group='conductor')
+
+        conductor_utils.log_step_flow_history(
+            self.node, flow=conductor_utils.StepFlow.DEPLOYMENT,
+            steps=self.steps, status='start')
+
+        mock_history.assert_called_once()
+        mock_log.info.assert_called_once()
+        assert 'deployment_start' in mock_history.call_args.kwargs[
+            'event_type']
+        assert self.node.uuid in mock_log.info.call_args.args[1]['node']
+
+    @mock.patch('ironic.conductor.utils.node_history_record', autospec=True)
+    def test_sanitizes_passwords_in_args(self, mock_history):
+        steps = [
+            {'interface': 'clean', 'step': 'noop',
+             'args': {'password': 'meow'}, 'priority': 10}
+        ]
+
+        conductor_utils.log_step_flow_history(
+            self.node, flow=conductor_utils.StepFlow.CLEANING_AUTO,
+            steps=steps, status='start')
+
+        mock_history.assert_called_once()
+        event_string = mock_history.call_args.kwargs['event']
+        assert 'password' in event_string
+        assert '***' in event_string
+        assert 'meow' not in event_string
+
+    def test_record_node_history_event_truncation(self):
+        # MySQL TEXT column max is 65535 bytes.
+        _MAX_BYTES = 65535
+        _MARKER = " ... [truncated] ... "
+        _MARKER_LEN = len(_MARKER.encode('utf-8'))
+
+        # keep = 65535 - 21 = 65514
+        # head = 65514 // 2 = 32757
+        # tail = 65514 - 32757 = 32757
+        available_space = _MAX_BYTES - _MARKER_LEN
+        expected_head_size = available_space // 2
+        expected_tail_size = available_space - expected_head_size
+
+        long_event = 'A' * 40000 + 'B' * 5000 + 'C' * 40000
+
+        conductor_utils.node_history_record(self.node, event=long_event)
+
+        entries = objects.NodeHistory.list_by_node_id(self.context,
+                                                      self.node.id)
+        entry = entries[0]
+        actual_event = entry['event']
+
+        # Verify the new marker exists
+        self.assertIn(_MARKER, actual_event)
+
+        # Verify the 50/50 split preservation
+        self.assertTrue(actual_event.startswith('A' * expected_head_size))
+        self.assertTrue(actual_event.endswith('C' * (expected_tail_size - 10)))
+
+        # 3. Verify the final byte count
+        # (Since we used ASCII, len(str) == len(bytes))
+        self.assertEqual(_MAX_BYTES, len(actual_event.encode('utf-8')))
+
+    def test_record_node_history_no_truncation_if_short(self):
+        # Events under 1024 characters should be saved as-is.
+        short_event = 'meow ' * 100  # 500 chars, under limit
+        conductor_utils.node_history_record(self.node, event=short_event)
+        entries = objects.NodeHistory.list_by_node_id(self.context,
+                                                      self.node.id)
+        entry = entries[0]
+        self.assertEqual(short_event, entry['event'])
+
+
+    @mock.patch('oslo_utils.timeutils.utcnow', autospec=True)
+    def test_record_node_history_with_state_fields(self, mock_utcnow):
+        """Test that node history captures state and duration correctly"""
+
+        frozen_time = datetime.datetime(
+            2026, 6, 10, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        mock_utcnow.return_value = frozen_time
+
+        self.node.provision_state = states.DEPLOYING
+        self.node.target_provision_state = states.ACTIVE
+        self.node.provision_updated_at = frozen_time
+        self.node.save()
+
+        mock_utcnow.return_value = frozen_time + datetime.timedelta(
+            seconds=120)
+
+        conductor_utils.node_history_record(
+            self.node, event='deploying started')
+
+        entries = objects.NodeHistory.list_by_node_id(
+            self.context, self.node.id)
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+
+        self.assertEqual(states.DEPLOYING, entry.state)
+        self.assertEqual(states.ACTIVE, entry.target_provision_state)
+        self.assertEqual(120, entry.duration_seconds)
+        self.assertEqual('deploying started', entry.event)
+
+
+    def test_record_node_history_without_provision_updated_at(self):
+        """Test that history still works when we don't have a timestamp"""
+
+        self.node.provision_state = states.ACTIVE
+        self.node.provision_updated_at = None
+        self.node.save()
+
+        conductor_utils.node_history_record(self.node, event='node active')
+
+        entries = objects.NodeHistory.list_by_node_id(self.context,
+                                                      self.node.id)
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+
+        self.assertEqual(states.ACTIVE, entry.state)
+        self.assertEqual(0, entry.duration_seconds)
+
+    @mock.patch('oslo_utils.timeutils.utcnow', autospec=True)
+    def test_record_node_history_with_error_and_state_fields(self,
+                                                             mock_utcnow):
+        """Test that error events also capture state information"""
+
+        frozen_time = datetime.datetime(2026, 6, 10, 12, 0, 0,
+                                        tzinfo=datetime.timezone.utc)
+        mock_utcnow.return_value = frozen_time
+
+        self.node.provision_state = states.DEPLOYFAIL
+        self.node.target_provision_state = states.AVAILABLE
+        self.node.provision_updated_at = frozen_time
+        self.node.save()
+
+        mock_utcnow.return_value = frozen_time + datetime.timedelta(
+            seconds=300)
+
+        conductor_utils.node_history_record(
+            self.node,
+            event='deployment failed',
+            error=True,
+            event_type='provisioning'
+        )
+
+        entries = objects.NodeHistory.list_by_node_id(self.context,
+                                                      self.node.id)
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+
+        self.assertEqual(states.DEPLOYFAIL, entry.state)
+        self.assertEqual(states.AVAILABLE, entry.target_provision_state)
+        self.assertEqual(300, entry.duration_seconds)
+        self.assertEqual('ERROR', entry.severity)
+        self.assertEqual('deployment failed', self.node.last_error)
+
+    @mock.patch(
+            'ironic.conductor.utils.oslo_context.get_current', autospec=True)
+    def test_record_node_history_discovers_context_user(
+            self, mock_get_current):
+        """Ensure node history record falls back to request context user."""
+        fake_context = mock.Mock()
+        fake_context.user_id = 'context-user-alpha'
+        mock_get_current.return_value = fake_context
+
+        conductor_utils.node_history_record(self.node, event='meow')
+
+        entries = objects.NodeHistory.list_by_node_id(self.context,
+                                                      self.node.id)
+
+        entry = entries[0]
+
+        self.assertEqual('context-user-alpha', entry['user'])
+
 
 class GetTokenProjectFromRequestTestCase(db_base.DbTestCase):
 
@@ -2684,3 +3469,238 @@ class GetTokenProjectFromRequestTestCase(db_base.DbTestCase):
         self.context.auth_token_info = self.auth_token_info
         res = conductor_utils.get_token_project_from_request(self.context)
         self.assertEqual('user-project', res)
+
+
+class ServiceUtilsTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super(ServiceUtilsTestCase, self).setUp()
+        self.node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            uuid=uuidutils.generate_uuid(),
+            driver_internal_info={
+                'agent_last_heartbeat': str(timeutils.utcnow().isoformat()),
+                'agent_url': 'a_url'})
+        self.config(fast_track=True, group='deploy')
+
+    @mock.patch.object(fake.FakePower, 'get_power_state', autospec=True)
+    def test_wipe_service_internal_info(self, mock_power):
+        mock_power.return_value = False
+        self.node.driver_internal_info = {
+            'service_steps': {'foo': 'bar'},
+            'agent_cached_service_steps': {'more_foo': None},
+            'servicing_reboot': False,
+            'servicing_polling': 1,
+            'service_disable_ramdisk': False,
+            'skip_current_service_step': False,
+            'steps_validated': 'meow',
+            'agent_secret_token': 'token',
+            'agent_start_attempted': True,
+            'image_source': 'image_ref'}
+        self.node.save()
+        not_in_list = ['agent_cached_service_steps',
+                       'servicing_reboot',
+                       'servicing_polling',
+                       'service_disable_ramdisk',
+                       'skip_current_service_step',
+                       'steps_validated',
+                       'agent_secret_token',
+                       'agent_start_attempted',
+                       'image_source']
+        with task_manager.acquire(self.context, self.node.id,
+                                  shared=True) as task:
+            conductor_utils.wipe_service_internal_info(task)
+            task.node.save()
+            self.assertIsNone(
+                task.node.driver_internal_info['service_steps']
+            )
+            for field in not_in_list:
+                self.assertNotIn(field, task.node.driver_internal_info)
+
+
+class NodeCacheHealthTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super(NodeCacheHealthTestCase, self).setUp()
+        self.node = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            power_interface='redfish',
+            health=None)
+        self.config(enabled_power_interfaces=['fake', 'redfish'])
+
+    @mock.patch.object(conductor_utils, 'node_history_record',
+                       autospec=True)
+    def test_node_cache_health_status_changed(self, mock_history):
+        # Mock the management interface to return health status
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            # Mock get_node_health to return OK
+            task.driver.management.get_node_health = mock.Mock(
+                return_value=health_states.HealthState.OK)
+            conductor_utils.node_cache_health(task)
+            task.node.refresh()
+
+        # Refresh the test node to get updated values
+        self.node.refresh()
+        # Verify health was updated (stored as string value)
+        self.assertEqual(health_states.HealthState.OK.value, self.node.health)
+        # Verify history was recorded
+        mock_history.assert_called_once()
+        self.assertEqual('monitoring',
+                         mock_history.call_args.kwargs['event_type'])
+        self.assertIn('health status changed',
+                      mock_history.call_args.kwargs['event'])
+
+    @mock.patch.object(conductor_utils, 'node_history_record',
+                       autospec=True)
+    def test_node_cache_health_no_change(self, mock_history):
+        # Node already has OK health (stored as string value)
+        self.node.health = health_states.HealthState.OK.value
+        self.node.save()
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            # Mock the management interface to return health status
+            task.driver.management.get_node_health = mock.Mock(
+                return_value=health_states.HealthState.OK)
+            conductor_utils.node_cache_health(task)
+
+        # Verify no history was recorded (no change)
+        mock_history.assert_not_called()
+
+    def test_node_cache_health_non_redfish_node(self):
+        # Node with driver that doesn't support health monitoring
+        self.node.power_interface = 'fake'
+        self.node.save()
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            # Mock the management interface to raise UnsupportedDriverExtension
+            task.driver.management.get_node_health = mock.Mock(
+                side_effect=exception.UnsupportedDriverExtension(
+                    driver=task.node.driver, extension='get_node_health'))
+            conductor_utils.node_cache_health(task)
+
+        # Verify health remains None (driver doesn't support it)
+        self.node.refresh()
+        self.assertIsNone(self.node.health)
+
+    def test_node_cache_health_no_status(self):
+        # Management interface returns None (no status available)
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            # Mock the management interface to return None
+            task.driver.management.get_node_health = mock.Mock(
+                return_value=None)
+            # Should not raise an exception
+            conductor_utils.node_cache_health(task)
+            task.node.refresh()
+
+        # Verify health remains None
+        # Refresh the test node to get updated values
+        self.node.refresh()
+        self.assertIsNone(self.node.health)
+
+    @mock.patch.object(conductor_utils, 'LOG', autospec=True)
+    @mock.patch.object(conductor_utils, 'node_history_record',
+                       autospec=True)
+    def test_node_cache_health_warning_state(self, mock_history, mock_log):
+        # Create system with Warning health status
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            # Mock the management interface to return health status
+            task.driver.management.get_node_health = mock.Mock(
+                return_value=health_states.HealthState.WARNING)
+            conductor_utils.node_cache_health(task)
+            task.node.refresh()
+
+        # Verify health was updated (stored as string value)
+        self.node.refresh()
+        self.assertEqual(health_states.HealthState.WARNING.value,
+                         self.node.health)
+        # Verify warning was logged
+        mock_log.warning.assert_called_once()
+        self.assertIn('indicates a problem',
+                      mock_log.warning.call_args.args[0])
+
+    @mock.patch.object(conductor_utils, 'LOG', autospec=True)
+    @mock.patch.object(conductor_utils, 'node_history_record',
+                       autospec=True)
+    def test_node_cache_health_critical_state(self, mock_history, mock_log):
+        # Create system with Critical health status
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            # Mock the management interface to return health status
+            task.driver.management.get_node_health = mock.Mock(
+                return_value=health_states.HealthState.CRITICAL)
+            conductor_utils.node_cache_health(task)
+            task.node.refresh()
+
+        # Verify health was updated (stored as string value)
+        self.node.refresh()
+        self.assertEqual(health_states.HealthState.CRITICAL.value,
+                         self.node.health)
+        # Verify warning was logged
+        mock_log.warning.assert_called_once()
+        self.assertIn('indicates a problem',
+                      mock_log.warning.call_args.args[0])
+
+    @mock.patch.object(conductor_utils, 'LOG', autospec=True)
+    @mock.patch.object(conductor_utils, 'node_history_record',
+                       autospec=True)
+    def test_node_cache_health_invalid_value_rejected(self, mock_history,
+                                                      mock_log):
+        # Invalid health values should be rejected and not saved
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            # Mock the management interface to return an invalid health value
+            task.driver.management.get_node_health = mock.Mock(
+                return_value='InvalidValue')
+            conductor_utils.node_cache_health(task)
+            task.node.refresh()
+
+        # Verify health was NOT updated (remains None)
+        self.node.refresh()
+        self.assertIsNone(self.node.health)
+        # Verify no history was recorded (value was rejected)
+        mock_history.assert_not_called()
+        # Verify warning message was logged about invalid value
+        mock_log.warning.assert_called_once()
+        self.assertIn('invalid health value',
+                      mock_log.warning.call_args.args[0])
+
+    @mock.patch.object(conductor_utils, 'LOG', autospec=True)
+    def test_node_cache_health_exception(self, mock_log):
+        # Simulate an exception during health check
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            # Mock the management interface to raise an exception
+            task.driver.management.get_node_health = mock.Mock(
+                side_effect=Exception('Connection failed'))
+            # Should not raise an exception
+            conductor_utils.node_cache_health(task)
+            task.node.refresh()
+
+        # Verify health remains None
+        # Refresh the test node to get updated values
+        self.node.refresh()
+        self.assertIsNone(self.node.health)
+        # Verify warning message was logged
+        mock_log.warning.assert_called_once()
+        self.assertIn('Could not retrieve health status',
+                      mock_log.warning.call_args.args[0])
+
+    @mock.patch.object(conductor_utils, 'node_history_record',
+                       autospec=True)
+    def test_node_cache_health_only_health_set(self, mock_history):
+        # System has health set
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            # Mock the management interface to return health status
+            task.driver.management.get_node_health = mock.Mock(
+                return_value=health_states.HealthState.OK)
+            conductor_utils.node_cache_health(task)
+            task.node.refresh()
+
+        # Verify only health was updated (stored as string value)
+        self.node.refresh()
+        self.assertEqual(health_states.HealthState.OK.value, self.node.health)
+        # Verify history was recorded
+        mock_history.assert_called_once()

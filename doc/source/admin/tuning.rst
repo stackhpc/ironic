@@ -1,3 +1,10 @@
+.. meta::
+   :description: Performance tuning for Ironic bare metal service. Optimize conductor performance, database configuration, and large-scale deployment considerations.
+   :keywords: performance tuning, scalability, conductor performance, database optimization, large scale deployment, performance optimization
+   :author: OpenStack Ironic Team
+   :robots: index, follow
+   :audience: performance engineers, system administrators
+
 =============
 Tuning Ironic
 =============
@@ -53,6 +60,8 @@ trade-offs.
   as prior requests complete. In environments with long running synchronous
   calls, such as use of the vendor passthru interface, this can be very
   problematic.
+* As a combined ``ironic`` process. In this case, a single primary process
+  with two worker sub-processes are used.
 
 When the webserver is launched by the API process directly, the default is
 based upon the number of CPU sockets in your machine.
@@ -60,8 +69,7 @@ based upon the number of CPU sockets in your machine.
 When launching using uwsgi, this will entirely vary upon your configuration,
 but balancing workers/threads based upon your load and needs is highly
 advisable. Each worker process is unique and consumes far more memory than
-a comparable number of worker threads. At the same time, the scheduler will
-focus on worker processes as the threads are greenthreads.
+a comparable number of worker threads.
 
 .. note::
    Host operating systems featuring in-memory de-duplication should see
@@ -113,6 +121,46 @@ perform ten concurrent deployments of images requiring conversion, the memory
 needed may exceed 10GB. This does however, entirely depend upon image block
 structure and layout, and what deploy interface is being used.
 
+.. _worker-threads:
+
+Threads
+-------
+
+The conductor uses python threads to enable concurrency. When a
+request comes from the API to the conductor over the RPC, the conductor
+verifies it, acquires a node-level lock (if needed) and launches a processing
+thread for further handling. The maximum number of such threads is limited to
+the value of :oslo.config:option:`conductor.workers_pool_size`
+configuration option.
+
+.. note::
+   Some workers are always or regularly occupied by internal processes, e.g.
+   :doc:`/admin/power-sync`.
+
+Once the limit is reached, any new requests will be denied with HTTP code 503
+(service unavailable). The clients are expected to be able to handle this code,
+most likely by retrying after a short delay or by throttling their requests.
+If you see a large number of this errors, you may try raising the limit
+gradually, while observing the conductor behavior and making sure the requests
+don't start to take longer because of switching between threads. A better
+alternative is to increase the number of conductors because it will also allow
+using more than one CPU core.
+
+.. note::
+   Running more than one conductor on the same machine is a somewhat uncharted
+   territory. You need to make sure they either have separate HTTP servers or
+   share the same HTTP server without conflicting.
+
+   If you use JSON RPC, you also need to make sure the ports don't conflict by
+   setting the :oslo.config:option:`json_rpc.port` option.
+
+Starting with the 2024.1 "Caracal" release cycle, a small proportion of the
+threads (specified by the
+:oslo.config:option:`conductor.reserved_workers_pool_percentage` option) is
+reserved for API requests and other critical tasks. Periodic tasks and agent
+heartbeats cannot use them. This ensures that the API stays responsive even
+under extreme internal load.
+
 Database
 ========
 
@@ -122,7 +170,7 @@ user.
 
 Often, depending on load, query patterns, periodic tasks, and so on and so
 forth, additional indexes may be needed to help provide hints to the database
-so it can most efficently attempt to reduce the number of rows which need to
+so it can most efficiently attempt to reduce the number of rows which need to
 be examined in order to return a result set.
 
 Adding indexes
@@ -178,7 +226,7 @@ Indexes will not fix everything
 -------------------------------
 
 Indexes are not a magical cure-all for all API or database performance issues,
-but they are an increadibly important part depending on data access and query
+but they are an incredibly important part depending on data access and query
 patterns.
 
 The underlying object layer and data conversions including record pagination

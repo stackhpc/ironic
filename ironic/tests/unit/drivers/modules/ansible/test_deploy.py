@@ -13,7 +13,6 @@
 import json
 from unittest import mock
 
-from ironic_lib import utils as irlib_utils
 from oslo_concurrency import processutils
 
 from ironic.common import exception
@@ -199,6 +198,8 @@ class TestAnsibleMethods(AnsibleDeployTestCaseBase):
         self.config(group='ansible', verbosity=3)
         self.config(group='ansible',
                     default_python_interpreter='/usr/bin/python3')
+        self.config(group='ansible',
+                    allow_node_python_interpreter_override=True)
         self.config(group='ansible', ansible_extra_args='--timeout=100')
         self.node.driver_info['ansible_python_interpreter'] = (
             '/usr/bin/python4')
@@ -217,6 +218,52 @@ class TestAnsibleMethods(AnsibleDeployTestCaseBase):
 
         all_vars = execute_mock.call_args[0][7]
         self.assertEqual({"ansible_python_interpreter": "/usr/bin/python4",
+                          "ironic": {"foo": "bar"}},
+                         json.loads(all_vars))
+
+    @mock.patch.object(com_utils, 'execute', return_value=('out', 'err'),
+                       autospec=True)
+    def test__run_playbook_interpreter_override_disabled(self, execute_mock):
+        self.config(group='ansible', playbooks_path='/path/to/playbooks')
+        self.config(group='ansible', config_file_path='/path/to/config')
+        self.config(group='ansible', verbosity=3)
+        self.config(group='ansible',
+                    default_python_interpreter='/usr/bin/python3')
+        self.config(group='ansible',
+                    allow_node_python_interpreter_override=False)
+        self.node.driver_info['ansible_python_interpreter'] = (
+            '/usr/bin/python4')
+        extra_vars = {'foo': 'bar'}
+
+        # a per-node override is rejected outright rather than silently
+        # dropped; the playbook must never be executed
+        self.assertRaises(exception.InvalidParameterValue,
+                          ansible_deploy._run_playbook, self.node, 'deploy',
+                          extra_vars, '/path/to/key',
+                          tags=['spam'], notags=['ham'])
+        self.assertFalse(execute_mock.called)
+
+    @mock.patch.object(com_utils, 'execute', return_value=('out', 'err'),
+                       autospec=True)
+    def test__run_playbook_interpreter_override_disabled_no_node_value(
+            self, execute_mock):
+        self.config(group='ansible', playbooks_path='/path/to/playbooks')
+        self.config(group='ansible', config_file_path='/path/to/config')
+        self.config(group='ansible', verbosity=3)
+        self.config(group='ansible',
+                    default_python_interpreter='/usr/bin/python3')
+        self.config(group='ansible',
+                    allow_node_python_interpreter_override=False)
+        extra_vars = {'foo': 'bar'}
+
+        ansible_deploy._run_playbook(self.node, 'deploy',
+                                     extra_vars, '/path/to/key',
+                                     tags=['spam'], notags=['ham'])
+
+        # with no per-node value only the conductor-configured interpreter is
+        # emitted as a top-level extra-var
+        all_vars = execute_mock.call_args[0][7]
+        self.assertEqual({"ansible_python_interpreter": "/usr/bin/python3",
                           "ironic": {"foo": "bar"}},
                          json.loads(all_vars))
 
@@ -319,12 +366,44 @@ class TestAnsibleMethods(AnsibleDeployTestCaseBase):
     def test__get_python_interpreter(self):
         self.config(group='ansible',
                     default_python_interpreter='/usr/bin/python3')
+        self.config(group='ansible',
+                    allow_node_python_interpreter_override=True)
         self.node.driver_info['ansible_python_interpreter'] = (
             '/usr/bin/python4')
 
         python_interpreter = ansible_deploy._get_python_interpreter(self.node)
 
         self.assertEqual('/usr/bin/python4', python_interpreter)
+
+    def test__get_python_interpreter_override_disabled(self):
+        self.config(group='ansible',
+                    default_python_interpreter='/usr/bin/python3')
+        self.config(group='ansible',
+                    allow_node_python_interpreter_override=False)
+        self.node.driver_info['ansible_python_interpreter'] = (
+            '/usr/bin/python4')
+
+        # a per-node value with overrides disabled is a validation failure
+        self.assertRaises(exception.InvalidParameterValue,
+                          ansible_deploy._get_python_interpreter, self.node)
+
+    def test__get_python_interpreter_override_disabled_no_node_value(self):
+        self.config(group='ansible',
+                    default_python_interpreter='/usr/bin/python3')
+        self.config(group='ansible',
+                    allow_node_python_interpreter_override=False)
+
+        python_interpreter = ansible_deploy._get_python_interpreter(self.node)
+
+        self.assertEqual('/usr/bin/python3', python_interpreter)
+
+    def test__get_python_interpreter_override_disabled_no_default(self):
+        self.config(group='ansible',
+                    allow_node_python_interpreter_override=False)
+
+        python_interpreter = ansible_deploy._get_python_interpreter(self.node)
+
+        self.assertIsNone(python_interpreter)
 
     def test__get_configdrive_path(self):
         self.config(tempdir='/path/to/tmpdir')
@@ -419,6 +498,7 @@ class TestAnsibleMethods(AnsibleDeployTestCaseBase):
                               "mem_req": 3000,
                               "disk_format": "qcow2",
                               "checksum": "md5:checksum",
+                              "tls_minimum_version": "1.3",
                               "whatever": "hello"}}
         with task_manager.acquire(self.context, self.node.uuid) as task:
             self.assertEqual(expected,
@@ -433,7 +513,8 @@ class TestAnsibleMethods(AnsibleDeployTestCaseBase):
                               "validate_certs": "yes",
                               "source": "fake-image",
                               "disk_format": "qcow2",
-                              "checksum": "md5:checksum"},
+                              "checksum": "md5:checksum",
+                              "tls_minimum_version": "1.3"},
                     "root_device_hints": {"wwn": "fake-wwn"}}
         with task_manager.acquire(self.context, self.node.uuid) as task:
             self.assertEqual(expected,
@@ -449,10 +530,63 @@ class TestAnsibleMethods(AnsibleDeployTestCaseBase):
                               "validate_certs": "no",
                               "source": "fake-image",
                               "disk_format": "qcow2",
-                              "checksum": "sha256:checksum"}}
+                              "checksum": "sha256:checksum",
+                              "tls_minimum_version": "1.3"}}
         with task_manager.acquire(self.context, self.node.uuid) as task:
             self.assertEqual(expected,
                              ansible_deploy._prepare_variables(task))
+
+    def test__prepare_variables_tls_minimum_version(self):
+        self.config(webserver_tls_minimum_version='1.2')
+        i_info = self.node.instance_info
+        i_info['image_checksum'] = 'sha256:checksum'
+        self.node.instance_info = i_info
+        self.node.save()
+        with task_manager.acquire(self.context,
+                                  self.node.uuid) as task:
+            result = ansible_deploy._prepare_variables(task)
+        self.assertEqual('1.2',
+                         result['image']['tls_minimum_version'])
+
+    def test__prepare_variables_tls_ciphers(self):
+        self.config(webserver_tls_ciphers='ECDHE+AESGCM')
+        i_info = self.node.instance_info
+        i_info['image_checksum'] = 'sha256:checksum'
+        self.node.instance_info = i_info
+        self.node.save()
+        with task_manager.acquire(self.context,
+                                  self.node.uuid) as task:
+            result = ansible_deploy._prepare_variables(task)
+        self.assertEqual('ECDHE+AESGCM',
+                         result['image']['tls_ciphers'])
+
+    def test__prepare_variables_tls_both(self):
+        self.config(webserver_tls_minimum_version='1.2')
+        self.config(webserver_tls_ciphers='ECDHE+AESGCM')
+        i_info = self.node.instance_info
+        i_info['image_checksum'] = 'sha256:checksum'
+        self.node.instance_info = i_info
+        self.node.save()
+        with task_manager.acquire(self.context,
+                                  self.node.uuid) as task:
+            result = ansible_deploy._prepare_variables(task)
+        self.assertEqual(
+            '1.2', result['image']['tls_minimum_version'])
+        self.assertEqual(
+            'ECDHE+AESGCM', result['image']['tls_ciphers'])
+
+    def test__prepare_variables_tls_defaults(self):
+        i_info = self.node.instance_info
+        i_info['image_checksum'] = 'sha256:checksum'
+        self.node.instance_info = i_info
+        self.node.save()
+        with task_manager.acquire(self.context,
+                                  self.node.uuid) as task:
+            result = ansible_deploy._prepare_variables(task)
+        self.assertEqual('1.3',
+                         result['image']['tls_minimum_version'])
+        self.assertNotIn('tls_ciphers',
+                         result['image'])
 
     def test__prepare_variables_configdrive_url(self):
         i_info = self.node.instance_info
@@ -463,7 +597,8 @@ class TestAnsibleMethods(AnsibleDeployTestCaseBase):
                               "validate_certs": "yes",
                               "source": "fake-image",
                               "disk_format": "qcow2",
-                              "checksum": "md5:checksum"},
+                              "checksum": "md5:checksum",
+                              "tls_minimum_version": "1.3"},
                     'configdrive': {'type': 'url',
                                     'location': 'http://configdrive_url'}}
         with task_manager.acquire(self.context, self.node.uuid) as task:
@@ -482,7 +617,8 @@ class TestAnsibleMethods(AnsibleDeployTestCaseBase):
                               "validate_certs": "yes",
                               "source": "fake-image",
                               "disk_format": "qcow2",
-                              "checksum": "md5:checksum"},
+                              "checksum": "md5:checksum",
+                              "tls_minimum_version": "1.3"},
                     'configdrive': {'type': 'file',
                                     'location': configdrive_path}}
         with mock.patch.object(ansible_deploy, 'open', mock.mock_open(),
@@ -496,7 +632,8 @@ class TestAnsibleMethods(AnsibleDeployTestCaseBase):
                 mock.call().write('fake-content'),
                 mock.call().__exit__(None, None, None)))
 
-    @mock.patch.object(utils, 'build_configdrive', autospec=True)
+    @mock.patch('ironic.conductor.configdrive_utils.build_configdrive',
+                autospec=True)
     def test__prepare_variables_configdrive_json(self, mock_build_configdrive):
         i_info = self.node.instance_info
         i_info['configdrive'] = {'meta_data': {}}
@@ -510,7 +647,8 @@ class TestAnsibleMethods(AnsibleDeployTestCaseBase):
                               "validate_certs": "yes",
                               "source": "fake-image",
                               "disk_format": "qcow2",
-                              "checksum": "md5:checksum"},
+                              "checksum": "md5:checksum",
+                              "tls_minimum_version": "1.3"},
                     'configdrive': {'type': 'file',
                                     'location': configdrive_path}}
         with mock.patch.object(ansible_deploy, 'open', mock.mock_open(),
@@ -610,6 +748,24 @@ class TestAnsibleDeploy(AnsibleDeployTestCaseBase):
                 + ['agent_verify_ca', 'deploy_forces_oob_reboot']),
             set(self.driver.get_properties()))
 
+    def test_supports_deploy_with_ansible_keys(self):
+        """Test supports_deploy returns True with ansible driver_info keys."""
+        with task_manager.acquire(
+                self.context, self.node['uuid'], shared=False) as task:
+            self.assertTrue(self.driver.supports_deploy(task))
+
+    def test_supports_deploy_without_ansible_keys(self):
+        """Test supports_deploy returns False without ansible driver_info."""
+        self.node.driver_info = {
+            'deploy_kernel': 'glance://deploy_kernel_uuid',
+            'deploy_ramdisk': 'glance://deploy_ramdisk_uuid',
+            'ipmi_address': '127.0.0.1',
+        }
+        self.node.save()
+        with task_manager.acquire(
+                self.context, self.node['uuid'], shared=False) as task:
+            self.assertFalse(self.driver.supports_deploy(task))
+
     @mock.patch.object(deploy_utils, 'check_for_missing_params',
                        autospec=True)
     @mock.patch.object(pxe.PXEBoot, 'validate', autospec=True)
@@ -622,6 +778,20 @@ class TestAnsibleDeploy(AnsibleDeployTestCaseBase):
             check_params_mock.assert_called_once_with(
                 {'instance_info.image_source': INSTANCE_INFO['image_source']},
                 mock.ANY)
+
+    @mock.patch.object(deploy_utils, 'check_for_missing_params',
+                       autospec=True)
+    @mock.patch.object(pxe.PXEBoot, 'validate', autospec=True)
+    def test_validate_interpreter_override_disabled(
+            self, pxe_boot_validate_mock, check_params_mock):
+        self.config(group='ansible',
+                    allow_node_python_interpreter_override=False)
+        with task_manager.acquire(
+                self.context, self.node['uuid'], shared=False) as task:
+            task.node.driver_info['ansible_python_interpreter'] = (
+                '/usr/bin/python4')
+            self.assertRaises(exception.InvalidParameterValue,
+                              self.driver.validate, task)
 
     @mock.patch.object(ansible_deploy, '_calculate_memory_req', autospec=True,
                        return_value=2000)
@@ -676,7 +846,7 @@ class TestAnsibleDeploy(AnsibleDeployTestCaseBase):
 
     @mock.patch.object(ansible_deploy, '_get_configdrive_path',
                        return_value='/path/test', autospec=True)
-    @mock.patch.object(irlib_utils, 'unlink_without_raise', autospec=True)
+    @mock.patch.object(com_utils, 'unlink_without_raise', autospec=True)
     @mock.patch.object(pxe.PXEBoot, 'clean_up_ramdisk', autospec=True)
     def test_clean_up(self, pxe_clean_up_mock, unlink_mock,
                       get_cfdrive_path_mock):

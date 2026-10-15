@@ -21,6 +21,7 @@ from oslo_config import cfg
 from testtools import matchers
 
 from ironic.common import exception
+from ironic.db.sqlalchemy.api import Connection as db_conn
 from ironic import objects
 from ironic.objects import base as obj_base
 from ironic.tests.unit.db import base as db_base
@@ -34,7 +35,8 @@ class TestPortObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
 
     def setUp(self):
         super(TestPortObject, self).setUp()
-        self.fake_port = db_utils.get_test_port(name='port-name')
+        self.fake_port = db_utils.get_test_port(
+            name='port-name', description='port-description')
 
     def test_get_by_id(self):
         port_id = self.fake_port['id']
@@ -86,9 +88,9 @@ class TestPortObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
 
     def test_create(self):
         port = objects.Port(self.context, **self.fake_port)
-        with mock.patch.object(self.dbapi, 'create_port',
+        with mock.patch.object(db_conn, 'create_port',
                                autospec=True) as mock_create_port:
-            with mock.patch.object(self.dbapi, 'get_port_by_id',
+            with mock.patch.object(db_conn, 'get_port_by_id',
                                    autospec=True) as mock_get_port:
                 test_port = db_utils.get_test_port()
                 mock_create_port.return_value = test_port
@@ -97,7 +99,7 @@ class TestPortObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
                 port.create()
 
                 args, _kwargs = mock_create_port.call_args
-                self.assertEqual(objects.Port.VERSION, args[0]['version'])
+                self.assertEqual(objects.Port.VERSION, args[1]['version'])
 
     def test_save(self):
         uuid = self.fake_port['uuid']
@@ -106,7 +108,7 @@ class TestPortObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
         with mock.patch.object(self.dbapi, 'get_port_by_uuid',
                                autospec=True) as mock_get_port:
             mock_get_port.return_value = self.fake_port
-            with mock.patch.object(self.dbapi, 'update_port',
+            with mock.patch.object(db_conn, 'update_port',
                                    autospec=True) as mock_update_port:
                 mock_update_port.return_value = (
                     db_utils.get_test_port(address=address,
@@ -117,8 +119,10 @@ class TestPortObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
 
                 mock_get_port.assert_called_once_with(uuid)
                 mock_update_port.assert_called_once_with(
-                    uuid, {'version': objects.Port.VERSION,
-                           'address': "b2:54:00:cf:2d:40"})
+                    mock.ANY,
+                    uuid,
+                    {'version': objects.Port.VERSION,
+                     'address': "b2:54:00:cf:2d:40"})
                 self.assertEqual(self.context, p._context)
                 res_updated_at = (p.updated_at).replace(tzinfo=None)
                 self.assertEqual(test_time, res_updated_at)
@@ -163,7 +167,7 @@ class TestPortObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
             self.assertEqual(self.context, ports[0]._context)
             mock_get_list.assert_called_once_with(
                 limit=None, marker=None, project=None, sort_dir=None,
-                sort_key=None)
+                sort_key=None, conductor_groups=None, filters=None)
 
     def test_list_deprecated_owner(self):
         with mock.patch.object(self.dbapi, 'get_port_list',
@@ -176,7 +180,7 @@ class TestPortObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
             self.assertEqual(self.context, ports[0]._context)
             mock_get_list.assert_called_once_with(
                 limit=None, marker=None, project='12345', sort_dir=None,
-                sort_key=None)
+                sort_key=None, conductor_groups=None, filters=None)
 
     @mock.patch.object(obj_base.IronicObject, 'supports_version',
                        spec_set=types.FunctionType)
@@ -420,3 +424,60 @@ class TestConvertToVersion(db_base.DbTestCase):
         port._convert_to_version("1.9", False)
         self.assertIsNone(port.name)
         self.assertNotIn('name', port.obj_get_changes())
+
+    def test_available_for_dynamic_portgroup_supported_missing(self):
+        port = objects.Port(self.context, **self.fake_port)
+        delattr(port, 'available_for_dynamic_portgroup')
+        port.obj_reset_changes()
+        port._convert_to_version("1.16")
+        self.assertTrue(port.available_for_dynamic_portgroup)
+        self.assertIn('available_for_dynamic_portgroup',
+                      port.obj_get_changes())
+
+    def test_available_for_dynamic_portgroup_supported_set(self):
+        port = objects.Port(self.context, **self.fake_port)
+        port.available_for_dynamic_portgroup = False
+        port.obj_reset_changes()
+        port._convert_to_version("1.16")
+        self.assertFalse(port.available_for_dynamic_portgroup)
+        self.assertNotIn('available_for_dynamic_portgroup',
+                         port.obj_get_changes())
+
+    def test_available_for_dynamic_portgroup_unsupported(self):
+        port = objects.Port(self.context, **self.fake_port)
+        port._convert_to_version("1.15")
+        self.assertNotIn('available_for_dynamic_portgroup', port)
+
+    def test_available_for_dynamic_portgroup_unsupported_missing(self):
+        port = objects.Port(self.context, **self.fake_port)
+        delattr(port, 'available_for_dynamic_portgroup')
+        port.obj_reset_changes()
+        port._convert_to_version("1.15")
+        self.assertNotIn('available_for_dynamic_portgroup', port)
+
+    def test_available_for_dynamic_portgroup_unsupported_set_remove(self):
+        port = objects.Port(self.context, **self.fake_port)
+        port.available_for_dynamic_portgroup = True
+        port.obj_reset_changes()
+        port._convert_to_version("1.15")
+        self.assertNotIn('available_for_dynamic_portgroup', port)
+
+    def test_available_for_dynamic_portgroup_unsupported_no_remove_non_default(
+            self):
+        port = objects.Port(self.context, **self.fake_port)
+        port.available_for_dynamic_portgroup = False
+        port.obj_reset_changes()
+        port._convert_to_version("1.15", False)
+        self.assertTrue(port.available_for_dynamic_portgroup)
+        self.assertIn('available_for_dynamic_portgroup',
+                      port.obj_get_changes())
+
+    def test_available_for_dynamic_portgroup_unsupported_no_remove_default(
+            self):
+        port = objects.Port(self.context, **self.fake_port)
+        port.available_for_dynamic_portgroup = True
+        port.obj_reset_changes()
+        port._convert_to_version("1.15", False)
+        self.assertTrue(port.available_for_dynamic_portgroup)
+        self.assertNotIn('available_for_dynamic_portgroup',
+                         port.obj_get_changes())

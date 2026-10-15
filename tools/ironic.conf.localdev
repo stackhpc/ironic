@@ -1,0 +1,34 @@
+[DEFAULT]
+# Disable all but fake hardware types and interfaces
+enabled_hardware_types = fake-hardware
+enabled_boot_interfaces = fake
+enabled_deploy_interfaces = fake
+enabled_management_interfaces = fake
+enabled_console_interfaces = fake-graphical,no-console
+enabled_vendor_interfaces = fake
+default_network_interface = noop
+
+# Enable single-process Ironic
+rpc_transport = none
+
+# No authentication for dev
+auth_strategy = noauth
+
+[vnc]
+enabled = true
+public_url = http://127.0.0.1:6090/vnc_auto.html
+container_provider = container
+container_executable = podman
+console_image = localhost/ironic-vnc-container
+
+[conductor]
+cache_clean_up_interval = 0
+
+[deploy]
+# Disable image caching
+iso_master_path = ''
+
+[pxe]
+# Disable image caching
+instance_master_path = ''
+

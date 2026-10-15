@@ -8,9 +8,15 @@
 _build
 doc/source/contributor/api/
 _static
+doc/source/admin/drivers/redfish/OpenStackIronicProfile.*.rst
 
 # release notes build
 releasenotes/build
+
+# sample config files
+etc/ironic/ironic.conf.sample
+etc/ironic/ironic.networking.conf.sample
+etc/ironic/policy.yaml.sample
 
 # Packages/installer info
 *.egg
@@ -28,6 +34,7 @@ develop-eggs
 # Other
 *.DS_Store
 .idea
+.vscode
 .testrepository
 .stestr
 .tox

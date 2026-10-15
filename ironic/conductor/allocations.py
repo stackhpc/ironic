@@ -14,14 +14,13 @@
 
 import random
 
-from ironic_lib import metrics_utils
 from oslo_config import cfg
 from oslo_log import log
-from oslo_utils import excutils
 import tenacity
 
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import metrics_utils
 from ironic.common import states
 from ironic.conductor import task_manager
 from ironic import objects
@@ -212,7 +211,7 @@ def _allocate_node(context, allocation, nodes):
         try:
             # NOTE(dtantsur): retries are done for all nodes above, so disable
             # per-node retry. Also disable loading the driver, since the
-            # current conductor may not have the requried hardware type or
+            # current conductor may not have the required hardware type or
             # interfaces (it's picked at random).
             with task_manager.acquire(context, node.uuid, shared=False,
                                       retry=False, load_driver=False,
@@ -275,15 +274,15 @@ def backfill_allocation(context, allocation, node_id):
             exception.InstanceAssociated,
             exception.NodeAssociated,
             exception.NodeNotFound) as exc:
-        with excutils.save_and_reraise_exception():
-            LOG.error(str(exc))
-            _allocation_failed(allocation, exc)
+        LOG.error(str(exc))
+        _allocation_failed(allocation, exc)
+        raise
     except Exception as exc:
-        with excutils.save_and_reraise_exception():
-            LOG.exception("Unexpected exception during backfilling of "
-                          "allocation %s", allocation.uuid)
-            reason = _("Unexpected exception during allocation: %s") % exc
-            _allocation_failed(allocation, reason)
+        LOG.exception("Unexpected exception during backfilling of "
+                      "allocation %s", allocation.uuid)
+        reason = _("Unexpected exception during allocation: %s") % exc
+        _allocation_failed(allocation, reason)
+        raise
 
 
 def _do_backfill_allocation(context, allocation, node_id):

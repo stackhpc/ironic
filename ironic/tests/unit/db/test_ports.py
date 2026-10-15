@@ -22,6 +22,24 @@ from ironic.tests.unit.db import base
 from ironic.tests.unit.db import utils as db_utils
 
 
+def _create_test_port_with_shard(shard, address, owner='12345',
+                                 lessee='54321'):
+    node = db_utils.create_test_node(
+        uuid=uuidutils.generate_uuid(),
+        owner=owner, lessee=lessee, shard=shard)
+    pg = db_utils.create_test_portgroup(
+        name='pg-%s' % shard,
+        uuid=uuidutils.generate_uuid(),
+        node_id=node.id,
+        address=address)
+    return db_utils.create_test_port(
+        name='port-%s' % shard,
+        uuid=uuidutils.generate_uuid(),
+        node_id=node.id,
+        address=address,
+        portgroup_id=pg.id)
+
+
 class DbPortTestCase(base.DbTestCase):
 
     def setUp(self):
@@ -148,6 +166,39 @@ class DbPortTestCase(base.DbTestCase):
         res_uuids = [r.uuid for r in res]
         self.assertCountEqual(uuids, res_uuids)
 
+    def test_get_port_list_filter_by_conductor_groups(self):
+        group_a_node = db_utils.create_test_node(
+            uuid=uuidutils.generate_uuid(), conductor_group='group_a')
+        group_b_node = db_utils.create_test_node(
+            uuid=uuidutils.generate_uuid(), conductor_group='group_b')
+
+        group_a_uuids = []
+        group_b_uuids = []
+        for i in range(1, 3):
+            port = db_utils.create_test_port(uuid=uuidutils.generate_uuid(),
+                                             node_id=group_a_node.id,
+                                             address='52:54:00:cf:2d:4%s' % i)
+            group_a_uuids.append(str(port.uuid))
+        for i in range(7, 9):
+            port = db_utils.create_test_port(uuid=uuidutils.generate_uuid(),
+                                             node_id=group_b_node.id,
+                                             address='52:54:00:cf:2d:4%s' % i)
+            group_b_uuids.append(str(port.uuid))
+        for i in range(4, 6):
+            port = db_utils.create_test_port(uuid=uuidutils.generate_uuid(),
+                                             node_id=self.node.id,
+                                             address='52:54:00:cf:2d:4%s' % i)
+        res = self.dbapi.get_port_list(conductor_groups=['group_a'])
+        res_uuids = [r.uuid for r in res]
+        self.assertJsonEqual(group_a_uuids, res_uuids)
+        res = self.dbapi.get_port_list(conductor_groups=['group_b'])
+        res_uuids = [r.uuid for r in res]
+        self.assertJsonEqual(group_b_uuids, res_uuids)
+        res = self.dbapi.get_port_list(
+            conductor_groups=['group_a', 'group_b'])
+        res_uuids = [r.uuid for r in res]
+        self.assertJsonEqual(group_a_uuids + group_b_uuids, res_uuids)
+
     def test_get_ports_by_node_id(self):
         res = self.dbapi.get_ports_by_node_id(self.node.id)
         self.assertEqual(self.port.address, res[0].address)
@@ -202,6 +253,35 @@ class DbPortTestCase(base.DbTestCase):
     def test_get_ports_by_portgroup_id_that_does_not_exist(self):
         self.assertEqual([], self.dbapi.get_ports_by_portgroup_id(99))
 
+    def test_get_ports_by_shard_no_match(self):
+        res = self.dbapi.get_ports_by_shards(['shard1', 'shard2'])
+        self.assertEqual([], res)
+
+    def test_get_ports_by_shard_with_match_single(self):
+        _create_test_port_with_shard('shard1', 'aa:bb:cc:dd:ee:ff')
+
+        res = self.dbapi.get_ports_by_shards(['shard1'])
+        self.assertEqual(1, len(res))
+        self.assertEqual('port-shard1', res[0].name)
+
+    def test_get_ports_by_shard_with_match_multi(self):
+        _create_test_port_with_shard('shard1', 'aa:bb:cc:dd:ee:ff')
+        _create_test_port_with_shard('shard2', 'ab:bb:cc:dd:ee:ff')
+        _create_test_port_with_shard('shard3', 'ac:bb:cc:dd:ee:ff')
+
+        res = self.dbapi.get_ports_by_shards(['shard1', 'shard2'])
+        self.assertEqual(2, len(res))
+        # note(JayF): We do not query for shard3; ensure we don't get it.
+        self.assertNotEqual('port-shard3', res[0].name)
+        self.assertNotEqual('port-shard3', res[1].name)
+
+    def test_get_ports_by_shard_with_invalid_project(self):
+        _create_test_port_with_shard('shard1', 'aa:bb:cc:dd:ee:ff')
+        _create_test_port_with_shard('shard2', 'ff:ee:dd:cc:bb:aa',
+                                     owner='67890', lessee='09876')
+        res = self.dbapi.get_ports_by_shards(['shard2'], project='12345')
+        self.assertEqual(0, len(res))
+
     def test_destroy_port(self):
         self.dbapi.destroy_port(self.port.id)
         self.assertRaises(exception.PortNotFound,
@@ -244,3 +324,81 @@ class DbPortTestCase(base.DbTestCase):
                           uuid=self.port.uuid,
                           node_id=self.node.id,
                           address='aa-bb-cc-33-11-22')
+
+    def test_create_port_with_description(self):
+        description = 'Management Port'
+        port1 = db_utils.create_test_port(
+            uuid=uuidutils.generate_uuid(),
+            node_id=self.node.id,
+            address='52:54:00:cf:2d:42',
+            description=description)
+
+        port2 = db_utils.create_test_port(
+            uuid=uuidutils.generate_uuid(),
+            node_id=self.node.id,
+            address='52:54:00:cf:2d:45',
+            description=description)
+
+        self.assertEqual(description, port1.description)
+        self.assertEqual(description, port2.description)
+
+        new_description = 'Updated Description'
+        updated_port = self.dbapi.update_port(
+            port1.id, {'description': new_description})
+
+        self.assertEqual(new_description, updated_port.description)
+
+        retrieved_port1 = self.dbapi.get_port_by_uuid(port1.uuid)
+        self.assertEqual(new_description, retrieved_port1.description)
+
+    def test_create_port_with_vendor(self):
+        vendor = 'intel'
+        port1 = db_utils.create_test_port(
+            uuid=uuidutils.generate_uuid(),
+            node_id=self.node.id,
+            address='52:54:00:cf:2d:42',
+            vendor=vendor)
+
+        port2 = db_utils.create_test_port(
+            uuid=uuidutils.generate_uuid(),
+            node_id=self.node.id,
+            address='52:54:00:cf:2d:45',
+            vendor=vendor)
+
+        self.assertEqual(vendor, port1.vendor)
+        self.assertEqual(vendor, port2.vendor)
+
+        new_vendor = 'mikrotik'
+        updated_port = self.dbapi.update_port(
+            port1.id, {'vendor': new_vendor})
+
+        self.assertEqual(new_vendor, updated_port.vendor)
+
+        retrieved_port1 = self.dbapi.get_port_by_uuid(port1.uuid)
+        self.assertEqual(new_vendor, retrieved_port1.vendor)
+
+    def test_create_port_with_category(self):
+        category = 'hypernet'
+        port1 = db_utils.create_test_port(
+            uuid=uuidutils.generate_uuid(),
+            node_id=self.node.id,
+            address='52:54:00:cf:2d:42',
+            category=category)
+
+        port2 = db_utils.create_test_port(
+            uuid=uuidutils.generate_uuid(),
+            node_id=self.node.id,
+            address='52:54:00:cf:2d:45',
+            category=category)
+
+        self.assertEqual(category, port1.category)
+        self.assertEqual(category, port2.category)
+
+        new_category = 'ultranet'
+        updated_port = self.dbapi.update_port(
+            port1.id, {'category': new_category})
+
+        self.assertEqual(new_category, updated_port.category)
+
+        retrieved_port1 = self.dbapi.get_port_by_uuid(port1.uuid)
+        self.assertEqual(new_category, retrieved_port1.category)

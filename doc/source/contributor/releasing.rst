@@ -5,10 +5,8 @@ Releasing Ironic Projects
 Since the responsibility for releases will move between people, we document
 that process here.
 
-A full list of projects that ironic manages is available in the `governance
+A full list of projects that Ironic manages is available in the `governance
 site`_.
-
-.. _`governance site`: https://governance.openstack.org/reference/projects/ironic.html
 
 Who is responsible for releases?
 ================================
@@ -20,20 +18,16 @@ documented in the `cross-project liaison wiki`_.
 Anyone may submit a release request per the process below, but the PTL or
 liaison must +1 the request for it to be processed.
 
-.. _`cross-project liaison wiki`: https://wiki.openstack.org/wiki/CrossProjectLiaisons#Release_management
-
 Release process
 ===============
 
 Releases are managed by the OpenStack release team. The release process is
 documented in the `Project Team Guide`_.
 
-.. _`Project Team Guide`: https://docs.openstack.org/project-team-guide/release-management.html#how-to-release
-
 What do we have to release?
 ===========================
 
-The ironic project has a number of deliverables under its governance.  The
+The Ironic project has a number of deliverables under its governance.  The
 ultimate source of truth for this is `projects.yaml
 <https://opendev.org/openstack/governance/src/branch/master/reference/projects.yaml>`__
 in the governance repository. These deliverables have varying release models,
@@ -41,7 +35,7 @@ and these are defined in the `deliverables YAML files
 <https://opendev.org/openstack/releases/src/branch/master/deliverables>`__ in
 the releases repository.
 
-In general, ironic deliverables follow the `cycle-with-intermediary
+In general, Ironic deliverables follow the `cycle-with-intermediary
 <https://releases.openstack.org/reference/release_models.html#cycle-with-intermediary>`__
 release model.
 
@@ -50,45 +44,45 @@ Non-client libraries
 
 The following deliverables are non-client libraries:
 
-* ironic-lib
-* metalsmith
-* sushy
+* `sushy`_
 
 Client libraries
 ----------------
 
 The following deliverables are client libraries:
 
-* python-ironicclient
-* python-ironic-inspector-client
+* `python-ironicclient`_
 
 Normal release
 --------------
 
 The following deliverables are Neutron plugins:
 
-* networking-baremetal
-* networking-generic-switch
+* `networking-baremetal`_
+* `networking-generic-switch`_
 
 The following deliverables are Horizon plugins:
 
-* ironic-ui
+* `ironic-ui`_
 
 The following deliverables are Tempest plugins:
 
-* ironic-tempest-plugin
+* `ironic-tempest-plugin`_
 
 The following deliverables are tools:
 
-* ironic-python-agent-builder
+* `ironic-python-agent-builder`_
+
+  .. NOTE:: if ironic-python-agent-builder is branched after
+            ironic-python-agent, we need to make sure all artifacts
+            are built by the time of Ironic branching.
 
 The following deliverables are services, or treated as such:
 
-* bifrost
-* ironic
-* ironic-inspector
-* ironic-prometheus-exporter
-* ironic-python-agent
+* `bifrost`_
+* `ironic`_
+* `ironic-prometheus-exporter`_
+* `ironic-python-agent`_
 
 Manual release
 --------------
@@ -103,17 +97,103 @@ Independent
 The following deliverables are released `independently
 <https://releases.openstack.org/reference/release_models.html#independent>`__:
 
-* sushy-tools
-* tenks
-* virtualbmc
+* `sushy-tools`_
+* `virtualbmc`_
 
 Not released
 ------------
 
 The following deliverables do not need to be released:
 
-* ironic-inspector-specs
-* ironic-specs
+* `ironic-specs`_
+
+OpenStack Release Schedule
+==========================
+
+The Ironic project follows the OpenStack coordinated release schedule. Each
+OpenStack release cycle spans approximately 6 months (26 weeks) and follows
+a structured timeline with specific milestones and deadlines.
+
+Based on the standard OpenStack release schedule, a typical release cycle
+includes the following key phases:
+
+Release Timeline Overview
+-------------------------
+
+**Development Phase (Weeks R-25 to R-12)**
+  * **R-25 to R-21**: Early development, feature planning
+  * **R-20 (Week 6)**: First milestone
+  * **R-17**: Cycle-trailing release deadline for previous cycle
+  * **R-12 (Week 14)**: Second milestone and membership freeze
+
+**Feature Development Phase (Weeks R-11 to R-5)**
+  * **R-11 to R-8**: Active feature development
+  * **R-7**: Extra Active Contributor (AC) freeze
+  * **R-6**: Final release for non-client libraries (`sushy`_)
+  * **R-5 (Week 22)**: Third milestone, feature freeze,
+    final release for client libraries (`python-ironicclient`_),
+    plugins (`networking-baremetal`_, `networking-generic-switch`_, `ironic-ui`_, `ironic-tempest-plugin`_),
+    and tools (`ironic-python-agent-builder`_), soft string freeze, requirements freeze
+
+**Stabilization Phase (Weeks R-4 to R-1)**
+  * **R-4**: Cycle highlights deadline
+  * **R-3**: RC1 target week for services (`bifrost`_, `ironic`_, `ironic-prometheus-exporter`_, `ironic-python-agent`_), hard string freeze
+  * **R-2**: Bug fixing and stabilization
+  * **R-1**: Final RCs and intermediary releases
+
+**Release Week (R+0)**
+  * **R+0**: Coordinated release for services (`bifrost`_, `ironic`_, `ironic-prometheus-exporter`_, `ironic-python-agent`_) (typically on a Wednesday)
+
+Key Deadlines for Ironic Projects
+----------------------------------
+
+**Milestone Releases**
+  * Projects following the cycle-with-intermediary model should aim to release
+    at each milestone
+  * Milestone participation is required for projects to be considered part of
+    the coordinated release
+
+**Library Releases**
+  * Non-client libraries (`sushy`_): Final release at R-6
+  * Client libraries (`python-ironicclient`_): Final release at R-5
+
+**Plugin Releases**
+  * Neutron plugins (`networking-baremetal`_, `networking-generic-switch`_): Final release at R-5
+  * Horizon plugins (`ironic-ui`_): Final release at R-5
+  * Tempest plugins (`ironic-tempest-plugin`_): Final release at R-5
+
+**Service Releases**
+  * Services (`bifrost`_, `ironic`_, `ironic-prometheus-exporter`_, `ironic-python-agent`_):
+    Release candidates at R-3, final release at R+0
+  * Tools (`ironic-python-agent-builder`_): Final release at R-5
+
+**Feature Freeze (R-5)**
+  * No new features accepted after the third milestone
+  * Focus shifts to bug fixes and stabilization
+  * Release notes should be finalized
+
+**String Freeze**
+  * Soft string freeze at R-5: No new user-facing strings
+  * Hard string freeze at R-3: No string changes to allow translation work
+
+**Requirements Freeze (R-5)**
+  * Only critical requirements changes allowed after feature freeze
+  * Helps downstream packagers prepare for the release
+
+Planning Your Release
+---------------------
+
+When planning Ironic releases within an OpenStack cycle:
+
+1. **Early Cycle (R-25 to R-12)**: Plan major features, coordinate with
+   dependencies
+2. **Mid Cycle (R-11 to R-6)**: Complete feature development, release
+   libraries
+3. **Late Cycle (R-5 to R+0)**: Focus on stabilization, bug fixes, and
+   release preparation
+
+For the most current release schedule, always refer to the official OpenStack
+releases website at https://releases.openstack.org/.
 
 Bugfix branches
 ===============
@@ -122,7 +202,6 @@ The following projects have ``bugfix/X.Y`` branches in addition to standard
 openstack ``stable/NAME`` branches:
 
 * ironic
-* ironic-inspector
 * ironic-python-agent
 
 These projects receive releases every six months as part of the coordinated
@@ -130,25 +209,83 @@ OpenStack release that happens semi-annually. These releases can be
 found in a ``stable/NAME`` branch.
 
 They are also evaluated for additional bugfix releases between scheduled
-stable releases at the two and four month milestore between stable releases
+stable releases at the two and four month milestone between stable releases
 (roughly every 2 months). These releases can be found in a ``bugfix/X.Y``
 branch. A bugfix release is only created if there are significant
 beneficial changes and a known downstream operator or distributor will consume
 the release.
 
+A bugfix branch is supported for 6 months after its creation date.
+
 To leave some version space for releases from these branches, releases of these
 projects from the master branch always increase either the major or the minor
 version.
 
-Currently releases and retirements from bugfix branches cannot be automated and
-must be done by the release team manually.
+Currently retirement of bugfix branches cannot be automated and
+must be done by the ironic team manually as explained below.
 
-After the creation of a bugfix branch it is utmost important to update the
-upper-constraints link for the tests in the tox.ini file, plus override the
-branch for the requirements project to be sure to use the correct
-upper-constraints; for example see the following change:
+There are usually 3 bugfix branches present at all time, the latest 2 are
+actively maintained, while the third one is considered unmaintained.
+After creating a new bugfix branch, the oldest bugfix branch
+should be tagged as EoL and deleted.
 
-https://review.opendev.org/c/openstack/ironic-python-agent/+/841290
+Only members of the ironic-core or ironic-release groups can delete branches,
+please refer to this procedure to remove the oldest bugfix branch after
+the creation of a new one:
+
+* checkout locally the bugfix branch to move to EoL, if it does not exist
+  locally it's possible to checkout it from remote and switch to it using
+  ``git checkout -t``, for example for bugfix/24.0 use:
+
+.. code-block:: bash
+
+   git checkout -t origin/bugfix/24.0
+
+* fast forward to latest change using:
+
+.. code-block:: bash
+
+   git pull --ff-only
+
+* add a signed tag to the latest commit of the bugfix branch named ``bugfix-X.Y-eol``
+  and add "EOL bugfix/X.Y" as description, for example
+  for bugfix/24.0 add the tag bugfix-24.0-eol; use the ``git tag``
+  command for that, for example for bugfix/24.0 the syntax would be:
+
+.. code-block:: bash
+
+   git tag -s bugfix-24.0-eol -m "EOL bugfix/24.0"
+
+* push the new tag to gerrit using ``git push gerrit TAG_NAME``, for example
+  for bugfix/24.0 use:
+
+.. code-block:: bash
+
+   git push gerrit bugfix-24.0-eol
+
+* delete the bugfix branch on gerrit using ``git push gerrit --delete BUGFIX_BRANCH_NAME``,
+  again for bugfix/24.0 would be:
+
+.. code-block:: bash
+
+   git push gerrit --delete bugfix/24.0
+
+After the creation of a bugfix branch it is highly recommended to update
+the upper-constraints link for the tests in the tox.ini file, plus override
+the branch for the requirements project to be sure to use the correct
+upper-constraints from the branch creation time; for example see the
+following change:
+
+https://review.opendev.org/c/openstack/ironic/+/938660
+
+It is also mandatory to comment out or remove the metal3 integration job as it
+is not supposed to run in stable or bugfix branches, and also comment out or
+remove the tox codespell job to avoid failures due to version changes, spelling
+is fixed in master and most recent stable branches only and backported "as is".
+
+The remaining metal3 jobs can be left on stable and bugfix branches but they
+need to be updated once the metal3 community follows up with its releases. See
+the comments in the job definitions for instructions.
 
 Things to do before releasing
 =============================
@@ -159,7 +296,7 @@ Things to do before releasing
   Combine release notes if necessary (for example, a release note for a
   feature and another release note to add to that feature may be combined).
 
-* For ironic releases only, not ironic-inspector releases: if any new API
+* For Ironic releases only: if any new API
   microversions have been added since the last release, update the REST API
   version history (``doc/source/contributor/webapi-version-history.rst``) to
   indicate that they were part of the new release.
@@ -200,7 +337,7 @@ following the next steps:
     deliverable (i.e. subproject) grouped by release cycles.
 
   * The ``_independent`` directory contains yaml files for deliverables that
-    are not bound to (official) cycles (e.g. ironic-python-agent-builder).
+    are not bound to (official) cycles (e.g. Ironic-python-agent-builder).
 
 * To check the changes we're about to release we can use the tox environment
   ``list-unreleased-changes``, with this syntax:
@@ -213,7 +350,7 @@ following the next steps:
   not stable/ussuri or stable/train).
 
   For example, assuming we're in the main directory of the releases repository,
-  to check the changes in the ussuri series for ironic-python-agent
+  to check the changes in the ussuri series for Ironic-python-agent
   type:
 
   .. code-block:: bash
@@ -243,12 +380,12 @@ following the next steps:
 
   The ``--intermediate-branch`` option is used to create an intermediate
   bugfix branch following the
-  `new release model for ironic projects <https://specs.openstack.org/openstack/ironic-specs/specs/not-implemented/new-release-model.html>`_.
+  `new release model for Ironic projects <https://specs.openstack.org/openstack/ironic-specs/specs/approved/new-release-model.html>`_.
 
   To propose the release, use the script to update the deliverable file, then
   commit the change, and propose it for review.
 
-  For example, to propose a minor release for ironic in the master branch
+  For example, to propose a minor release for Ironic in the master branch
   (current development branch), considering that the code name of the future
   stable release is wallaby, use:
 
@@ -260,7 +397,7 @@ following the next steps:
   deliverable, the new version and the branch, if applicable.
 
   A good commit message title should also include the same, for example
-  "Release ironic 1.2.3 for ussuri"
+  "Release Ironic 1.2.3 for ussuri"
 
 * As an optional step, we can use ``tox -e list-changes`` to double-check the
   changes before submitting them for review.
@@ -291,6 +428,8 @@ This includes:
 
 * In the new stable branch:
 
+  .. NOTE:: OpenStack Release tooling does this automatically.
+
   * a change to point ``.gitreview`` at the branch
   * a change to update the upper constraints file used by ``tox``
 
@@ -302,21 +441,29 @@ This includes:
     typically submit a follow-up patch to do that. An example of this patch is
     `here <https://review.opendev.org/685070>`__.
 
-  * update the `templates` in `.zuul.yaml` or `zuul.d/project.yaml`.
+  * update the ``templates`` in ``.zuul.yaml`` or ``zuul.d/project.yaml``.
 
     The update is necessary to use the job for the next release
-    `openstack-python3-<next_release>-jobs`. An example of this patch is
+    ``openstack-python3-<next_release>-jobs``. An example of this patch is
     `here <https://review.opendev.org/#/c/689705/>`__.
 
 We need to submit patches for changes in the stable branch to:
 
-* update the ironic devstack plugin to point at the branched tarball for IPA.
+* update the Ironic devstack plugin to point at the branched tarball for IPA.
   An example of this patch is
   `here <https://review.opendev.org/685069/>`_.
 * set appropriate defaults for ``TEMPEST_BAREMETAL_MIN_MICROVERSION`` and
   ``TEMPEST_BAREMETAL_MAX_MICROVERSION`` in ``devstack/lib/ironic`` to make sure
   that unsupported API tempest tests are skipped on stable branches. E.g.
   `patch 495319 <https://review.opendev.org/495319>`_.
+* remove any CI jobs which are *not* required. Mainly this revolves around the
+  metal3-integration CI job, however other non-voting jobs can also be removed
+  safely. This can be achieved by editing the ``.zuul.d/project.yaml`` file.
+
+.. NOTE:: It is normal to reduce the number of CI jobs present on a stable
+   branch the longer the branch exists. This is a mix of challenges related
+   to distributions, dependencies, and CI resources. Maintainers should
+   anticipate this as a normal activity and should avoid heroic efforts.
 
 We need to submit patches for changes on master to:
 
@@ -324,7 +471,7 @@ We need to submit patches for changes on master to:
   need to make these changes. Note that we need to wait until *after* the
   switch in grenade is made to test the latest release (N) with master
   (e.g. `for stable/queens <https://review.opendev.org/#/c/543615>`_).
-  Doing these changes sooner -- after the ironic release and before the switch
+  Doing these changes sooner -- after the Ironic release and before the switch
   when grenade is testing the prior release (N-1) with master, will cause
   the tests to fail. (You may want to ask/remind infra/qa team, as to
   when they will do this switch.)
@@ -334,8 +481,8 @@ We need to submit patches for changes on master to:
     support upgrades between adjacent named releases, the master branch will
     only support upgrades from the most recent named release to master.
 
-  * remove any DB migration scripts from ``ironic.cmd.dbsync.ONLINE_MIGRATIONS``
-    and remove the corresponding code from ironic. (These migration scripts
+  * remove any DB migration scripts from ``ironic.command.dbsync.ONLINE_MIGRATIONS``
+    and remove the corresponding code from Ironic. (These migration scripts
     are used to migrate from an old release to this latest release; they
     shouldn't be needed after that.)
 
@@ -353,8 +500,6 @@ After the release:
   take jobs definitions from. See the following examples:
 
   * `ironic 18.1 <https://review.opendev.org/c/openstack/ironic/+/801876>`_
-  * `ironic-inspector 10.7
-    <https://review.opendev.org/c/openstack/ironic-inspector/+/801873>`_
   * `ironic-python-agent 8.1
     <https://review.opendev.org/c/openstack/ironic-python-agent/+/801898>`_
 
@@ -382,3 +527,21 @@ For all releases, whether or not it results in a stable branch:
   implemented.
 
 * remove any -2s on patches that were blocked until after the release.
+
+.. _`bifrost`: https://opendev.org/openstack/bifrost
+.. _`cross-project liaison wiki`: https://wiki.openstack.org/wiki/CrossProjectLiaisons#Release_management
+.. _`governance site`: https://governance.openstack.org/reference/projects/ironic.html
+.. _`ironic`: https://opendev.org/openstack/ironic
+.. _`ironic-prometheus-exporter`: https://opendev.org/openstack/ironic-prometheus-exporter
+.. _`ironic-python-agent`: https://opendev.org/openstack/ironic-python-agent
+.. _`ironic-python-agent-builder`: https://opendev.org/openstack/ironic-python-agent-builder
+.. _`ironic-specs`: https://opendev.org/openstack/ironic-specs
+.. _`ironic-tempest-plugin`: https://opendev.org/openstack/ironic-tempest-plugin
+.. _`ironic-ui`: https://opendev.org/openstack/ironic-ui
+.. _`networking-baremetal`: https://opendev.org/openstack/networking-baremetal
+.. _`networking-generic-switch`: https://opendev.org/openstack/networking-generic-switch
+.. _`Project Team Guide`: https://docs.openstack.org/project-team-guide/release-management.html#how-to-release
+.. _`python-ironicclient`: https://opendev.org/openstack/python-ironicclient
+.. _`sushy`: https://opendev.org/openstack/sushy
+.. _`sushy-tools`: https://opendev.org/openstack/sushy-tools
+.. _`virtualbmc`: https://opendev.org/openstack/virtualbmc

@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Copyright 2013 Hewlett-Packard Development Company, L.P.
 # Copyright 2014 Red Hat, Inc.
@@ -19,6 +18,7 @@ Utility for caching master images.
 """
 
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -51,21 +51,28 @@ _concurrency_semaphore = threading.Semaphore(CONF.image_download_concurrency)
 class ImageCache(object):
     """Class handling access to cache for master images."""
 
-    def __init__(self, master_dir, cache_size, cache_ttl):
+    def __init__(self, master_dir, cache_size, cache_ttl,
+                 disable_validation=False, force_raw=True):
         """Constructor.
 
         :param master_dir: cache directory to work on
                            Value of None disables image caching.
         :param cache_size: desired maximum cache size in bytes
         :param cache_ttl: cache entity TTL in seconds
+        :param disable_validation: disable security checks on cached images
         """
         self.master_dir = master_dir
         self._cache_size = cache_size
         self._cache_ttl = cache_ttl
+        self._force_raw = force_raw
+        self._disable_validation = disable_validation
         if master_dir is not None:
             fileutils.ensure_tree(master_dir)
 
-    def fetch_image(self, href, dest_path, ctx=None, force_raw=True):
+    def fetch_image(self, href, dest_path, ctx=None, force_raw=None,
+                    expected_format=None, expected_checksum=None,
+                    expected_checksum_algo=None,
+                    image_auth_data=None):
         """Fetch image by given href to the destination path.
 
         Does nothing if destination path exists and is up to date with cache
@@ -80,16 +87,41 @@ class ImageCache(object):
         :param ctx: context
         :param force_raw: boolean value, whether to convert the image to raw
                           format
+        :param expected_format: The expected image format.
+        :param expected_checksum: The expected image checksum
+        :param expected_checksum_algo: The expected image checksum algorithm,
+                                       if needed/supplied.
         """
+        force_raw = force_raw if force_raw is not None else self._force_raw
+        if expected_format is not None and self._disable_validation:
+            raise AssertionError("BUG: passing expected_format to caches with "
+                                 "disabled validation makes no sense")
         img_download_lock_name = 'download-image'
         if self.master_dir is None:
             # NOTE(ghe): We don't share images between instances/hosts
+            # NOTE(TheJulia): These is a weird code path, because master_dir
+            # has to be None, which by default it never should be unless
+            # an operator forces it to None, which is a path we just never
+            # expect.
+            # TODO(TheJulia): This may be dead-ish code and likely needs
+            # to be removed. Likely originated *out* of just the iscsi
+            # deployment interface and local image caching.
             if not CONF.parallel_image_downloads:
                 with lockutils.lock(img_download_lock_name):
-                    _fetch(ctx, href, dest_path, force_raw)
+                    _fetch(ctx, href, dest_path, force_raw,
+                           expected_format=expected_format,
+                           expected_checksum=expected_checksum,
+                           expected_checksum_algo=expected_checksum_algo,
+                           disable_validation=self._disable_validation,
+                           image_auth_data=image_auth_data)
             else:
                 with _concurrency_semaphore:
-                    _fetch(ctx, href, dest_path, force_raw)
+                    _fetch(ctx, href, dest_path, force_raw,
+                           expected_format=expected_format,
+                           expected_checksum=expected_checksum,
+                           expected_checksum_algo=expected_checksum_algo,
+                           disable_validation=self._disable_validation,
+                           image_auth_data=image_auth_data)
             return
 
         # TODO(ghe): have hard links and counts the same behaviour in all fs
@@ -113,6 +145,10 @@ class ImageCache(object):
         # TODO(dtantsur): lock expiration time
         with lockutils.lock(img_download_lock_name):
             img_service = image_service.get_image_service(href, context=ctx)
+            if img_service.is_auth_set_needed:
+                # We need to possibly authenticate based on what a user
+                # has supplied, so we'll send that along.
+                img_service.set_image_auth(href, image_auth_data)
             img_info = img_service.show(href)
             # NOTE(vdrok): After rebuild requested image can change, so we
             # should ensure that dest_path and master_path (if exists) are
@@ -131,7 +167,17 @@ class ImageCache(object):
             if cache_up_to_date:
                 # NOTE(dtantsur): ensure we're not in the middle of clean up
                 with lockutils.lock('master_image'):
-                    os.link(master_path, dest_path)
+                    try:
+                        os.link(master_path, dest_path)
+                    except OSError as exc:
+                        LOG.debug(
+                            "Could not hardlink image file %(image)s to "
+                            "the cache location %(dest_path)s (will copy it "
+                            "over): %(error)s", {
+                                'image': master_path,
+                                'dest_path': dest_path,
+                                'error': exc})
+                        shutil.copyfile(master_path, dest_path)
                 LOG.debug("Master cache hit for image %(href)s",
                           {'href': href})
                 return
@@ -140,13 +186,19 @@ class ImageCache(object):
                      {'href': href})
             self._download_image(
                 href, master_path, dest_path, img_info,
-                ctx=ctx, force_raw=force_raw)
+                ctx=ctx, force_raw=force_raw,
+                expected_format=expected_format,
+                expected_checksum=expected_checksum,
+                expected_checksum_algo=expected_checksum_algo,
+                image_auth_data=image_auth_data)
 
         # NOTE(dtantsur): we increased cache size - time to clean up
         self.clean_up()
 
     def _download_image(self, href, master_path, dest_path, img_info,
-                        ctx=None, force_raw=True):
+                        ctx=None, force_raw=None, expected_format=None,
+                        expected_checksum=None, expected_checksum_algo=None,
+                        image_auth_data=None):
         """Download image by href and store at a given path.
 
         This method should be called with uuid-specific lock taken.
@@ -158,6 +210,11 @@ class ImageCache(object):
         :param ctx: context
         :param force_raw: boolean value, whether to convert the image to raw
                           format
+        :param expected_format: The expected original format for the image.
+        :param expected_checksum: The expected image checksum.
+        :param expected_checksum_algo: The expected image checksum algorithm.
+        :param image_auth_data: Dictionary with credential details which may be
+                                required to download the file.
         :raise ImageDownloadFailed: when the image cache and the image HTTP or
                                     TFTP location are on different file system,
                                     causing hard link to fail.
@@ -166,28 +223,43 @@ class ImageCache(object):
         # TODO(ghe): logging when image cannot be created
         tmp_dir = tempfile.mkdtemp(dir=self.master_dir)
         tmp_path = os.path.join(tmp_dir, os.path.basename(master_path))
-
+        force_raw = force_raw if force_raw is not None else self._force_raw
         try:
-            with _concurrency_semaphore:
-                _fetch(ctx, href, tmp_path, force_raw)
+            try:
+                with _concurrency_semaphore:
+                    _fetch(ctx, href, tmp_path, force_raw, expected_format,
+                           expected_checksum=expected_checksum,
+                           expected_checksum_algo=expected_checksum_algo,
+                           disable_validation=self._disable_validation,
+                           image_auth_data=image_auth_data)
+            except OSError as exc:
+                msg = (_("Could not download image %(img_href)s to temp file "
+                         "%(tmp_path)s, error: %(exc)s") %
+                       {'img_href': href, 'tmp_path': tmp_path, 'exc': exc})
+                LOG.error(msg)
+                raise exception.ImageDownloadFailed(msg)
 
-            if img_info.get('no_cache'):
-                LOG.debug("Caching is disabled for image %s", href)
-                # Cache disabled, link directly to destination
-                os.link(tmp_path, dest_path)
-            else:
-                # NOTE(dtantsur): no need for global lock here - master_path
-                # will have link count >1 at any moment, so won't be cleaned up
-                os.link(tmp_path, master_path)
-                os.link(master_path, dest_path)
-        except OSError as exc:
-            msg = (_("Could not link image %(img_href)s from %(src_path)s "
-                     "to %(dst_path)s, error: %(exc)s") %
-                   {'img_href': href, 'src_path': master_path,
-                    'dst_path': dest_path, 'exc': exc})
-            LOG.error(msg)
-            raise exception.ImageDownloadFailed(msg)
+            try:
+                if img_info.get('no_cache'):
+                    LOG.debug("Caching is disabled for image %s", href)
+                    # Cache disabled, link directly to destination
+                    os.link(tmp_path, dest_path)
+                else:
+                    # NOTE(dtantsur): no need for global lock here
+                    # master_path will have link count >1 at any moment, so
+                    # won't be cleaned up
+                    os.link(tmp_path, master_path)
+                    os.link(master_path, dest_path)
+            except OSError as exc:
+                msg = (_("Could not link image %(img_href)s from %(src_path)s "
+                         "to %(dst_path)s, error: %(exc)s") %
+                       {'img_href': href, 'src_path': master_path,
+                        'dst_path': dest_path, 'exc': exc})
+                LOG.error(msg)
+                raise exception.ImageDownloadFailed(msg)
         finally:
+            # NOTE(cardoe): This finally block is to ensure we clean up no
+            # matter the error path
             utils.rmtree_without_raise(tmp_dir)
 
     @lockutils.synchronized('master_image')
@@ -333,31 +405,69 @@ def _free_disk_space_for(path):
     return stat.f_frsize * stat.f_bavail
 
 
-def _fetch(context, image_href, path, force_raw=False):
+def _fetch(context, image_href, path, force_raw=False,
+           expected_format=None, expected_checksum=None,
+           expected_checksum_algo=None,
+           disable_validation=False, image_auth_data=None):
     """Fetch image and convert to raw format if needed."""
+    assert not (disable_validation and expected_format)
     path_tmp = "%s.part" % path
-    images.fetch(context, image_href, path_tmp, force_raw=False)
+    if os.path.exists(path_tmp):
+        LOG.warning("%s exist, assuming it's stale", path_tmp)
+        os.remove(path_tmp)
+    images.fetch(context, image_href, path_tmp, force_raw=False,
+                 checksum=expected_checksum,
+                 checksum_algo=expected_checksum_algo,
+                 image_auth_data=image_auth_data)
+    # By default, the image format is unknown
+    image_format = None
+    disable_dii = (disable_validation
+                   or CONF.conductor.disable_deep_image_inspection)
+    if not disable_dii:
+        if not expected_format:
+            # Call of last resort to check the image format. Caching other
+            # artifacts like kernel/ramdisks are not going to have an expected
+            # format known even if they are not passed to qemu-img.
+            remote_image_format = images.image_show(
+                context,
+                image_href,
+                image_auth_data=image_auth_data).get('disk_format')
+        else:
+            remote_image_format = expected_format
+        image_format = images.safety_check_image(path_tmp)
+        images.check_if_image_format_is_permitted(
+            image_format, remote_image_format)
+
     # Notes(yjiang5): If glance can provide the virtual size information,
     # then we can firstly clean cache and then invoke images.fetch().
-    if force_raw:
-        if images.force_raw_will_convert(image_href, path_tmp):
-            required_space = images.converted_size(path_tmp, estimate=False)
-            directory = os.path.dirname(path_tmp)
+    if (force_raw
+            and ((disable_dii
+                 and images.force_raw_will_convert(image_href, path_tmp))
+                 or (not disable_dii
+                     and image_format not in images.RAW_IMAGE_FORMATS))):
+        # NOTE(TheJulia): What is happening here is the rest of the logic
+        # is hinged on force_raw, but also we don't need to take the entire
+        # path *if* the image on disk is *already* raw. Depending on settings,
+        # the path differs slightly because if we have deep image inspection,
+        # we can just rely upon the inspection image format, otherwise we
+        # need to ask the image format.
+
+        required_space = images.converted_size(path_tmp, estimate=False)
+        directory = os.path.dirname(path_tmp)
+        try:
+            _clean_up_caches(directory, required_space)
+        except exception.InsufficientDiskSpace:
+
+            # try again with an estimated raw size instead of the full size
+            required_space = images.converted_size(path_tmp, estimate=True)
             try:
                 _clean_up_caches(directory, required_space)
             except exception.InsufficientDiskSpace:
-
-                # try again with an estimated raw size instead of the full size
-                required_space = images.converted_size(path_tmp, estimate=True)
-                try:
-                    _clean_up_caches(directory, required_space)
-                except exception.InsufficientDiskSpace:
-                    LOG.warning('Not enough space for estimated image size. '
-                                'Consider lowering '
-                                '[DEFAULT]raw_image_growth_factor=%s',
-                                CONF.raw_image_growth_factor)
-                    raise
-
+                LOG.error('Not enough space for estimated image size. '
+                          'Consider lowering '
+                          '[DEFAULT]raw_image_growth_factor=%s',
+                          CONF.raw_image_growth_factor)
+                raise
         images.image_to_raw(image_href, path, path_tmp)
     else:
         os.rename(path_tmp, path)
@@ -394,7 +504,7 @@ def _clean_up_caches(directory, amount):
                                               )
 
 
-def clean_up_caches(ctx, directory, images_info):
+def clean_up_caches(ctx, directory, images_info, image_auth_data=None):
     """Explicitly cleanup caches based on their priority (if required).
 
     This cleans up the caches to free up the amount of space required for the
@@ -409,7 +519,8 @@ def clean_up_caches(ctx, directory, images_info):
     :raises: InsufficientDiskSpace exception, if we cannot free up enough space
              after trying all the caches.
     """
-    total_size = sum(images.download_size(ctx, uuid)
+    total_size = sum(images.download_size(ctx, uuid,
+                                          image_auth_data=image_auth_data)
                      for (uuid, path) in images_info)
     _clean_up_caches(directory, total_size)
 
@@ -442,6 +553,9 @@ def _delete_master_path_if_stale(master_path, href, img_info):
     """
     if service_utils.is_glance_image(href):
         # Glance image contents cannot be updated without changing image's UUID
+        return os.path.exists(master_path)
+    if image_service.is_container_registry_url(href):
+        # OCI Images cannot be changed without changing the digest values.
         return os.path.exists(master_path)
     if os.path.exists(master_path):
         img_mtime = img_info.get('updated_at')

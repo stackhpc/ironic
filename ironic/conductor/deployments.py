@@ -14,22 +14,25 @@
 
 import tempfile
 
-from ironic_lib import metrics_utils
 from oslo_db import exception as db_exception
 from oslo_log import log
-from oslo_utils import excutils
 
+from ironic.common import async_steps
 from ironic.common import exception
 from ironic.common.glance_service import service_utils as glance_utils
 from ironic.common.i18n import _
+from ironic.common import lessee_sources
+from ironic.common import metrics_utils
 from ironic.common import states
 from ironic.common import swift
+from ironic.conductor import configdrive_utils
 from ironic.conductor import notification_utils as notify_utils
 from ironic.conductor import steps as conductor_steps
 from ironic.conductor import task_manager
 from ironic.conductor import utils
 from ironic.conf import CONF
 from ironic.objects import fields
+from ironic.objects import Node
 
 LOG = log.getLogger(__name__)
 
@@ -41,7 +44,8 @@ def validate_node(task, event='deploy'):
 
     :param task: a TaskManager instance.
     :param event: event to process: deploy or rebuild.
-    :raises: NodeInMaintenance, NodeProtected, InvalidStateRequested
+    :raises: NodeInMaintenance, NodeProtected, InvalidStateRequested,
+             BootModeNotAllowed
     """
     if task.node.maintenance:
         raise exception.NodeInMaintenance(op=_('provisioning'),
@@ -53,6 +57,81 @@ def validate_node(task, event='deploy'):
     if not task.fsm.is_actionable_event(event):
         raise exception.InvalidStateRequested(
             action=event, node=task.node.uuid, state=task.node.provision_state)
+
+    disallowed_boot_modes = CONF.conductor.disallowed_deployment_boot_modes
+    boot_mode = task.node.properties.get('boot_mode', '').lower()
+    if disallowed_boot_modes and boot_mode.strip() in disallowed_boot_modes:
+        raise exception.BootModeNotAllowed(mode=boot_mode,
+                                           op=_('provisioning'))
+
+
+def apply_automatic_lessee(task):
+    """Apply a automatic lessee to the node, if applicable
+
+    First of all, until removed next cycle, we check to see if
+    CONF.automatic_lessee was explicitly set "False" by an operator -- if so,
+    we do not apply a lessee.
+
+    When CONF.conductor.automatic_lessee_source is instance:
+    - Take the lessee from instance_info[project_id] (e.g. as set by nova)
+
+    When CONF.conductor.automatic_lessee_source is request:
+    - Take the lessee from request context (e.g. from keystone)
+
+    When CONF.conductor.automatic_lessee_source is none:
+    OR the legacy CONF.automatic_lessee is explicitly set by an operator to
+    False (regardless of lessee_source)
+    - Don't apply a lessee to the node
+
+    :param task: a TaskManager instance.
+    :returns: True if node had a lessee applied
+    """
+    node = task.node
+    applied = False
+    # TODO(JayF): During 2025.1 cycle, remove automatic_lessee boolean config.
+    if CONF.conductor.automatic_lessee:
+        project = None
+        if CONF.conductor.automatic_lessee_source == lessee_sources.REQUEST:
+            project = utils.get_token_project_from_request(task.context)
+            if project is None:
+                LOG.debug('Could not automatically save lessee: No project '
+                          'found in request context for node %(uuid)s.',
+                          {'uuid': node.uuid})
+
+        elif CONF.conductor.automatic_lessee_source == lessee_sources.INSTANCE:
+            # NOTE(JayF): If we have a project_id explicitly set (typical nova
+            #  case), use it. Otherwise, try to derive it from the context of
+            #  the request (typical standalone+keystone) case.
+            project = node.instance_info.get('project_id')
+            if project is None:
+                LOG.debug('Could not automatically save lessee: node['
+                          '\'instance_info\'][\'project_id\'] is unset for '
+                          'node %(uuid)s.',
+                          {'uuid': node.uuid})
+
+        # NOTE(JayF): the CONF.conductor.automatic_lessee_source == 'none'
+        # falls through since project will never be set.
+        if project:
+            if node.lessee is None:
+                LOG.debug('Adding lessee %(project)s to node %(uuid)s.',
+                          {'project': project,
+                           'uuid': node.uuid})
+                node.set_driver_internal_info('automatic_lessee', True)
+                node.lessee = project
+                applied = True
+            else:
+                # Since the model is a bit of a matrix and we're largely
+                # just empowering operators, lets at least log a warning
+                # since they may need to remedy something here. Or maybe
+                # not.
+                LOG.warning('Could not automatically save lessee '
+                            '%(project)s to node %(uuid)s. Node already '
+                            'has a defined lessee of %(lessee)s.',
+                            {'project': project,
+                             'uuid': node.uuid,
+                             'lessee': node.lessee})
+
+        return applied
 
 
 @METRICS.timer('start_deploy')
@@ -82,35 +161,23 @@ def start_deploy(task, manager, configdrive=None, event='deploy',
             instance_info = node.instance_info
             instance_info.pop('kernel', None)
             instance_info.pop('ramdisk', None)
+            instance_info.pop('boot_iso', None)
+            instance_info.pop('original_image_source', None)
             node.instance_info = instance_info
-    elif CONF.conductor.automatic_lessee:
-        # This should only be on deploy...
-        project = utils.get_token_project_from_request(task.context)
-        if (project and node.lessee is None):
-            LOG.debug('Adding lessee $(project)s to node %(uuid)s.',
-                      {'project': project,
-                       'uuid': node.uuid})
-            node.set_driver_internal_info('automatic_lessee', True)
-            node.lessee = project
-        elif project and node.lessee is not None:
-            # Since the model is a bit of a matrix and we're largely
-            # just empowering operators, lets at least log a warning
-            # since they may need to remedy something here. Or maybe
-            # not.
-            LOG.warning('Could not automatically save lessee '
-                        '$(project)s to node %(uuid)s. Node already '
-                        'has a defined lessee of %(lessee)s.',
-                        {'project': project,
-                         'uuid': node.uuid,
-                         'lessee': node.lessee})
+    else:
+        # NOTE(JayF): Don't apply lessee when rebuilding
+        auto_lessee = apply_automatic_lessee(task)
 
     # Infer the image type to make sure the deploy driver
     # validates only the necessary variables for different
     # image types.
-    if utils.update_image_type(task.context, task.node):
+    if utils.update_image_type(task.context, task.node) or auto_lessee:
         node.save()
 
     try:
+        # Give the deploy interface the opportunity to switch interfaces
+        task.driver.deploy.switch_interface(task)
+
         task.driver.power.validate(task)
         task.driver.deploy.validate(task)
         utils.validate_instance_info_traits(task.node)
@@ -144,56 +211,67 @@ def do_node_deploy(task, conductor_id=None, configdrive=None,
     utils.wipe_deploy_internal_info(task)
     try:
         if configdrive:
+            if (not CONF.conductor.disable_configdrive_check
+                    and 'metadata' in task.driver.network.capabilities):
+                # Network interface drivers in this interface have sufficient
+                # support to enable us to check/fix/regenerate metadata.
+                configdrive = configdrive_utils.check_and_fix_configdrive(
+                    task, configdrive)
             _store_configdrive(node, configdrive)
     except (exception.SwiftOperationError, exception.ConfigInvalid) as e:
-        with excutils.save_and_reraise_exception():
-            utils.deploying_error_handler(
-                task,
-                ('Error while uploading the configdrive for %(node)s '
-                 'to Swift') % {'node': node.uuid},
-                _('Failed to upload the configdrive to Swift: %s') % e,
-                clean_up=False)
+        utils.deploying_error_handler(
+            task,
+            ('Error while uploading the configdrive for %(node)s '
+             'to Swift') % {'node': node.uuid},
+            _('Failed to upload the configdrive to Swift: %s') % e,
+            clean_up=False)
+        raise
     except db_exception.DBDataError as e:
-        with excutils.save_and_reraise_exception():
-            # NOTE(hshiina): This error happens when the configdrive is
-            #                too large. Remove the configdrive from the
-            #                object to update DB successfully in handling
-            #                the failure.
-            node.obj_reset_changes()
-            utils.deploying_error_handler(
-                task,
-                ('Error while storing the configdrive for %(node)s into '
-                 'the database: %(err)s') % {'node': node.uuid, 'err': e},
-                _("Failed to store the configdrive in the database. "
-                  "%s") % e,
-                clean_up=False)
+        # NOTE(hshiina): This error happens when the configdrive is
+        #                too large. Remove the configdrive from the
+        #                object to update DB successfully in handling
+        #                the failure.
+        node.obj_reset_changes()
+        utils.deploying_error_handler(
+            task,
+            ('Error while storing the configdrive for %(node)s into '
+             'the database: %(err)s') % {'node': node.uuid, 'err': e},
+            _("Failed to store the configdrive in the database. "
+              "%s") % e,
+            clean_up=False)
+        raise
     except Exception as e:
-        with excutils.save_and_reraise_exception():
-            utils.deploying_error_handler(
-                task,
-                ('Unexpected error while preparing the configdrive for '
-                 'node %(node)s') % {'node': node.uuid},
-                _("Failed to prepare the configdrive. Exception: %s") % e,
-                traceback=True, clean_up=False)
+        utils.deploying_error_handler(
+            task,
+            ('Unexpected error while preparing the configdrive for '
+             'node %(node)s') % {'node': node.uuid},
+            _("Failed to prepare the configdrive. Exception: %s") % e,
+            traceback=True, clean_up=False)
+        raise
 
     try:
         task.driver.deploy.prepare(task)
+    except exception.AgentConnectionFailed:
+        LOG.info('Agent is not yet running on node %(node)s, waiting for agent'
+                 ' to come up for fast track', {'node': node.uuid})
+        task.process_event('wait')
+        return
     except exception.IronicException as e:
-        with excutils.save_and_reraise_exception():
-            utils.deploying_error_handler(
-                task,
-                ('Error while preparing to deploy to node %(node)s: '
-                 '%(err)s') % {'node': node.uuid, 'err': e},
-                _("Failed to prepare to deploy: %s") % e,
-                clean_up=False)
+        utils.deploying_error_handler(
+            task,
+            ('Error while preparing to deploy to node %(node)s: '
+             '%(err)s') % {'node': node.uuid, 'err': e},
+            _("Failed to prepare to deploy: %s") % e,
+            clean_up=False)
+        raise
     except Exception as e:
-        with excutils.save_and_reraise_exception():
-            utils.deploying_error_handler(
-                task,
-                ('Unexpected error while preparing to deploy to node '
-                 '%(node)s') % {'node': node.uuid},
-                _("Failed to prepare to deploy. Exception: %s") % e,
-                traceback=True, clean_up=False)
+        utils.deploying_error_handler(
+            task,
+            ('Unexpected error while preparing to deploy to node '
+             '%(node)s') % {'node': node.uuid},
+            _("Failed to prepare to deploy. Exception: %s") % e,
+            traceback=True, clean_up=False)
+        raise
 
     try:
         # If any deploy steps provided by user, save them to node. They will be
@@ -208,12 +286,12 @@ def do_node_deploy(task, conductor_id=None, configdrive=None,
         # we know that an agent is not running yet.
         conductor_steps.set_node_deployment_steps(task, skip_missing=True)
     except exception.InstanceDeployFailure as e:
-        with excutils.save_and_reraise_exception():
-            utils.deploying_error_handler(
-                task,
-                'Error while getting deploy steps; cannot deploy to node '
-                '%(node)s: %(err)s' % {'node': node.uuid, 'err': e},
-                _("Cannot get deploy steps; failed to deploy: %s") % e)
+        utils.deploying_error_handler(
+            task,
+            'Error while getting deploy steps; cannot deploy to node '
+            '%(node)s: %(err)s' % {'node': node.uuid, 'err': e},
+            _("Cannot get deploy steps; failed to deploy: %s") % e)
+        raise
 
     if not node.driver_internal_info.get('deploy_steps'):
         msg = _('Error while getting deploy steps: no steps returned for '
@@ -228,6 +306,12 @@ def do_node_deploy(task, conductor_id=None, configdrive=None,
         # since there may be local persistent state
         node.conductor_affinity = conductor_id
         node.save()
+
+    utils.log_step_flow_history(
+        node=node, flow=utils.StepFlow.DEPLOYMENT,
+        steps=node.driver_internal_info.get("deploy_steps", []),
+        status="start",
+    )
 
     do_next_deploy_step(task, 0)
 
@@ -269,30 +353,72 @@ def do_next_deploy_step(task, step_index):
         node.deploy_step = step
         node.set_driver_internal_info('deploy_step_index', idx)
         node.save()
-        interface = getattr(task.driver, step.get('interface'))
-        LOG.info('Executing %(step)s on node %(node)s',
-                 {'step': step, 'node': node.uuid})
+
+        child_node_execution = step.get('execute_on_child_nodes', False)
+        result = None
         try:
-            result = interface.execute_deploy_step(task, step)
+            if async_steps.DEPLOYMENT_POLLING in node.driver_internal_info:
+                # We're going to execute a new step, we should delete any
+                # older/out of date option.
+                node.del_driver_internal_info(async_steps.DEPLOYMENT_POLLING)
+            if not child_node_execution:
+                interface = getattr(task.driver, step.get('interface'))
+                LOG.info('Executing %(step)s on node %(node)s',
+                         {'step': step, 'node': node.uuid})
+                use_step_handler = conductor_steps.use_reserved_step_handler(
+                    task, step)
+                if use_step_handler:
+                    if use_step_handler == conductor_steps.EXIT_STEPS:
+                        # Exit the step, i.e. hold step
+                        return
+                    # if use_step_handler == conductor_steps.USED_HANDLER
+                    # Then we have completed the needful in the handler,
+                    # but since there is no other value to check now,
+                    # we know we just need to skip execute_deploy_step
+                else:
+                    interface = getattr(task.driver, step.get('interface'))
+                    result = interface.execute_deploy_step(task, step)
+            else:
+                LOG.info('Executing %(step)s on child nodes for node '
+                         '%(node)s',
+                         {'step': step, 'node': node.uuid})
+                result = execute_step_on_child_nodes(task, step)
         except exception.AgentInProgress as e:
             LOG.info('Conductor attempted to process deploy step for '
                      'node %(node)s. Agent indicated it is presently '
                      'executing a command. Error: %(error)s',
                      {'node': task.node.uuid,
                       'error': e})
-            node.set_driver_internal_info('skip_current_deploy_step',
-                                          False)
+            node.set_driver_internal_info(
+                async_steps.SKIP_CURRENT_DEPLOY_STEP, False)
             task.process_event('wait')
             return
         except exception.IronicException as e:
+            utils.log_step_flow_history(
+                node=node, flow=utils.StepFlow.DEPLOYMENT,
+                steps=node.driver_internal_info.get("deploy_steps", []),
+                status="end", aborted_step=step.get("step"),
+            )
+
             if isinstance(e, exception.AgentConnectionFailed):
-                if task.node.driver_internal_info.get('deployment_reboot'):
+                if task.node.driver_internal_info.get(
+                        async_steps.DEPLOYMENT_REBOOT):
                     LOG.info('Agent is not yet running on node %(node)s after '
                              'deployment reboot, waiting for agent to come up '
                              'to run next deploy step %(step)s.',
                              {'node': node.uuid, 'step': step})
-                    node.set_driver_internal_info('skip_current_deploy_step',
-                                                  False)
+                    node.set_driver_internal_info(
+                        async_steps.SKIP_CURRENT_DEPLOY_STEP, False)
+                    task.process_event('wait')
+                    return
+                if not node.driver_internal_info.get('agent_url'):
+                    LOG.info('Agent URL is not yet available for node '
+                             '%(node)s (fast-track from inspection), '
+                             'waiting for the next heartbeat to run '
+                             'deploy step %(step)s.',
+                             {'node': node.uuid, 'step': step})
+                    node.set_driver_internal_info(
+                        async_steps.SKIP_CURRENT_DEPLOY_STEP, False)
                     task.process_event('wait')
                     return
 
@@ -308,6 +434,12 @@ def do_next_deploy_step(task, step_index):
                     % {'step': conductor_steps.step_id(step), 'err': e})
             return
         except Exception as e:
+            utils.log_step_flow_history(
+                node=node, flow=utils.StepFlow.DEPLOYMENT,
+                steps=node.driver_internal_info.get("deploy_steps", []),
+                status="end", aborted_step=step.get("step"),
+            )
+
             log_msg = ('Node %(node)s failed deploy step %(step)s with '
                        'unexpected error: %(err)s' %
                        {'node': node.uuid, 'step': node.deploy_step, 'err': e})
@@ -352,6 +484,12 @@ def do_next_deploy_step(task, step_index):
 
         LOG.info('Node %(node)s finished deploy step %(step)s',
                  {'node': node.uuid, 'step': step})
+
+    utils.log_step_flow_history(
+        node=node, flow=utils.StepFlow.DEPLOYMENT,
+        steps=node.driver_internal_info.get("deploy_steps", []),
+        status="end",
+    )
 
     # Finished executing the steps. Clear deploy_step.
     node.deploy_step = None
@@ -404,7 +542,61 @@ def continue_node_deploy(task):
 
     next_step_index = utils.update_next_step_index(task, 'deploy')
 
+    # If the deployment operation is flagged to abort after the deploy step
+    # that just finished, we abort the deployment operation.
+    if node.deploy_step.get('abort_after'):
+        step_name = node.deploy_step['step']
+        if next_step_index is not None:
+            LOG.debug('The deployment operation for node %(node)s was '
+                      'marked to be aborted after step "%(step)s" '
+                      'completed. Aborting now that it has completed.',
+                      {'node': task.node.uuid, 'step': step_name})
+        else:
+            LOG.debug('The deployment operation for node %(node)s was '
+                      'marked to be aborted after the last step '
+                      '"%(step)s" completed. Aborting now.',
+                      {'node': node.uuid, 'step': step_name})
+
+        task.process_event('fail')
+        do_node_deploy_abort(task)
+        return
+
     do_next_deploy_step(task, next_step_index)
+
+
+def do_node_deploy_abort(task):
+    """Abort an ongoing deployment operation.
+
+    :param task: a TaskManager instance with an exclusive lock
+    """
+    node = task.node
+    try:
+        task.driver.deploy.clean_up(task)
+    except Exception as e:
+        log_msg = (_('Failed to clean up deploying for node %(node)s '
+                     'after aborting the operation. Error: %(err)s') %
+                   {'node': node.uuid, 'err': e})
+        error_msg = _('Failed to clean up deploying after aborting '
+                      'the operation')
+        utils.deploying_error_handler(task, log_msg,
+                                      errmsg=error_msg,
+                                      traceback=True,
+                                      clean_up=False)
+        return
+
+    info_message = _('Deploy operation aborted for node %s') % node.uuid
+    last_error = _('By request, the deploy operation was aborted')
+    if node.deploy_step:
+        step_msg = (_(' during or after the completion of step "%s"')
+                    % conductor_steps.step_id(node.deploy_step))
+        info_message += step_msg
+        last_error += step_msg
+
+    node.last_error = last_error
+    node.deploy_step = {}
+    utils.wipe_deploy_internal_info(task)
+    node.save()
+    LOG.info(info_message)
 
 
 def _get_configdrive_obj_name(node):
@@ -431,12 +623,14 @@ def _store_configdrive(node, configdrive):
     if CONF.deploy.configdrive_use_object_store:
         # Don't store the JSON source in swift.
         if isinstance(configdrive, dict):
-            configdrive = utils.build_configdrive(node, configdrive)
+            configdrive = configdrive_utils.build_configdrive(
+                node, configdrive)
 
         # NOTE(lucasagomes): No reason to use a different timeout than
         # the one used for deploying the node
         timeout = (CONF.conductor.configdrive_swift_temp_url_duration
-                   or CONF.conductor.deploy_callback_timeout
+                   or ((CONF.conductor.deploy_callback_timeout + 120)
+                       if CONF.conductor.deploy_callback_timeout else None)
                    # The documented default in ironic.conf.conductor
                    or 1800)
         container = CONF.conductor.configdrive_swift_container
@@ -449,11 +643,11 @@ def _store_configdrive(node, configdrive):
             fileobj.write(configdrive)
             fileobj.flush()
 
-            swift_api = swift.SwiftAPI()
-            swift_api.create_object(container, object_name, fileobj.name,
-                                    object_headers=object_headers)
-            configdrive = swift_api.get_temp_url(container, object_name,
-                                                 timeout)
+            with swift.SwiftAPI() as swift_api:
+                swift_api.create_object(container, object_name, fileobj.name,
+                                        object_headers=object_headers)
+                configdrive = swift_api.get_temp_url(container, object_name,
+                                                     timeout)
 
     i_info = node.instance_info
     i_info['configdrive'] = configdrive
@@ -490,3 +684,65 @@ def _start_console_in_deploy(task):
     else:
         notify_utils.emit_console_notification(
             task, 'console_restore', fields.NotificationStatus.END)
+
+
+def execute_step_on_child_nodes(task, step):
+    """Execute a requested step against a child node.
+
+    :param task: The TaskManager object for the parent node.
+    :param step: The requested step to be executed.
+    :returns: None on Success, the resulting error message if a
+              failure has occurred.
+    """
+    # NOTE(TheJulia): We could just use nodeinfo list calls against
+    # dbapi.
+    # NOTE(TheJulia): We validate the data in advance in the API
+    # with the original request context.
+    eocn = step.get('execute_on_child_nodes')
+    child_nodes = step.get('limit_child_node_execution', [])
+    filters = {'parent_node': task.node.uuid}
+    if eocn and len(child_nodes) >= 1:
+        filters['uuid_in'] = child_nodes
+
+    child_nodes = Node.list(
+        task.context,
+        filters=filters,
+        fields=['uuid']
+    )
+    for child_node in child_nodes:
+        result = None
+        LOG.info('Executing step %(step)s on child node %(node)s for parent '
+                 'node %(parent_node)s',
+                 {'step': step,
+                  'node': child_node.uuid,
+                  'parent_node': task.node.uuid})
+        with task_manager.acquire(task.context,
+                                  child_node.uuid,
+                                  purpose='execute step') as child_task:
+            interface = getattr(child_task.driver, step.get('interface'))
+            LOG.info('Executing %(step)s on node %(node)s',
+                     {'step': step, 'node': child_task.node.uuid})
+            if not conductor_steps.use_reserved_step_handler(child_task, step):
+                result = interface.execute_clean_step(child_task, step)
+            if result is not None:
+                if (result == states.DEPLOYWAIT
+                    and CONF.conductor.permit_child_node_step_async_result):
+                    # Operator has chosen to permit this due to some reason
+                    # NOTE(TheJulia): This is where we would likely wire agent
+                    # error handling if we ever implicitly allowed child node
+                    # deploys to take place with the agent from a parent node
+                    # being deployed.
+                    continue
+                # NOTE(TheJulia): If your here debugging a step which fails,
+                # part of the constraint is that a value *cannot* be returned.
+                # to the runner. The step has to either succeed and return
+                # None, or raise an exception.
+                msg = (_('While executing step %(step)s on child node '
+                         '%(node)s, step returned invalid value: %(val)s')
+                       % {'step': step, 'node': child_task.node.uuid,
+                          'val': result})
+                LOG.error(msg)
+                # Only None or states.DEPLOYWAIT are possible paths forward
+                # in the parent step execution code, so returning the message
+                # means it will be logged.
+                return msg

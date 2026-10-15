@@ -20,32 +20,49 @@
 
 from collections import abc
 import contextlib
+import copy
 import datetime
 import errno
 import hashlib
 import ipaddress
 import os
 import re
+import shlex
 import shutil
 import tempfile
 import time
+from urllib import parse as urlparse
+import warnings
 
 import jinja2
+from jinja2 import sandbox as jinja2sandbox
 from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import fileutils
 from oslo_utils import netutils
+from oslo_utils import specs_matcher
 from oslo_utils import strutils
 from oslo_utils import timeutils
+from oslo_utils import units
 import psutil
-import pytz
 
 from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.conf import CONF
 
+
 LOG = logging.getLogger(__name__)
+
+
+# A dictionary in the form {hint name: hint type}
+VALID_ROOT_DEVICE_HINTS = {
+    'size': int, 'model': str, 'wwn': str, 'serial': str, 'vendor': str,
+    'wwn_with_extension': str, 'wwn_vendor_extension': str, 'name': str,
+    'rotational': bool, 'hctl': str, 'by_path': str,
+}
+
+ROOT_DEVICE_HINTS_GRAMMAR = specs_matcher.make_grammar()
 
 DATE_RE = r'(?P<year>-?\d{4,})-(?P<month>\d{2})-(?P<day>\d{2})'
 TIME_RE = r'(?P<hour>\d{2}):(?P<min>\d{2}):(?P<sec>\d{2})' + \
@@ -56,39 +73,63 @@ TZ_RE = r'((?P<tz_sign>[+-])(?P<tz_hour>\d{2}):(?P<tz_min>\d{2}))' + \
 DATETIME_RE = re.compile(
     '%sT%s(%s)?' % (DATE_RE, TIME_RE, TZ_RE))
 
-
-def _get_root_helper():
-    # NOTE(jlvillal): This function has been moved to ironic-lib. And is
-    # planned to be deleted here. If need to modify this function, please
-    # also do the same modification in ironic-lib
-    return 'sudo ironic-rootwrap %s' % CONF.rootwrap_config
+USING_SQLITE = None
 
 
-def execute(*cmd, **kwargs):
+def execute(*cmd, use_standard_locale=False, log_stdout=True, **kwargs):
     """Convenience wrapper around oslo's execute() method.
 
-    :param cmd: Passed to processutils.execute.
-    :param use_standard_locale: True | False. Defaults to False. If set to
-                                True, execute command with standard locale
-                                added to environment variables.
-    :returns: (stdout, stderr) from process execution
-    :raises: UnknownArgumentError
-    :raises: ProcessExecutionError
-    """
+    Executes and logs results from a system command. See docs for
+    oslo_concurrency.processutils.execute for usage.
 
-    use_standard_locale = kwargs.pop('use_standard_locale', False)
+    :param cmd: positional arguments to pass to processutils.execute()
+    :param use_standard_locale: Defaults to False. If set to True,
+                                execute command with standard locale
+                                added to environment variables.
+    :param log_stdout: Defaults to True. If set to True, logs the output.
+    :param kwargs: keyword arguments to pass to processutils.execute()
+    :returns: (stdout, stderr) from process execution
+    :raises: UnknownArgumentError on receiving unknown arguments
+    :raises: ProcessExecutionError
+    :raises: OSError
+    """
     if use_standard_locale:
         env = kwargs.pop('env_variables', os.environ.copy())
         env['LC_ALL'] = 'C'
         kwargs['env_variables'] = env
-    if kwargs.get('run_as_root') and 'root_helper' not in kwargs:
-        kwargs['root_helper'] = _get_root_helper()
-    result = processutils.execute(*cmd, **kwargs)
-    LOG.debug('Execution completed, command line is "%s"',
-              ' '.join(map(str, cmd)))
-    LOG.debug('Command stdout is: "%s"', result[0])
-    LOG.debug('Command stderr is: "%s"', result[1])
-    return result
+
+    if kwargs.pop('run_as_root', False):
+        warnings.warn("run_as_root is deprecated and has no effect",
+                      DeprecationWarning)
+
+    def _log(stdout, stderr):
+        if log_stdout:
+            try:
+                LOG.debug('Command stdout is: "%s"', stdout)
+            except UnicodeEncodeError:
+                LOG.debug('stdout contains invalid UTF-8 characters')
+                stdout = (stdout.encode('utf8', 'surrogateescape')
+                          .decode('utf8', 'ignore'))
+                LOG.debug('Command stdout is: "%s"', stdout)
+        try:
+            LOG.debug('Command stderr is: "%s"', stderr)
+        except UnicodeEncodeError:
+            LOG.debug('stderr contains invalid UTF-8 characters')
+            stderr = (stderr.encode('utf8', 'surrogateescape')
+                      .decode('utf8', 'ignore'))
+            LOG.debug('Command stderr is: "%s"', stderr)
+
+    try:
+        result = processutils.execute(*cmd, **kwargs)
+    except FileNotFoundError:
+        LOG.debug('Command not found: "%s"', ' '.join(map(str, cmd)))
+        raise
+    except processutils.ProcessExecutionError as exc:
+        _log(exc.stdout, exc.stderr)
+        raise
+    else:
+        _log(result[0], result[1])
+        return result
 
 
 def is_valid_datapath_id(datapath_id):
@@ -121,7 +162,7 @@ def is_valid_logical_name(hostname):
     """Determine if a logical name is valid.
 
     The logical name may only consist of RFC3986 unreserved
-    characters, to wit:
+    characters:
 
         ALPHA / DIGIT / "-" / "." / "_" / "~"
     """
@@ -203,6 +244,15 @@ def validate_and_normalize_mac(address):
     """
     if not netutils.is_valid_mac(address):
         raise exception.InvalidMAC(mac=address)
+    return normalize_mac(address)
+
+
+def normalize_mac(address):
+    """Normalize a MAC address without validating it.
+
+    :param address: MAC address to be normalized.
+    :returns: Normalized MAC address.
+    """
     return address.lower()
 
 
@@ -315,33 +365,6 @@ def safe_rstrip(value, chars=None):
     return value.rstrip(chars) or value
 
 
-def mount(src, dest, *args):
-    """Mounts a device/image file on specified location.
-
-    :param src: the path to the source file for mounting
-    :param dest: the path where it needs to be mounted.
-    :param args: a tuple containing the arguments to be
-        passed to mount command.
-    :raises: processutils.ProcessExecutionError if it failed
-        to run the process.
-    """
-    args = ('mount', ) + args + (src, dest)
-    execute(*args, run_as_root=True)
-
-
-def umount(loc, *args):
-    """Umounts a mounted location.
-
-    :param loc: the path to be unmounted.
-    :param args: a tuple containing the arguments to be
-        passed to the umount command.
-    :raises: processutils.ProcessExecutionError if it failed
-        to run the process.
-    """
-    args = ('umount', ) + args + (loc, )
-    execute(*args, run_as_root=True)
-
-
 def check_dir(directory_to_check=None, required_space=1):
     """Check a directory is usable.
 
@@ -362,8 +385,6 @@ def check_dir(directory_to_check=None, required_space=1):
     # check if directory_to_check is passed in, if not set to tempdir
     if directory_to_check is None:
         directory_to_check = CONF.tempdir
-
-    LOG.debug("checking directory: %s", directory_to_check)
 
     if not os.path.exists(directory_to_check):
         raise exception.PathNotFound(dir=directory_to_check)
@@ -450,7 +471,7 @@ def unix_file_modification_datetime(file_name):
         # normalize time to be UTC without timezone
         datetime.datetime.fromtimestamp(
             # fromtimestamp will return local time by default, make it UTC
-            os.path.getmtime(file_name), tz=pytz.utc
+            os.path.getmtime(file_name), tz=datetime.timezone.utc
         )
     )
 
@@ -481,6 +502,8 @@ def render_template(template, params, is_file=True, strict=False):
     :param strict: Enable strict template rendering. Default is False
     :returns: Rendered template
     :raises: jinja2.exceptions.UndefinedError
+    :raises: jinja2.exceptions.SecurityError when the template has insecure
+             operations detected.
     """
     if is_file:
         tmpl_path, tmpl_name = os.path.split(template)
@@ -488,11 +511,9 @@ def render_template(template, params, is_file=True, strict=False):
     else:
         tmpl_name = 'template'
         loader = jinja2.DictLoader({tmpl_name: template})
-    # NOTE(pas-ha) bandit does not seem to cope with such syntaxis
-    # and still complains with B701 for that line
     # NOTE(pas-ha) not using default_for_string=False as we set the name
     # of the template above for strings too.
-    env = jinja2.Environment(  # nosec B701
+    env = jinja2sandbox.SandboxedEnvironment(
         loader=loader,
         autoescape=jinja2.select_autoescape(),
         undefined=jinja2.StrictUndefined if strict else jinja2.Undefined
@@ -571,13 +592,6 @@ def pop_node_nested_field(node, collection, field, default=None):
     result = col.pop(field, default)
     setattr(node, collection, col)
     return result
-
-
-def wrap_ipv6(ip):
-    """Wrap the address in square brackets if it's an IPv6 address."""
-    if ipaddress.ip_address(ip).version == 6:
-        return "[%s]" % ip
-    return ip
 
 
 def file_mime_type(path):
@@ -696,3 +710,483 @@ def stop_after_retries(option, group=None):
         return retry_state.attempt_number >= num_retries + 1
 
     return should_stop
+
+
+def is_loopback(hostname_or_ip):
+    """Check if the provided hostname or IP address is a loopback."""
+    try:
+        return ipaddress.ip_address(hostname_or_ip).is_loopback
+    except ValueError:  # host name
+        return hostname_or_ip in ('localhost', 'localhost.localdomain')
+
+
+def parse_kernel_params(params):
+    """Parse kernel parameters into a dictionary.
+
+    NOTE: This method is considered deprecated and should not be used. Instead
+    use ironic.common.kernel_parameters.KernelCommandLine.parse() to handle
+    parsing of kernel parameters. When
+    conf.conductor.disable_kernel_parameter_parsing is retired, this function
+    should be as well.
+
+    ``None`` is used as a value for parameters that are not in
+    the ``key=value`` format.
+
+    :param params: kernel parameters as a space-delimited string.
+    """
+    result = {}
+    for s in shlex.split(params):
+        try:
+            key, value = s.split('=', 1)
+        except ValueError:
+            result[s] = None
+        else:
+            result[key] = value
+    return result
+
+
+def is_ironic_using_sqlite():
+    """Return True if Ironic is configured to use SQLite"""
+    global USING_SQLITE
+    if USING_SQLITE is not None:
+        return USING_SQLITE
+
+    # We're being called for the first time, lets cache and
+    # return the value.
+    USING_SQLITE = 'sqlite' in CONF.database.connection.lower()
+    return USING_SQLITE
+
+
+def try_execute(*cmd, **kwargs):
+    """The same as execute but returns None on error.
+
+    Executes and logs results from a system command. See docs for
+    oslo_concurrency.processutils.execute for usage.
+
+    Instead of raising an exception on failure, this method simply
+    returns None in case of failure.
+
+    :param cmd: positional arguments to pass to processutils.execute()
+    :param kwargs: keyword arguments to pass to processutils.execute()
+    :raises: UnknownArgumentError on receiving unknown arguments
+    :returns: tuple of (stdout, stderr) or None in some error cases
+    """
+    try:
+        return execute(*cmd, **kwargs)
+    except (processutils.ProcessExecutionError, OSError) as e:
+        LOG.debug('Command failed: %s', e)
+
+
+def mkfs(fs, path, label=None):
+    """Format a file or block device
+
+    :param fs: Filesystem type (examples include 'swap', 'ext3', 'ext4'
+               'btrfs', etc.)
+    :param path: Path to file or block device to format
+    :param label: Volume label to use
+    """
+    if fs == 'swap':
+        args = ['mkswap']
+    else:
+        args = ['mkfs', '-t', fs]
+    # add -F to force no interactive execute on non-block device.
+    if fs in ('ext3', 'ext4'):
+        args.extend(['-F'])
+    if label:
+        if fs in ('msdos', 'vfat'):
+            label_opt = '-n'
+        else:
+            label_opt = '-L'
+        args.extend([label_opt, label])
+    args.append(path)
+    try:
+        execute(*args, use_standard_locale=True)
+    except processutils.ProcessExecutionError as e:
+        if os.strerror(errno.ENOENT) in e.stderr:
+            LOG.exception('Failed to make file system. '
+                          'File system %s is not supported.', fs)
+            raise exception.FileSystemNotSupported(fs=fs) from e
+        else:
+            LOG.exception('Failed to create a file system '
+                          'in %(path)s. Error: %(error)s',
+                          {'path': path, 'error': e})
+            raise
+
+
+def unlink_without_raise(path):
+    try:
+        os.unlink(path)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return
+        else:
+            LOG.warning("Failed to unlink %(path)s, error: %(e)s",
+                        {'path': path, 'e': e})
+
+
+def dd(src, dst, *args):
+    """Execute dd from src to dst.
+
+    :param src: the input file for dd command.
+    :param dst: the output file for dd command.
+    :param args: a tuple containing the arguments to be
+        passed to dd command.
+    :raises: processutils.ProcessExecutionError if it failed
+        to run the process.
+    """
+    LOG.debug("Starting dd process.")
+    execute('dd', 'if=%s' % src, 'of=%s' % dst, *args,
+            use_standard_locale=True)
+
+
+def is_http_url(url):
+    url = url.lower()
+    return url.startswith('http://') or url.startswith('https://')
+
+
+def _extract_hint_operator_and_values(hint_expression, hint_name):
+    """Extract the operator and value(s) of a root device hint expression.
+
+    A root device hint expression could contain one or more values
+    depending on the operator. This method extracts the operator and
+    value(s) and returns a dictionary containing both.
+
+    :param hint_expression: The hint expression string containing value(s)
+                            and operator (optionally).
+    :param hint_name: The name of the hint. Used for logging.
+    :raises: ValueError if the hint_expression is empty.
+    :returns: A dictionary containing:
+
+        :op: The operator. An empty string in case of None.
+        :values: A list of values stripped and converted to lowercase.
+    """
+    expression = str(hint_expression).strip().lower()
+    if not expression:
+        raise ValueError(
+            _('Root device hint "%s" expression is empty') % hint_name)
+
+    # parse_string() returns a list of tokens which the operator (if
+    # present) is always the first element.
+    ast = ROOT_DEVICE_HINTS_GRAMMAR.parse_string(expression)
+    if len(ast) <= 1:
+        # hint_expression had no operator
+        return {'op': '', 'values': [expression]}
+
+    op = ast[0]
+    return {'values': [v.strip() for v in re.split(op, expression) if v],
+            'op': op}
+
+
+def _normalize_hint_expression(hint_expression, hint_name):
+    """Normalize a string type hint expression.
+
+    A string-type hint expression contains one or more operators and
+    one or more values: [<op>] <value> [<op> <value>]*. This normalizes
+    the values by url-encoding white spaces and special characters. The
+    operators are not normalized. For example: the hint value of "<or>
+    foo bar <or> bar" will become "<or> foo%20bar <or> bar".
+
+    :param hint_expression: The hint expression string containing value(s)
+                            and operator (optionally).
+    :param hint_name: The name of the hint. Used for logging.
+    :raises: ValueError if the hint_expression is empty.
+    :returns: A normalized string.
+    """
+    hdict = _extract_hint_operator_and_values(hint_expression, hint_name)
+    result = hdict['op'].join([' %s ' % urlparse.quote(t)
+                               for t in hdict['values']])
+    return (hdict['op'] + result).strip()
+
+
+def _append_operator_to_hints(root_device):
+    """Add an equal (s== or ==) operator to the hints.
+
+    For backwards compatibility, for root device hints where no operator
+    means equal, this method adds the equal operator to the hint. This is
+    needed when using oslo.utils.specs_matcher methods.
+
+    :param root_device: The root device hints dictionary.
+    """
+    for name, expression in root_device.items():
+        # NOTE(lucasagomes): The specs_matcher from oslo.utils does not
+        # support boolean, so we don't need to append any operator
+        # for it.
+        if VALID_ROOT_DEVICE_HINTS[name] is bool:
+            continue
+
+        expression = str(expression)
+        ast = ROOT_DEVICE_HINTS_GRAMMAR.parse_string(expression)
+        if len(ast) > 1:
+            continue
+
+        op = 's== %s' if VALID_ROOT_DEVICE_HINTS[name] is str else '== %s'
+        root_device[name] = op % expression
+
+    return root_device
+
+
+def parse_root_device_hints(root_device):
+    """Parse the root_device property of a node.
+
+    Parses and validates the root_device property of a node. These are
+    hints for how a node's root device is created. The 'size' hint
+    should be a positive integer. The 'rotational' hint should be a
+    Boolean value.
+
+    :param root_device: the root_device dictionary from the node's property.
+    :returns: a dictionary with the root device hints parsed or
+              None if there are no hints.
+    :raises: ValueError, if some information is invalid.
+
+    """
+    if not root_device:
+        return
+
+    root_device = copy.deepcopy(root_device)
+
+    invalid_hints = set(root_device) - set(VALID_ROOT_DEVICE_HINTS)
+    if invalid_hints:
+        raise ValueError(
+            _('The hints "%(invalid_hints)s" are invalid. '
+              'Valid hints are: "%(valid_hints)s"') %
+            {'invalid_hints': ', '.join(invalid_hints),
+             'valid_hints': ', '.join(VALID_ROOT_DEVICE_HINTS)})
+
+    for name, expression in root_device.items():
+        hint_type = VALID_ROOT_DEVICE_HINTS[name]
+        hint_info = _extract_hint_operator_and_values(expression,
+                                                      name)
+        operator = hint_info['op']
+        if name == 'size' and operator == '<range-in>':
+            pass
+        elif hint_type is str:
+            if not isinstance(expression, str):
+                raise ValueError(
+                    _('Root device hint "%(name)s" is not a string value. '
+                      'Hint expression: %(expression)s') %
+                    {'name': name, 'expression': expression})
+            root_device[name] = _normalize_hint_expression(expression, name)
+
+        elif hint_type is int:
+            for v in _extract_hint_operator_and_values(expression,
+                                                       name)['values']:
+                try:
+                    integer = int(v)
+                except ValueError:
+                    raise ValueError(
+                        _('Root device hint "%(name)s" is not an integer '
+                          'value. Current value: %(expression)s') %
+                        {'name': name, 'expression': expression})
+
+                if integer <= 0:
+                    raise ValueError(
+                        _('Root device hint "%(name)s" should be a positive '
+                          'integer. Current value: %(expression)s') %
+                        {'name': name, 'expression': expression})
+
+        elif hint_type is bool:
+            try:
+                root_device[name] = strutils.bool_from_string(
+                    expression, strict=True)
+            except ValueError:
+                raise ValueError(
+                    _('Root device hint "%(name)s" is not a Boolean value. '
+                      'Current value: %(expression)s') %
+                    {'name': name, 'expression': expression})
+
+    return _append_operator_to_hints(root_device)
+
+
+def find_devices_by_hints(devices, root_device_hints):
+    """Find all devices that match the root device hints.
+
+    Try to find devices that match the root device hints. In order
+    for a device to be matched it needs to satisfy all the given hints.
+
+    :param devices: A list of dictionaries representing the devices
+                    containing one or more of the following keys:
+
+        :name: (String) The device name, e.g /dev/sda
+        :size: (Integer) Size of the device in *bytes*
+        :model: (String) Device model
+        :vendor: (String) Device vendor name
+        :serial: (String) Device serial number
+        :wwn: (String) Unique storage identifier
+        :wwn_with_extension: (String): Unique storage identifier with
+                             the vendor extension appended
+        :wwn_vendor_extension: (String): United vendor storage identifier
+        :rotational: (Boolean) Whether it's a rotational device or
+                     not. Useful to distinguish HDDs (rotational) and SSDs
+                     (not rotational).
+        :hctl: (String): The SCSI address: Host, channel, target and lun.
+                         For example: '1:0:0:0'.
+        :by_path: (String): The alternative device name,
+                  e.g. /dev/disk/by-path/pci-0000:00
+
+    :param root_device_hints: A dictionary with the root device hints.
+    :raises: ValueError, if some information is invalid.
+    :returns: A generator with all matching devices as dictionaries.
+    """
+    LOG.debug('Trying to find devices from "%(devs)s" that match the '
+              'device hints "%(hints)s"',
+              {'devs': ', '.join([d.get('name') for d in devices]),
+               'hints': root_device_hints})
+    parsed_hints = parse_root_device_hints(root_device_hints)
+    for dev in devices:
+        device_name = dev.get('name')
+
+        for hint in parsed_hints:
+            hint_type = VALID_ROOT_DEVICE_HINTS[hint]
+            device_value = dev.get(hint)
+            hint_value = parsed_hints[hint]
+
+            if hint_type is str:
+                try:
+                    device_value = _normalize_hint_expression(device_value,
+                                                              hint)
+                except ValueError:
+                    LOG.warning(
+                        'The attribute "%(attr)s" of the device "%(dev)s" '
+                        'has an empty value. Skipping device.',
+                        {'attr': hint, 'dev': device_name})
+                    break
+
+            if hint == 'size':
+                # Since we don't support units yet we expect the size
+                # in GiB for now
+                device_value = device_value / units.Gi
+                if hint_value.startswith('<range-in>'):
+                    device_value = str(device_value)
+
+            LOG.debug('Trying to match the device hint "%(hint)s" '
+                      'with a value of "%(hint_value)s" against the same '
+                      'device\'s (%(dev)s) attribute with a value of '
+                      '"%(dev_value)s"', {'hint': hint, 'dev': device_name,
+                                          'hint_value': hint_value,
+                                          'dev_value': device_value})
+
+            # NOTE(lucasagomes): Boolean hints are not supported by
+            # specs_matcher.match(), so we need to do the comparison
+            # ourselves
+            if hint_type is bool:
+                try:
+                    device_value = strutils.bool_from_string(device_value,
+                                                             strict=True)
+                except ValueError:
+                    LOG.warning('The attribute "%(attr)s" (with value '
+                                '"%(value)s") of device "%(dev)s" is not '
+                                'a valid Boolean. Skipping device.',
+                                {'attr': hint, 'value': device_value,
+                                 'dev': device_name})
+                    break
+                if device_value == hint_value:
+                    continue
+
+            elif specs_matcher.match(device_value, hint_value):
+                continue
+
+            LOG.debug('The attribute "%(attr)s" (with value "%(value)s") '
+                      'of device "%(dev)s" does not match the hint %(hint)s',
+                      {'attr': hint, 'value': device_value,
+                       'dev': device_name, 'hint': hint_value})
+            break
+        else:
+            yield dev
+
+
+def match_root_device_hints(devices, root_device_hints):
+    """Try to find a device that matches the root device hints.
+
+    Try to find a device that matches the root device hints. In order
+    for a device to be matched it needs to satisfy all the given hints.
+
+    :param devices: A list of dictionaries representing the devices
+                    containing one or more of the following keys:
+
+        :name: (String) The device name, e.g /dev/sda
+        :size: (Integer) Size of the device in *bytes*
+        :model: (String) Device model
+        :vendor: (String) Device vendor name
+        :serial: (String) Device serial number
+        :wwn: (String) Unique storage identifier
+        :wwn_with_extension: (String): Unique storage identifier with
+                             the vendor extension appended
+        :wwn_vendor_extension: (String): United vendor storage identifier
+        :rotational: (Boolean) Whether it's a rotational device or
+                     not. Useful to distinguish HDDs (rotational) and SSDs
+                     (not rotational).
+        :hctl: (String): The SCSI address: Host, channel, target and lun.
+                         For example: '1:0:0:0'.
+        :by_path: (String): The alternative device name,
+                  e.g. /dev/disk/by-path/pci-0000:00
+
+    :param root_device_hints: A dictionary with the root device hints.
+    :raises: ValueError, if some information is invalid.
+    :returns: The first device to match all the hints or None.
+    """
+    try:
+        dev = next(find_devices_by_hints(devices, root_device_hints))
+    except StopIteration:
+        LOG.warning('No device found that matches the root device hints %s',
+                    root_device_hints)
+    else:
+        LOG.info('Root device found! The device "%s" matches the root '
+                 'device hints %s', dev, root_device_hints)
+        return dev
+
+
+def get_route_source(dest, ignore_link_local=True):
+    """Get the IP address to send packages to destination."""
+    try:
+        out, _err = execute('ip', 'route', 'get', dest)
+    except (EnvironmentError, processutils.ProcessExecutionError) as e:
+        LOG.warning('Cannot get route to host %(dest)s: %(err)s',
+                    {'dest': dest, 'err': e})
+        return
+
+    try:
+        source = out.strip().split('\n')[0].split('src')[1].split()[0]
+        if (ipaddress.ip_address(source).is_link_local
+                and ignore_link_local):
+            LOG.debug('Ignoring link-local source to %(dest)s: %(rec)s',
+                      {'dest': dest, 'rec': out})
+            return
+        return source
+    except (IndexError, ValueError):
+        LOG.debug('No route to host %(dest)s, route record: %(rec)s',
+                  {'dest': dest, 'rec': out})
+
+
+def check_iso_path(base_folder, folder, file=None):
+    """Sanity check an ISO path, folder, and file structure.
+
+    :param base_folder: The target folder for path operations.
+    :param folder: The folder being evaluated in the ISO.
+    :param file: An optional file to also evaluate for path
+                 transversal attempts.
+    :raises: InvalidContent when an inconsistency is detected.
+    """
+    if folder.startswith('/'):
+        # If we're here, we were handed the base folder path with a leading /.
+        # Any caller of this method should pre-emptively strip it.
+        raise exception.InvalidContent()
+
+    target_folder = os.path.join(base_folder, folder)
+    resolved_folder = os.path.realpath(target_folder)
+    if not resolved_folder.startswith(base_folder):
+        # supplied folder path has something like ../ in the data set
+        # or resolution has resulted in a change in the value.
+        # Possible risk: if the temp folder is being used with a symlink...
+        LOG.error('ISO path evaluation identified a folder based '
+                  'transversal attempt.')
+        raise exception.InvalidContent()
+    if file:
+        target_file_path = os.path.join(resolved_folder, file)
+        resolved_file_path = os.path.realpath(target_file_path)
+        # Check that the folder itself doesn't change,
+        # and then check that the resolved path matches
+        if (not target_file_path.startswith(resolved_folder)
+                or target_file_path != resolved_file_path):
+            LOG.error('ISO path evaluation identified a file name based '
+                      'transversal attempt.')
+            raise exception.InvalidContent()

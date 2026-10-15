@@ -21,8 +21,10 @@ from oslo_utils import uuidutils
 
 from ironic.common import exception
 from ironic.common import images
+from ironic.common import lessee_sources
 from ironic.common import states
 from ironic.common import swift
+from ironic.conductor import configdrive_utils as cd_utils
 from ironic.conductor import deployments
 from ironic.conductor import steps as conductor_steps
 from ironic.conductor import task_manager
@@ -125,9 +127,13 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         self._test__do_node_deploy_driver_exception(RuntimeError('test'),
                                                     unexpected=True)
 
+    @mock.patch.object(cd_utils, 'check_and_fix_configdrive',
+                       autospec=True)
     @mock.patch.object(deployments, '_store_configdrive', autospec=True)
-    def _test__do_node_deploy_ok(self, mock_store, configdrive=None,
-                                 expected_configdrive=None, fast_track=False):
+    def _test__do_node_deploy_ok(self, mock_store, mock_c_cd,
+                                 configdrive=None,
+                                 expected_configdrive=None,
+                                 fast_track=False):
         if fast_track:
             self.config(fast_track=True, group='deploy')
         expected_configdrive = expected_configdrive or configdrive
@@ -142,6 +148,8 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                 driver_internal_info={'agent_url': 'url',
                                       'agent_secret_token': 'token'})
             task = task_manager.TaskManager(self.context, self.node.uuid)
+            if expected_configdrive:
+                mock_c_cd.return_value = configdrive
 
             deployments.do_node_deploy(task, self.service.conductor.id,
                                        configdrive=configdrive)
@@ -151,6 +159,8 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
             self.assertIsNone(self.node.last_error)
             mock_deploy.assert_called_once_with(mock.ANY, mock.ANY)
             if configdrive:
+                mock_c_cd.assert_called_once_with(
+                    task, configdrive)
                 mock_store.assert_called_once_with(task.node,
                                                    expected_configdrive)
             else:
@@ -174,11 +184,13 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
     def test__do_node_deploy_fast_track(self):
         self._test__do_node_deploy_ok(fast_track=True)
 
+    @mock.patch.object(cd_utils, 'check_and_fix_configdrive',
+                       autospec=True)
     @mock.patch.object(swift, 'SwiftAPI', autospec=True)
     @mock.patch('ironic.drivers.modules.fake.FakeDeploy.prepare',
                 autospec=True)
     def test__do_node_deploy_configdrive_swift_error(self, mock_prepare,
-                                                     mock_swift):
+                                                     mock_swift, mock_c_cd):
         CONF.set_override('configdrive_use_object_store', True,
                           group='deploy')
         self._start_service()
@@ -186,7 +198,7 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                                           provision_state=states.DEPLOYING,
                                           target_provision_state=states.ACTIVE)
         task = task_manager.TaskManager(self.context, node.uuid)
-
+        mock_c_cd.return_value = 'fake config drive'
         mock_swift.side_effect = exception.SwiftOperationError('error')
         self.assertRaises(exception.SwiftOperationError,
                           deployments.do_node_deploy, task,
@@ -197,10 +209,14 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         self.assertEqual(states.ACTIVE, node.target_provision_state)
         self.assertIsNotNone(node.last_error)
         self.assertFalse(mock_prepare.called)
+        self.assertTrue(mock_c_cd.called)
 
+    @mock.patch.object(cd_utils, 'check_and_fix_configdrive',
+                       autospec=True)
     @mock.patch('ironic.drivers.modules.fake.FakeDeploy.prepare',
                 autospec=True)
-    def test__do_node_deploy_configdrive_db_error(self, mock_prepare):
+    def test__do_node_deploy_configdrive_db_error(self, mock_prepare,
+                                                  mock_c_cd):
         self._start_service()
         node = obj_utils.create_test_node(self.context, driver='fake-hardware',
                                           provision_state=states.DEPLOYING,
@@ -208,6 +224,7 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         task = task_manager.TaskManager(self.context, node.uuid)
         task.node.save()
         expected_instance_info = dict(node.instance_info)
+        mock_c_cd.return_value = 'fake config drive'
         with mock.patch.object(dbapi.IMPL, 'update_node',
                                autospec=True) as mock_db:
             db_node = self.dbapi.get_node_by_uuid(node.uuid)
@@ -237,12 +254,19 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
             ]
             self.assertEqual(expected_calls, mock_db.mock_calls)
             self.assertFalse(mock_prepare.called)
+            self.assertTrue(mock_c_cd.called)
 
+    @mock.patch.object(cd_utils, 'check_and_fix_configdrive',
+                       autospec=True)
     @mock.patch.object(deployments, '_store_configdrive', autospec=True)
     @mock.patch('ironic.drivers.modules.fake.FakeDeploy.prepare',
                 autospec=True)
     def test__do_node_deploy_configdrive_unexpected_error(self, mock_prepare,
-                                                          mock_store):
+                                                          mock_store,
+                                                          mock_c_cd):
+        CONF.set_override('disable_configdrive_check', True,
+                          group="conductor")
+        mock_c_cd.return_value = 'fake config drive'
         self._start_service()
         node = obj_utils.create_test_node(self.context, driver='fake-hardware',
                                           provision_state=states.DEPLOYING,
@@ -259,6 +283,7 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         self.assertEqual(states.ACTIVE, node.target_provision_state)
         self.assertIsNotNone(node.last_error)
         self.assertFalse(mock_prepare.called)
+        self.assertFalse(mock_c_cd.called)
 
     def test__do_node_deploy_ok_2(self):
         # NOTE(rloo): a different way of testing for the same thing as in
@@ -281,6 +306,56 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
             self.assertEqual(states.NOSTATE, node.target_provision_state)
             self.assertIsNone(node.last_error)
             mock_deploy.assert_called_once_with(mock.ANY, mock.ANY)
+
+    def test_node_validation_in_disabled_bios_boot_mode_fails(self):
+        self.config(disallowed_deployment_boot_modes=['bios'],
+                    group='conductor')
+        node = obj_utils.create_test_node(self.context,
+                                          properties={'boot_mode': 'bios'},
+                                          driver='fake-hardware')
+
+        with task_manager.acquire(self.context, node.uuid,
+                                  shared=False) as task:
+            self.assertRaises(exception.BootModeNotAllowed,
+                              deployments.validate_node,
+                              task, event='deploy')
+
+    def test_node_validation_in_disabled_uefi_boot_mode_fails(self):
+        self.config(disallowed_deployment_boot_modes=['uefi'],
+                    group='conductor')
+        node = obj_utils.create_test_node(self.context,
+                                          properties={'boot_mode': 'uefi'},
+                                          driver='fake-hardware')
+
+        with task_manager.acquire(self.context, node.uuid,
+                                  shared=False) as task:
+            self.assertRaises(exception.BootModeNotAllowed,
+                              deployments.validate_node,
+                              task, event='deploy')
+
+    def test_update_fails_on_invalid_boot_mode(self):
+        # NOTE(cid): This test might need updating if boot modes' naming
+        # convention changes
+        self.assertRaises(ValueError,
+                          self.config,
+                          disallowed_deployment_boot_modes=['BIOS'],
+                          group='conductor')
+        self.assertRaises(ValueError,
+                          self.config,
+                          disallowed_deployment_boot_modes=['Bios'],
+                          group='conductor')
+        self.assertRaises(ValueError,
+                          self.config,
+                          disallowed_deployment_boot_modes=['UEFI'],
+                          group='conductor')
+        self.assertRaises(ValueError,
+                          self.config,
+                          disallowed_deployment_boot_modes=['Uefi'],
+                          group='conductor')
+        self.assertRaises(ValueError,
+                          self.config,
+                          disallowed_deployment_boot_modes=['blah'],
+                          group='conductor')
 
     @mock.patch.object(deployments, 'do_next_deploy_step', autospec=True)
     @mock.patch.object(conductor_steps, 'set_node_deployment_steps',
@@ -341,19 +416,29 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                            mock_validate_deploy_user_steps_and_templates,
                            mock_deploy_validate,
                            mock_power_validate, mock_process_event,
-                           automatic_lessee=False):
+                           automatic_lessee=None, iinfo=None,
+                           automatic_lessee_source=None):
         self.context.auth_token_info = {
             'token': {'project': {'id': 'user-project'}}
         }
-        if automatic_lessee:
-            self.config(automatic_lessee=True, group='conductor')
+        if iinfo is None:
+            iinfo = {}
+
+        if automatic_lessee is not None:
+            self.config(automatic_lessee=automatic_lessee, group='conductor')
+
+        if automatic_lessee_source is not None:
+            self.config(automatic_lessee_source=automatic_lessee_source,
+                        group='conductor')
+
         self._start_service()
         mock_iwdi.return_value = False
         deploy_steps = [{"interface": "bios", "step": "factory_reset",
                          "priority": 95}]
         node = obj_utils.create_test_node(self.context, driver='fake-hardware',
                                           provision_state=states.AVAILABLE,
-                                          target_provision_state=states.ACTIVE)
+                                          target_provision_state=states.ACTIVE,
+                                          instance_info=iinfo)
         task = task_manager.TaskManager(self.context, node.uuid)
 
         deployments.start_deploy(task, self.service, configdrive=None,
@@ -372,18 +457,87 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
             mock.ANY, 'deploy', call_args=(
                 deployments.do_node_deploy, task, 1, None, deploy_steps),
             callback=mock.ANY, err_handler=mock.ANY)
-        if automatic_lessee:
-            self.assertEqual('user-project', node.lessee)
+        expected_project = iinfo.get('project_id', 'user-project')
+        if (automatic_lessee_source not in [None, lessee_sources.NONE]
+                and automatic_lessee in [None, True]):
+            self.assertEqual(expected_project, node.lessee)
             self.assertIn('automatic_lessee', node.driver_internal_info)
         else:
             self.assertIsNone(node.lessee)
             self.assertNotIn('automatic_lessee', node.driver_internal_info)
 
-    def test_start_deploy(self):
+    def test_start_deploy_lessee_legacy_false(self):
         self._test_start_deploy(automatic_lessee=False)
 
-    def test_start_deploy_records_lessee(self):
-        self._test_start_deploy(automatic_lessee=True)
+    def test_start_deploy_lessee_source_none(self):
+        self._test_start_deploy(automatic_lessee_source=lessee_sources.NONE)
+
+    def test_start_deploy_lessee_source_request(self):
+        """Validates that project_id from request context is the lessee."""
+        self._test_start_deploy(automatic_lessee_source=lessee_sources.REQUEST)
+
+    def test_start_deploy_lessee_source_instance(self):
+        """Validates that project_id from instance info is the lessee."""
+        self._test_start_deploy(
+            automatic_lessee_source=lessee_sources.INSTANCE,
+            iinfo={'project_id': 'user-project-iinfo'})
+
+    @mock.patch.object(task_manager.TaskManager, 'process_event',
+                       autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.validate',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.validate',
+                autospec=True)
+    @mock.patch.object(conductor_steps,
+                       'validate_user_deploy_steps_and_templates',
+                       autospec=True)
+    @mock.patch.object(conductor_utils, 'validate_instance_info_traits',
+                       autospec=True)
+    @mock.patch.object(images, 'is_whole_disk_image', autospec=True)
+    def test_start_deploy_lessee_legacy_false_even_if_src_set(
+            self, mock_iwdi, mock_validate_traits,
+            mock_validate_deploy_user_steps_and_templates,
+            mock_deploy_validate, mock_power_validate, mock_process_event):
+        self.context.auth_token_info = {
+            'token': {'project': {'id': 'user-project'}}
+        }
+        iinfo = {'project_id': 'user-project-iinfo'}
+
+        # Legacy lessee is disabled
+        self.config(automatic_lessee=False, group='conductor')
+        # but source is also set -- we should respect the disablement above all
+        self.config(automatic_lessee_source=lessee_sources.INSTANCE,
+                    group='conductor')
+
+        self._start_service()
+        mock_iwdi.return_value = False
+        deploy_steps = [{"interface": "bios", "step": "factory_reset",
+                         "priority": 95}]
+        node = obj_utils.create_test_node(self.context, driver='fake-hardware',
+                                          provision_state=states.AVAILABLE,
+                                          target_provision_state=states.ACTIVE,
+                                          instance_info=iinfo)
+        task = task_manager.TaskManager(self.context, node.uuid)
+
+        deployments.start_deploy(task, self.service, configdrive=None,
+                                 event='deploy', deploy_steps=deploy_steps)
+        node.refresh()
+        mock_iwdi.assert_called_once_with(task.context,
+                                          task.node.instance_info)
+        self.assertFalse(node.driver_internal_info['is_whole_disk_image'])
+        self.assertEqual('partition', node.instance_info['image_type'])
+        mock_power_validate.assert_called_once_with(task.driver.power, task)
+        mock_deploy_validate.assert_called_once_with(task.driver.deploy, task)
+        mock_validate_traits.assert_called_once_with(task.node)
+        mock_validate_deploy_user_steps_and_templates.assert_called_once_with(
+            task, deploy_steps, skip_missing=True)
+        mock_process_event.assert_called_with(
+            mock.ANY, 'deploy', call_args=(
+                deployments.do_node_deploy, task, 1, None, deploy_steps),
+            callback=mock.ANY, err_handler=mock.ANY)
+
+        self.assertIsNone(node.lessee)
+        self.assertNotIn('automatic_lessee', node.driver_internal_info)
 
     @mock.patch.object(images, 'is_source_a_path', autospec=True)
     @mock.patch.object(task_manager.TaskManager, 'process_event',
@@ -484,6 +638,7 @@ class DoNodeDeployTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
             callback=mock.ANY, err_handler=mock.ANY)
 
 
+
 @mgr_utils.mock_record_keepalive
 class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
                                db_base.DbTestCase):
@@ -498,7 +653,6 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
             'step': 'deploy_middle', 'priority': 30, 'interface': 'deploy'}
 
     def test__do_next_deploy_step_none(self):
-        self._start_service()
         node = obj_utils.create_test_node(self.context, driver='fake-hardware')
         task = task_manager.TaskManager(self.context, node.uuid)
         task.process_event('deploy')
@@ -513,7 +667,6 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
     def test__do_next_deploy_step_async(self, mock_execute):
         driver_internal_info = {'deploy_step_index': None,
                                 'deploy_steps': self.deploy_steps}
-        self._start_service()
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
             driver_internal_info=driver_internal_info,
@@ -537,8 +690,8 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
                 autospec=True)
     def test__do_next_deploy_step_in_deploywait(self, mock_execute):
         driver_internal_info = {'deploy_step_index': None,
-                                'deploy_steps': self.deploy_steps}
-        self._start_service()
+                                'deploy_steps': self.deploy_steps,
+                                'deployment_polling': True}
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
             driver_internal_info=driver_internal_info,
@@ -562,6 +715,7 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
         self.assertEqual(states.ACTIVE, node.target_provision_state)
         self.assertEqual(expected_first_step, node.deploy_step)
         self.assertEqual(0, node.driver_internal_info['deploy_step_index'])
+        self.assertNotIn('deployment_polling', node.driver_internal_info)
         mock_execute.assert_called_once_with(mock.ANY, task,
                                              self.deploy_steps[0])
 
@@ -571,7 +725,6 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
         # Resume an in-progress deploy after the first async step
         driver_internal_info = {'deploy_step_index': 0,
                                 'deploy_steps': self.deploy_steps}
-        self._start_service()
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
             provision_state=states.DEPLOYWAIT,
@@ -604,7 +757,6 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
         # Resume where last_step is the last deploy step that was executed
         driver_internal_info = {'deploy_step_index': 1,
                                 'deploy_steps': self.deploy_steps}
-        self._start_service()
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
             provision_state=states.DEPLOYWAIT,
@@ -684,7 +836,6 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
                                 'deploy_steps': self.deploy_steps[:1],
                                 'agent_url': 'url',
                                 'agent_secret_token': 'token'}
-        self._start_service()
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
             driver_internal_info=driver_internal_info,
@@ -760,7 +911,6 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
         # When a deploy step fails, go to DEPLOYFAIL
         driver_internal_info = {'deploy_step_index': None,
                                 'deploy_steps': self.deploy_steps}
-        self._start_service()
 
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
@@ -867,7 +1017,6 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
         # When a deploy step fails, go to DEPLOYWAIT
         tgt_prov_state = states.ACTIVE
 
-        self._start_service()
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
             provision_state=states.DEPLOYING,
@@ -884,7 +1033,6 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
                 self.context, node.uuid, shared=False) as task:
             deployments.do_next_deploy_step(task, 0)
 
-        self._stop_service()
         node.refresh()
 
         # Make sure we go to DEPLOYWAIT
@@ -902,7 +1050,6 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
         # When a deploy step fails, go to DEPLOYWAIT
         tgt_prov_state = states.ACTIVE
 
-        self._start_service()
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
             provision_state=states.DEPLOYING,
@@ -919,7 +1066,6 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
                 self.context, node.uuid, shared=False) as task:
             deployments.do_next_deploy_step(task, 0)
 
-        self._stop_service()
         node.refresh()
 
         # Make sure we go to DEPLOYWAIT
@@ -933,11 +1079,11 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
 
     @mock.patch('ironic.drivers.modules.fake.FakeDeploy.execute_deploy_step',
                 autospec=True)
-    def test_do_next_deploy_step_oob_reboot_fail(self, mock_execute):
-        # When a deploy step fails with no reboot requested go to DEPLOYFAIL
+    def test_do_next_deploy_step_no_agent_url(self, mock_execute):
+        # When a deploy step fails with AgentConnectionFailed and agent_url
+        # was never recorded, go to DEPLOYWAIT to wait for a heartbeat.
         tgt_prov_state = states.ACTIVE
 
-        self._start_service()
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
             provision_state=states.DEPLOYING,
@@ -953,10 +1099,42 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
                 self.context, node.uuid, shared=False) as task:
             deployments.do_next_deploy_step(task, 0)
 
-        self._stop_service()
         node.refresh()
 
-        # Make sure we go to DEPLOYFAIL, clear deploy_steps
+        self.assertEqual(states.DEPLOYWAIT, node.provision_state)
+        self.assertEqual(tgt_prov_state, node.target_provision_state)
+        self.assertEqual(self.deploy_steps[0], node.deploy_step)
+        self.assertEqual(0, node.driver_internal_info['deploy_step_index'])
+        self.assertFalse(
+            node.driver_internal_info['skip_current_deploy_step'])
+        mock_execute.assert_called_once_with(
+            mock.ANY, mock.ANY, self.deploy_steps[0])
+
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.execute_deploy_step',
+                autospec=True)
+    def test_do_next_deploy_step_agent_conn_failed_with_url(self,
+                                                            mock_execute):
+        # When agent_url is present but agent is unreachable, go to DEPLOYFAIL
+        tgt_prov_state = states.ACTIVE
+
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.DEPLOYING,
+            target_provision_state=tgt_prov_state,
+            last_error=None,
+            driver_internal_info={'deploy_steps': self.deploy_steps,
+                                  'deploy_step_index': None,
+                                  'agent_url': 'https://1.2.3.4:9999'},
+            deploy_step={})
+        mock_execute.side_effect = exception.AgentConnectionFailed(
+            reason='failed')
+
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            deployments.do_next_deploy_step(task, 0)
+
+        node.refresh()
+
         self.assertEqual(states.DEPLOYFAIL, node.provision_state)
         self.assertEqual(tgt_prov_state, node.target_provision_state)
         self.assertEqual({}, node.deploy_step)
@@ -965,6 +1143,34 @@ class DoNextDeployStepTestCase(mgr_utils.ServiceSetUpMixin,
         self.assertIsNotNone(node.last_error)
         mock_execute.assert_called_once_with(
             mock.ANY, mock.ANY, self.deploy_steps[0])
+
+    def _test_do_next_deploy_step_handles(self, start_state):
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=start_state,
+            driver_internal_info={
+                'deploy_steps': [
+                    {
+                        'step': 'hold',
+                        'priority': 10,
+                        'interface': 'deploy'
+                    }
+                ],
+                'deploy_step_index': None},
+            clean_step=None)
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            deployments.do_next_deploy_step(task, 0)
+        node.refresh()
+        self.assertEqual(states.DEPLOYHOLD, node.provision_state)
+
+    def test_do_next_deploy_step_handles_hold_from_active(self):
+        # Prior step/action was out of the conductor
+        self._test_do_next_deploy_step_handles(states.DEPLOYING)
+
+    def test_do_next_deploy_step_handles_hold_from_wait(self):
+        # Prior step was async in a wait state
+        self._test_do_next_deploy_step_handles(states.DEPLOYWAIT)
 
     @mock.patch.object(deployments, 'do_next_deploy_step', autospec=True)
     @mock.patch.object(conductor_steps, '_get_steps', autospec=True)
@@ -1066,7 +1272,9 @@ class StoreConfigDriveTestCase(db_base.DbTestCase):
         container_name = 'foo_container'
         timeout = 123
         expected_obj_name = 'configdrive-%s' % self.node.uuid
-        expected_obj_header = {'X-Delete-After': str(timeout)}
+        # Timeout should include the 120 second buffer
+        expected_timeout = timeout + 120
+        expected_obj_header = {'X-Delete-After': str(expected_timeout)}
         expected_instance_info = {'configdrive': 'http://1.2.3.4'}
 
         # set configs and mocks
@@ -1076,28 +1284,34 @@ class StoreConfigDriveTestCase(db_base.DbTestCase):
                           group='conductor')
         CONF.set_override('deploy_callback_timeout', timeout,
                           group='conductor')
-        mock_swift.return_value.get_temp_url.return_value = 'http://1.2.3.4'
+        swift_api_mock = mock_swift.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        swift_api_mock.get_temp_url.return_value = 'http://1.2.3.4'
 
         deployments._store_configdrive(self.node, 'foo')
 
         mock_swift.assert_called_once_with()
-        mock_swift.return_value.create_object.assert_called_once_with(
+        swift_api_mock.create_object.assert_called_once_with(
             container_name, expected_obj_name, mock.ANY,
             object_headers=expected_obj_header)
-        mock_swift.return_value.get_temp_url.assert_called_once_with(
-            container_name, expected_obj_name, timeout)
+        swift_api_mock.get_temp_url.assert_called_once_with(
+            container_name, expected_obj_name, expected_timeout)
         self.node.refresh()
         self.assertEqual(expected_instance_info, self.node.instance_info)
 
-    @mock.patch.object(conductor_utils, 'build_configdrive', autospec=True)
-    def test_store_configdrive_swift_build(self, mock_cd, mock_swift):
+    @mock.patch('ironic.conductor.configdrive_utils.build_configdrive',
+                autospec=True)
+    def test_store_configdrive_swift_build(
+            self, mock_cd, mock_swift):
         container_name = 'foo_container'
         timeout = 123
         expected_obj_name = 'configdrive-%s' % self.node.uuid
-        expected_obj_header = {'X-Delete-After': str(timeout)}
+        # Timeout should include the 120 second buffer
+        expected_timeout = timeout + 120
+        expected_obj_header = {'X-Delete-After': str(expected_timeout)}
         expected_instance_info = {'configdrive': 'http://1.2.3.4'}
 
-        mock_cd.return_value = 'fake'
+        mock_cd.return_value = 'fake_configdrive_content'
 
         # set configs and mocks
         CONF.set_override('configdrive_use_object_store', True,
@@ -1106,16 +1320,18 @@ class StoreConfigDriveTestCase(db_base.DbTestCase):
                           group='conductor')
         CONF.set_override('deploy_callback_timeout', timeout,
                           group='conductor')
-        mock_swift.return_value.get_temp_url.return_value = 'http://1.2.3.4'
+        swift_api_mock = mock_swift.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        swift_api_mock.get_temp_url.return_value = 'http://1.2.3.4'
 
         deployments._store_configdrive(self.node, {'meta_data': {}})
 
         mock_swift.assert_called_once_with()
-        mock_swift.return_value.create_object.assert_called_once_with(
+        swift_api_mock.create_object.assert_called_once_with(
             container_name, expected_obj_name, mock.ANY,
             object_headers=expected_obj_header)
-        mock_swift.return_value.get_temp_url.assert_called_once_with(
-            container_name, expected_obj_name, timeout)
+        swift_api_mock.get_temp_url.assert_called_once_with(
+            container_name, expected_obj_name, expected_timeout)
         self.node.refresh()
         self.assertEqual(expected_instance_info, self.node.instance_info)
         mock_cd.assert_called_once_with(self.node, {'meta_data': {}})
@@ -1135,15 +1351,17 @@ class StoreConfigDriveTestCase(db_base.DbTestCase):
                           group='conductor')
         CONF.set_override('deploy_callback_timeout', 0,
                           group='conductor')
-        mock_swift.return_value.get_temp_url.return_value = 'http://1.2.3.4'
+        swift_api_mock = mock_swift.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        swift_api_mock.get_temp_url.return_value = 'http://1.2.3.4'
 
         deployments._store_configdrive(self.node, 'foo')
 
         mock_swift.assert_called_once_with()
-        mock_swift.return_value.create_object.assert_called_once_with(
+        swift_api_mock.create_object.assert_called_once_with(
             container_name, expected_obj_name, mock.ANY,
             object_headers=expected_obj_header)
-        mock_swift.return_value.get_temp_url.assert_called_once_with(
+        swift_api_mock.get_temp_url.assert_called_once_with(
             container_name, expected_obj_name, 1200)
         self.node.refresh()
         self.assertEqual(expected_instance_info, self.node.instance_info)
@@ -1162,15 +1380,79 @@ class StoreConfigDriveTestCase(db_base.DbTestCase):
                           group='conductor')
         CONF.set_override('deploy_callback_timeout', 0,
                           group='conductor')
-        mock_swift.return_value.get_temp_url.return_value = 'http://1.2.3.4'
+        swift_api_mock = mock_swift.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        swift_api_mock.get_temp_url.return_value = 'http://1.2.3.4'
 
         deployments._store_configdrive(self.node, 'foo')
 
         mock_swift.assert_called_once_with()
-        mock_swift.return_value.create_object.assert_called_once_with(
+        swift_api_mock.create_object.assert_called_once_with(
             container_name, expected_obj_name, mock.ANY,
             object_headers=expected_obj_header)
-        mock_swift.return_value.get_temp_url.assert_called_once_with(
+        swift_api_mock.get_temp_url.assert_called_once_with(
             container_name, expected_obj_name, 1800)
         self.node.refresh()
         self.assertEqual(expected_instance_info, self.node.instance_info)
+
+
+@mock.patch.object(fake.FakeDeploy, 'clean_up', autospec=True)
+class DoNodeDeployAbortTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super(DoNodeDeployAbortTestCase, self).setUp()
+        self.node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.DEPLOYFAIL,
+            target_provision_state=states.ACTIVE)
+
+    def _test_do_node_deploy_abort(self, deploy_step, clean_up_mock):
+        self.node.provision_state = states.DEPLOYWAIT
+        self.node.deploy_step = deploy_step
+        self.node.driver_internal_info = {
+            'agent_url': 'some url',
+            'agent_secret_token': 'token',
+            'deploy_step_index': 2,
+            'deployment_reboot': True,
+            'deployment_polling': True,
+            'skip_current_deploy_step': True
+        }
+        self.node.save()
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            deployments.do_node_deploy_abort(task)
+            self.assertIsNotNone(task.node.last_error)
+            clean_up_mock.assert_called_once_with(task.driver.deploy, task)
+            if deploy_step:
+                self.assertIn(deploy_step['step'], task.node.last_error)
+            # assert node's deploy_step and metadata was cleaned up
+            self.assertEqual({}, task.node.deploy_step)
+            self.assertNotIn('deploy_step_index',
+                             task.node.driver_internal_info)
+            self.assertNotIn('deployment_reboot',
+                             task.node.driver_internal_info)
+            self.assertNotIn('deployment_polling',
+                             task.node.driver_internal_info)
+            self.assertNotIn('skip_current_deploy_step',
+                             task.node.driver_internal_info)
+
+    def test_do_node_deploy_abort_early(self, clean_up_mock):
+        self._test_do_node_deploy_abort(None, clean_up_mock)
+
+    def test_do_node_deploy_abort_with_step(self, clean_up_mock):
+        self._test_do_node_deploy_abort(
+            {'step': 'foo', 'interface': 'deploy', 'abortable': True},
+            clean_up_mock)
+
+    def test_do_node_deploy_abort_clean_up_fail(self, clean_up_mock):
+        clean_up_mock.side_effect = Exception('Surprise')
+        self.node.provision_state = states.DEPLOYWAIT
+        self.node.deploy_step = {'step': 'foo', 'abortable': True}
+        self.node.save()
+
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            deployments.do_node_deploy_abort(task)
+            clean_up_mock.assert_called_once_with(task.driver.deploy, task)
+            self.assertIsNotNone(task.node.last_error)
+            # Node should be in DEPLOYFAIL after clean_up failure
+            self.assertEqual(states.DEPLOYFAIL, task.node.provision_state)

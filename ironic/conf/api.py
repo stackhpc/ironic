@@ -17,6 +17,7 @@
 from oslo_config import cfg
 from oslo_config import types as cfg_types
 
+from ironic.common import boot_modes
 from ironic.common.i18n import _
 
 
@@ -73,11 +74,23 @@ opts = [
                        "[oslo_middleware]enable_proxy_headers_parsing "
                        "option or configure [api]public_endpoint option "
                        "to set URLs in responses to the SSL terminated one.")),
+    cfg.BoolOpt('enable_ramdisk_endpoints',
+                default=True,
+                mutable=True,
+                help=_('Whether to enable the ramdisk agent API '
+                       'endpoints (lookup, heartbeat, and '
+                       'continue_inspection). Set this to False on '
+                       'API instances that should not accept requests '
+                       'from ramdisk agents, for example the '
+                       'public-facing API in a split-horizon '
+                       'deployment. When disabled, these endpoints '
+                       'return HTTP 403.')),
     cfg.BoolOpt('restrict_lookup',
                 default=True,
                 mutable=True,
                 help=_('Whether to restrict the lookup API to only nodes '
-                       'in certain states.')),
+                       'in certain states. Setting this to False can be '
+                       'insecure and is not advisable.')),
     cfg.IntOpt('ramdisk_heartbeat_timeout',
                default=300,
                mutable=True,
@@ -90,8 +103,172 @@ opts = [
                 default=True,
                 mutable=True,
                 help=_('If a project scoped administrative user is permitted '
-                       'to create/delte baremetal nodes in their project.')),
+                       'to create/delete baremetal nodes in their project.')),
+    cfg.ListOpt('disallowed_enrollment_boot_modes',
+                item_type=cfg_types.String(
+                    choices=[
+                        (boot_modes.UEFI, _('UEFI boot mode')),
+                        (boot_modes.LEGACY_BIOS, _('Legacy BIOS boot mode'))],
+                ),
+                default=[],
+                mutable=True,
+                help=_("Specifies a list of boot modes that are not allowed "
+                       "during enrollment. Eg: ['bios']")),
+    cfg.StrOpt('cert_file',
+               help="Certificate file to use when starting "
+                    "the server securely."),
+    cfg.StrOpt('key_file',
+               help="Private key file to use when starting "
+                    "the server securely."),
+    cfg.StrOpt(
+        'server_tls_minimum_version',
+        deprecated_name='tls_minimum_version',
+        default='1.3',
+        choices=[
+            ('1.2',
+             _('Require TLS 1.2 as the minimum version.')),
+            ('1.3',
+             _('Require TLS 1.3 as the minimum version. '
+               'Recommended for Post-Quantum Cryptography '
+               'readiness as PQC key exchange is only '
+               'available in TLS 1.3.')),
+        ],
+        help=_("Set the minimum TLS protocol version for "
+               "the integrated API server when "
+               "[api]enable_ssl_api is True. Defaults to "
+               "TLS 1.3 since TLS 1.0 and 1.1 are "
+               "deprecated (RFC 8996). This option has "
+               "no effect when TLS is terminated by an "
+               "external service such as a reverse proxy "
+               "or a WSGI application container.")),
+    cfg.StrOpt(
+        'server_tls_ciphers',
+        deprecated_name='tls_ciphers',
+        help=_("Set the list of available ciphers for the "
+               "integrated API server. The value should be "
+               "a string in the OpenSSL cipher list format. "
+               "Has no effect when [api]enable_ssl_api is "
+               "False or when TLS is terminated by an "
+               "external service.")),
+    cfg.IntOpt('max_json_body_depth',
+               default=25,
+               min=8,
+               mutable=True,
+               help=_('Maximum JSON nesting depth allowed in API '
+                      'request bodies. Requests exceeding this '
+                      'depth are rejected with HTTP 400 to prevent '
+                      'recursion-based crashes in the JSON parser. '
+                      'The deepest known legitimate structure in '
+                      'the Ironic API is approximately 7 levels '
+                      '(configdrive network_data).')),
+    cfg.IntOpt('max_json_body_size',
+               default=1024,
+               min=4,
+               mutable=True,
+               help=_('Maximum size of a JSON request body, '
+                      'in KiB. Requests with a Content-Length '
+                      'exceeding this value are rejected with '
+                      'HTTP 413 before the body is read into '
+                      'memory. The node provision and inspection '
+                      'endpoints use the separate '
+                      '[api]max_json_body_size_provision and '
+                      '[api]max_json_body_size_inspection limits '
+                      'respectively. Defaults to 1 MiB.')),
+    cfg.IntOpt('max_json_body_size_provision',
+               default=65536,
+               min=4,
+               mutable=True,
+               help=_('Maximum size of a JSON request body '
+                      'for the node provision state endpoint, '
+                      'in KiB. This endpoint may carry '
+                      'configdrive data and deploy steps. '
+                      'Defaults to 64 MiB.')),
+    cfg.IntOpt('max_json_body_size_inspection',
+               default=16384,
+               min=4,
+               mutable=True,
+               help=_('Maximum size of a JSON request body '
+                      'for the continue_inspection endpoint, '
+                      'in KiB. Inspection data from the '
+                      'ramdisk may include system logs such '
+                      'as the journal, making the payload '
+                      'significantly larger than normal API '
+                      'requests. Defaults to 16 MiB.')),
+    cfg.ListOpt('middleware',
+                default=[],
+                help=_('Comma-separated list of WSGI middleware to load '
+                       'from the ironic.api.middleware entry point namespace. '
+                       'Middleware are applied in the order specified, '
+                       'wrapping the API application. This allows operators '
+                       'to add custom request processing (validation, '
+                       'logging, '
+                       'rate limiting, etc.) without modifying Ironic code. '
+                       'External packages can register middleware by adding '
+                       'entry points to the ironic.api.middleware namespace. '
+                       'Each middleware must be a callable that accepts a '
+                       'WSGI application and returns a wrapped application.')),
+    cfg.ListOpt('disallow_deploy_steps',
+                default=['vendor.send_raw'],
+                mutable=True,
+                help=_("List of steps not allowed across the deploy "
+                       "workflow. Each entry should be in 'interface.step' "
+                       "format, e.g. ['raid.apply_configuration']. "
+                       "Applies to user-requested steps, deploy template "
+                       "steps, and driver steps alike.")),
+    cfg.ListOpt('disallow_service_steps',
+                default=['vendor.send_raw'],
+                mutable=True,
+                help=_("List of steps not allowed across the service "
+                       "workflow. Each entry should be in 'interface.step' "
+                       "format, e.g. "
+                       "['bios.factory_reset','bios.apply_configuration']. "
+                       "Applies to user-requested steps and driver steps "
+                       "alike.")),
+    cfg.ListOpt('disallow_clean_steps',
+                default=['vendor.send_raw'],
+                mutable=True,
+                help=_("List of steps not allowed across the clean "
+                       "workflow. Each entry should be in 'interface.step' "
+                       "format, e.g. "
+                       "['bios.factory_reset','bios.apply_configuration']. "
+                       "Applies to user-requested (manual) steps, "
+                       "automated cleaning steps, and runbook steps "
+                       "alike.")),
 ]
+
+
+validation_opts = [
+    cfg.StrOpt(
+        'response_validation',
+        choices=(
+            (
+                'error',
+                'Raise a HTTP 500 (Server Error) for responses that fail '
+                'response body schema validation',
+            ),
+            (
+                'warn',
+                'Log a warning for responses that fail response body schema '
+                'validation',
+            ),
+            (
+                'ignore',
+                'Ignore response body schema validation failures',
+            ),
+        ),
+        default='warn',
+        help=_("""\
+Configure validation of API responses.
+
+``warn`` is the current recommendation for production environments and
+``error`` should only be used in testing environments.
+
+If you find it necessary to enable the ``ignore`` option, please report the
+issues you are seeing to the Nova team so we can improve our schemas.
+"""),
+    ),
+]
+
 
 opt_group = cfg.OptGroup(name='api',
                          title='Options for the ironic-api service')
@@ -100,3 +277,4 @@ opt_group = cfg.OptGroup(name='api',
 def register_opts(conf):
     conf.register_group(opt_group)
     conf.register_opts(opts, group=opt_group)
+    conf.register_opts(validation_opts, group=opt_group)

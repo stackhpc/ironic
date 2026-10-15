@@ -49,7 +49,7 @@ CONSOLE_PTY = """
       <target port='0'/>
     </serial>
     <console type='pty'>
-      <target type='serial' port='0'/>
+      <target port='0'/>
     </console>
 """
 
@@ -65,6 +65,8 @@ def main():
                         help='The virtualization engine to use')
     parser.add_argument('--arch', default='i686',
                         help='The architecture to use')
+    parser.add_argument('--machine_type', default='q35',
+                        help='Machine type based on architecture')
     parser.add_argument('--memory', default='2097152',
                         help="Maximum memory for the VM in KB.")
     parser.add_argument('--cpus', default='1',
@@ -77,6 +79,10 @@ def main():
                         help='The number of interfaces to add to VM.'),
     parser.add_argument('--mac', default=None,
                         help='The mac for the first interface on the vm')
+    parser.add_argument('--mtu', default=None,
+                        help='The mtu for the interfaces on the vm')
+    parser.add_argument('--net_simulator', default='ovs',
+                        help='Network simulator is in use.')
     parser.add_argument('--console-log',
                         help='File to log console')
     parser.add_argument('--emulator', default=None,
@@ -89,6 +95,8 @@ def main():
                         help=('The absolute path of the non-volatile memory '
                               'to store the UEFI variables. Should be used '
                               'only when --uefi-loader is also specified.'))
+    parser.add_argument('--block-size', default='512',
+                        help='The block size for the block storage.')
     args = parser.parse_args()
 
     env = jinja2.Environment(loader=jinja2.FileSystemLoader(templatedir))
@@ -104,16 +112,20 @@ def main():
         'images': images,
         'engine': args.engine,
         'arch': args.arch,
+        'machine_type': args.machine_type,
         'memory': args.memory,
         'cpus': args.cpus,
         'bootdev': args.bootdev,
         'interface_count': args.interface_count,
         'mac': args.mac,
+        'mtu': args.mtu,
+        'net_simulator': args.net_simulator,
         'nicdriver': args.libvirt_nic_driver,
         'emulator': args.emulator,
         'disk_format': args.disk_format,
         'uefi_loader': args.uefi_loader,
         'uefi_nvram': args.uefi_nvram,
+        'block_size': args.block_size,
     }
 
     if args.emulator:
@@ -133,6 +145,7 @@ def main():
         params['console'] = CONSOLE_LOG % {'console_log': args.console_log}
     else:
         params['console'] = CONSOLE_PTY
+
     libvirt_template = template.render(**params)
     conn = libvirt.open("qemu:///system")
 

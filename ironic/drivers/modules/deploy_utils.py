@@ -16,15 +16,16 @@
 
 import os
 import re
-import time
+from urllib import parse as urlparse
 
-from ironic_lib import metrics_utils
-from ironic_lib import utils as il_utils
 from oslo_log import log as logging
-from oslo_utils import excutils
 from oslo_utils import fileutils
 from oslo_utils import strutils
+from oslo_utils import units
 
+from ironic.common import async_steps
+from ironic.common import checksum_utils
+from ironic.common import context
 from ironic.common import exception
 from ironic.common import faults
 from ironic.common.glance_service import service_utils
@@ -32,6 +33,7 @@ from ironic.common.i18n import _
 from ironic.common import image_service
 from ironic.common import images
 from ironic.common import keystone
+from ironic.common import metrics_utils
 from ironic.common import states
 from ironic.common import utils
 from ironic.conductor import utils as manager_utils
@@ -41,14 +43,6 @@ from ironic.drivers.modules import image_cache
 from ironic.drivers import utils as driver_utils
 from ironic import objects
 
-# TODO(Faizan): Move this logic to common/utils.py and deprecate
-# rootwrap_config.
-# This is required to set the default value of ironic_lib option
-# only if rootwrap_config does not contain the default value.
-
-if CONF.rootwrap_config != '/etc/ironic/rootwrap.conf':
-    root_helper = 'sudo ironic-rootwrap %s' % CONF.rootwrap_config
-    CONF.set_default('root_helper', root_helper, 'ironic_lib')
 
 LOG = logging.getLogger(__name__)
 
@@ -65,6 +59,7 @@ RESCUE_LIKE_STATES = (states.RESCUING, states.RESCUEWAIT, states.RESCUEFAIL,
                       states.UNRESCUING, states.UNRESCUEFAIL)
 
 DISK_LAYOUT_PARAMS = ('root_gb', 'swap_mb', 'ephemeral_gb')
+
 
 # All functions are called from deploy() directly or indirectly.
 # They are split for stub-out.
@@ -211,7 +206,10 @@ def check_for_missing_params(info_dict, error_msg, param_prefix=''):
                        'missing_info': missing_info})
 
 
-def fetch_images(ctx, cache, images_info, force_raw=True):
+def fetch_images(ctx, cache, images_info, force_raw=True,
+                 expected_format=None, expected_checksum=None,
+                 expected_checksum_algo=None,
+                 image_auth_data=None):
     """Check for available disk space and fetch images using ImageCache.
 
     :param ctx: context
@@ -219,11 +217,20 @@ def fetch_images(ctx, cache, images_info, force_raw=True):
     :param images_info: list of tuples (image href, destination path)
     :param force_raw: boolean value, whether to convert the image to raw
                       format
+    :param expected_format: The expected format of the image.
+    :param expected_checksum: The expected image checksum, to be used if we
+           need to convert the image to raw prior to deploying.
+    :param expected_checksum_algo: The checksum algo in use, if separately
+           set.
     :raises: InstanceDeployFailure if unable to find enough disk space
+    :raises: InvalidImage if the supplied image metadata or contents are
+             deemed to be invalid, unsafe, or not matching the expectations
+             asserted by configuration supplied or set.
     """
 
     try:
-        image_cache.clean_up_caches(ctx, cache.master_dir, images_info)
+        image_cache.clean_up_caches(ctx, cache.master_dir, images_info,
+                                    image_auth_data)
     except exception.InsufficientDiskSpace as e:
         raise exception.InstanceDeployFailure(reason=e)
 
@@ -231,8 +238,18 @@ def fetch_images(ctx, cache, images_info, force_raw=True):
     # if disk space is used between the check and actual download.
     # This is probably unavoidable, as we can't control other
     # (probably unrelated) processes
+    image_list = []
     for href, path in images_info:
-        cache.fetch_image(href, path, ctx=ctx, force_raw=force_raw)
+        # NOTE(TheJulia): Href in this case can be an image UUID or a URL.
+        image_format = cache.fetch_image(
+            href, path, ctx=ctx,
+            force_raw=force_raw,
+            expected_format=expected_format,
+            expected_checksum=expected_checksum,
+            expected_checksum_algo=expected_checksum_algo,
+            image_auth_data=image_auth_data)
+        image_list.append((href, path, image_format))
+    return image_list
 
 
 def set_failed_state(task, msg, collect_logs=True):
@@ -354,12 +371,12 @@ def try_set_boot_device(task, device, persistent=True):
         manager_utils.node_set_boot_device(task, device,
                                            persistent=persistent)
     except exception.IPMIFailure:
-        with excutils.save_and_reraise_exception() as ctxt:
-            if boot_mode_utils.get_boot_mode(task.node) == 'uefi':
-                ctxt.reraise = False
-                LOG.warning("ipmitool is unable to set boot device while "
-                            "the node %s is in UEFI boot mode. Please set "
-                            "the boot device manually.", task.node.uuid)
+        if boot_mode_utils.get_boot_mode(task.node) == 'uefi':
+            LOG.warning("ipmitool is unable to set boot device while "
+                        "the node %s is in UEFI boot mode. Please set "
+                        "the boot device manually.", task.node.uuid)
+        else:
+            raise
 
 
 def get_disk_label(node):
@@ -384,16 +401,23 @@ def get_pxe_boot_file(node):
     """Return the PXE boot file name requested for deploy.
 
     This method returns PXE boot file name to be used for deploy.
-    Architecture specific boot file is searched first. BIOS/UEFI
-    boot file is used if no valid architecture specific file found.
+    Architecture and boot mode specific boot file is searched first
+    using a composite key of ``arch-boot_mode`` (e.g. ``x86_64-uefi``).
+    If not found, architecture-only key is tried for backward
+    compatibility. BIOS/UEFI boot file is used if no valid
+    architecture specific file found.
 
     :param node: A single Node.
     :returns: The PXE boot file name.
     """
     cpu_arch = node.properties.get('cpu_arch')
-    boot_file = CONF.pxe.pxe_bootfile_name_by_arch.get(cpu_arch)
+    boot_mode = boot_mode_utils.get_boot_mode(node)
+    boot_file = CONF.pxe.pxe_bootfile_name_by_arch.get(
+        '%s-%s' % (cpu_arch, boot_mode))
     if boot_file is None:
-        if boot_mode_utils.get_boot_mode(node) == 'uefi':
+        boot_file = CONF.pxe.pxe_bootfile_name_by_arch.get(cpu_arch)
+    if boot_file is None:
+        if boot_mode == 'uefi':
             boot_file = CONF.pxe.uefi_pxe_bootfile_name
         else:
             boot_file = CONF.pxe.pxe_bootfile_name
@@ -405,8 +429,11 @@ def get_ipxe_boot_file(node):
     """Return the iPXE boot file name requested for deploy.
 
     This method returns iPXE boot file name to be used for deploy.
-    Architecture specific boot file is searched first. BIOS/UEFI
-    boot file is used if no valid architecture specific file found.
+    Architecture and boot mode specific boot file is searched first
+    using a composite key of ``arch-boot_mode`` (e.g. ``x86_64-bios``).
+    If not found, architecture-only key is tried for backward
+    compatibility. BIOS/UEFI boot file is used if no valid
+    architecture specific file found.
 
     If no valid value is found, the default reverts to the
     ``get_pxe_boot_file`` method and thus the
@@ -417,9 +444,13 @@ def get_ipxe_boot_file(node):
     :returns: The iPXE boot file name.
     """
     cpu_arch = node.properties.get('cpu_arch')
-    boot_file = CONF.pxe.ipxe_bootfile_name_by_arch.get(cpu_arch)
+    boot_mode = boot_mode_utils.get_boot_mode(node)
+    boot_file = CONF.pxe.ipxe_bootfile_name_by_arch.get(
+        '%s-%s' % (cpu_arch, boot_mode))
     if boot_file is None:
-        if boot_mode_utils.get_boot_mode(node) == 'uefi':
+        boot_file = CONF.pxe.ipxe_bootfile_name_by_arch.get(cpu_arch)
+    if boot_file is None:
+        if boot_mode == 'uefi':
             boot_file = CONF.pxe.uefi_ipxe_bootfile_name
         else:
             boot_file = CONF.pxe.ipxe_bootfile_name
@@ -443,9 +474,22 @@ def get_ipxe_config_template(node):
     # loaders by architecture as they are all consistent. Where as PXE
     # could need to be grub for one arch, PXELINUX for another.
     configured_template = CONF.pxe.ipxe_config_template
-    override_template = node.driver_info.get('pxe_template')
-    if override_template:
-        configured_template = override_template
+    insecure_override_template = node.driver_info.get('pxe_template')
+    if CONF.pxe.enable_insecure_template_override:
+        # TODO(TheJulia): Remove the node level pxe_template setting in
+        # a future release as it is inhernetly insecure.
+        if insecure_override_template:
+            configured_template = insecure_override_template
+    elif insecure_override_template:
+        raise exception.InvalidParameterValue(_(
+            'The node\'s driver_info field pxe_template override value is '
+            'insecure (CVE-2026-44917) and should not be used. The '
+            'appropriate approach is to utilize [pxe]ipxe_template_by_arch '
+            'configuration in ironic.conf to match the baremetal node\'s '
+            'architecture. Please work with your Ironic operator to remedy '
+            'your usage and configuration. Default templates may be '
+            'leveraged by deleting the pxe_template value in the driver_info '
+            'field.'))
     return configured_template or get_pxe_config_template(node)
 
 
@@ -460,7 +504,22 @@ def get_pxe_config_template(node):
     :param node: A single Node.
     :returns: The PXE config template file name.
     """
-    config_template = node.driver_info.get("pxe_template", None)
+    config_template = None
+    insecure_override_template = node.driver_info.get("pxe_template", None)
+    if CONF.pxe.enable_insecure_template_override:
+        # TODO(TheJulia): Remove the node level pxe_template setting in
+        # a future release as it is inhernetly insecure.
+        config_template = insecure_override_template
+    elif insecure_override_template:
+        raise exception.InvalidParameterValue(_(
+            'The node\'s driver_info field pxe_template override value is '
+            'insecure (CVE-2026-44917) and should not be used. The '
+            'appropriate approach is to utilize [pxe]pxe_template_by_arch '
+            'configuration in ironic.conf to match the baremetal node\'s '
+            'architecture. Please work with your Ironic operator to remedy '
+            'your usage and configuration. Default templates may be '
+            'leveraged by deleting the pxe_template value in the driver_info '
+            'field.'))
     if config_template is None:
         cpu_arch = node.properties.get('cpu_arch')
         config_template = CONF.pxe.pxe_config_template_by_arch.get(cpu_arch)
@@ -534,6 +593,10 @@ def get_image_properties(ctx, image_href):
     except exception.ImageNotFound:
         raise exception.InvalidParameterValue(_(
             "Image %s can not be found.") % image_href)
+    except exception.ImageUnacceptable as e:
+        raise exception.InvalidParameterValue(_(
+            "Image %(image)s is not acceptable: %(reason)s")
+            % {'image': image_href, 'reason': str(e)})
     except exception.ImageRefValidationFailed as e:
         raise exception.InvalidParameterValue(err=e)
 
@@ -592,6 +655,9 @@ def validate_image_properties(task, deploy_info):
         if boot_option == 'kickstart':
             properties.append('stage2_id')
         image_props = get_image_properties(task.context, image_href)
+        # boot_iso_id is sufficient for ramdisk deploy
+        if boot_option == 'ramdisk' and image_props.get('boot_iso_id'):
+            return
     else:
         # We are likely netbooting in this case...
         properties = ['kernel', 'ramdisk']
@@ -758,7 +824,7 @@ def tear_down_inband_cleaning(task, manage_boot=True):
     node = task.node
     cleaning_failure = (node.fault == faults.CLEAN_FAILURE)
 
-    if not (fast_track or cleaning_failure):
+    if not (fast_track or cleaning_failure or node.disable_power_off):
         manager_utils.node_power_action(task, states.POWER_OFF)
 
     if manage_boot:
@@ -767,8 +833,81 @@ def tear_down_inband_cleaning(task, manage_boot=True):
     power_state_to_restore = manager_utils.power_on_node_if_needed(task)
     task.driver.network.remove_cleaning_network(task)
     if not (fast_track or cleaning_failure):
-        manager_utils.restore_power_state_if_needed(
-            task, power_state_to_restore)
+        if node.disable_power_off:
+            manager_utils.node_power_action(task, states.REBOOT)
+        else:
+            manager_utils.restore_power_state_if_needed(
+                task, power_state_to_restore)
+
+
+def prepare_inband_service(task):
+    """Boot a service ramdisk on the node.
+
+    :param task: a TaskManager instance.
+    :raises: NetworkError if the tenant ports cannot be removed.
+    :raises: InvalidParameterValue when the wrong power state is specified
+         or the wrong driver info is specified for power management.
+    :raises: other exceptions by the node's power driver if something
+            wrong occurred during the power action.
+    :raises: any boot interface's prepare_ramdisk exceptions.
+    :returns: Returns states.SERVICEWAIT
+    """
+    with driver_utils.power_off_and_on(task):
+        # NOTE(TheJulia): Revealing that the power is off at any time can
+        # cause external power sync to decide that the node must be off.
+        # This may result in a post-rescued instance being turned off
+        # unexpectedly after rescue has started.
+        # TODO(TheJulia): Once we have power/state callbacks to nova,
+        # the reset of the power_state can be removed.
+        task.node.power_state = states.POWER_ON
+        task.node.save()
+
+        task.driver.boot.clean_up_instance(task)
+        with manager_utils.power_state_for_network_configuration(task):
+            task.driver.network.unconfigure_tenant_networks(task)
+            task.driver.network.add_servicing_network(task)
+        if CONF.agent.manage_agent_boot:
+            # prepare_ramdisk will set the boot device
+            prepare_agent_boot(task)
+
+    return states.SERVICEWAIT
+
+
+def tear_down_inband_service(task):
+    """Tears down the environment setup for in-band service.
+
+    This method does the following:
+    1. Powers off the bare metal node (unless the node is fast
+    tracked or there was a service failure).
+    2. If 'manage_boot' parameter is set to true, it also calls
+    the 'clean_up_ramdisk' method of boot interface to clean
+    up the environment that was set for booting agent ramdisk.
+    3. Deletes the cleaning ports which were setup as part
+    of cleaning.
+
+    :param task: a TaskManager object containing the node
+    :raises: NetworkError, NodeServiceFailure if the cleaning ports cannot be
+        removed.
+    """
+    node = task.node
+    service_failure = (node.fault == faults.SERVICE_FAILURE)
+
+    if not service_failure and not node.disable_power_off:
+        manager_utils.node_power_action(task, states.POWER_OFF)
+
+    task.driver.boot.clean_up_ramdisk(task)
+
+    if not service_failure:
+        with manager_utils.power_state_for_network_configuration(task):
+            task.driver.network.remove_servicing_network(task)
+            task.driver.network.configure_tenant_networks(task)
+
+        task.driver.boot.prepare_instance(task)
+        # prepare_instance does not power on the node, the deploy interface is
+        # normally responsible for that.
+        next_state = (states.REBOOT if task.node.disable_power_off
+                      else states.POWER_ON)
+        manager_utils.node_power_action(task, next_state)
 
 
 def get_image_instance_info(node):
@@ -801,9 +940,21 @@ def get_image_instance_info(node):
     else:
         boot_option = get_boot_option(node)
         if boot_option == 'ramdisk':
-            # Ramdisk deploy does not require an image
-            info['kernel'] = node.instance_info.get('kernel')
-            info['ramdisk'] = node.instance_info.get('ramdisk')
+            kernel = node.instance_info.get('kernel')
+            ramdisk_val = node.instance_info.get('ramdisk')
+            if kernel or ramdisk_val:
+                # Standalone: kernel/ramdisk directly specified
+                info['kernel'] = kernel
+                info['ramdisk'] = ramdisk_val
+            elif image_source:
+                # Nova path: resolve kernel/ramdisk from Glance
+                # image properties later (in
+                # pxe_utils.get_instance_image_info)
+                info['image_source'] = image_source
+            else:
+                # Nothing useful provided — will fail validation
+                info['kernel'] = None
+                info['ramdisk'] = None
         else:
             info['image_source'] = image_source
 
@@ -998,7 +1149,8 @@ class InstanceImageCache(image_cache.ImageCache):
 
 
 @METRICS.timer('cache_instance_image')
-def cache_instance_image(ctx, node, force_raw=None):
+def cache_instance_image(ctx, node, force_raw=None, expected_format=None,
+                         expected_checksum=None, expected_checksum_algo=None):
     """Fetch the instance's image from Glance
 
     This method pulls the disk image and writes them to the appropriate
@@ -1007,8 +1159,16 @@ def cache_instance_image(ctx, node, force_raw=None):
     :param ctx: context
     :param node: an ironic node object
     :param force_raw: whether convert image to raw format
+    :param expected_format: The expected format of the disk image contents.
+    :param expected_checksum: The expected image checksum, to be used if we
+           need to convert the image to raw prior to deploying.
+    :param expected_checksum_algo: The checksum algo in use, if separately
+           set.
     :returns: a tuple containing the uuid of the image and the path in
         the filesystem where image is cached.
+    :raises: InvalidImage if the requested image is invalid and cannot be
+        used for deployed based upon contents of the image or the metadata
+        surrounding the image not matching the configured image.
     """
     # NOTE(dtantsur): applying the default here to make the option mutable
     if force_raw is None:
@@ -1017,15 +1177,23 @@ def cache_instance_image(ctx, node, force_raw=None):
     i_info = parse_instance_info(node)
     fileutils.ensure_tree(_get_image_dir_path(node.uuid))
     image_path = _get_image_file_path(node.uuid)
-    uuid = i_info['image_source']
+
+    if 'image_source' in node.driver_internal_info:
+        uuid = node.driver_internal_info.get('image_source')
+    else:
+        uuid = i_info['image_source']
+
+    img_auth = image_service.get_image_service_auth_override(node)
 
     LOG.debug("Fetching image %(image)s for node %(uuid)s",
               {'image': uuid, 'uuid': node.uuid})
 
-    fetch_images(ctx, InstanceImageCache(), [(uuid, image_path)],
-                 force_raw)
-
-    return (uuid, image_path)
+    image_list = fetch_images(ctx, InstanceImageCache(), [(uuid, image_path)],
+                              force_raw, expected_format=expected_format,
+                              expected_checksum=expected_checksum,
+                              expected_checksum_algo=expected_checksum_algo,
+                              image_auth_data=img_auth)
+    return (uuid, image_path, image_list[0][2])
 
 
 @METRICS.timer('destroy_images')
@@ -1034,7 +1202,7 @@ def destroy_images(node_uuid):
 
     :param node_uuid: the uuid of the ironic node.
     """
-    il_utils.unlink_without_raise(_get_image_file_path(node_uuid))
+    utils.unlink_without_raise(_get_image_file_path(node_uuid))
     utils.rmtree_without_raise(_get_image_dir_path(node_uuid))
     InstanceImageCache().clean_up()
 
@@ -1042,22 +1210,16 @@ def destroy_images(node_uuid):
 @METRICS.timer('compute_image_checksum')
 def compute_image_checksum(image_path, algorithm='md5'):
     """Compute checksum by given image path and algorithm."""
-    time_start = time.time()
-    LOG.debug('Start computing %(algo)s checksum for image %(image)s.',
-              {'algo': algorithm, 'image': image_path})
-    checksum = fileutils.compute_file_checksum(image_path,
-                                               algorithm=algorithm)
-    time_elapsed = time.time() - time_start
-    LOG.debug('Computed %(algo)s checksum for image %(image)s in '
-              '%(delta).2f seconds, checksum value: %(checksum)s.',
-              {'algo': algorithm, 'image': image_path, 'delta': time_elapsed,
-               'checksum': checksum})
-    return checksum
+    # NOTE(TheJulia): This likely wouldn't be removed, but if we do
+    # significant refactoring we could likely just change everything
+    # over to the images common code, if we don't need the metrics
+    # data anymore.
+    return checksum_utils.compute_image_checksum(image_path, algorithm)
 
 
 def remove_http_instance_symlink(node_uuid):
     symlink_path = _get_http_image_symlink_file_path(node_uuid)
-    il_utils.unlink_without_raise(symlink_path)
+    utils.unlink_without_raise(symlink_path)
 
 
 def destroy_http_instance_images(node):
@@ -1066,32 +1228,135 @@ def destroy_http_instance_images(node):
     destroy_images(node.uuid)
 
 
-def _validate_image_url(node, url, secret=False):
+def _validate_image_url(node, url, secret=False, inspect_image=None,
+                        expected_format=None):
     """Validates image URL through the HEAD request.
 
     :param url: URL to be validated
     :param secret: if URL is secret (e.g. swift temp url),
         it will not be shown in logs.
+    :param inspect_image: If the requested URL should have extensive
+        content checking applied. Defaults to the value provided by
+        the [conductor]conductor_always_validates_images configuration
+        parameter setting, but is also able to be turned off by supplying
+        False where needed to perform a redirect or URL head request only.
+    :param expected_format: The expected image format, if known, for
+        the image inspection logic.
+    :returns: Returns a dictionary with basic information about the
+              requested image if image introspection is
     """
+    if inspect_image is not None:
+        # The caller has a bit more context and we can rely upon it,
+        # for example if it knows we cannot or should not inspect
+        # the image contents.
+        inspect = inspect_image
+    elif not CONF.conductor.disable_deep_image_inspection:
+        inspect = CONF.conductor.conductor_always_validates_images
+    else:
+        # If we're here, file inspection has been explicitly disabled.
+        inspect = False
+
+    # NOTE(TheJulia): This method gets used in two different ways.
+    # The first is as a "i did a thing, let me make sure my url works."
+    # The second is to validate a remote URL is valid. In the remote case
+    # we will grab the file and proceed from there.
+    image_info = {}
     try:
         # NOTE(TheJulia): This method only validates that an exception
         # is NOT raised. In other words, that the endpoint does not
         # return a 200. If we're fed a folder list, this will still
         # work, which is a good and bad thing at the same time. :/
-        image_service.HttpImageService().validate_href(url, secret)
+        if image_service.is_container_registry_url(url):
+            oci = image_service.OciImageService()
+            image_auth = image_service.get_image_service_auth_override(node)
+            oci.set_image_auth(url, image_auth)
+            oci.validate_href(url, secret)
+        else:
+            # Check scheme first to use the appropriate validator.
+            # NFS and CIFS URLs cannot be validated by HttpImageService.
+            scheme = urlparse.urlparse(url).scheme.lower()
+            if scheme == 'nfs':
+                image_service.NfsImageService().validate_href(url, secret)
+            elif scheme in ('cifs', 'smb'):
+                image_service.CifsImageService().validate_href(url, secret)
+            else:
+                resp = image_service.HttpImageService().validate_href(
+                    url, secret)
+                if resp and resp.url != url:
+                    LOG.debug('URL %s redirected to %s', url, resp.url)
+                    image_info['image_source'] = resp.url
     except exception.ImageRefValidationFailed as e:
-        with excutils.save_and_reraise_exception():
-            LOG.error("The specified URL is not a valid HTTP(S) URL or is "
-                      "not reachable for node %(node)s: %(msg)s",
-                      {'node': node.uuid, 'msg': e})
+        LOG.error("The specified URL is not a valid HTTP(S)/NFS/CIFS URL "
+                  "or is not reachable for node %(node)s: %(msg)s",
+                  {'node': node.uuid, 'msg': e})
+        raise
+    if inspect:
+        LOG.info("Inspecting image contents for %(node)s with url %(url)s. "
+                 "Expecting user supplied format: %(expected)s",
+                 {'node': node.uuid,
+                  'expected': expected_format,
+                  'url': url})
+        # Utilizes the file cache since it knows how to pull files down
+        # and handles pathing and caching and all that fun, however with
+        # force_raw set as false.
+
+        # The goal here being to get the file we would normally just point
+        # IPA at, be it via swift transfer *or* direct URL request, and
+        # perform the safety check on it before allowing it to proceed.
+        ctx = context.get_admin_context()
+        # NOTE(TheJulia): Because we're using the image cache here, we
+        # let it run the image validation checking as it's normal course
+        # of action, and save what it tells us the image format is.
+        # if there *was* a mismatch, it will raise the error.
+
+        # NOTE(TheJulia): We don't need to supply the checksum here, because
+        # we are not converting the image. The net result is the deploy
+        # interface or remote agent has the responsibility to checksum the
+        # image.
+        _, image_path, img_format = cache_instance_image(
+            ctx,
+            node,
+            force_raw=False,
+            expected_format=expected_format)
+        # NOTE(TheJulia): We explicitly delete this file because it has no use
+        # in the cache after this point.
+        utils.unlink_without_raise(image_path)
+        image_info['disk_format'] = img_format
+    return image_info
 
 
 def _cache_and_convert_image(task, instance_info, image_info=None):
-    """Cache an image locally and covert it to RAW if needed."""
+    """Cache an image locally and convert it to RAW if needed.
+
+    Caches the supplied image as defined in the request, and converts it
+    to raw if required. This method should only be called once initial
+    first pass validation has been performed and can be called on multiple
+    code paths where the file contents must be downloaded.
+
+    :param task: The Taskmanager object related to this action.
+    :param instance_info: The instance_info field being used in
+                          association with this method call.
+    :param image_info: The supplied image_info from Glance.
+    """
     # Ironic cache and serve images from httpboot server
     force_raw = direct_deploy_should_convert_raw_image(task.node)
-    _, image_path = cache_instance_image(task.context, task.node,
-                                         force_raw=force_raw)
+    if 'image_source' in task.node.driver_internal_info:
+        image_source = task.node.driver_internal_info.get('image_source')
+    else:
+        image_source = task.node.instance_info.get('image_source')
+
+    if image_info is None:
+        initial_format = instance_info.get('image_disk_format')
+    else:
+        initial_format = image_info.get('disk_format')
+    checksum, checksum_algo = checksum_utils.get_checksum_and_algo(
+        instance_info)
+    _, image_path, img_format = cache_instance_image(
+        task.context, task.node,
+        force_raw=force_raw,
+        expected_format=initial_format,
+        expected_checksum=checksum,
+        expected_checksum_algo=checksum_algo)
     if force_raw or image_info is None:
         if force_raw:
             instance_info['image_disk_format'] = 'raw'
@@ -1100,7 +1365,7 @@ def _cache_and_convert_image(task, instance_info, image_info=None):
                       '%(image)s for node %(node)s',
                       {'image': image_path, 'node': task.node.uuid})
             instance_info['image_disk_format'] = \
-                images.get_source_format(instance_info['image_source'],
+                images.get_source_format(image_source,
                                          image_path)
 
         # Standard behavior is for image_checksum to be MD5,
@@ -1108,21 +1373,30 @@ def _cache_and_convert_image(task, instance_info, image_info=None):
         # sha256.
         if image_info is None:
             os_hash_algo = instance_info.get('image_os_hash_algo')
+            hash_value = instance_info.get('image_os_hash_value')
+            old_checksum = instance_info.get('image_checksum')
         else:
             os_hash_algo = image_info.get('os_hash_algo')
+            hash_value = image_info.get('os_hash_value')
+            old_checksum = image_info.get('checksum')
 
-        if not os_hash_algo or os_hash_algo == 'md5':
-            LOG.debug("Checksum algorithm for image %(image)s for node "
-                      "%(node)s is set to '%(algo)s', changing to 'sha256'",
-                      {'algo': os_hash_algo, 'node': task.node.uuid,
-                       'image': image_path})
-            os_hash_algo = 'sha256'
+        if initial_format != instance_info['image_disk_format']:
+            if not os_hash_algo or os_hash_algo == 'md5':
+                LOG.debug("Checksum algorithm for image %(image)s for node "
+                          "%(node)s is set to '%(algo)s', changing to sha256",
+                          {'algo': os_hash_algo, 'node': task.node.uuid,
+                           'image': image_path})
+                os_hash_algo = 'sha256'
 
-        LOG.debug('Recalculating checksum for image %(image)s for node '
-                  '%(node)s due to image conversion',
-                  {'image': image_path, 'node': task.node.uuid})
-        instance_info['image_checksum'] = None
-        hash_value = compute_image_checksum(image_path, os_hash_algo)
+            LOG.debug('Recalculating checksum for image %(image)s for node '
+                      '%(node)s due to image conversion',
+                      {'image': image_path, 'node': task.node.uuid})
+            instance_info['image_checksum'] = None
+            hash_value = checksum_utils.compute_image_checksum(image_path,
+                                                               os_hash_algo)
+        else:
+            instance_info['image_checksum'] = old_checksum
+
         instance_info['image_os_hash_algo'] = os_hash_algo
         instance_info['image_os_hash_value'] = hash_value
     else:
@@ -1165,7 +1439,11 @@ def _cache_and_convert_image(task, instance_info, image_info=None):
          task.node.uuid])
     if file_extension:
         http_image_url = http_image_url + file_extension
-    _validate_image_url(task.node, http_image_url, secret=False)
+    # We don't inspect the image in our url check because we just need to do
+    # an quick path validity check here, we should be checking contents way
+    # earlier on in this method.
+    _validate_image_url(task.node, http_image_url, secret=False,
+                        inspect_image=False)
     instance_info['image_url'] = http_image_url
 
 
@@ -1174,6 +1452,100 @@ def get_image_download_source(node):
     return (node.instance_info.get('image_download_source')
             or node.driver_info.get('image_download_source')
             or CONF.agent.image_download_source)
+
+
+def _instance_info_for_glance(task, instance_info, image_download_source,
+                              image_source, iwdi):
+    """Helper for build_instance_info_for_deploy with glance."""
+    # This is a helper method which should only contain code as it relates
+    # to interacting with glance.
+    glance = image_service.GlanceImageService(context=task.context)
+    image_info = glance.show(image_source)
+    LOG.debug('Got image info: %(info)s for node %(node)s.',
+              {'info': image_info, 'node': task.node.uuid})
+    # Values are explicitly set into the instance info field
+    # so IPA have the values available.
+    instance_info['image_checksum'] = image_info['checksum']
+    instance_info['image_os_hash_algo'] = image_info['os_hash_algo']
+    instance_info['image_os_hash_value'] = image_info['os_hash_value']
+    if image_download_source == 'swift':
+        # In this case, we are getting a file *from* swift for a glance
+        # image which is backed by swift. IPA downloads the file directly
+        # from swift, but cannot get any metadata related to it otherwise.
+        swift_temp_url = glance.swift_temp_url(image_info)
+        image_format = image_info.get('disk_format')
+        # In the process of validating the URL is valid, we will perform
+        # the requisite safety checking of the asset as we can end up
+        # converting it in the agent, or needing the disk format value
+        # to be correct for the Ansible deployment interface.
+        validate_results = _validate_image_url(
+            task.node, swift_temp_url, secret=True,
+            expected_format=image_format)
+        instance_info['image_url'] = swift_temp_url
+        instance_info['image_disk_format'] = \
+            validate_results.get('disk_format', image_format)
+    else:
+        # In this case, we're directly downloading the glance image and
+        # hosting it locally for retrieval by the IPA.
+        _cache_and_convert_image(task, instance_info, image_info)
+
+    # We're just populating extra information for a glance backed image in
+    # case a deployment interface driver needs them at some point.
+    instance_info['image_container_format'] = (
+        image_info['container_format'])
+    instance_info['image_tags'] = image_info.get('tags', [])
+    instance_info['image_properties'] = image_info['properties']
+
+    if not iwdi and get_boot_option(task.node) != 'local':
+        instance_info['kernel'] = image_info['properties']['kernel_id']
+        instance_info['ramdisk'] = image_info['properties']['ramdisk_id']
+    return instance_info, image_info
+
+
+@METRICS.timer('check_image_size')
+def check_image_size(node, image_info):
+    """Check if the requested image is larger than the ram size.
+
+    :param node: a Node object containing the node to act on.
+    :param image_info: A dict containing image information.
+    :raises: InvalidParameterValue if size of the image is greater than
+        the available ram size.
+    """
+    properties = node.properties
+    image_disk_format = node.instance_info.get('image_disk_format')
+
+    # Skip check if 'memory_mb' is not defined
+    if 'memory_mb' not in properties:
+        LOG.debug('Skip the image size check as memory_mb is not '
+                  'defined in properties on node %s.', node.uuid)
+        return
+
+    if direct_deploy_should_convert_raw_image(node):
+        LOG.debug('Skip the image size check since the conductor is '
+                  'converting the image to raw format for node %s.',
+                  node.uuid)
+        return
+
+    image_format = image_info.get('disk_format')
+    if CONF.agent.stream_raw_images and (image_format == 'raw'
+                                         or image_disk_format == 'raw'):
+        LOG.debug('Skip the image size check since the image is going to be '
+                  'streamed directly onto the disk for node %s', node.uuid)
+        return
+
+    memory_size = int(properties.get('memory_mb'))
+    image_size = int(image_info['size'])
+    reserved_size = CONF.agent.memory_consumed_by_agent
+    if (image_size + (reserved_size * units.Mi)) > (memory_size * units.Mi):
+        msg = (_('Memory size is too small for requested image, if it is '
+                 'less than (image size + reserved RAM size), will break '
+                 'the IPA deployments. Image size: %(image_size)d MiB, '
+                 'Memory size: %(memory_size)d MiB, Reserved size: '
+                 '%(reserved_size)d MiB.')
+               % {'image_size': image_size / units.Mi,
+                  'memory_size': memory_size,
+                  'reserved_size': reserved_size})
+        raise exception.InvalidParameterValue(msg)
 
 
 @METRICS.timer('build_instance_info_for_deploy')
@@ -1188,57 +1560,166 @@ def build_instance_info_for_deploy(task):
     """
     node = task.node
     instance_info = node.instance_info
+    di_info = node.driver_internal_info
     iwdi = node.driver_internal_info.get('is_whole_disk_image')
     image_source = instance_info['image_source']
+
+    # Remove the saved image_source in case it exists in driver_internal_info
+    di_info.pop('image_source', None)
+
+    # Save out driver_internal_info to prevent race conditions.
+    node.driver_internal_info = di_info
+
+    # Flag if we know the source is a path, used for Anaconda
+    # deploy interface where you can just tell anaconda to
+    # consume artifacts from a path. In this case, we are not
+    # doing any image conversions, we're just passing through
+    # a URL in the form of configuration.
     isap = node.driver_internal_info.get('is_source_a_path')
+
     # If our url ends with a /, i.e. we have been supplied with a path,
     # we can only deploy this in limited cases for drivers and tools
     # which are aware of such. i.e. anaconda.
     image_download_source = get_image_download_source(node)
-    boot_option = get_boot_option(task.node)
 
+    # There is no valid reason this should already be set, and
+    # and gets replaced at various points in this sequence.
+    instance_info['image_url'] = None
+
+    # This flag exists to lockout the overall continued flow of
+    # file validation if glance is in use. This is because glance
+    # can have have objects stored in Swift and those objects can
+    # be directly referenced by a separate swift client. Which means,
+    # additional information then needs to be gathered and exchanged
+    # which is a separate process from just a remote http file.
+    is_glance_image = False
+
+    # TODO(TheJulia): We should likely look at splitting this method
+    # into everal distinct helpers. First, glance, then OCI, then
+    # general file activities like download/cache or verify a remote
+    # URL.
+
+    # Remote image services/repositories are a little different, they house
+    # extra data we need to collect data from to streamline the process.
     if service_utils.is_glance_image(image_source):
-        glance = image_service.GlanceImageService(context=task.context)
-        image_info = glance.show(image_source)
-        LOG.debug('Got image info: %(info)s for node %(node)s.',
-                  {'info': image_info, 'node': node.uuid})
-        if image_download_source == 'swift':
-            swift_temp_url = glance.swift_temp_url(image_info)
-            _validate_image_url(node, swift_temp_url, secret=True)
-            instance_info['image_url'] = swift_temp_url
-            instance_info['image_checksum'] = image_info['checksum']
-            instance_info['image_disk_format'] = image_info['disk_format']
-            instance_info['image_os_hash_algo'] = image_info['os_hash_algo']
-            instance_info['image_os_hash_value'] = image_info['os_hash_value']
+        # We know the image source is likely rooted from a glance record,
+        # so we don't need to do other checks unrelated to non-glance flows.
+        is_glance_image = True
+        # Trigger the glance image handling code path
+        (instance_info, image_info) = _instance_info_for_glance(
+            task, instance_info, image_download_source, image_source,
+            iwdi)
+
+        check_image_size(node, image_info)
+
+    elif image_service.is_container_registry_url(image_source):
+        # Is an oci image, we need to figure out the particulars...
+        # but we *don't* need to also handle special casing with Swift.
+        # We will setup things so _cache_and_convert_image can do the needful
+        # Or just validate the remote url data.
+        oci = image_service.OciImageService()
+        image_auth = image_service.get_image_service_auth_override(task.node)
+        oci.set_image_auth(image_source, image_auth)
+
+        # Ask the image service method to identify and gather
+        # information about the image. This is different from a
+        # specific manifest supplied upfront.
+        image_info = oci.identify_specific_image(
+            image_source, image_download_source,
+            node.properties.get('cpu_arch')
+        )
+        if (image_info.get('image_disk_format') == 'unknown'
+            and instance_info.get('image_disk_format') == 'raw'):
+            # Ironic, internally, resets image_disk_format for IPA, and
+            # we're in a case where we've been given a specific URL, which
+            # might not be raw. There is no way to know what is actually
+            # correct, so we'll pop the value out completely, and let
+            # auto-detection run it's course, so rebuilds or redeploy
+            # attempts are an available option.
+            image_info.pop('image_disk_format')
+            instance_info.pop('image_disk_format')
+        instance_info.update(image_info)
+        # Save what we are using for discoverability by the user, and
+        # save an override image_source to driver_internal_info for
+        # other methods to rely upon as the authoritative source.
+        image_source = instance_info.get('oci_image_manifest_url')
+        # This preserves an override for _cache_and_convert_image
+        # so it knows where to actually retrieve data from without
+        # us overriding image_source saved by the user, so rebuilds
+        # will work as expected.
+        di_info['image_source'] = image_source
+        di_info['container_image_type'] = 'oci_artifact'
+        node.driver_internal_info = di_info
+
+        check_image_size(node, image_info)
+
+    if not is_glance_image:
+        is_file_url = image_source.startswith('file://')
+        if (is_file_url or image_download_source == 'local'):
+            # In this case, we're explicitly downloading (or copying a file)
+            # hosted locally so IPA can download it directly from Ironic.
+
+            # NOTE(TheJulia): Intentionally only supporting file:/// as image
+            # based deploy source since we don't want to, nor should we be in
+            # in the business of copying large numbers of files as it is a
+            # huge performance impact.
+            if is_file_url:
+                # In this case, we need to validate the URL first before
+                # moving on to _cache_and_convert_image, because it's whole
+                # existence is to download, checksum, convert, etc.
+                image_service.FileImageService().validate_href(image_href=image_source)
+            # Either the file is local, or the file needs to be downloaded.
+            # _cache_and_convert_image handles both cases
+            _cache_and_convert_image(task, instance_info)
         else:
-            _cache_and_convert_image(task, instance_info, image_info)
+            # This is the "all other cases" logic for aspects like the user
+            # has supplied us a direct URL to reference. In cases like the
+            # anaconda deployment interface where we might just have a path
+            # and not a file, or where a user may be supplying a full URL to
+            # a remotely hosted image, we at a minimum need to check if the
+            # url is valid, and address any redirects upfront.
 
-        instance_info['image_container_format'] = (
-            image_info['container_format'])
-        instance_info['image_tags'] = image_info.get('tags', [])
-        instance_info['image_properties'] = image_info['properties']
-
-        if not iwdi and boot_option != 'local':
-            instance_info['kernel'] = image_info['properties']['kernel_id']
-            instance_info['ramdisk'] = image_info['properties']['ramdisk_id']
-    elif (image_source.startswith('file://')
-          or image_download_source == 'local'):
-        # NOTE(TheJulia): Intentionally only supporting file:/// as image
-        # based deploy source since we don't want to, nor should we be in
-        # in the business of copying large numbers of files as it is a
-        # huge performance impact.
-        _cache_and_convert_image(task, instance_info)
-    else:
-        try:
-            _validate_image_url(node, image_source)
-            # image_url is internal, and used by IPA and some boot templates.
-            # in most cases, it needs to come from image_source explicitly.
-            instance_info['image_url'] = image_source
-        except exception.ImageRefIsARedirect as e:
-            if e.redirect_url:
-                instance_info['image_url'] = e.redirect_url
+            # NOTE(TheJulia): In the case we're here, we not doing an
+            # integrated image based deploy, but we may also be doing
+            # a path based anaconda base deploy, in which case we have
+            # no backing image, but we need to check for a URL
+            # redirection. So, if the source is a path (i.e. isap),
+            # we don't need to inspect the image as there is no image
+            # in the case for the deployment to drive.
+            if isap:
+                # This is if the source is a path url, such as one used by
+                # anaconda templates to to rely upon bootstrapping
+                # defaults.
+                validate_results = _validate_image_url(node, image_source,
+                                                       inspect_image=False)
             else:
-                raise
+                # When not isap, we can just let _validate_image_url make
+                # the required decision on if contents need to be sampled,
+                # or not. We try to pass the image_disk_format which may
+                # be declared by the user, and if not we set
+                # expected_format to None.
+                validate_results = _validate_image_url(
+                    node,
+                    image_source,
+                    expected_format=instance_info.get(
+                        'image_disk_format',
+                        None))
+                # image_url is internal, and used by IPA and some boot
+                # templates. In most cases, it needs to come from image_source
+                # explicitly.
+                if 'disk_format' in validate_results:
+                    # Ensure IPA has the value available, so write what we
+                    # detect, if anything. This is also an item which might be
+                    # needful with ansible deploy interface, when used in
+                    # standalone mode.
+                    instance_info['image_disk_format'] = \
+                        validate_results.get('disk_format')
+            redirect_target = validate_results.get('image_source')
+            if redirect_target:
+                instance_info['image_source'] = redirect_target
+                instance_info['image_url'] = redirect_target
+            if not instance_info.get('image_url'):
+                instance_info['image_url'] = image_source
 
     if not isap:
         if not iwdi:
@@ -1251,7 +1732,6 @@ def build_instance_info_for_deploy(task):
         # Call central parsing so we retain things like config drives.
         i_info = parse_instance_info(node, image_deploy=False)
         instance_info.update(i_info)
-
     return instance_info
 
 
@@ -1369,74 +1849,9 @@ parse_instance_info_capabilities = (
     utils.parse_instance_info_capabilities
 )
 
-
-def get_async_step_return_state(node):
-    """Returns state based on operation (cleaning/deployment) being invoked
-
-    :param node: an ironic node object.
-    :returns: states.CLEANWAIT if cleaning operation in progress
-              or states.DEPLOYWAIT if deploy operation in progress.
-    """
-    return states.CLEANWAIT if node.clean_step else states.DEPLOYWAIT
-
-
-def _check_agent_token_prior_to_agent_reboot(node):
-    """Removes the agent token if it was not pregenerated.
-
-    Removal of the agent token in cases where it is not pregenerated
-    is a vital action prior to rebooting the agent, as without doing
-    so the agent will be unable to establish communication with
-    the ironic API after the reboot. Effectively locking itself out
-    as in cases where the value is not pregenerated, it is not
-    already included in the payload and must be generated again
-    upon lookup.
-
-    :param node: The Node object.
-    """
-    if not node.driver_internal_info.get('agent_secret_token_pregenerated',
-                                         False):
-        node.del_driver_internal_info('agent_secret_token')
-
-
-def set_async_step_flags(node, reboot=None, skip_current_step=None,
-                         polling=None):
-    """Sets appropriate reboot flags in driver_internal_info based on operation
-
-    :param node: an ironic node object.
-    :param reboot: Boolean value to set for node's driver_internal_info flag
-        cleaning_reboot or deployment_reboot based on cleaning or deployment
-        operation in progress. If it is None, corresponding reboot flag is
-        not set in node's driver_internal_info.
-    :param skip_current_step: Boolean value to set for node's
-        driver_internal_info flag skip_current_clean_step or
-        skip_current_deploy_step based on cleaning or deployment operation
-        in progress. If it is None, corresponding skip step flag is not set
-        in node's driver_internal_info.
-    :param polling: Boolean value to set for node's driver_internal_info flag
-        deployment_polling or cleaning_polling. If it is None, the
-        corresponding polling flag is not set in the node's
-        driver_internal_info.
-    """
-    if node.clean_step:
-        reboot_field = 'cleaning_reboot'
-        skip_field = 'skip_current_clean_step'
-        polling_field = 'cleaning_polling'
-    else:
-        reboot_field = 'deployment_reboot'
-        skip_field = 'skip_current_deploy_step'
-        polling_field = 'deployment_polling'
-
-    if reboot is not None:
-        node.set_driver_internal_info(reboot_field, reboot)
-        if reboot:
-            # If rebooting, we must ensure that we check and remove
-            # an agent token if necessary.
-            _check_agent_token_prior_to_agent_reboot(node)
-    if skip_current_step is not None:
-        node.set_driver_internal_info(skip_field, skip_current_step)
-    if polling is not None:
-        node.set_driver_internal_info(polling_field, polling)
-    node.save()
+# NOTE(dtantsur): backward compatibility, do not use
+get_async_step_return_state = async_steps.get_return_state
+set_async_step_flags = async_steps.set_node_flags
 
 
 def prepare_agent_boot(task):
@@ -1444,8 +1859,26 @@ def prepare_agent_boot(task):
 
     :param task: a TaskManager instance.
     """
+    # Record that we're attempting to start the agent, because this
+    # is the *central* location where we trigger ramdisk launches
+    # for actions outside of inspection.
+    task.node.set_driver_internal_info('agent_start_attempted', True)
+    task.node.save()
+
     deploy_opts = build_agent_options(task.node)
     task.driver.boot.prepare_ramdisk(task, deploy_opts)
+
+
+def is_ramdisk_disabled(node) -> bool:
+    """Check if the ramdisk (IPA) is disabled for the node."""
+    if node.provision_state in [states.CLEANING, states.CLEANWAIT]:
+        return bool(node.driver_internal_info.get(
+            'cleaning_disable_ramdisk'))
+    elif node.provision_state in [states.SERVICING, states.SERVICEWAIT]:
+        return bool(node.driver_internal_info.get(
+            'service_disable_ramdisk'))
+    else:
+        return False
 
 
 def reboot_to_finish_step(task):
@@ -1455,17 +1888,33 @@ def reboot_to_finish_step(task):
     :returns: states.CLEANWAIT if cleaning operation in progress
               or states.DEPLOYWAIT if deploy operation in progress.
     """
-    disable_ramdisk = task.node.driver_internal_info.get(
-        'cleaning_disable_ramdisk')
+    disable_ramdisk = is_ramdisk_disabled(task.node)
     if not disable_ramdisk:
-        if manager_utils.is_fast_track(task):
+        if (manager_utils.is_fast_track(task)
+                and not task.node.disable_power_off):
             LOG.debug('Forcing power off on node %s for a clean reboot into '
                       'the agent image', task.node)
             manager_utils.node_power_action(task, states.POWER_OFF)
         prepare_agent_boot(task)
 
     manager_utils.node_power_action(task, states.REBOOT)
-    return get_async_step_return_state(task.node)
+    return async_steps.get_return_state(task.node)
+
+
+def step_error_handler(task, logmsg, errmsg=None):
+    """Run the correct handler for the current step.
+
+    :param task: a TaskManager instance.
+    :param logmsg: Message to be logged.
+    :param errmsg: Message for the user. Optional, if not provided `logmsg` is
+        used.
+    """
+    if task.node.provision_state in [states.CLEANING, states.CLEANWAIT]:
+        manager_utils.cleaning_error_handler(task, logmsg, errmsg=errmsg)
+    elif task.node.provision_state in [states.DEPLOYING, states.DEPLOYWAIT]:
+        manager_utils.deploying_error_handler(task, logmsg, errmsg=errmsg)
+    elif task.node.provision_state in [states.SERVICING, states.SERVICEWAIT]:
+        manager_utils.servicing_error_handler(task, logmsg, errmsg=errmsg)
 
 
 def get_root_device_for_deploy(node):
@@ -1484,7 +1933,7 @@ def get_root_device_for_deploy(node):
         source = 'instance_info'
 
     try:
-        return il_utils.parse_root_device_hints(hints)
+        return utils.parse_root_device_hints(hints)
     except ValueError as e:
         raise exception.InvalidParameterValue(
             _('Failed to validate the root device hints %(hints)s (from the '

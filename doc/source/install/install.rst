@@ -1,3 +1,4 @@
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Install and configure the Bare Metal service
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -18,20 +19,46 @@ More installation projects are developed by other OpenStack teams:
   can install ironic in containers as part of OpenStack.
 * OpenStack-Ansible has a `role to install ironic
   <https://docs.openstack.org/openstack-ansible-os_ironic/latest/>`_.
-* TripleO uses ironic for provisioning bare metal nodes and can also be used
-  `to install ironic
-  <https://docs.openstack.org/project-deploy-guide/tripleo-docs/latest/features/baremetal_overcloud.html>`_.
 
 .. NOTE(dtantsur): add your favourite installation tool, but please link to the
    **Ironic guide**, not to the generic page. If a separate Ironic guide does
    not exist yet, create it first.
 
-Contents
---------
-
 .. toctree::
-   :maxdepth: 2
+   :hidden:
 
    install-rdo.rst
    install-ubuntu.rst
-   install-obs.rst
+
+.. include:: include/common-prerequisites.inc
+
+Install and configure components
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Using DNF on RHEL/CentOS Stream and RDO packages:
+
+.. code-block:: console
+
+   # dnf install openstack-ironic-api openstack-ironic-conductor openstack-ironic-novncproxy python3-ironicclient
+
+.. _rdo: https://www.rdoproject.org/
+
+On Ubuntu_/Debian:
+
+.. code-block:: console
+
+   # apt-get install ironic-api ironic-conductor ironic-novncproxy python3-ironicclient
+
+.. _ubuntu: https://docs.openstack.org/install-guide/environment-packages-ubuntu.html
+
+.. include:: include/common-configure.inc
+
+.. include:: include/configure-ironic-api.inc
+
+.. include:: include/configure-ironic-api-wsgi.inc
+
+.. include:: include/configure-ironic-conductor.inc
+
+.. include:: include/configure-ironic-novncproxy.inc
+
+.. include:: include/configure-ironic-singleprocess.inc

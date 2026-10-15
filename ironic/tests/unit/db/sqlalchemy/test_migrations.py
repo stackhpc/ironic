@@ -15,28 +15,20 @@
 #    under the License.
 
 """
-Tests for database migrations. There are "opportunistic" tests for both mysql
-and postgresql in here, which allows testing against these databases in a
-properly configured unit test environment.
+Tests for database migrations. There are "opportunistic" tests for mysql in
+here, which allow testing against a database in a properly configured unit
+test environment.
 
 For the opportunistic testing you need to set up a db named 'openstack_citest'
 with user 'openstack_citest' and password 'openstack_citest' on localhost.
-The test will then use that db and u/p combo to run the tests.
-
-For postgres on Ubuntu this can be done with the following commands:
-
-::
-
- sudo -u postgres psql
- postgres=# create user openstack_citest with createdb login password
-      'openstack_citest';
- postgres=# create database openstack_citest with owner openstack_citest;
-
+The test will then use that db and u/p combo to run the tests. See
+tools/test-setup.sh in the root of the repo for a full setup example.
 """
 
 import collections
 import contextlib
 import json
+import os
 from unittest import mock
 
 from alembic import script
@@ -61,7 +53,8 @@ LOG = logging.getLogger(__name__)
 
 # NOTE(vdrok): This was introduced after migration tests started taking more
 # time in gate. Timeout value in seconds for tests performing migrations.
-MIGRATIONS_TIMEOUT = 300
+# Can be modified in tox.ini as env variable.
+MIGRATIONS_TIMEOUT = os.getenv('MIGRATIONS_TIMEOUT', 60)
 
 
 @contextlib.contextmanager
@@ -188,8 +181,8 @@ class MigrationCheckersMixin(object):
         self.engine = enginefacade.writer.get_engine()
         self.config = migration._alembic_config()
         self.migration_api = migration
-        self.useFixture(fixtures.Timeout(MIGRATIONS_TIMEOUT,
-                                         gentle=True))
+        self.useFixture(fixtures.Timeout(int(MIGRATIONS_TIMEOUT),
+                                         gentle=False))
 
     def test_walk_versions(self):
         self._walk_versions(self.engine, self.config)
@@ -309,7 +302,7 @@ class MigrationCheckersMixin(object):
 
             for row in result:
                 old = _get_state(row.uuid)
-                new = row['provision_state']
+                new = row.provision_state
                 if old is None:
                     self.assertEqual('available', new)
                 else:
@@ -348,6 +341,22 @@ class MigrationCheckersMixin(object):
                               sqlalchemy.types.DateTime)
         self.assertIsInstance(nodes.c.inspection_finished_at.type,
                               sqlalchemy.types.DateTime)
+
+    def _check_01f21d5e5195(self, engine, data):
+        node_history = db_utils.get_table(engine, 'node_history')
+        bigstring = 'a' * 64
+        uuid = uuidutils.generate_uuid()
+        data = {'uuid': uuid, 'user': bigstring}
+        with engine.begin() as connection:
+            insert_node_history = node_history.insert().values(data)
+            connection.execute(insert_node_history)
+            node_history_stmt = sqlalchemy.select(
+                models.NodeHistory.user
+            ).where(
+                models.NodeHistory.uuid == uuid
+            )
+            node_history = connection.execute(node_history_stmt).first()
+            self.assertEqual(bigstring, node_history.user)
 
     def _check_4f399b21ae71(self, engine, data):
         nodes = db_utils.get_table(engine, 'nodes')
@@ -481,8 +490,8 @@ class MigrationCheckersMixin(object):
                         return True
 
             for row in result:
-                if _was_inserted(row['uuid']):
-                    self.assertTrue(row['pxe_enabled'])
+                if _was_inserted(row.uuid):
+                    self.assertTrue(row.pxe_enabled)
 
     def _check_e294876e8028(self, engine, data):
         nodes = db_utils.get_table(engine, 'nodes')
@@ -525,8 +534,8 @@ class MigrationCheckersMixin(object):
         return data
 
     def _check_c14cef6dfedf(self, engine, data):
-        counts = collections.defaultdict(int)
         with engine.begin() as connection:
+            counts = collections.defaultdict(int)
             result = connection.execute(
                 sqlalchemy.select(
                     models.Node.uuid,
@@ -538,13 +547,13 @@ class MigrationCheckersMixin(object):
                         return True
 
             for row in result:
-                if _was_inserted(row['uuid']):
-                    counts[row['network_interface']] += 1
+                if _was_inserted(row.uuid):
+                    counts[row.network_interface] += 1
 
-        # using default config values, we should have 2 flat and one neutron
-        self.assertEqual(2, counts['flat'])
-        self.assertEqual(1, counts['neutron'])
-        self.assertEqual(0, counts[None])
+            # using default conf values, we should have 2 flat and one neutron
+            self.assertEqual(2, counts['flat'])
+            self.assertEqual(1, counts['neutron'])
+            self.assertEqual(0, counts[None])
 
     def _check_60cf717201bc(self, engine, data):
         portgroups = db_utils.get_table(engine, 'portgroups')
@@ -640,8 +649,8 @@ class MigrationCheckersMixin(object):
             result = connection.execute(
                 sqlalchemy.select(models.Portgroup.mode)
             )
-        for row in result:
-            self.assertEqual(CONF.default_portgroup_mode, row['mode'])
+            for row in result:
+                self.assertEqual(CONF.default_portgroup_mode, row.mode)
 
     def _check_1d6951876d68(self, engine, data):
         nodes = db_utils.get_table(engine, 'nodes')
@@ -717,7 +726,9 @@ class MigrationCheckersMixin(object):
                 models.Node.uuid == data['uuid']
             )
             node = connection.execute(node_stmt).first()
-            data['id'] = node.id
+            # WARNING: Always copy, never directly return a db object or
+            # piece of a db object. It is a sqlalchemy thing.
+            data['id'] = int(node.id)
         return data
 
     def _check_b4130a7fc904(self, engine, data):
@@ -753,7 +764,9 @@ class MigrationCheckersMixin(object):
                 models.Node.id
             ).where(models.Node.uuid == data['uuid'])
             node = connection.execute(node_stmt).first()
-            data['id'] = node.id
+            # WARNING: Always copy, never directly return a db object or
+            # piece of a db object. It is a sqlalchemy thing.
+            data['id'] = int(node.id)
         return data
 
     def _check_82c315d60161(self, engine, data):
@@ -788,7 +801,7 @@ class MigrationCheckersMixin(object):
                 models.BIOSSetting.name == setting['name']
             )
             setting = connection.execute(setting_stmt).first()
-            self.assertEqual('on', setting['value'])
+            self.assertEqual('on', setting[0])
 
     def _check_2bbd96b6ccb9(self, engine, data):
         bios_settings = db_utils.get_table(engine, 'bios_settings')
@@ -1147,6 +1160,152 @@ class MigrationCheckersMixin(object):
         self.assertIsInstance(deploy_templates.c.extra.type,
                               sqlalchemy.types.TEXT)
 
+    def _check_dada631878c4(self, engine, data):
+        # Runbooks.
+        runbooks = db_utils.get_table(engine, 'runbooks')
+        col_names = [column.name for column in runbooks.c]
+        expected = ['created_at', 'updated_at', 'version',
+                    'id', 'uuid', 'name']
+        self.assertEqual(sorted(expected), sorted(col_names))
+        self.assertIsInstance(runbooks.c.created_at.type,
+                              sqlalchemy.types.DateTime)
+        self.assertIsInstance(runbooks.c.updated_at.type,
+                              sqlalchemy.types.DateTime)
+        self.assertIsInstance(runbooks.c.version.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(runbooks.c.id.type,
+                              sqlalchemy.types.Integer)
+        self.assertIsInstance(runbooks.c.uuid.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(runbooks.c.name.type,
+                              sqlalchemy.types.String)
+
+        # Runbook steps.
+        runbook_steps = db_utils.get_table(engine, 'runbook_steps')
+        col_names = [column.name for column in runbook_steps.c]
+        expected = ['created_at', 'updated_at', 'version', 'id',
+                    'runbook_id', 'interface', 'step', 'args',
+                    'order']
+        self.assertEqual(sorted(expected), sorted(col_names))
+
+        self.assertIsInstance(runbook_steps.c.created_at.type,
+                              sqlalchemy.types.DateTime)
+        self.assertIsInstance(runbook_steps.c.updated_at.type,
+                              sqlalchemy.types.DateTime)
+        self.assertIsInstance(runbook_steps.c.version.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(runbook_steps.c.id.type,
+                              sqlalchemy.types.Integer)
+        self.assertIsInstance(runbook_steps.c.runbook_id.type,
+                              sqlalchemy.types.Integer)
+        self.assertIsInstance(runbook_steps.c.interface.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(runbook_steps.c.step.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(runbook_steps.c.args.type,
+                              sqlalchemy.types.Text)
+        self.assertIsInstance(runbook_steps.c.order.type,
+                              sqlalchemy.types.Integer)
+
+        with engine.begin() as connection:
+            # Insert a Runbook.
+            uuid = uuidutils.generate_uuid()
+            name = 'CUSTOM_DT1'
+            runbook = {'name': name, 'uuid': uuid}
+            insert_dpt = runbooks.insert().values(runbook)
+            connection.execute(insert_dpt)
+            # Query by UUID.
+            dpt_uuid_stmt = sqlalchemy.select(
+                models.Runbook.id,
+                models.Runbook.name,
+            ).where(
+                models.Runbook.uuid == uuid
+            )
+            result = connection.execute(dpt_uuid_stmt).first()
+            runbook_id = result.id
+            self.assertEqual(name, result.name)
+            # Query by name.
+            dpt_name_stmt = sqlalchemy.select(
+                models.Runbook.id
+            ).where(
+                models.Runbook.name == name
+            )
+            result = connection.execute(dpt_name_stmt).first()
+            self.assertEqual(runbook_id, result.id)
+            # Query by ID.
+            dpt_id_stmt = sqlalchemy.select(
+                models.Runbook.uuid,
+                models.Runbook.name
+            ).where(
+                models.Runbook.id == runbook_id
+            )
+            result = connection.execute(dpt_id_stmt).first()
+            self.assertEqual(uuid, result.uuid)
+            self.assertEqual(name, result.name)
+            savepoint_uuid = connection.begin_nested()
+            # UUID is unique.
+            runbook = {'name': 'CUSTOM_DT2', 'uuid': uuid}
+            self.assertRaises(db_exc.DBDuplicateEntry, connection.execute,
+                              runbooks.insert(), runbook)
+            savepoint_uuid.rollback()
+            savepoint_uuid.close()
+            # Name is unique.
+            savepoint_name = connection.begin_nested()
+            runbook = {'name': name, 'uuid': uuidutils.generate_uuid()}
+            self.assertRaises(db_exc.DBDuplicateEntry, connection.execute,
+                              runbooks.insert(), runbook)
+            savepoint_name.rollback()
+            savepoint_name.close()
+
+            # Insert a Runbook step.
+            interface = 'raid'
+            step_name = 'create_configuration'
+            # The line below is JSON.
+            args = '{"logical_disks": []}'
+            order = 1
+            step = {'runbook_id': runbook_id, 'interface': interface,
+                    'step': step_name, 'args': args, 'order': order}
+            insert_dpts = runbook_steps.insert().values(step)
+            connection.execute(insert_dpts)
+            # Query by Runbook ID.
+            query_id_stmt = sqlalchemy.select(
+                models.RunbookStep.runbook_id,
+                models.RunbookStep.interface,
+                models.RunbookStep.step,
+                models.RunbookStep.args,
+                models.RunbookStep.order,
+            ).where(
+                models.RunbookStep.runbook_id == runbook_id
+            )
+            result = connection.execute(query_id_stmt).first()
+            self.assertEqual(runbook_id, result.runbook_id)
+            self.assertEqual(interface, result.interface)
+            self.assertEqual(step_name, result.step)
+            if isinstance(result.args, dict):
+                # Postgres testing results in a dict being returned
+                # at this level which if you str() it, you get a dict,
+                # so comparing string to string fails.
+                result_args = json.dumps(result.args)
+            else:
+                # Mysql/MariaDB appears to be actually hand us
+                # a string back so we should be able to compare it.
+                result_args = result.args
+            self.assertEqual(args, result_args)
+            self.assertEqual(order, result.order)
+            # Insert another step for the same runbook.
+            insert_step = runbook_steps.insert().values(step)
+            connection.execute(insert_step)
+
+    def _check_245c3e54b247(self, engine, data):
+        # Runbook 'extra' field.
+        runbooks = db_utils.get_table(engine, 'runbooks')
+        col_names = [column.name for column in runbooks.c]
+        expected = ['created_at', 'updated_at', 'version',
+                    'id', 'uuid', 'name', 'extra']
+        self.assertEqual(sorted(expected), sorted(col_names))
+        self.assertIsInstance(runbooks.c.extra.type,
+                              sqlalchemy.types.TEXT)
+
     def _check_ce6c4b3cf5a2(self, engine, data):
         allocations = db_utils.get_table(engine, 'allocations')
         col_names = [column.name for column in allocations.c]
@@ -1240,6 +1399,23 @@ class MigrationCheckersMixin(object):
         self.assertIsInstance(node_history.c.user.type,
                               sqlalchemy.types.String)
 
+    def _check_9fb44677ef15(self, engine, data):
+        node_history = db_utils.get_table(engine, 'node_history')
+        col_names = [column.name for column in node_history.c]
+
+        expected_names = ['version', 'created_at', 'updated_at', 'id', 'uuid',
+                          'conductor', 'event_type', 'severity', 'event',
+                          'user', 'node_id', 'project', 'state',
+                          'target_provision_state', 'duration_seconds']
+        self.assertEqual(sorted(expected_names), sorted(col_names))
+
+        self.assertIsInstance(node_history.c.state.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(node_history.c.target_provision_state.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(node_history.c.duration_seconds.type,
+                              sqlalchemy.types.Integer)
+
     def _check_0ac0f39bc5aa(self, engine, data):
         node_inventory = db_utils.get_table(engine, 'node_inventory')
         col_names = [column.name for column in node_inventory.c]
@@ -1257,6 +1433,121 @@ class MigrationCheckersMixin(object):
         self.assertIsInstance(node_inventory.c.node_id.type,
                               sqlalchemy.types.Integer)
 
+    def _check_4dbec778866e(self, engine, data):
+        nodes = db_utils.get_table(engine, 'nodes')
+        self.assertIsInstance(nodes.c.shard.type, sqlalchemy.types.String)
+
+    def _pre_upgrade_163040c5513f(self, engine):
+        # Create a node to which firmware information can be added.
+        data = {'uuid': uuidutils.generate_uuid()}
+        nodes = db_utils.get_table(engine, 'nodes')
+        with engine.begin() as connection:
+            insert_node = nodes.insert().values(data)
+            connection.execute(insert_node)
+            node_stmt = sqlalchemy.select(
+                models.Node.id
+            ).where(models.Node.uuid == data['uuid'])
+            node = connection.execute(node_stmt).first()
+            # WARNING: Always copy, never directly return a db object or
+            # piece of a db object. It is a sqlalchemy thing.
+            data['id'] = int(node.id)
+
+        return data
+
+    def _check_163040c5513f(self, engine, data):
+        fw_information = db_utils.get_table(engine, 'firmware_information')
+        col_names = [column.name for column in fw_information.c]
+        expected_names = ['created_at', 'updated_at', 'id', 'node_id',
+                          'component', 'initial_version', 'current_version',
+                          'last_version_flashed', 'version']
+        self.assertEqual(sorted(expected_names), sorted(col_names))
+        self.assertIsInstance(fw_information.c.created_at.type,
+                              sqlalchemy.types.DateTime)
+        self.assertIsInstance(fw_information.c.updated_at.type,
+                              sqlalchemy.types.DateTime)
+        self.assertIsInstance(fw_information.c.id.type,
+                              sqlalchemy.types.Integer)
+        self.assertIsInstance(fw_information.c.node_id.type,
+                              sqlalchemy.types.Integer)
+        self.assertIsInstance(fw_information.c.component.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(fw_information.c.initial_version.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(fw_information.c.current_version.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(fw_information.c.last_version_flashed.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(fw_information.c.version.type,
+                              sqlalchemy.types.String)
+
+        nodes = db_utils.get_table(engine, 'nodes')
+        col_names = [column.name for column in nodes.c]
+        self.assertIn('firmware_interface', col_names)
+        self.assertIsInstance(nodes.c.firmware_interface.type,
+                              sqlalchemy.types.String)
+
+        with engine.begin() as connection:
+            fw_data = {'node_id': data['id'],
+                       'component': 'bmc',
+                       'initial_version': 'v1.0.0'}
+            insert_fw_cmp = fw_information.insert().values(fw_data)
+            connection.execute(insert_fw_cmp)
+            fw_cmp_stmt = sqlalchemy.select(
+                models.FirmwareComponent.initial_version
+            ).where(
+                models.FirmwareComponent.node_id == data['id'],
+                models.FirmwareComponent.component == fw_data['component']
+            )
+            fw_component = connection.execute(fw_cmp_stmt).first()
+            self.assertEqual('v1.0.0', fw_component[0])
+            del_stmt = (
+                sqlalchemy.delete(
+                    models.FirmwareComponent
+                ).where(models.FirmwareComponent.node_id == data['id'])
+            )
+            connection.execute(del_stmt)
+
+    def _pre_upgrade_9c0446cb6bc3(self, engine):
+        # Create a node to which bios_settings can be added.
+        data = {'uuid': uuidutils.generate_uuid()}
+        nodes = db_utils.get_table(engine, 'nodes')
+        with engine.begin() as connection:
+            insert_node = nodes.insert().values(data)
+            connection.execute(insert_node)
+            node_stmt = sqlalchemy.select(
+                models.Node.id
+            ).where(
+                models.Node.uuid == data['uuid']
+            )
+            node = connection.execute(node_stmt).first()
+            # WARNING: Always copy, never directly return a db object or
+            # piece of a db object. It is a sqlalchemy thing.
+            data['id'] = int(node.id)
+        return data
+
+    def _check_9c0446cb6bc3(self, engine, data):
+        bios_settings = db_utils.get_table(engine, 'bios_settings')
+        node_id = data['id']
+        name = "CbsCmnBoostFmax"
+        # Test max 32-bit unsigned value
+        upper_bound = 4294967295
+        lower_bound = 4294967295
+
+        setting_data = {'node_id': node_id, 'name': name,
+                        'upper_bound': upper_bound, 'lower_bound': lower_bound}
+        with engine.begin() as connection:
+            insert_setting = bios_settings.insert().values(setting_data)
+            connection.execute(insert_setting)
+            bios_setting_stmt = sqlalchemy.select(
+                models.BIOSSetting.upper_bound,
+                models.BIOSSetting.lower_bound
+            ).where(
+                models.BIOSSetting.node_id == node_id
+            )
+            bios_setting = connection.execute(bios_setting_stmt).first()
+            self.assertEqual(upper_bound, bios_setting.upper_bound)
+            self.assertEqual(lower_bound, bios_setting.lower_bound)
+
     def test_upgrade_and_version(self):
         with patch_with_engine(self.engine):
             self.migration_api.upgrade('head')
@@ -1272,6 +1563,19 @@ class MigrationCheckersMixin(object):
             self.migration_api.upgrade('31baaf680d2b')
             self.assertRaises(db_exc.DBMigrationError,
                               self.migration_api.create_schema)
+
+    def _check_772c0e7e8299(self, engine, data):
+        fw_information = db_utils.get_table(engine, 'firmware_information')
+        col_names = [column.name for column in fw_information.c]
+        self.assertIn('vendor', col_names)
+        self.assertIn('model', col_names)
+        self.assertIn('serial_number', col_names)
+        self.assertIsInstance(fw_information.c.vendor.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(fw_information.c.model.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(fw_information.c.serial_number.type,
+                              sqlalchemy.types.String)
 
     def test_upgrade_twice(self):
         with patch_with_engine(self.engine):
@@ -1336,7 +1640,7 @@ class TestMigrationsMySQL(MigrationCheckersMixin,
             insert_node = nodes.insert().values(data)
             connection.execute(insert_node)
 
-            # Re-uses the same query to fetch current results
+            # Reuses the same query to fetch current results
             i_info = connection.execute(
                 sqlalchemy.text(
                     "SELECT instance_info from nodes WHERE uuid = "
@@ -1370,8 +1674,8 @@ class ModelsMigrationSyncMixin(object):
     def setUp(self):
         super(ModelsMigrationSyncMixin, self).setUp()
         self.engine = enginefacade.writer.get_engine()
-        self.useFixture(fixtures.Timeout(MIGRATIONS_TIMEOUT,
-                                         gentle=True))
+        self.useFixture(fixtures.Timeout(int(MIGRATIONS_TIMEOUT),
+                                         gentle=False))
 
     def get_metadata(self):
         return models.Base.metadata
@@ -1389,10 +1693,3 @@ class ModelsMigrationsSyncMysql(ModelsMigrationSyncMixin,
                                 test_fixtures.OpportunisticDBTestMixin,
                                 test_base.BaseTestCase):
     FIXTURE = test_fixtures.MySQLOpportunisticFixture
-
-
-class ModelsMigrationsSyncPostgres(ModelsMigrationSyncMixin,
-                                   test_migrations.ModelsMigrationsSync,
-                                   test_fixtures.OpportunisticDBTestMixin,
-                                   test_base.BaseTestCase):
-    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture

@@ -14,14 +14,11 @@
 import os
 import sys
 
-import eventlet
+from oslo_service import backend
 
-# NOTE(dims): monkey patch subprocess to prevent failures in latest eventlet
-# See https://github.com/eventlet/eventlet/issues/398
-try:
-    eventlet.monkey_patch(subprocess=True)
-except TypeError:
-    pass
+# NOTE(Clif): Without this import errors related to oslo_service already
+# stuck with the wrong BackendType plague doc builds.
+backend.init_backend(backend.BackendType.THREADING)
 
 # -- General configuration ----------------------------------------------------
 
@@ -32,9 +29,10 @@ sys.path.insert(0, os.path.join(os.path.abspath('.'), '_exts'))
 
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
-extensions = ['sphinx.ext.viewcode',
+extensions = ['sphinx.ext.autodoc',
+              'sphinx.ext.autosummary',
+              'sphinx.ext.viewcode',
               'sphinx.ext.graphviz',
-              'sphinxcontrib.seqdiag',
               'sphinxcontrib.apidoc',
               'sphinxcontrib.rsvgconverter',
               'oslo_config.sphinxext',
@@ -43,37 +41,55 @@ extensions = ['sphinx.ext.viewcode',
               'oslo_policy.sphinxpolicygen',
               'automated_steps',
               'openstackdocstheme',
-              'web_api_docstring'
+              'web_api_docstring',
+              'redfish_interop',
               ]
 
 # sphinxcontrib.apidoc options
 apidoc_module_dir = '../../ironic'
 apidoc_output_dir = 'contributor/api'
 apidoc_excluded_paths = [
-    'db/sqlalchemy/alembic/env',
-    'db/sqlalchemy/alembic/versions/*',
+    'db/sqlalchemy/alembic/*',
     'drivers/modules/ansible/playbooks*',
     'hacking',
     'tests',
+    'tests/*',
+    # ironic.wsgi has side effects on import
+    'wsgi',
 ]
 apidoc_separate_modules = True
 
+autodoc_default_options = {
+    'special-members': '__call__',
+}
+
+# FIXME: Temporarily disable rendering of type annotations in autodoc
+# signatures until [1] is resolved.
+# [1] https://github.com/sphinx-doc/sphinx/issues/14223
+autodoc_typehints = 'none'
+
+autosummary_mock_imports = [
+    'ironic.wsgi',
+]
+
+redfish_interop_source = \
+    '../../redfish-interop-profiles/OpenStackIronicProfile.v1_2_0.json'
+redfish_interop_output_dir = 'admin/drivers/redfish/'
+
 openstackdocs_repo_name = 'openstack/ironic'
-openstackdocs_use_storyboard = True
+openstackdocs_use_storyboard = False
 openstackdocs_pdf_link = True
 openstackdocs_projects = [
     'bifrost',
     'cinder',
     'glance',
     'ironic',
-    'ironic-inspector',
     'ironic-lib',
     'ironic-neutron-agent',
     'ironic-python-agent',
     'ironic-ui',
     'keystone',
     'keystonemiddleware',
-    'metalsmith',
     'networking-baremetal',
     'neutron',
     'nova',
@@ -84,7 +100,6 @@ openstackdocs_projects = [
     'osprofiler',
     'os-traits',
     'python-ironicclient',
-    'python-ironic-inspector-client',
     'python-openstackclient',
     'swift',
 ]
@@ -107,10 +122,12 @@ master_doc = 'index'
 # General information about the project.
 copyright = 'OpenStack Foundation'
 
-config_generator_config_file = '../../tools/config/ironic-config-generator.conf'
+config_generator_config_file = \
+    '../../tools/config/ironic-config-generator.conf'
 sample_config_basename = '_static/ironic'
 
-policy_generator_config_file = '../../tools/policy/ironic-policy-generator.conf'
+policy_generator_config_file = \
+    '../../tools/policy/ironic-policy-generator.conf'
 sample_policy_basename = '_static/ironic'
 
 # A list of ignored prefixes for module index sorting.
@@ -135,13 +152,20 @@ exclude_patterns = ['api/ironic.drivers.modules.ansible.playbooks.*',
 # Ignore the following warning: WARNING: while setting up extension
 # wsmeext.sphinxext: directive 'autoattribute' is already registered,
 # it will be overridden.
-suppress_warnings = ['app.add_directive']
+# NOTE(clif) Also suppress autodoc warnings as a whole since it seems
+# impossible to only suppress mocked imports warnings.
+suppress_warnings = ['app.add_directive', 'autodoc']
 
 # -- Options for HTML output --------------------------------------------------
 
 # The theme to use for HTML and HTML Help pages.  Major themes that come with
 # Sphinx are currently 'default' and 'sphinxdoc'.
 html_theme = 'openstackdocs'
+
+#Enable project-scoped search in the sidebar
+html_theme_options = {
+    'sidebar_search': True,
+}
 
 # Output file base name for HTML help builder.
 htmlhelp_basename = 'Ironicdoc'
@@ -163,7 +187,3 @@ latex_documents = [
 
 # Allow deeper levels of nesting for \begin...\end stanzas
 latex_elements = {'maxlistdepth': 10}
-
-# -- Options for seqdiag ------------------------------------------------------
-
-seqdiag_html_image_format = "SVG"

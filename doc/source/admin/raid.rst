@@ -1,3 +1,10 @@
+.. meta::
+   :description: Configure RAID storage for Ironic bare metal nodes. Hardware RAID, software RAID, and automated storage configuration during deployment.
+   :keywords: raid configuration, hardware raid, software raid, storage configuration, disk management, ironic raid, automated setup
+   :author: OpenStack Ironic Team
+   :robots: index, follow
+   :audience: storage engineers, system administrators
+
 .. _raid:
 
 ==================
@@ -35,8 +42,7 @@ Build agent ramdisk which supports RAID configuration
 
 For doing in-band hardware RAID configuration, Ironic needs an agent ramdisk
 bundled with a hardware manager which supports RAID configuration for your
-hardware. For example, the :ref:`DIB_raid_support` should be used for HPE
-Proliant Servers.
+hardware.
 
 .. note::
     For in-band software RAID, the agent ramdisk does not need to be bundled
@@ -93,18 +99,29 @@ disk and have no default values:
 Optional properties
 ^^^^^^^^^^^^^^^^^^^
 
-These properties have default values and they may be overridden in the
-specification of any logical disk. None of these options are supported for
-software RAID.
+These properties have default values, and they may be overridden in the
+specification of any logical disk.
 
 - ``volume_name`` - Name of the volume. Should be unique within the Node.
-  If not specified, volume name will be auto-generated.
+  If not specified, the volume name will be auto-generated.
 
 - ``is_root_volume`` - Set to ``true`` if this is the root volume. At
   most one logical disk can have this set to ``true``; the other
-  logical disks must have this set to ``false``. The
-  ``root device hint`` will be saved, if the RAID interface is capable of
-  retrieving it. This is ``false`` by default.
+  logical disks must have this set to ``false`` or left unspecified.
+
+  For hardware RAID, this value currently only affects the
+  ``create_root_volume`` and  ``create_nonroot_volumes`` parameters to the
+  ``create_configuration`` step, but out-of-tree RAID interfaces may also use
+  it to populate *root device hints*. Otherwise, you need to populate the hints
+  yourself.
+
+  For software RAID (since the Gazpacho release - through the change
+  `963200 <https://review.opendev.org/c/openstack/ironic-python-agent/+/963200/>`_),
+  setting the parameter to ``false``, prevents it from being
+  picked up as the root volume. If both ``root device hint``, and the
+  ``is_root_volume`` (set to ``true``) parameters are set, the
+  ``is_root_volume`` parameter takes priority, and the volume should be
+  picked up for the root device.
 
 Backing physical disk hints
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -177,9 +194,8 @@ available. Make this the root volume to which Ironic deploys the image:
     ]
   }
 
-*Example 2*. Two RAID disks. One with RAID level 5 of 100 GiB and make it
-root volume and use SSD.  Another with RAID level 1 of 500 GiB and use
-HDD:
+*Example 2*. Two RAID disks. One with RAID level 5 of 100 GiB and use SSD.
+Another with RAID level 1 of 500 GiB and use HDD:
 
 .. code-block:: json
 
@@ -188,7 +204,6 @@ HDD:
       {
         "size_gb": 100,
         "raid_level": "5",
-        "is_root_volume": true,
         "disk_type": "ssd"
       },
       {
@@ -209,8 +224,7 @@ HDD:
         "size_gb": 100,
         "raid_level": "5",
         "controller": "Smart Array P822 in Slot 3",
-        "physical_disks": ["6I:1:5", "6I:1:6", "6I:1:7"],
-        "is_root_volume": true
+        "physical_disks": ["6I:1:5", "6I:1:6", "6I:1:7"]
       }
     ]
   }
@@ -226,7 +240,6 @@ HDD:
         "raid_level": "1+0",
         "controller": "RAID.Integrated.1-1",
         "volume_name": "root_volume",
-        "is_root_volume": true,
         "physical_disks": [
           "Disk.Bay.0:Encl.Int.0-1:RAID.Integrated.1-1",
           "Disk.Bay.1:Encl.Int.0-1:RAID.Integrated.1-1"
@@ -246,7 +259,8 @@ HDD:
     ]
   }
 
-*Example 5*. Software RAID with two RAID devices:
+*Example 5*. Software RAID with two RAID devices. The smaller one should be
+picked up as a root device:
 
 .. code-block:: json
 
@@ -255,6 +269,7 @@ HDD:
       {
         "size_gb": 100,
         "raid_level": "1",
+        "is_root_volume": true,
         "controller": "software"
       },
       {
@@ -276,6 +291,27 @@ devices with the size exceeding 100 GiB:
         "size_gb": "MAX",
         "raid_level": "0",
         "controller": "software",
+        "physical_disks": [
+          {"size": "> 100"},
+          {"size": "> 100"}
+        ]
+      }
+    ]
+  }
+
+*Example 7*. Single RAID disk of RAID level 1 which spans two disks.
+The ``is_root_volume`` set to false prevents the array from being picked
+up as the root volume. Therefore, unless there is a third disk present, this
+configuration would end up in an error:
+
+.. code-block:: json
+
+  {
+    "logical_disks": [
+      {
+        "size_gb": "MAX",
+        "raid_level": "1",
+        "is_root_volume": false,
         "physical_disks": [
           {"size": "> 100"},
           {"size": "> 100"}
@@ -392,7 +428,18 @@ There are certain limitations to be aware of:
 * The final instance image must have the ``mdadm`` utility installed
   and needs to be able to detect software RAID devices at boot time
   (which is usually done by having the RAID drivers embedded in the
-  image's initrd).
+  image's initrd). Note that many minimal or cloud images do not
+  include ``mdadm`` in the initramfs even when the package is
+  installed, and may need to have the initramfs regenerated as part
+  of the image build process.
+
+* When booting in UEFI mode, the GRUB bootloader within the image
+  must include support for reading software RAID arrays (e.g. the
+  ``mdraid1x`` module). Distribution-provided GRUB binaries
+  frequently lack this module, which will cause the node to drop
+  into a ``grub rescue>`` prompt. Rebuilding GRUB to include this
+  module will break the secure boot chain of trust unless the
+  resulting binary is re-signed.
 
 * Regular cleaning will not remove RAID configuration (similarly to hardware
   RAID). To destroy RAID run the ``delete_configuration`` manual clean step.
@@ -460,6 +507,27 @@ There are certain limitations to be aware of:
 Image requirements
 ------------------
 
+.. warning::
+   Linux distributions have been increasingly dropping built-in
+   support for software RAID in their default images and
+   installers. As a result, deploying to software RAID may
+   require significant image customization, such as rebuilding
+   the initramfs to include RAID assembly tools and rebuilding
+   the GRUB bootloader with RAID modules (e.g. ``mdraid1x``).
+
+   Some of these modifications -- particularly replacing GRUB
+   binaries -- will break the secure boot chain of trust unless
+   the replacement binaries are re-signed with an appropriate
+   key. This makes software RAID largely incompatible with
+   secure boot when using images that do not already ship with
+   RAID-capable bootloaders.
+
+   Operators considering software RAID should carefully evaluate
+   whether their chosen distribution and image support it, and
+   should expect to invest in custom image building and testing.
+   Hardware RAID, where available, avoids these complications
+   entirely as the RAID is transparent to the operating system.
+
 Since Ironic needs to perform additional steps when deploying nodes
 with software RAID, there are some requirements the deployed images need
 to fulfill. Up to and including the Train release, the image needs to
@@ -485,8 +553,8 @@ RAID deployments where Ironic does not have access to any image metadata
 Using RAID in nova flavor for scheduling
 ========================================
 
-The operator can specify the `raid_level` capability in nova flavor for node to be selected
-for scheduling::
+The operator can specify the ``raid_level`` capability in nova flavor for node
+to be selected for scheduling::
 
   openstack flavor set my-baremetal-flavor --property capabilities:raid_level="1+0"
 

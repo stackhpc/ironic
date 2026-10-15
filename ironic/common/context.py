@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -12,7 +11,11 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from oslo_config import cfg
 from oslo_context import context
+
+
+CONF = cfg.CONF
 
 
 class RequestContext(context.RequestContext):
@@ -44,6 +47,9 @@ class RequestContext(context.RequestContext):
             'project_name': self.project_name,
             'is_public_api': self.is_public_api,
         })
+        if (CONF.rbac_service_role_elevated_access
+                and CONF.rbac_service_project_name is not None):
+            policy_values['config.service_project_name'] = CONF.rbac_service_project_name  # noqa
         return policy_values
 
     def ensure_thread_contain_context(self):
@@ -70,9 +76,15 @@ class RequestContext(context.RequestContext):
         :param environ: The environment dictionary associated with a request.
         :type environ: dict
         """
-        context = super().from_environ(environ)
-        context.is_public_api = environ.get('is_public_api', False)
-        context.auth_token_info = environ.get('keystone.token_info')
+        is_public_api = environ.get('is_public_api', False)
+        auth_token_info = environ.get('keystone.token_info')
+
+        context = super().from_environ(
+            environ,
+            is_public_api=is_public_api,
+            auth_token_info=auth_token_info,
+            **kwargs
+        )
         return context
 
     def to_dict(self):

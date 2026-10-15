@@ -16,16 +16,16 @@
 
 import copy
 import os
+import pathlib
 import shutil
 import tempfile
 from urllib import parse as urlparse
 
-from ironic_lib import utils as ironic_utils
 import jinja2
 from oslo_concurrency import processutils
 from oslo_log import log as logging
-from oslo_utils import excutils
 from oslo_utils import fileutils
+from oslo_utils import netutils
 
 from ironic.common import dhcp_factory
 from ironic.common import exception
@@ -33,6 +33,7 @@ from ironic.common.glance_service import service_utils
 from ironic.common.i18n import _
 from ironic.common import image_service as service
 from ironic.common import images
+from ironic.common import kernel_parameters as kp
 from ironic.common import kickstart_utils as ks_utils
 from ironic.common import states
 from ironic.common import utils
@@ -48,6 +49,7 @@ LOG = logging.getLogger(__name__)
 
 PXE_CFG_DIR_NAME = CONF.pxe.pxe_config_subdir
 
+DHCP_VENDOR_CLASS_ID = '60'  # rfc2132
 DHCP_CLIENT_ID = '61'  # rfc2132
 DHCP_TFTP_SERVER_NAME = '66'  # rfc2132
 DHCP_BOOTFILE_NAME = '67'  # rfc2132
@@ -58,7 +60,6 @@ DHCPV6_BOOTFILE_NAME = '59'  # rfc5970
 # DHCPV6_BOOTFILE_PARAMS = '60'  # rfc5970
 DHCP_TFTP_SERVER_ADDRESS = '150'  # rfc5859
 DHCP_IPXE_ENCAP_OPTS = '175'  # Tentatively Assigned
-DHCP_TFTP_PATH_PREFIX = '210'  # rfc5071
 DHCP_SERVER_IP_ADDRESS = '255'  # dnsmasq server-ip-address
 
 DEPLOY_KERNEL_RAMDISK_LABELS = ['deploy_kernel', 'deploy_ramdisk']
@@ -67,8 +68,8 @@ KERNEL_RAMDISK_LABELS = {'deploy': DEPLOY_KERNEL_RAMDISK_LABELS,
                          'rescue': RESCUE_KERNEL_RAMDISK_LABELS}
 
 
-def _get_root_dir(ipxe_enabled):
-    if ipxe_enabled:
+def _get_root_dir(use_http_root):
+    if use_http_root:
         return CONF.deploy.http_root
     else:
         return CONF.pxe.tftp_root
@@ -107,7 +108,7 @@ def _link_mac_pxe_configs(task, ipxe_enabled=False):
     """
 
     def create_link(mac_path):
-        ironic_utils.unlink_without_raise(mac_path)
+        utils.unlink_without_raise(mac_path)
         relative_source_path = os.path.relpath(
             pxe_config_file_path, os.path.dirname(mac_path))
         utils.create_link_without_raise(relative_source_path, mac_path)
@@ -115,6 +116,8 @@ def _link_mac_pxe_configs(task, ipxe_enabled=False):
     pxe_config_file_path = get_pxe_config_file_path(
         task.node.uuid, ipxe_enabled=ipxe_enabled)
     for port in task.ports:
+        if not CONF.neutron.add_all_ports and not port.pxe_enabled:
+            continue
         client_id = port.extra.get('client-id')
         # Syslinux, ipxe, depending on settings.
         create_link(_get_pxe_mac_path(port.address, client_id=client_id,
@@ -156,7 +159,7 @@ def _link_ip_address_pxe_configs(task, ipxe_enabled=False):
         ip_addrs = []
     for port_ip_address in ip_addrs:
         ip_address_path = _get_pxe_ip_address_path(port_ip_address)
-        ironic_utils.unlink_without_raise(ip_address_path)
+        utils.unlink_without_raise(ip_address_path)
         relative_source_path = os.path.relpath(
             pxe_config_file_path, os.path.dirname(ip_address_path))
         utils.create_link_without_raise(relative_source_path,
@@ -240,7 +243,8 @@ def get_kernel_ramdisk_info(node_uuid, driver_info, mode='deploy',
     return image_info
 
 
-def get_pxe_config_file_path(node_uuid, ipxe_enabled=False):
+def get_pxe_config_file_path(node_uuid, ipxe_enabled=False,
+                             http_boot_enabled=False):
     """Generate the path for the node's PXE configuration file.
 
     :param node_uuid: the UUID of the node.
@@ -249,7 +253,8 @@ def get_pxe_config_file_path(node_uuid, ipxe_enabled=False):
     :returns: The path to the node's PXE configuration file.
 
     """
-    return os.path.join(_get_root_dir(ipxe_enabled), node_uuid, 'config')
+    return os.path.join(
+        _get_root_dir(ipxe_enabled or http_boot_enabled), node_uuid, 'config')
 
 
 def get_file_path_from_label(node_uuid, root_dir, label):
@@ -345,6 +350,12 @@ def create_pxe_config(task, pxe_options, template=None, ipxe_enabled=False):
     if uefi_with_grub:
         pxe_config_root_tag = '(( ROOT ))'
         pxe_config_disk_ident = '(( DISK_IDENTIFIER ))'
+
+        commands = {
+            'linux_cmd': 'linux',
+            'initrd_cmd': 'initrd'
+        }
+        pxe_options.update(commands)
     else:
         # TODO(stendulker): We should use '(' ')' as the delimiters for all our
         # config files so that we do not need special handling for each of the
@@ -371,10 +382,10 @@ def create_pxe_config(task, pxe_options, template=None, ipxe_enabled=False):
         # we can remove IP address creation for the grub use.
         except exception.FailedToGetIPAddressOnPort as e:
             if CONF.dhcp.dhcp_provider != 'none':
-                with excutils.save_and_reraise_exception():
-                    LOG.error('Unable to create boot config, IP address '
-                              'was unable to be retrieved. %(error)s',
-                              {'error': e})
+                LOG.error('Unable to create boot config, IP address '
+                          'was unable to be retrieved. %(error)s',
+                          {'error': e})
+                raise
 
 
 def create_ipxe_boot_script():
@@ -418,23 +429,25 @@ def clean_up_pxe_config(task, ipxe_enabled=False):
             except exception.FailedToGetIPAddressOnPort:
                 continue
             # Cleaning up config files created for grub2.
-            ironic_utils.unlink_without_raise(ip_address_path)
+            utils.unlink_without_raise(ip_address_path)
 
     for port in task.ports:
         client_id = port.extra.get('client-id')
         # syslinux, ipxe, etc.
-        ironic_utils.unlink_without_raise(
-            _get_pxe_mac_path(port.address, client_id=client_id,
+        utils.unlink_without_raise(
+            _get_pxe_mac_path(port.address,
+                              client_id=client_id,
                               ipxe_enabled=ipxe_enabled))
-        # Grub2 MAC address based confiuration
+        # Grub2 MAC address based configuration
         for path in _get_pxe_grub_mac_path(port.address,
                                            ipxe_enabled=ipxe_enabled):
-            ironic_utils.unlink_without_raise(path)
+            utils.unlink_without_raise(path)
     utils.rmtree_without_raise(os.path.join(_get_root_dir(ipxe_enabled),
                                             task.node.uuid))
 
 
-def _dhcp_option_file_or_url(task, urlboot=False, ip_version=None):
+def _dhcp_option_file_or_url(task, urlboot=False, ip_version=None,
+                             http_boot_enabled=False):
     """Returns the appropriate file or URL.
 
     :param task: A TaskManager object.
@@ -444,7 +457,11 @@ def _dhcp_option_file_or_url(task, urlboot=False, ip_version=None):
     :param ip_version: Integer representing the version of IP of
                        to return options for DHCP. Possible options
                        are 4, and 6.
+    :param http_boot_enabled: If HTTPBoot is utilized, default False.
+    :raises: InvalidParameterValue if the resulting property length
+        exceeds Neutron limitations.
     """
+    result = None
     try:
         if task.driver.boot.ipxe_enabled:
             boot_file = deploy_utils.get_ipxe_boot_file(task.node)
@@ -458,18 +475,30 @@ def _dhcp_option_file_or_url(task, urlboot=False, ip_version=None):
     # NOTE(TheJulia): There are additional cases as we add new
     # features, so the logic below is in the form of if/elif/elif
     if not urlboot:
-        return boot_file
-    elif urlboot:
+        result = boot_file
+    elif urlboot and not http_boot_enabled:
         if CONF.my_ipv6 and ip_version == 6:
-            host = utils.wrap_ipv6(CONF.my_ipv6)
-        else:
-            host = utils.wrap_ipv6(CONF.pxe.tftp_server)
-        return "tftp://{host}/{boot_file}".format(host=host,
-                                                  boot_file=boot_file)
+            host = netutils.escape_ipv6(CONF.my_ipv6)
+        elif not http_boot_enabled:
+            host = netutils.escape_ipv6(CONF.pxe.tftp_server)
+        result = "tftp://{host}/{boot_file}".format(host=host,
+                                                    boot_file=boot_file)
+    elif http_boot_enabled:
+        result = "{url}/{boot_file}".format(url=CONF.deploy.http_url,
+                                            boot_file=boot_file)
+    if len(result) > 64:
+        # This is an internal limitation for Neutron. We cannot send it
+        # a value longer than 64 characters.
+        raise exception.InvalidParameterValue('The resulting boot file or '
+                                              'URL length exceeds Neutron '
+                                              'limitations. Please explore '
+                                              'shorter file names or '
+                                              'hostnames.')
+    return result
 
 
 def dhcp_options_for_instance(task, ipxe_enabled=False, url_boot=False,
-                              ip_version=None):
+                              ip_version=None, http_boot_enabled=False):
     """Retrieves the DHCP PXE boot options.
 
     :param task: A TaskManager instance.
@@ -486,8 +515,16 @@ def dhcp_options_for_instance(task, ipxe_enabled=False, url_boot=False,
                        Possible options are integers 4 or 6.
     :returns: Dictionary to be sent to the networking service describing
               the DHCP options to be set.
+    :raises: InvalidParameterValue if the underlying configuration cannot
+        be conveyed to Neutron due to resulting value length.
     """
+    # FIXME(TheJulia): Presently, we determine if we should generate ipxe
+    # enabled configuration *via* the argument, and that presently gets set
+    # via the driver's interface, but we ought to double check because
+    # otherwise it is easy to miss, like when writing tests if you've touched
+    # this area of the code.
     if ip_version:
+        # IP version defines *which* parameter is used for file name.
         use_ip_version = ip_version
     else:
         use_ip_version = int(CONF.pxe.ip_version)
@@ -500,11 +537,15 @@ def dhcp_options_for_instance(task, ipxe_enabled=False, url_boot=False,
         # a URL reply.
         boot_file_param = DHCPV6_BOOTFILE_NAME
         url_boot = True
+    if http_boot_enabled:
+        # IF this is for httpboot, just always mark url boot as enabled.
+        url_boot = True
     # NOTE(TheJulia): The ip_version value config from the PXE config is
     # guarded in the configuration, so there is no real sense in having
     # anything else here in the event the value is something aside from
     # 4 or 6, as there are no other possible values.
-    boot_file = _dhcp_option_file_or_url(task, url_boot, use_ip_version)
+    boot_file = _dhcp_option_file_or_url(task, url_boot, use_ip_version,
+                                         http_boot_enabled=http_boot_enabled)
 
     if ipxe_enabled:
         # TODO(TheJulia): DHCPv6 through dnsmasq + ipxe matching simply
@@ -562,16 +603,11 @@ def dhcp_options_for_instance(task, ipxe_enabled=False, url_boot=False,
     else:
         dhcp_opts.append({'opt_name': boot_file_param,
                           'opt_value': boot_file})
-        # 210 == tftp server path-prefix or tftp root, will be used to find
-        # pxelinux.cfg directory. The pxelinux.0 loader infers this information
-        # from it's own path, but Petitboot needs it to be specified by this
-        # option since it doesn't use pxelinux.0 loader.
-        if not url_boot:
-            # Enforce trailing slash
-            prefix = os.path.join(CONF.pxe.tftp_root, '')
-            dhcp_opts.append(
-                {'opt_name': DHCP_TFTP_PATH_PREFIX,
-                 'opt_value': prefix})
+    if http_boot_enabled and use_ip_version == 4:
+        # So unlike v6 PXE's use of URLs above, we explicitly need
+        # to send a vendor class back (option 60, vendor-class in dnsmasq)
+        dhcp_opts.append({'opt_name': DHCP_VENDOR_CLASS_ID,
+                          'opt_value': 'HTTPClient'})
 
     if not url_boot:
         dhcp_opts.append({'opt_name': DHCP_TFTP_SERVER_NAME,
@@ -631,20 +667,11 @@ def parse_driver_info(node, mode='deploy'):
         # options. Skipping.
         return {}
 
-    info = node.driver_info
-
-    params_to_check = KERNEL_RAMDISK_LABELS[mode]
-
-    d_info = {k: info.get(k) for k in params_to_check}
-    if not any(d_info.values()):
-        # NOTE(dtantsur): avoid situation when e.g. deploy_kernel comes from
-        # driver_info but deploy_ramdisk comes from configuration, since it's
-        # a sign of a potential operator's mistake.
-        d_info = {k: getattr(CONF.conductor, k) for k in params_to_check}
+    info = driver_utils.get_agent_kernel_ramdisk(node, mode=mode)
     error_msg = _("Cannot validate PXE bootloader. Some parameters were"
                   " missing in node's driver_info and configuration")
-    deploy_utils.check_for_missing_params(d_info, error_msg)
-    return d_info
+    deploy_utils.check_for_missing_params(info, error_msg)
+    return info
 
 
 def get_instance_image_info(task, ipxe_enabled=False):
@@ -664,11 +691,12 @@ def get_instance_image_info(task, ipxe_enabled=False):
     """
     ctx = task.context
     node = task.node
+    boot_option = deploy_utils.get_boot_option(node)
     image_info = {}
     # NOTE(pas-ha) do not report image kernel and ramdisk for
     # local boot or whole disk images so that they are not cached
     if (node.driver_internal_info.get('is_whole_disk_image')
-            or deploy_utils.get_boot_option(node) == 'local'):
+            or boot_option == 'local'):
         return image_info
     root_dir = _get_root_dir(ipxe_enabled)
     i_info = node.instance_info
@@ -697,7 +725,9 @@ def get_instance_image_info(task, ipxe_enabled=False):
         # like is done with basically Glance.
 
     labels = ('kernel', 'ramdisk')
-    if not isap:
+    if boot_option != 'kickstart':
+        anaconda_labels = ()
+    elif not isap:
         anaconda_labels = ('stage2', 'ks_template', 'ks_cfg')
     else:
         # When a path is used, a stage2 ramdisk can be determiend
@@ -720,6 +750,7 @@ def get_instance_image_info(task, ipxe_enabled=False):
         # TODO(TheJulia): Add functionality to look/grab the hints file
         # for anaconda and just run with the entire path.
 
+    if 'stage2' in anaconda_labels:
         # stage2: installer stage2 squashfs image
         # ks_template: anaconda kickstart template
         # ks_cfg - rendered ks_template
@@ -743,30 +774,32 @@ def get_instance_image_info(task, ipxe_enabled=False):
                 else:
                     node.set_driver_internal_info(
                         'stage2', str(image_properties['stage2_id']))
-    # NOTE(TheJulia): A kickstart template is entirely independent
-    # of the stage2 ramdisk. In the end, it was the configuration which
-    # told anaconda how to execute.
-    if i_info.get('ks_template'):
-        # If the value is set, we always overwrite it, in the event
-        # a rebuild is occuring or something along those lines.
-        node.set_driver_internal_info('ks_template',
-                                      i_info['ks_template'])
-    else:
-        _get_image_properties()
-        # ks_template is an optional property on the image
-        if image_properties and 'ks_template' in image_properties:
-            node.set_driver_internal_info(
-                'ks_template', str(image_properties['ks_template']))
+
+    if 'ks_template' in anaconda_labels:
+        # NOTE(TheJulia): A kickstart template is entirely independent
+        # of the stage2 ramdisk. In the end, it was the configuration which
+        # told anaconda how to execute.
+        if i_info.get('ks_template'):
+            # If the value is set, we always overwrite it, in the event
+            # a rebuild is occurring or something along those lines.
+            node.set_driver_internal_info('ks_template',
+                                          i_info['ks_template'])
         else:
-            # If not defined, default to the overall system default
-            # kickstart template, as opposed to a user supplied
-            # template.
-            node.set_driver_internal_info(
-                'ks_template',
-                'file://' + os.path.abspath(
-                    CONF.anaconda.default_ks_template
+            _get_image_properties()
+            # ks_template is an optional property on the image
+            if image_properties and 'ks_template' in image_properties:
+                node.set_driver_internal_info(
+                    'ks_template', str(image_properties['ks_template']))
+            else:
+                # If not defined, default to the overall system default
+                # kickstart template, as opposed to a user supplied
+                # template.
+                node.set_driver_internal_info(
+                    'ks_template',
+                    'file://' + os.path.abspath(
+                        CONF.anaconda.default_ks_template
+                    )
                 )
-            )
 
     node.save()
 
@@ -904,6 +937,20 @@ def build_extra_pxe_options(task, ramdisk_params=None):
         pxe_append_params += (
             ' ipa-global-request-id=%s' % task.context.global_id)
 
+    if not CONF.conductor.disable_kernel_parameter_parsing:
+        # NOTE(clif): ramdisk_params is introducing arbitrary kernel parameter
+        # input here. Parsing provides a strong degree of certainty the
+        # parameters are well-formed.
+        try:
+            kp.KernelCommandLine.parse(pxe_append_params)
+        except exception.InvalidParameterValue:
+            raise exception.InvalidParameterValue(
+                    _('build_extra_pxe_options: ramdisk_params likely '
+                      'contain a malformed kernel parameter.'))
+
+    # NOTE(clif) Always run basic sanitization on pxe_append_params
+    kp.sanitize_kernel_command_line(pxe_append_params)
+
     return {'pxe_append_params': pxe_append_params,
             'tftp_server': CONF.pxe.tftp_server,
             'ipxe_timeout': CONF.pxe.ipxe_timeout * 1000}
@@ -930,6 +977,8 @@ def build_pxe_config_options(task, pxe_info, service=False,
                            as kernel command-line arguments.
     :returns: A dictionary of pxe options to be used in the pxe bootfile
         template.
+
+    :raises: InvalidParameterValue via get_kernel_append_params
     """
     node = task.node
     mode = deploy_utils.rescue_or_deploy_mode(node)
@@ -972,7 +1021,8 @@ def build_service_pxe_config(task, instance_image_info,
     # fail if the agent was booted outside the direct actions of the
     # boot interface.
     if (node.provision_state in [states.ACTIVE, states.UNRESCUING,
-                                 states.DEPLOYING]
+                                 states.DEPLOYING, states.ADOPTING,
+                                 states.SERVICING]
             and not os.path.isfile(pxe_config_path)):
         pxe_options = build_pxe_config_options(task, instance_image_info,
                                                service=True,
@@ -1046,12 +1096,10 @@ def get_volume_pxe_options(task):
         return __return_item_or_first_if_list(properties.get(key + 's', ''))
 
     def __format_portal(portal, iqn, lun):
-        if ':' in portal:
-            host, port = portal.split(':')
-        else:
-            host = portal
+        host, port = netutils.parse_host_port(portal)
+        if port is None:
             port = ''
-        return ("iscsi:%(host)s::%(port)s:%(lun)s:%(iqn)s" %
+        return ("iscsi:%(host)s::%(port)s:%(lun)x:%(iqn)s" %
                 {'host': host, 'port': port, 'lun': lun, 'iqn': iqn})
 
     def __generate_iscsi_url(properties):
@@ -1124,7 +1172,7 @@ def validate_kickstart_template(ks_template):
         msg = (_("The kickstart template includes a variable that is not "
                  "a valid kickstart option. Rendering the template returned "
                  " %(msg)s. The valid options are %(valid_options)s.") %
-               {'msg': exc.message,
+               {'msg': exc,
                 'valid_options': ','.join(ks_options.keys())})
         raise exception.InvalidKickstartTemplate(msg)
 
@@ -1160,7 +1208,7 @@ def validate_kickstart_file(ks_cfg):
         ks_file.flush()
         try:
             utils.execute(
-                'ksvalidator', ks_file.name, check_on_exit=[0], attempts=1
+                'ksvalidator', ks_file.name, check_exit_code=[0], attempts=1
             )
         except processutils.ProcessExecutionError as e:
             msg = (_("The kickstart file generated does not pass validation. "
@@ -1173,7 +1221,8 @@ def prepare_instance_pxe_config(task, image_info,
                                 iscsi_boot=False,
                                 ramdisk_boot=False,
                                 ipxe_enabled=False,
-                                anaconda_boot=False):
+                                anaconda_boot=False,
+                                http_boot_enabled=False):
     """Prepares the config file for PXE boot
 
     :param task: a task from TaskManager.
@@ -1184,6 +1233,8 @@ def prepare_instance_pxe_config(task, image_info,
     :param ipxe_enabled: Default false boolean to indicate if ipxe
                          is in use by the caller.
     :param anaconda_boot: if the boot is to a anaconda ramdisk configuration.
+    :param http_boot_enabled: If httpboot models of use are to be used
+                              with the underlying boot loaders.
     :returns: None
     """
     node = task.node
@@ -1193,14 +1244,19 @@ def prepare_instance_pxe_config(task, image_info,
     # development cycle so that we call a single method and return
     # combined options. The method we currently call is relied upon
     # by two eternal projects, to changing the behavior is not ideal.
-    dhcp_opts = dhcp_options_for_instance(task, ipxe_enabled,
-                                          ip_version=4)
-    dhcp_opts += dhcp_options_for_instance(task, ipxe_enabled,
-                                           ip_version=6)
+    dhcp_opts = dhcp_options_for_instance(
+        task, ipxe_enabled,
+        ip_version=4,
+        http_boot_enabled=http_boot_enabled)
+    dhcp_opts += dhcp_options_for_instance(
+        task, ipxe_enabled,
+        ip_version=6,
+        http_boot_enabled=http_boot_enabled)
     provider = dhcp_factory.DHCPFactory()
     provider.update_dhcp(task, dhcp_opts)
     pxe_config_path = get_pxe_config_file_path(
-        node.uuid, ipxe_enabled=ipxe_enabled)
+        node.uuid, ipxe_enabled=ipxe_enabled,
+        http_boot_enabled=http_boot_enabled)
     if not os.path.isfile(pxe_config_path):
         pxe_options = build_pxe_config_options(
             task, image_info, service=ramdisk_boot or anaconda_boot,
@@ -1247,7 +1303,10 @@ class TFTPImageCache(image_cache.ImageCache):
             # MiB -> B
             cache_size=CONF.pxe.image_cache_size * 1024 * 1024,
             # min -> sec
-            cache_ttl=CONF.pxe.image_cache_ttl * 60)
+            cache_ttl=CONF.pxe.image_cache_ttl * 60,
+            # This is a cache for kernel, initramfs and anaconda artifacts,
+            # none of which can be validated
+            disable_validation=True)
 
 
 def cache_ramdisk_kernel(task, pxe_info, ipxe_enabled=False):
@@ -1277,8 +1336,16 @@ def cache_ramdisk_kernel(task, pxe_info, ipxe_enabled=False):
     LOG.debug("Fetching necessary kernel and ramdisk for node %s",
               node.uuid)
     images_info = list(t_pxe_info.values())
+
+    # Call the central auth override lookup, but signal it is not
+    # for *user* direct artifacts, i.e. this is system related
+    # activity as we're getting TFTP Image cache artifacts.
+    img_service_auth = service.get_image_service_auth_override(
+        task.node, permit_user_auth=False)
+
     deploy_utils.fetch_images(ctx, TFTPImageCache(), images_info,
-                              CONF.force_raw_images)
+                              CONF.force_raw_images,
+                              image_auth_data=img_service_auth)
     if CONF.pxe.file_permission:
         for info in images_info:
             os.chmod(info[1], CONF.pxe.file_permission)
@@ -1297,13 +1364,13 @@ def clean_up_pxe_env(task, images_info, ipxe_enabled=False):
     """
     for label in images_info:
         path = images_info[label][1]
-        ironic_utils.unlink_without_raise(path)
+        utils.unlink_without_raise(path)
 
     clean_up_pxe_config(task, ipxe_enabled=ipxe_enabled)
     TFTPImageCache().clean_up()
 
 
-def place_loaders_for_boot(base_path):
+def place_loaders_for_boot(base_path: str | os.PathLike):
     """Place configured bootloaders from the host OS.
 
     Example: grubaa64.efi:/path/to/grub-aarch64.efi,...
@@ -1314,29 +1381,25 @@ def place_loaders_for_boot(base_path):
     if not loaders or not base_path:
         # Do nothing, return.
         return
+    dir_mode = CONF.pxe.dir_permission or 0o755
+
+    base_path = pathlib.Path(base_path)
+
+    try:
+        # ensure that we have somewhere to copy the files to
+        base_path.mkdir(mode=dir_mode, parents=True, exist_ok=True)
+    except OSError as e:
+        msg = _('Failed to create bootloader destination path. Error: %s') % e
+        raise exception.IncorrectConfiguration(msg)
 
     for dest, src in loaders.items():
-        (head, _tail) = os.path.split(dest)
-        if head:
-            if head.startswith('/'):
-                # NOTE(TheJulia): The intent here is to error if the operator
-                # has put absolute paths in place, as we can and likely should
-                # copy to multiple folders based upon the protocol operation
-                # being used. Absolute paths are problematic there, where
-                # as a relative path is more a "well, that is silly, but okay
-                # misconfiguration.
-                msg = ('File paths configured for [pxe]loader_file_paths '
-                       'must be relative paths. Entry: %s') % dest
-                raise exception.IncorrectConfiguration(msg)
-            else:
-                try:
-                    ensure_tree(os.path.join(base_path, head))
-                except OSError as e:
-                    msg = ('Failed to create supplied directories in '
-                           'asset copy paths. Error: %s') % e
-                    raise exception.IncorrectConfiguration(msg)
+        dest = pathlib.Path(dest)
+        if len(dest.parts) != 1:
+            msg = ('File paths configured for [pxe]loader_file_paths '
+                   'must be a base path. Entry: %s') % dest
+            raise exception.IncorrectConfiguration(msg)
 
-        full_dest = os.path.join(base_path, dest)
+        full_dest = base_path.joinpath(dest)
         LOG.debug('Copying bootloader %(dest)s from %(src)s.',
                   {'src': src, 'dest': full_dest})
         try:
@@ -1359,15 +1422,16 @@ def place_common_config():
     if not CONF.pxe.initial_grub_template:
         return
 
-    grub_dir_path = os.path.join(_get_root_dir(False), 'grub')
-    if not os.path.isdir(grub_dir_path):
-        fileutils.ensure_tree(grub_dir_path)
-        if CONF.pxe.dir_permission:
-            os.chmod(grub_dir_path, CONF.pxe.dir_permission)
-
-    initial_grub = utils.render_template(
-        CONF.pxe.initial_grub_template,
-        {'tftp_root': _get_root_dir(False)})
-    initial_grub_path = os.path.join(grub_dir_path, 'grub.cfg')
-
-    utils.write_to_file(initial_grub_path, initial_grub)
+    for use_http in [False, True]:
+        # Create paths
+        grub_dir_path = os.path.join(_get_root_dir(use_http), 'grub')
+        if not os.path.isdir(grub_dir_path):
+            fileutils.ensure_tree(grub_dir_path)
+            if CONF.pxe.dir_permission:
+                os.chmod(grub_dir_path, CONF.pxe.dir_permission)
+        # Write templates
+        initial_grub = utils.render_template(
+            CONF.pxe.initial_grub_template,
+            {'tftp_root': _get_root_dir(False)})
+        initial_grub_path = os.path.join(grub_dir_path, 'grub.cfg')
+        utils.write_to_file(initial_grub_path, initial_grub)

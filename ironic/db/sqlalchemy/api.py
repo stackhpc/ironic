@@ -16,7 +16,9 @@
 
 import collections
 import datetime
+import functools
 import json
+import logging
 import threading
 
 from oslo_concurrency import lockutils
@@ -37,6 +39,7 @@ from sqlalchemy.exc import NoResultFound, MultipleResultsFound
 from sqlalchemy.orm import Load
 from sqlalchemy.orm import selectinload
 from sqlalchemy import sql
+import tenacity
 
 from ironic.common import exception
 from ironic.common.i18n import _
@@ -61,6 +64,48 @@ synchronized = lockutils.synchronized_with_prefix('ironic-')
 # NOTE(mgoddard): We limit the number of traits per node to 50 as this is the
 # maximum number of traits per resource provider allowed in placement.
 MAX_TRAITS_PER_NODE = 50
+
+
+def wrap_sqlite_retry(f):
+
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if (not CONF.database.sqlite_retries
+                or not utils.is_ironic_using_sqlite()):
+            return f(*args, **kwargs)
+        else:
+            # NOTE(TheJulia): We likely need to see if we can separate
+            # update_node in API from the final actions of task manager
+            # actions, but that would also be an internal API change
+            # because we would likely need a special object method to
+            # call for update_node to delineate an internal save versus
+            # an external save.
+            if f.__name__ in ['update_node', 'release_node']:
+                stop = tenacity.stop_never
+            else:
+                stop = tenacity.stop_after_delay(
+                    max_delay=CONF.database.sqlite_max_wait_for_retry
+                )
+            for attempt in tenacity.Retrying(
+                retry=(
+                    tenacity.retry_if_exception_type(
+                        sa.exc.OperationalError)
+                    & tenacity.retry_if_exception(
+                        lambda e: 'database is locked' in str(e))
+                ),
+                wait=tenacity.wait_random(
+                    min=0.1,
+                    max=1,
+                ),
+                before_sleep=(
+                    tenacity.before_sleep_log(LOG, logging.DEBUG)
+                ),
+                stop=stop,
+                reraise=False,
+                retry_error_cls=exception.TemporaryFailure):
+                with attempt:
+                    return f(*args, **kwargs)
+    return wrapper
 
 
 def get_backend():
@@ -124,14 +169,31 @@ def _get_deploy_template_select_with_steps():
     ).options(selectinload(models.DeployTemplate.steps))
 
 
+def _get_runbook_select_with_steps():
+    """Return a select object for the Runbook joined with steps and traits.
+
+    :returns: a select object.
+    """
+    return sa.select(
+        models.Runbook
+    ).options(selectinload(models.Runbook.steps),
+              selectinload(models.Runbook.traits))
+
+
 def model_query(model, *args, **kwargs):
     """Query helper for simpler session usage.
+
+    WARNING: DO NOT USE, unless you know exactly what your doing
+    AND are okay with a transaction possibly hanging.
 
     :param session: if present, the session to use
     """
 
     with _session_for_read() as session:
         query = session.query(model, *args)
+        # NOTE(TheJulia): This is intentional, because we are intentionally
+        # returning the session as part of the query, which we should
+        # generally attempt to avoid.
         return query
 
 
@@ -187,6 +249,16 @@ def add_port_filter(query, value):
         return query.filter_by(address=value)
     else:
         return add_identity_filter(query, value)
+
+
+def add_port_filter_description_contains(query, filters):
+    filters = filters or {}
+    if 'description_contains' in filters:
+        keyword = filters['description_contains']
+        if keyword is not None:
+            query = query.filter(
+                models.Port.description.like(r'%{}%'.format(keyword)))
+    return query
 
 
 def add_port_filter_by_node(query, value):
@@ -266,6 +338,24 @@ def add_port_filter_by_portgroup(query, value):
         return query.filter(models.Portgroup.uuid == value)
 
 
+def add_port_filter_by_node_conductor_groups(query, conductor_groups):
+    if conductor_groups:
+        query = query.join(models.Node,
+                           models.Port.node_id == models.Node.id)
+        query = query.filter(
+            models.Node.conductor_group.in_(conductor_groups))
+    return query
+
+
+def add_portgroup_filter_by_node_conductor_groups(query, conductor_groups):
+    if conductor_groups:
+        query = query.join(models.Node,
+                           models.Portgroup.node_id == models.Node.id)
+        query = query.filter(
+            models.Node.conductor_group.in_(conductor_groups))
+    return query
+
+
 def add_node_filter_by_chassis(query, value):
     if strutils.is_int_like(value):
         return query.filter_by(chassis_id=value)
@@ -301,6 +391,8 @@ def _paginate_query(model, limit=None, marker=None, sort_key=None,
     # populated, so we need to ask if it is None.
     if query is None:
         query = sa.select(model)
+    elif isinstance(query, sa_orm.Query):
+        raise TypeError("Use SQLAlchemy 2.0 queries")
     sort_keys = ['id']
     if sort_key and sort_key not in sort_keys:
         sort_keys.insert(0, sort_key)
@@ -312,42 +404,35 @@ def _paginate_query(model, limit=None, marker=None, sort_key=None,
             _('The sort_key value "%(key)s" is an invalid field for sorting')
             % {'key': sort_key})
     with _session_for_read() as session:
-        # NOTE(TheJulia): SQLAlchemy 2.0 no longer returns pre-uniqued result
-        # sets in ORM mode, so we need to explicitly ask for it to be unique
-        # before returning it to the caller.
-        if isinstance(query, sa_orm.Query):
-            # The classic "Legacy" ORM query object result set which is
-            # deprecated in advance of SQLAlchemy 2.0.
-            # TODO(TheJulia): Calls of this style basically need to be
-            # eliminated in ironic as returning this way does not allow
-            # commit or rollback in enginefacade to occur until the returned
-            # object is garbage collected as ORM Query objects allow
-            # for DB interactions to occur after the fact, so it remains
-            # connected to the DB..
-            return query.all()
-        else:
-            # In this case, we have a sqlalchemy.sql.selectable.Select
-            # (most likely) which utilizes the unified select interface.
-            res = session.execute(query).fetchall()
-            if len(res) == 0:
-                # Return an empty list instead of a class with no objects.
-                return []
-            if return_base_tuple:
-                # The caller expects a tuple, lets just give it to them.
-                return res
-            # Everything is a tuple in a resultset from the unified interface
-            # but for objects, our model expects just object access,
-            # so we extract and return them.
-            return [r[0] for r in res]
+        # We have a sqlalchemy.sql.selectable.Select
+        # (most likely) which utilizes the unified select interface.
+        res = session.execute(query).fetchall()
+        if len(res) == 0:
+            # Return an empty list instead of a class with no objects.
+            return []
+        if return_base_tuple:
+            # The caller expects a tuple, lets just give it to them.
+            return [tuple(r) for r in res]
+        # Everything is a tuple in a resultset from the unified interface
+        # but for objects, our model expects just object access,
+        # so we extract and return them.
+        ref = [r[0] for r in res]
+    # Return the results to the caller, outside of the session context
+    # if an ORM object, because we want the session to close.
+    return ref
 
 
 def _filter_active_conductors(query, interval=None):
     if interval is None:
         interval = CONF.conductor.heartbeat_timeout
-    limit = timeutils.utcnow() - datetime.timedelta(seconds=interval)
-
-    query = (query.filter(models.Conductor.online.is_(True))
-             .filter(models.Conductor.updated_at >= limit))
+    if not utils.is_ironic_using_sqlite() and interval > 0:
+        # Check for greater than zero because if the value is zero,
+        # then the logic makes no sense.
+        limit = timeutils.utcnow() - datetime.timedelta(seconds=interval)
+        query = (query.filter(models.Conductor.online.is_(True))
+                 .filter(models.Conductor.updated_at >= limit))
+    else:
+        query = query.filter(models.Conductor.online.is_(True))
     return query
 
 
@@ -396,18 +481,27 @@ class Connection(api.Connection):
     _NODE_QUERY_FIELDS = {'console_enabled', 'maintenance', 'retired',
                           'driver', 'resource_class', 'provision_state',
                           'uuid', 'id', 'fault', 'conductor_group',
-                          'owner', 'lessee', 'instance_uuid'}
+                          'owner', 'lessee', 'instance_uuid', 'instance_name'}
     _NODE_IN_QUERY_FIELDS = {'%s_in' % field: field
-                             for field in ('uuid', 'provision_state')}
+                             for field in ('uuid', 'provision_state', 'shard')}
     _NODE_NON_NULL_FILTERS = {'associated': 'instance_uuid',
                               'reserved': 'reservation',
-                              'with_power_state': 'power_state'}
+                              'with_power_state': 'power_state',
+                              'sharded': 'shard'}
     _NODE_FILTERS = ({'chassis_uuid', 'reserved_by_any_of',
                       'provisioned_before', 'inspection_started_before',
-                      'description_contains', 'project'}
+                      'description_contains', 'project', 'include_children',
+                      'parent_node'}
                      | _NODE_QUERY_FIELDS
                      | set(_NODE_IN_QUERY_FIELDS)
                      | set(_NODE_NON_NULL_FILTERS))
+
+    _RUNBOOK_QUERY_FIELDS = {'id', 'uuid', 'name', 'public', 'owner',
+                             'disable_ramdisk'}
+    _RUNBOOK_IN_QUERY_FIELDS = {'%s_in' % field: field
+                                for field in ('id', 'uuid', 'name')}
+    _RUNBOOK_FILTERS = ({'project'} | _RUNBOOK_QUERY_FIELDS
+                        | set(_RUNBOOK_IN_QUERY_FIELDS))
 
     def __init__(self):
         pass
@@ -466,7 +560,42 @@ class Connection(api.Connection):
             project = filters['project']
             query = query.filter((models.Node.owner == project)
                                  | (models.Node.lessee == project))
+        # Determine parent/child node handling
+        if not filters.get('include_children', False):
+            if 'parent_node' in filters:
+                query = query.filter(
+                    models.Node.parent_node == filters.get('parent_node')
+                )
+            else:
+                query = query.filter(models.Node.parent_node == sql.null())
 
+        # The presence of ``include_children`` as a filter results in
+        # a full list of both parents and children being conveyed.
+        return query
+
+    def _validate_runbooks_filters(self, filters):
+        if filters is None:
+            filters = dict()
+        unsupported_filters = set(filters).difference(self._RUNBOOK_FILTERS)
+        if unsupported_filters:
+            msg = _("SqlAlchemy API does not support "
+                    "filtering by %s") % ', '.join(unsupported_filters)
+            raise ValueError(msg)
+        return filters
+
+    def _add_runbooks_filters(self, query, filters):
+        filters = self._validate_runbooks_filters(filters)
+        for field in self._RUNBOOK_QUERY_FIELDS:
+            if field in filters:
+                query = query.filter_by(**{field: filters[field]})
+        for key, field in self._RUNBOOK_IN_QUERY_FIELDS.items():
+            if key in filters:
+                query = query.filter(
+                    getattr(models.Runbook, field).in_(filters[key]))
+        if 'project' in filters:
+            project = filters['project']
+            query = query.filter((models.Runbook.owner == project)
+                                 | (models.Runbook.public))
         return query
 
     def _add_allocations_filters(self, query, filters):
@@ -509,6 +638,10 @@ class Connection(api.Connection):
 
         query = sa.select(*columns)
         query = self._add_nodes_filters(query, filters)
+        # TODO(TheJulia): Why are we paginating this?!?!?!
+        # If we are not using sorting, or any other query magic,
+        # we could likely just do a query execution and
+        # prepare the tuple responses.
         return _paginate_query(models.Node, limit, marker,
                                sort_key, sort_dir, query,
                                return_base_tuple=True)
@@ -615,87 +748,70 @@ class Connection(api.Connection):
         return mapping
 
     @synchronized(RESERVATION_SEMAPHORE, fair=True)
+    @wrap_sqlite_retry
     def _reserve_node_place_lock(self, tag, node_id, node):
-        try:
-            # NOTE(TheJulia): We explicitly do *not* synch the session
-            # so the other actions in the conductor do not become aware
-            # that the lock is in place and believe they hold the lock.
-            # This necessitates an overall lock in the code side, so
-            # we avoid conditions where two separate threads can believe
-            # they hold locks at the same time.
-            with _session_for_write() as session:
-                res = session.execute(
-                    sa.update(models.Node).
-                    where(models.Node.id == node.id).
-                    where(models.Node.reservation == None).  # noqa
-                    values(reservation=tag).
-                    execution_options(synchronize_session=False))
-                session.flush()
-            node = self._get_node_by_id_no_joins(node.id)
-            # NOTE(TheJulia): In SQLAlchemy 2.0 style, we don't
-            # magically get a changed node as they moved from the
-            # many ways to do things to singular ways to do things.
-            if res.rowcount != 1:
-                # Nothing updated and node exists. Must already be
-                # locked.
-                raise exception.NodeLocked(node=node.uuid,
-                                           host=node.reservation)
-        except NoResultFound:
-            # In the event that someone has deleted the node on
-            # another thread.
-            raise exception.NodeNotFound(node=node_id)
+        # NOTE(TheJulia): We explicitly do *not* synch the session
+        # so the other actions in the conductor do not become aware
+        # that the lock is in place and believe they hold the lock.
+        # This necessitates an overall lock in the code side, so
+        # we avoid conditions where two separate threads can believe
+        # they hold locks at the same time.
+        with _session_for_write() as session:
+            res = session.execute(
+                sa.update(models.Node).
+                where(models.Node.id == node.id).
+                where(models.Node.reservation == None).  # noqa
+                values(reservation=tag).
+                execution_options(synchronize_session=False))
+            session.flush()
+        # NOTE(TheJulia): In SQLAlchemy 2.0 style, we don't
+        # magically get a changed node as they moved from the
+        # many ways to do things to singular ways to do things.
+        if res.rowcount != 1:
+            # Nothing updated and node exists. Must already be
+            # locked. Identify who holds it and log.
+            if utils.is_ironic_using_sqlite():
+                lock_holder = CONF.host
+            else:
+                lock_holder = self._get_node_reservation(node.id).reservation
+            raise exception.NodeLocked(node=node.uuid, host=lock_holder)
 
     @oslo_db_api.retry_on_deadlock
     def reserve_node(self, tag, node_id):
-        with _session_for_read() as session:
-            try:
-                # TODO(TheJulia): Figure out a good way to query
-                # this so that we do it as light as possible without
-                # the full object invocation, which will speed lock
-                # activities. Granted, this is all at the DB level
-                # so maybe that is okay in the grand scheme of things.
-                query = session.query(models.Node)
-                query = add_identity_filter(query, node_id)
-                node = query.one()
-            except NoResultFound:
-                raise exception.NodeNotFound(node=node_id)
-            if node.reservation:
-                # Fail fast, instead of attempt the update.
-                raise exception.NodeLocked(node=node.uuid,
-                                           host=node.reservation)
+        # Check existence and convert UUID to ID
+        node = self._get_node_reservation(node_id)
+        if node.reservation:
+            # Fail fast, instead of attempt the update.
+            raise exception.NodeLocked(node=node.uuid, host=node.reservation)
+
         self._reserve_node_place_lock(tag, node_id, node)
         # Return a node object as that is the contract for this method.
         return self.get_node_by_id(node.id)
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def release_node(self, tag, node_id):
-        with _session_for_read() as session:
-            try:
-                query = session.query(models.Node)
-                query = add_identity_filter(query, node_id)
-                node = query.one()
-            except NoResultFound:
-                raise exception.NodeNotFound(node=node_id)
-        with _session_for_write() as session:
-            try:
-                res = session.execute(
-                    sa.update(models.Node).
-                    where(models.Node.id == node.id).
-                    where(models.Node.reservation == tag).
-                    values(reservation=None).
-                    execution_options(synchronize_session=False)
-                )
-                node = self.get_node_by_id(node.id)
-                if res.rowcount != 1:
-                    if node.reservation is None:
-                        raise exception.NodeNotLocked(node=node.uuid)
-                    else:
-                        raise exception.NodeLocked(node=node.uuid,
-                                                   host=node['reservation'])
-                session.flush()
-            except NoResultFound:
-                raise exception.NodeNotFound(node=node_id)
+        # Check existence and convert UUID to ID
+        node = self._get_node_reservation(node_id)
 
+        with _session_for_write() as session:
+            res = session.execute(
+                sa.update(models.Node).
+                where(models.Node.id == node.id).
+                where(models.Node.reservation == tag).
+                values(reservation=None).
+                execution_options(synchronize_session=False)
+            )
+            session.flush()
+
+        if res.rowcount != 1:
+            if node.reservation is None:
+                raise exception.NodeNotLocked(node=node.uuid)
+            else:
+                raise exception.NodeLocked(node=node.uuid,
+                                           host=node.reservation)
+
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def create_node(self, values):
         # ensure defaults are present for new nodes
@@ -739,49 +855,57 @@ class Connection(api.Connection):
             raise exception.NodeAlreadyExists(uuid=values['uuid'])
         return node
 
-    def _get_node_by_id_no_joins(self, node_id):
-        # TODO(TheJulia): Maybe replace with this with a minimal
-        # "get these three fields" thing.
-        try:
-            with _session_for_read() as session:
-                # Explicitly load NodeBase as the invocation of the
-                # priamary model object reesults in the join query
-                # triggering.
-                return session.execute(
-                    sa.select(models.NodeBase).filter_by(id=node_id).limit(1)
-                ).scalars().first()
-        except NoResultFound:
+    def _get_node_reservation(self, node_id):
+        with _session_for_read() as session:
+            # Explicitly load NodeBase as the invocation of the
+            # primary model object results in the join query
+            # triggering.
+            res = session.execute(
+                add_identity_filter(
+                    sa.select(models.NodeBase.id,
+                              models.NodeBase.uuid,
+                              models.NodeBase.reservation),
+                    node_id
+                ).limit(1)
+            ).first()
+
+        if res is None:
             raise exception.NodeNotFound(node=node_id)
+        else:
+            return res
 
     def get_node_by_id(self, node_id):
         try:
             query = _get_node_select()
             with _session_for_read() as session:
-                return session.scalars(
+                res = session.scalars(
                     query.filter_by(id=node_id).limit(1)
                 ).unique().one()
         except NoResultFound:
             raise exception.NodeNotFound(node=node_id)
+        return res
 
     def get_node_by_uuid(self, node_uuid):
         try:
             query = _get_node_select()
             with _session_for_read() as session:
-                return session.scalars(
+                res = session.scalars(
                     query.filter_by(uuid=node_uuid).limit(1)
                 ).unique().one()
         except NoResultFound:
             raise exception.NodeNotFound(node=node_uuid)
+        return res
 
     def get_node_by_name(self, node_name):
         try:
             query = _get_node_select()
             with _session_for_read() as session:
-                return session.scalars(
+                res = session.scalars(
                     query.filter_by(name=node_name).limit(1)
                 ).unique().one()
         except NoResultFound:
             raise exception.NodeNotFound(node=node_name)
+        return res
 
     def get_node_by_instance(self, instance):
         if not uuidutils.is_uuid_like(instance):
@@ -790,12 +914,14 @@ class Connection(api.Connection):
         try:
             query = _get_node_select()
             with _session_for_read() as session:
-                return session.scalars(
+                res = session.scalars(
                     query.filter_by(instance_uuid=instance).limit(1)
                 ).unique().one()
         except NoResultFound:
             raise exception.InstanceNotFound(instance_uuid=instance)
+        return res
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def destroy_node(self, node_id):
         with _session_for_write() as session:
@@ -864,8 +990,14 @@ class Connection(api.Connection):
                 models.NodeInventory).filter_by(node_id=node_id)
             inventory_query.delete()
 
+            # delete all firmware components attached to the node
+            firmware_component_query = session.query(
+                models.FirmwareComponent).filter_by(node_id=node_id)
+            firmware_component_query.delete()
+
             query.delete()
 
+    @wrap_sqlite_retry
     def update_node(self, node_id, values):
         # NOTE(dtantsur): this can lead to very strange errors
         if 'uuid' in values:
@@ -903,11 +1035,13 @@ class Connection(api.Connection):
                 if values['provision_state'] == states.INSPECTING:
                     values['inspection_started_at'] = timeutils.utcnow()
                     values['inspection_finished_at'] = None
-                elif (ref.provision_state == states.INSPECTING
+                elif ((ref.provision_state == states.INSPECTING
+                       or ref.provision_state == states.INSPECTWAIT)
                       and values['provision_state'] == states.MANAGEABLE):
                     values['inspection_finished_at'] = timeutils.utcnow()
                     values['inspection_started_at'] = None
-                elif (ref.provision_state == states.INSPECTING
+                elif ((ref.provision_state == states.INSPECTING
+                       or ref.provision_state == states.INSPECTWAIT)
                       and values['provision_state'] == states.INSPECTFAIL):
                     values['inspection_started_at'] = None
 
@@ -920,74 +1054,105 @@ class Connection(api.Connection):
         # use the proper execution format for SQLAlchemy 2.0. Likely
         # A query, independent update, and a re-query on the transaction.
         with _session_for_read() as session:
-            return session.execute(query).one()[0]
+            res = session.execute(query).one()[0]
+        return res
 
     def get_port_by_id(self, port_id):
-        query = model_query(models.Port).filter_by(id=port_id)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.Port).filter_by(id=port_id)
+                res = query.one()
         except NoResultFound:
             raise exception.PortNotFound(port=port_id)
+        return res
 
     def get_port_by_uuid(self, port_uuid):
-        query = model_query(models.Port).filter_by(uuid=port_uuid)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.Port).filter_by(uuid=port_uuid)
+                res = query.one()
         except NoResultFound:
             raise exception.PortNotFound(port=port_uuid)
+        return res
 
     def get_port_by_address(self, address, owner=None, project=None):
-        query = model_query(models.Port).filter_by(address=address)
-        if owner:
-            query = add_port_filter_by_node_owner(query, owner)
-        elif project:
-            query = add_port_filter_by_node_project(query, project)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.Port).filter_by(address=address)
+                if owner:
+                    query = add_port_filter_by_node_owner(query, owner)
+                elif project:
+                    query = add_port_filter_by_node_project(query, project)
+                res = query.one()
         except NoResultFound:
             raise exception.PortNotFound(port=address)
+        return res
 
     def get_port_by_name(self, port_name):
-        query = model_query(models.Port).filter_by(name=port_name)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.Port).filter_by(name=port_name)
+                res = query.one()
         except NoResultFound:
             raise exception.PortNotFound(port=port_name)
+        return res
 
     def get_port_list(self, limit=None, marker=None,
                       sort_key=None, sort_dir=None, owner=None,
-                      project=None):
+                      project=None, conductor_groups=None, filters=None):
         query = sa.select(models.Port)
+
         if owner:
             query = add_port_filter_by_node_owner(query, owner)
         elif project:
             query = add_port_filter_by_node_project(query, project)
+        query = add_port_filter_description_contains(query, filters)
+        query = add_port_filter_by_node_conductor_groups(query,
+                                                         conductor_groups)
         return _paginate_query(models.Port, limit, marker,
                                sort_key, sort_dir, query)
 
+    def get_ports_by_shards(self, shards, limit=None, marker=None,
+                            sort_key=None, sort_dir=None,
+                            project=None, filters=None):
+        shard_node_ids = sa.select(models.Node) \
+            .where(models.Node.shard.in_(shards)) \
+            .with_only_columns(models.Node.id)
+        query = sa.select(models.Port) \
+            .where(models.Port.node_id.in_(shard_node_ids))
+
+        if project:
+            query = add_port_filter_by_node_project(query, project)
+        query = add_port_filter_description_contains(query, filters)
+        return _paginate_query(
+            models.Port, limit, marker, sort_key, sort_dir, query)
+
     def get_ports_by_node_id(self, node_id, limit=None, marker=None,
                              sort_key=None, sort_dir=None, owner=None,
-                             project=None):
+                             project=None, filters=None):
         query = sa.select(models.Port).where(models.Port.node_id == node_id)
         if owner:
             query = add_port_filter_by_node_owner(query, owner)
         elif project:
             query = add_port_filter_by_node_project(query, project)
+        query = add_port_filter_description_contains(query, filters)
         return _paginate_query(models.Port, limit, marker,
                                sort_key, sort_dir, query)
 
     def get_ports_by_portgroup_id(self, portgroup_id, limit=None, marker=None,
                                   sort_key=None, sort_dir=None, owner=None,
-                                  project=None):
+                                  project=None, filters=None):
         query = sa.select(models.Port).where(
             models.Port.portgroup_id == portgroup_id)
         if owner:
             query = add_port_filter_by_node_owner(query, owner)
         elif project:
             query = add_port_filter_by_node_project(query, project)
+        query = add_port_filter_description_contains(query, filters)
         return _paginate_query(models.Port, limit, marker,
                                sort_key, sort_dir, query)
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def create_port(self, values):
         if not values.get('uuid'):
@@ -1005,6 +1170,7 @@ class Connection(api.Connection):
             raise exception.PortAlreadyExists(uuid=values['uuid'])
         return port
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def update_port(self, port_id, values):
         # NOTE(dtantsur): this can lead to very strange errors
@@ -1027,6 +1193,7 @@ class Connection(api.Connection):
                 raise exception.MACAlreadyExists(mac=values['address'])
         return ref
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def destroy_port(self, port_id):
         with _session_for_write() as session:
@@ -1037,40 +1204,56 @@ class Connection(api.Connection):
                 raise exception.PortNotFound(port=port_id)
 
     def get_portgroup_by_id(self, portgroup_id, project=None):
-        query = model_query(models.Portgroup).filter_by(id=portgroup_id)
-        if project:
-            query = add_portgroup_filter_by_node_project(query, project)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.Portgroup).filter_by(
+                    id=portgroup_id)
+                if project:
+                    query = add_portgroup_filter_by_node_project(query,
+                                                                 project)
+                res = query.one()
         except NoResultFound:
             raise exception.PortgroupNotFound(portgroup=portgroup_id)
+        return res
 
     def get_portgroup_by_uuid(self, portgroup_uuid):
-        query = model_query(models.Portgroup).filter_by(uuid=portgroup_uuid)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.Portgroup).filter_by(
+                    uuid=portgroup_uuid)
+                res = query.one()
         except NoResultFound:
             raise exception.PortgroupNotFound(portgroup=portgroup_uuid)
+        return res
 
     def get_portgroup_by_address(self, address, project=None):
-        query = model_query(models.Portgroup).filter_by(address=address)
-        if project:
-            query = add_portgroup_filter_by_node_project(query, project)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.Portgroup).filter_by(
+                    address=address)
+                if project:
+                    query = add_portgroup_filter_by_node_project(query,
+                                                                 project)
+                res = query.one()
         except NoResultFound:
             raise exception.PortgroupNotFound(portgroup=address)
+        return res
 
     def get_portgroup_by_name(self, name):
-        query = model_query(models.Portgroup).filter_by(name=name)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.Portgroup).filter_by(name=name)
+                res = query.one()
         except NoResultFound:
             raise exception.PortgroupNotFound(portgroup=name)
+        return res
 
     def get_portgroup_list(self, limit=None, marker=None,
-                           sort_key=None, sort_dir=None, project=None):
+                           sort_key=None, sort_dir=None, project=None,
+                           conductor_groups=None, filters=None):
         query = sa.select(models.Portgroup)
+        query = add_portgroup_filter_by_node_conductor_groups(
+            query, conductor_groups)
         if project:
             query = add_portgroup_filter_by_node_project(query, project)
         return _paginate_query(models.Portgroup, limit, marker,
@@ -1084,6 +1267,19 @@ class Connection(api.Connection):
             query = add_portgroup_filter_by_node_project(query, project)
         return _paginate_query(models.Portgroup, limit, marker,
                                sort_key, sort_dir, query)
+
+    def get_portgroups_by_shards(self, shards, limit=None, marker=None,
+                                 sort_key=None, sort_dir=None, project=None):
+        shard_node_ids = sa.select(models.Node) \
+            .where(models.Node.shard.in_(shards)) \
+            .with_only_columns(models.Node.id)
+        query = sa.select(models.Portgroup) \
+            .where(models.Portgroup.node_id.in_(shard_node_ids))
+
+        if project:
+            query = add_portgroup_filter_by_node_project(query, project)
+        return _paginate_query(
+            models.Portgroup, limit, marker, sort_key, sort_dir, query)
 
     @oslo_db_api.retry_on_deadlock
     def create_portgroup(self, values):
@@ -1105,7 +1301,7 @@ class Connection(api.Connection):
                     raise exception.PortgroupMACAlreadyExists(
                         mac=values['address'])
                 raise exception.PortgroupAlreadyExists(uuid=values['uuid'])
-            return portgroup
+        return portgroup
 
     @oslo_db_api.retry_on_deadlock
     def update_portgroup(self, portgroup_id, values):
@@ -1130,17 +1326,20 @@ class Connection(api.Connection):
                         mac=values['address'])
                 else:
                     raise
-            return ref
+        return ref
 
     @oslo_db_api.retry_on_deadlock
     def destroy_portgroup(self, portgroup_id):
         def portgroup_not_empty(session):
             """Checks whether the portgroup does not have ports."""
-            with _session_for_read() as session:
-                return session.scalar(
-                    sa.select(
-                        sa.func.count(models.Port.id)
-                    ).where(models.Port.portgroup_id == portgroup_id)) != 0
+            res = session.scalar(
+                sa.select(
+                    sa.func.count(models.Port.id)
+                ).join(
+                    models.Portgroup,
+                    models.Port.portgroup_id == models.Portgroup.id
+                ).where(models.Port.portgroup_id == portgroup_id)) != 0
+            return res
 
         with _session_for_write() as session:
             if portgroup_not_empty(session):
@@ -1159,9 +1358,10 @@ class Connection(api.Connection):
 
         try:
             with _session_for_read() as session:
-                return session.execute(query).one()[0]
+                res = session.execute(query).one()[0]
         except NoResultFound:
             raise exception.ChassisNotFound(chassis=chassis_id)
+        return res
 
     def get_chassis_by_uuid(self, chassis_uuid):
         query = sa.select(models.Chassis).where(
@@ -1169,9 +1369,10 @@ class Connection(api.Connection):
 
         try:
             with _session_for_read() as session:
-                return session.execute(query).one()[0]
+                res = session.execute(query).one()[0]
         except NoResultFound:
             raise exception.ChassisNotFound(chassis=chassis_uuid)
+        return res
 
     def get_chassis_list(self, limit=None, marker=None,
                          sort_key=None, sort_dir=None):
@@ -1259,7 +1460,7 @@ class Connection(api.Connection):
                 query = query.where(models.Conductor.online == online)
             with _session_for_read() as session:
                 res = session.execute(query).one()[0]
-                return res
+            return res
         except NoResultFound:
             raise exception.ConductorNotFound(conductor=hostname)
 
@@ -1275,13 +1476,58 @@ class Connection(api.Connection):
                 raise exception.ConductorNotFound(conductor=hostname)
 
     @oslo_db_api.retry_on_deadlock
-    def touch_conductor(self, hostname):
+    def delete_conductor(self, hostname):
+        with _session_for_write() as session:
+
+            # Before deleting the conductor, we clear any node
+            # reservations to prevent nodes from being left in a reserved
+            # state by a non-existent conductor which could block other
+            # conductors from managing those nodes.
+            self.clear_node_reservations_for_conductor(hostname)
+
+            # Reset state to prevent transitional or inconsistent states and
+            # orphaned power state requests after deletion.
+            self.clear_node_target_power_state(hostname)
+
+            conductor_id_subquery = (
+                session.query(models.Conductor.id).where(
+                    models.Conductor.hostname == hostname
+                ).scalar_subquery()
+            )
+
+            # Clear conductor_affinity FK references.
+            session.execute(
+                sa.update(models.Node).where(
+                    models.Node.conductor_affinity == conductor_id_subquery
+                ).values(conductor_affinity=None)
+            )
+
+            # Delete conductor hardware interfaces
+            query = sa.delete(models.ConductorHardwareInterfaces).where(
+                models.ConductorHardwareInterfaces.conductor_id
+                == conductor_id_subquery
+            )
+            session.execute(query)
+
+            query = sa.delete(models.Conductor).where(
+                models.Conductor.hostname == hostname
+            )
+            result = session.execute(query)
+            count = result.rowcount
+            if count == 0:
+                raise exception.ConductorNotFound(conductor=hostname)
+
+            LOG.info('Deleted conductor with hostname %(hostname)s',
+                     {'hostname': hostname})
+
+    @oslo_db_api.retry_on_deadlock
+    def touch_conductor(self, hostname, online=True):
         with _session_for_write() as session:
             query = sa.update(models.Conductor).where(
                 models.Conductor.hostname == hostname
             ).values({
                 'updated_at': timeutils.utcnow(),
-                'online': True}
+                'online': online}
             ).execution_options(synchronize_session=False)
             res = session.execute(query)
             count = res.rowcount
@@ -1326,6 +1572,12 @@ class Connection(api.Connection):
 
     def get_active_hardware_type_dict(self, use_groups=False):
         with _session_for_read() as session:
+            # TODO(TheJulia): We should likely take a look at this
+            # joined query, as we may not be getting what we expect.
+            # Metal3 logs upwards of 200 rows returned with multiple datetime
+            # columns.
+            # Given dualing datetime fields, we really can't just expect
+            # requesting a unique set to "just work".
             query = (session.query(models.ConductorHardwareInterfaces,
                                    models.Conductor)
                      .join(models.Conductor))
@@ -1344,11 +1596,18 @@ class Connection(api.Connection):
     def get_offline_conductors(self, field='hostname'):
         with _session_for_read() as session:
             field = getattr(models.Conductor, field)
-            interval = CONF.conductor.heartbeat_timeout
-            limit = timeutils.utcnow() - datetime.timedelta(seconds=interval)
-            result = (session.query(field)
-                      .filter(models.Conductor.updated_at < limit))
-            return [row[0] for row in result]
+            if not utils.is_ironic_using_sqlite():
+                interval = CONF.conductor.heartbeat_timeout
+                limit = (timeutils.utcnow()
+                         - datetime.timedelta(seconds=interval))
+                result = (session.query(field)
+                          .filter(models.Conductor.updated_at < limit))
+            else:
+                result = session.query(
+                    field
+                ).filter(models.Conductor.online.is_(False))
+            result = [row[0] for row in result]
+        return result
 
     def get_online_conductors(self):
         with _session_for_read() as session:
@@ -1360,16 +1619,19 @@ class Connection(api.Connection):
         with _session_for_read() as session:
             query = (session.query(models.ConductorHardwareInterfaces)
                      .filter_by(conductor_id=conductor_id))
-            return query.all()
+            ref = query.all()
+        return ref
 
     def list_hardware_type_interfaces(self, hardware_types):
         with _session_for_read() as session:
-            query = (session.query(models.ConductorHardwareInterfaces)
+            query = (session.query(models.ConductorHardwareInterfaces,
+                                   models.Conductor)
+                     .join(models.Conductor)
                      .filter(models.ConductorHardwareInterfaces.hardware_type
                              .in_(hardware_types)))
 
             query = _filter_active_conductors(query)
-            return query.all()
+            return [row[0] for row in query]
 
     @oslo_db_api.retry_on_deadlock
     def register_conductor_hardware_interfaces(self, conductor_id, interfaces):
@@ -1380,6 +1642,8 @@ class Connection(api.Connection):
                     conductor_hw_iface['conductor_id'] = conductor_id
                     for k, v in iface.items():
                         conductor_hw_iface[k] = v
+                    # TODO(TheJulia): Uhh... We should try to do this as one
+                    # bulk operation and not insert each row.
                     session.add(conductor_hw_iface)
                 session.flush()
             except db_exc.DBDuplicateEntry as e:
@@ -1394,6 +1658,7 @@ class Connection(api.Connection):
                      .filter_by(conductor_id=conductor_id))
             query.delete()
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def touch_node_provisioning(self, node_id):
         with _session_for_write() as session:
@@ -1485,7 +1750,7 @@ class Connection(api.Connection):
                 _('Node with port addresses %s was not found')
                 % addresses)
         except MultipleResultsFound:
-            raise exception.NodeNotFound(
+            raise exception.DuplicateNodeOnLookup(
                 _('Multiple nodes with port addresses %s were found')
                 % addresses)
 
@@ -1498,19 +1763,24 @@ class Connection(api.Connection):
                                sort_key, sort_dir, query)
 
     def get_volume_connector_by_id(self, db_id):
-        query = model_query(models.VolumeConnector).filter_by(id=db_id)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.VolumeConnector).filter_by(
+                    id=db_id)
+                res = query.one()
         except NoResultFound:
             raise exception.VolumeConnectorNotFound(connector=db_id)
+        return res
 
     def get_volume_connector_by_uuid(self, connector_uuid):
-        query = model_query(models.VolumeConnector).filter_by(
-            uuid=connector_uuid)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.VolumeConnector).filter_by(
+                    uuid=connector_uuid)
+                res = query.one()
         except NoResultFound:
             raise exception.VolumeConnectorNotFound(connector=connector_uuid)
+        return res
 
     def get_volume_connectors_by_node_id(self, node_id, limit=None,
                                          marker=None, sort_key=None,
@@ -1518,7 +1788,7 @@ class Connection(api.Connection):
         query = sa.select(models.VolumeConnector).where(
             models.VolumeConnector.node_id == node_id)
         if project:
-            add_volume_conn_filter_by_node_project(query, project)
+            query = add_volume_conn_filter_by_node_project(query, project)
         return _paginate_query(models.VolumeConnector, limit, marker,
                                sort_key, sort_dir, query)
 
@@ -1584,19 +1854,24 @@ class Connection(api.Connection):
                                sort_key, sort_dir, query)
 
     def get_volume_target_by_id(self, db_id):
-        query = model_query(models.VolumeTarget).where(
-            models.VolumeTarget.id == db_id)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.VolumeTarget).where(
+                    models.VolumeTarget.id == db_id)
+                res = query.one()
         except NoResultFound:
             raise exception.VolumeTargetNotFound(target=db_id)
+        return res
 
     def get_volume_target_by_uuid(self, uuid):
-        query = model_query(models.VolumeTarget).filter_by(uuid=uuid)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.VolumeTarget).filter_by(
+                    uuid=uuid)
+                res = query.one()
         except NoResultFound:
             raise exception.VolumeTargetNotFound(target=uuid)
+        return res
 
     def get_volume_targets_by_node_id(self, node_id, limit=None, marker=None,
                                       sort_key=None, sort_dir=None,
@@ -1604,7 +1879,7 @@ class Connection(api.Connection):
         query = sa.select(models.VolumeTarget).where(
             models.VolumeTarget.node_id == node_id)
         if project:
-            add_volume_target_filter_by_node_project(query, project)
+            query = add_volume_target_filter_by_node_project(query, project)
         return _paginate_query(models.VolumeTarget, limit, marker, sort_key,
                                sort_dir, query)
 
@@ -1667,31 +1942,6 @@ class Connection(api.Connection):
             if count == 0:
                 raise exception.VolumeTargetNotFound(target=ident)
 
-    def get_not_versions(self, model_name, versions):
-        """Returns objects with versions that are not the specified versions.
-
-        This returns objects with versions that are not the specified versions.
-        Objects with null versions (there shouldn't be any) are also returned.
-
-        :param model_name: the name of the model (class) of desired objects
-        :param versions: list of versions of objects not to be returned
-        :returns: list of the DB objects
-        :raises: IronicException if there is no class associated with the name
-        """
-        if not versions:
-            return []
-
-        if model_name == 'Node':
-            model_name = 'NodeBase'
-        model = models.get_class(model_name)
-
-        # NOTE(rloo): .notin_ does not handle null:
-        # http://docs.sqlalchemy.org/en/latest/core/sqlelement.html#sqlalchemy.sql.operators.ColumnOperators.notin_
-        query = model_query(model).filter(
-            sql.or_(model.version == sql.null(),
-                    model.version.notin_(versions)))
-        return query.all()
-
     def check_versions(self, ignore_models=(), permit_initial_version=False):
         """Checks the whole database for incompatible objects.
 
@@ -1726,12 +1976,14 @@ class Connection(api.Connection):
             if not supported_versions:
                 continue
 
-            if permit_initial_version and supported_versions == {'1.0'}:
+            if permit_initial_version and '1.0' in supported_versions:
                 # We're getting called from someplace it is okay to handle
                 # a missing table, i.e. database upgrades which will create
-                # the table *and* the field version is 1.0, which means we
-                # are likely about to *create* the table, but first have to
-                # pass the version/compatability checking logic.
+                # the table *and* the initial version 1.0 is still in the
+                # set of supported versions, which means the object was
+                # introduced recently enough that the table may not exist
+                # yet on the source database. We have to pass the
+                # version/compatibility checking logic first.
                 table_missing_ok = True
 
             # NOTE(mgagne): Additional safety check to detect old database
@@ -1763,11 +2015,12 @@ class Connection(api.Connection):
             #             compatible with its (old) DB representation.
             # NOTE(rloo): .notin_ does not handle null:
             # http://docs.sqlalchemy.org/en/latest/core/sqlelement.html#sqlalchemy.sql.operators.ColumnOperators.notin_
-            query = model_query(model.version).filter(
-                sql.or_(model.version == sql.null(),
-                        model.version.notin_(supported_versions)))
-            if query.count():
-                return False
+            with _session_for_read() as session:
+                query = session.query(model.version).filter(
+                    sql.or_(model.version == sql.null(),
+                            model.version.notin_(supported_versions)))
+                if query.count():
+                    return False
 
         return True
 
@@ -1819,6 +2072,9 @@ class Connection(api.Connection):
         max_to_migrate = max_count or total_to_migrate
 
         for model in sql_models:
+            use_node_id = False
+            if (not hasattr(model, 'id') and hasattr(model, 'node_id')):
+                use_node_id = True
             version = mapping[model.__name__][0]
             num_migrated = 0
             with _session_for_write() as session:
@@ -1832,13 +2088,27 @@ class Connection(api.Connection):
                     # max_to_migrate objects.
                     ids = []
                     for obj in query.slice(0, max_to_migrate):
-                        ids.append(obj['id'])
-                    num_migrated = (
-                        session.query(model).
-                        filter(sql.and_(model.id.in_(ids),
-                                        model.version != version)).
-                        update({model.version: version},
-                               synchronize_session=False))
+                        if not use_node_id:
+                            ids.append(obj['id'])
+                        else:
+                            # BIOSSettings, NodeTrait, NodeTag do not have id
+                            # columns, fallback to node_id as they both have
+                            # it.
+                            ids.append(obj['node_id'])
+                    if not use_node_id:
+                        num_migrated = (
+                            session.query(model).
+                            filter(sql.and_(model.id.in_(ids),
+                                            model.version != version)).
+                            update({model.version: version},
+                                   synchronize_session=False))
+                    else:
+                        num_migrated = (
+                            session.query(model).
+                            filter(sql.and_(model.node_id.in_(ids),
+                                            model.version != version)).
+                            update({model.version: version},
+                                   synchronize_session=False))
                 else:
                     num_migrated = (
                         session.query(model).
@@ -1852,6 +2122,115 @@ class Connection(api.Connection):
                 break
 
         return total_to_migrate, total_migrated
+
+    @oslo_db_api.retry_on_deadlock
+    def migrate_to_builtin_inspection(self, context, max_count):
+        """Handle the migration from "inspector" to "agent" inspection.
+
+        :param context: the admin context
+        :param max_count: The maximum number of objects to migrate. Must be
+                          >= 0. If zero, all the objects will be migrated.
+        :returns: A 2-tuple, 1. the total number of objects that need to be
+                  migrated (at the beginning of this call) and 2. the number
+                  of migrated objects.
+        """
+        # TODO(dtantsur): remove this check when removing inspector and just
+        # unconditionally migrate everything.
+        if ('agent' not in CONF.enabled_inspect_interfaces
+                or 'inspector' in CONF.enabled_inspect_interfaces):
+            return 0, 0
+
+        model = models.Node
+
+        with _session_for_read() as session:
+            # NOTE(dtantsur): this is the total number of objects, including
+            # the ones that are on inspection and cannot be migrated.
+            total_to_migrate = session.query(model).filter(
+                model.inspect_interface == 'inspector').count()
+
+        if not total_to_migrate:
+            return 0, 0
+
+        no_states = [states.INSPECTING, states.INSPECTWAIT, states.INSPECTFAIL]
+
+        with _session_for_write() as session:
+            query = session.query(model).filter(
+                sql.and_(model.inspect_interface == 'inspector',
+                         model.provision_state.not_in(no_states)))
+            # NOTE(rloo) Caution here; after doing query.count(), it is
+            #            possible that the value is different in the
+            #            next invocation of the query.
+            total_count = query.count()
+            if not total_count:
+                return 0, 0
+            elif max_count and max_count < total_count:
+                # Only want to update max_count objects; cannot use
+                # sql's limit(), so we generate a new query with
+                # max_count objects.
+                ids = [obj['id'] for obj in query.slice(0, max_count)]
+                num_migrated = (
+                    session.query(model).
+                    filter(sql.and_(model.id.in_(ids),
+                                    model.inspect_interface == 'inspector',
+                                    model.provision_state.not_in(no_states))).
+                    update({model.inspect_interface: 'agent'},
+                           synchronize_session=False))
+            else:
+                num_migrated = (
+                    session.query(model).
+                    filter(sql.and_(model.inspect_interface == 'inspector',
+                                    model.provision_state.not_in(no_states))).
+                    update({model.inspect_interface: 'agent'},
+                           synchronize_session=False))
+
+        return total_to_migrate, num_migrated
+
+    def migrate_runbook_names_to_traits(self, context, max_count):
+        """Migrate runbook names to runbook_traits table.
+
+        This migrates existing runbooks that don't have any traits yet by
+        creating a trait entry in runbook_traits that matches the runbook's
+        name. This preserves backward compatibility when the trait matching
+        logic was changed from name-based to trait-based.
+
+        :param context: the admin context
+        :param max_count: The maximum number of objects to migrate. Must be
+                          >= 0. If zero, all the objects will be migrated.
+        :returns: A 2-tuple, 1. the total number of objects that need to be
+                  migrated (at the beginning of this call) and 2. the number
+                  of migrated objects.
+        """
+        with _session_for_write() as session:
+            # Find runbooks that have no traits yet - these need migration
+            # Use a LEFT JOIN to find runbooks without any traits
+            query = (session.query(models.Runbook)
+                     .outerjoin(models.RunbookTrait,
+                                models.Runbook.id
+                                == models.RunbookTrait.runbook_id)
+                     .filter(models.RunbookTrait.runbook_id.is_(None)))
+
+            total_to_migrate = query.count()
+            if not total_to_migrate:
+                return 0, 0
+
+            if max_count and max_count < total_to_migrate:
+                runbooks_to_migrate = query.slice(0, max_count)
+            else:
+                runbooks_to_migrate = query
+
+            num_migrated = 0
+            for runbook in runbooks_to_migrate:
+                # Create a trait entry matching the runbook name
+                trait = models.RunbookTrait(
+                    runbook_id=runbook.id,
+                    trait=runbook.name,
+                    version='1.0')
+                session.add(trait)
+                num_migrated += 1
+
+            session.flush()
+
+        return total_to_migrate, num_migrated
 
     @staticmethod
     def _verify_max_traits_per_node(node_id, num_traits):
@@ -1942,6 +2321,7 @@ class Connection(api.Connection):
                 models.NodeTrait).filter_by(node_id=node_id, trait=trait)
             return session.query(q.exists()).scalar()
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def create_bios_setting_list(self, node_id, settings, version):
         bios_settings = []
@@ -1971,6 +2351,7 @@ class Connection(api.Connection):
                     node=node_id, name=setting['name'])
         return bios_settings
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def update_bios_setting_list(self, node_id, settings, version):
         bios_settings = []
@@ -2002,6 +2383,7 @@ class Connection(api.Connection):
                     node=node_id, name=setting['name'])
         return bios_settings
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def delete_bios_setting_list(self, node_id, names):
         missing_bios_settings = []
@@ -2046,9 +2428,10 @@ class Connection(api.Connection):
             query = session.query(models.Allocation).filter_by(
                 id=allocation_id)
             try:
-                return query.one()
+                ref = query.one()
             except NoResultFound:
                 raise exception.AllocationNotFound(allocation=allocation_id)
+        return ref
 
     def get_allocation_by_uuid(self, allocation_uuid):
         """Return an allocation representation.
@@ -2061,9 +2444,10 @@ class Connection(api.Connection):
             query = session.query(models.Allocation).filter_by(
                 uuid=allocation_uuid)
             try:
-                return query.one()
+                ref = query.one()
             except NoResultFound:
                 raise exception.AllocationNotFound(allocation=allocation_uuid)
+        return ref
 
     def get_allocation_by_name(self, name):
         """Return an allocation representation.
@@ -2075,9 +2459,10 @@ class Connection(api.Connection):
         with _session_for_read() as session:
             query = session.query(models.Allocation).filter_by(name=name)
             try:
-                return query.one()
+                ref = query.one()
             except NoResultFound:
                 raise exception.AllocationNotFound(allocation=name)
+        return ref
 
     def get_allocation_list(self, filters=None, limit=None, marker=None,
                             sort_key=None, sort_dir=None):
@@ -2153,8 +2538,8 @@ class Connection(api.Connection):
         # initialized, but set them to None just in case.
         instance_uuid = node_uuid = None
 
-        with _session_for_write() as session:
-            try:
+        try:
+            with _session_for_write() as session:
                 query = session.query(models.Allocation)
                 query = add_identity_filter(query, allocation_id)
                 ref = query.one()
@@ -2174,20 +2559,26 @@ class Connection(api.Connection):
                                  'instance_uuid': instance_uuid,
                                  'instance_info': iinfo})
                 session.flush()
-            except NoResultFound:
-                raise exception.AllocationNotFound(allocation=allocation_id)
-            except db_exc.DBDuplicateEntry as exc:
-                if 'name' in exc.columns:
-                    raise exception.AllocationDuplicateName(
-                        name=values['name'])
-                elif 'instance_uuid' in exc.columns:
-                    # Case when the allocation UUID is already used on some
-                    # node as instance_uuid.
-                    raise exception.InstanceAssociated(
-                        instance_uuid=instance_uuid, node=node_uuid)
-                else:
-                    raise
-            return ref
+            # Perform a separate read so the commit closes out on the write
+            # transaction.
+            with _session_for_read() as session:
+                query = session.query(models.Allocation)
+                query = add_identity_filter(query, allocation_id)
+                ref = query.one()
+        except NoResultFound:
+            raise exception.AllocationNotFound(allocation=allocation_id)
+        except db_exc.DBDuplicateEntry as exc:
+            if 'name' in exc.columns:
+                raise exception.AllocationDuplicateName(
+                    name=values['name'])
+            elif 'instance_uuid' in exc.columns:
+                # Case when the allocation UUID is already used on some
+                # node as instance_uuid.
+                raise exception.InstanceAssociated(
+                    instance_uuid=instance_uuid, node=node_uuid)
+            else:
+                raise
+        return ref
 
     @oslo_db_api.retry_on_deadlock
     def take_over_allocation(self, allocation_id, old_conductor_id,
@@ -2205,8 +2596,8 @@ class Connection(api.Connection):
         :returns: True if the take over was successful, False otherwise.
         :raises: AllocationNotFound
         """
-        with _session_for_write() as session:
-            try:
+        try:
+            with _session_for_write() as session:
                 query = session.query(models.Allocation)
                 query = add_identity_filter(query, allocation_id)
                 # NOTE(dtantsur): the FOR UPDATE clause locks the allocation
@@ -2217,10 +2608,10 @@ class Connection(api.Connection):
 
                 ref.update({'conductor_affinity': new_conductor_id})
                 session.flush()
-            except NoResultFound:
-                raise exception.AllocationNotFound(allocation=allocation_id)
-            else:
-                return True
+        except NoResultFound:
+            raise exception.AllocationNotFound(allocation=allocation_id)
+        else:
+            return True
 
     @oslo_db_api.retry_on_deadlock
     def destroy_allocation(self, allocation_id):
@@ -2234,7 +2625,11 @@ class Connection(api.Connection):
             query = add_identity_filter(query, allocation_id)
 
             try:
-                ref = query.one()
+                # NOTE(TheJulia): We explicitly need to indicate we intend
+                # to update the record so we block until the other users of
+                # the row are free, such as the process to match the
+                # allocation to a node.
+                ref = query.with_for_update().one()
             except NoResultFound:
                 raise exception.AllocationNotFound(allocation=allocation_id)
 
@@ -2348,7 +2743,8 @@ class Connection(api.Connection):
                 # Return the updated template joined with all relevant fields.
                 query = _get_deploy_template_select_with_steps()
                 query = add_identity_filter(query, template_id)
-                return session.execute(query).one()[0]
+                res = session.execute(query).one()[0]
+            return res
         except db_exc.DBDuplicateEntry as e:
             if 'name' in e.columns:
                 raise exception.DeployTemplateDuplicateName(
@@ -2374,9 +2770,9 @@ class Connection(api.Connection):
         query = (_get_deploy_template_select_with_steps()
                  .where(field == value))
         try:
-            # FIXME(TheJulia): This needs to be fixed for SQLAlchemy 2.0
             with _session_for_read() as session:
-                return session.execute(query).one()[0]
+                res = session.execute(query).one()[0]
+            return res
         except NoResultFound:
             raise exception.DeployTemplateNotFound(template=value)
 
@@ -2394,7 +2790,7 @@ class Connection(api.Connection):
 
     def get_deploy_template_list(self, limit=None, marker=None,
                                  sort_key=None, sort_dir=None):
-        query = model_query(models.DeployTemplate).options(
+        query = sa.select(models.DeployTemplate).options(
             selectinload(models.DeployTemplate.steps))
         return _paginate_query(models.DeployTemplate, limit, marker,
                                sort_key, sort_dir, query)
@@ -2409,6 +2805,274 @@ class Connection(api.Connection):
             ).all()
             return [r[0] for r in res]
 
+    @staticmethod
+    def _get_runbook_steps(steps, runbook_id=None):
+        results = []
+        for values in steps:
+            step = models.RunbookStep()
+            step.update(values)
+            if runbook_id:
+                step['runbook_id'] = runbook_id
+            results.append(step)
+        return results
+
+    @oslo_db_api.retry_on_deadlock
+    def create_runbook(self, values):
+        steps = values.get('steps', [])
+        values['steps'] = self._get_runbook_steps(steps)
+        # Deduplicate traits while preserving order so that duplicate values
+        # in a create request do not trigger DBDuplicateEntry on the PK.
+        seen = set()
+        unique_traits = []
+        for t in values.pop('traits', []):
+            if t not in seen:
+                seen.add(t)
+                unique_traits.append(t)
+        # Build RunbookTrait objects without an explicit runbook_id; SQLAlchemy
+        # will populate the FK via the 'traits' relationship when the runbook
+        # is flushed, avoiding a separate flush just to obtain runbook.id.
+        values['traits'] = [
+            models.RunbookTrait(trait=t) for t in unique_traits
+        ]
+
+        runbook = models.Runbook()
+        runbook.update(values)
+        with _session_for_write() as session:
+            try:
+                session.add(runbook)
+                session.flush()
+            except db_exc.DBDuplicateEntry as e:
+                if 'name' in e.columns:
+                    raise exception.RunbookDuplicateName(
+                        name=values['name'])
+                if 'uuid' in e.columns:
+                    raise exception.RunbookAlreadyExists(
+                        uuid=values['uuid'])
+                raise
+        # Re-fetch so that the traits relationship is eagerly loaded within
+        # a fresh read session (the write session above is now closed).
+        return self.get_runbook_by_uuid(runbook.uuid)
+
+    def _update_runbook_steps(self, session, runbook_id, steps):
+        """Update the steps for a runbook.
+
+        :param session: DB session object.
+        :param runbook_id: runbook ID.
+        :param steps: list of steps that should exist for the runbook.
+        """
+
+        def _step_key(step):
+            """Compare two runbook steps."""
+            # NOTE(mgoddard): In python 3, dicts are not orderable so cannot be
+            # used as a sort key. Serialise the step arguments to a JSON string
+            # for comparison. Taken from https://stackoverflow.com/a/22003440.
+            sortable_args = json.dumps(step.args, sort_keys=True)
+            return step.interface, step.step, sortable_args, step.order
+
+        # List all existing steps for the runbook.
+        current_steps = (session.query(models.RunbookStep)
+                         .filter_by(runbook_id=runbook_id))
+
+        # List the new steps for the runbook.
+        new_steps = self._get_runbook_steps(steps, runbook_id)
+
+        # The following is an efficient way to ensure that the steps in the
+        # database match those that have been requested. We compare the current
+        # and requested steps in a single pass using the _zip_matching
+        # function.
+        steps_to_create = []
+        step_ids_to_delete = []
+        for current_step, new_step in _zip_matching(current_steps, new_steps,
+                                                    _step_key):
+            if current_step is None:
+                # No matching current step found for this new step - create.
+                steps_to_create.append(new_step)
+            elif new_step is None:
+                # No matching new step found for this current step - delete.
+                step_ids_to_delete.append(current_step.id)
+            # else: steps match, no work required.
+
+        # Delete and create steps in bulk as necessary.
+        if step_ids_to_delete:
+            ((session.query(models.RunbookStep)
+              .filter(models.RunbookStep.id.in_(step_ids_to_delete)))
+             .delete(synchronize_session=False))
+        if steps_to_create:
+            session.bulk_save_objects(steps_to_create)
+
+    @oslo_db_api.retry_on_deadlock
+    def update_runbook(self, runbook_id, values):
+        if 'uuid' in values:
+            msg = _("Cannot overwrite UUID for an existing runbook.")
+            raise exception.InvalidParameterValue(err=msg)
+
+        try:
+            with _session_for_write() as session:
+                # NOTE(mgoddard): Don't issue a joined query for the update as
+                # this does not work with PostgreSQL.
+                query = session.query(models.Runbook)
+                query = add_identity_filter(query, runbook_id)
+                ref = query.with_for_update().one()
+                # First, update non-step columns.
+                steps = values.pop('steps', None)
+                ref.update(values)
+                # If necessary, update steps.
+                if steps is not None:
+                    self._update_runbook_steps(session, ref.id, steps)
+                session.flush()
+
+            with _session_for_read() as session:
+                # Return the updated runbook joined with all relevant fields.
+                query = _get_runbook_select_with_steps()
+                query = add_identity_filter(query, runbook_id)
+                res = session.execute(query).one()[0]
+            return res
+        except db_exc.DBDuplicateEntry as e:
+            if 'name' in e.columns:
+                raise exception.RunbookDuplicateName(
+                    name=values['name'])
+            raise
+        except NoResultFound:
+            # TODO(TheJulia): What would unified core raise?!?
+            raise exception.RunbookNotFound(
+                runbook=runbook_id)
+
+    @oslo_db_api.retry_on_deadlock
+    def destroy_runbook(self, runbook_id):
+        with _session_for_write() as session:
+            session.query(models.RunbookStep).filter_by(
+                runbook_id=runbook_id).delete()
+            session.query(models.RunbookTrait).filter_by(
+                runbook_id=runbook_id).delete()
+            count = session.query(models.Runbook).filter_by(
+                id=runbook_id).delete()
+            if count == 0:
+                raise exception.RunbookNotFound(runbook=runbook_id)
+
+    def _get_runbook(self, field, value):
+        """Helper method for retrieving a runbook."""
+        query = (_get_runbook_select_with_steps()
+                 .where(field == value))
+        try:
+            with _session_for_read() as session:
+                res = session.execute(query).one()[0]
+            return res
+        except NoResultFound:
+            raise exception.RunbookNotFound(runbook=value)
+
+    def get_runbook_by_id(self, runbook_id):
+        return self._get_runbook(models.Runbook.id,
+                                 runbook_id)
+
+    def get_runbook_by_uuid(self, runbook_uuid):
+        return self._get_runbook(models.Runbook.uuid,
+                                 runbook_uuid)
+
+    def get_runbook_by_name(self, runbook_name):
+        return self._get_runbook(models.Runbook.name,
+                                 runbook_name)
+
+    def get_runbook_list(self, limit=None, marker=None, filters=None,
+                         sort_key=None, sort_dir=None):
+        query = (sa.select(models.Runbook)
+                 .options(selectinload(models.Runbook.steps),
+                          selectinload(models.Runbook.traits)))
+        query = self._add_runbooks_filters(query, filters)
+        return _paginate_query(models.Runbook, limit, marker,
+                               sort_key, sort_dir, query)
+
+    def get_runbook_list_by_names(self, names):
+        query = _get_runbook_select_with_steps()
+        with _session_for_read() as session:
+            res = session.execute(
+                query.where(
+                    models.Runbook.name.in_(names)
+                )
+            ).all()
+            return [r[0] for r in res]
+
+    def _check_runbook_exists(self, session, runbook_id):
+        if not session.query(models.Runbook).where(
+                models.Runbook.id == runbook_id).scalar():
+            raise exception.RunbookNotFound(runbook=runbook_id)
+
+    @oslo_db_api.retry_on_deadlock
+    def set_runbook_traits(self, runbook_id, traits, version):
+        # Remove duplicate traits
+        traits = set(traits)
+        runbook_traits = [
+            models.RunbookTrait(trait=t, runbook_id=runbook_id,
+                                version=version)
+            for t in traits
+        ]
+
+        with _session_for_write() as session:
+            # Lock the runbook row to serialise concurrent set operations.
+            # This also serves as the existence check: two clients calling
+            # set_runbook_traits at the same time will queue at this point
+            # rather than racing on the delete + insert below.
+            if not (session.query(models.Runbook)
+                    .filter_by(id=runbook_id)
+                    .with_for_update()
+                    .scalar()):
+                raise exception.RunbookNotFound(runbook=runbook_id)
+            session.query(models.RunbookTrait).filter_by(
+                runbook_id=runbook_id).delete()
+            for runbook_trait in runbook_traits:
+                session.add(runbook_trait)
+
+        return runbook_traits
+
+    @oslo_db_api.retry_on_deadlock
+    def unset_runbook_traits(self, runbook_id):
+        with _session_for_write() as session:
+            self._check_runbook_exists(session, runbook_id)
+            session.query(models.RunbookTrait).filter_by(
+                runbook_id=runbook_id).delete()
+
+    def get_runbook_traits_by_runbook_id(self, runbook_id):
+        with _session_for_read() as session:
+            self._check_runbook_exists(session, runbook_id)
+            result = (session.query(models.RunbookTrait)
+                      .filter_by(runbook_id=runbook_id)
+                      .all())
+        return result
+
+    @oslo_db_api.retry_on_deadlock
+    def add_runbook_trait(self, runbook_id, trait, version):
+        runbook_trait = models.RunbookTrait(
+            trait=trait, runbook_id=runbook_id, version=version)
+
+        try:
+            with _session_for_write() as session:
+                self._check_runbook_exists(session, runbook_id)
+                session.add(runbook_trait)
+                session.flush()
+        except db_exc.DBDuplicateEntry:
+            # Ignore duplicate traits
+            pass
+
+        return runbook_trait
+
+    @oslo_db_api.retry_on_deadlock
+    def delete_runbook_trait(self, runbook_id, trait):
+        with _session_for_write() as session:
+            self._check_runbook_exists(session, runbook_id)
+            result = session.query(models.RunbookTrait).filter_by(
+                runbook_id=runbook_id, trait=trait).delete()
+
+        if not result:
+            raise exception.RunbookTraitNotFound(
+                runbook_id=runbook_id, trait=trait)
+
+    def runbook_trait_exists(self, runbook_id, trait):
+        with _session_for_read() as session:
+            self._check_runbook_exists(session, runbook_id)
+            q = session.query(
+                models.RunbookTrait).filter_by(
+                    runbook_id=runbook_id, trait=trait)
+            return session.query(q.exists()).scalar()
+
     @oslo_db_api.retry_on_deadlock
     def create_node_history(self, values):
         values['uuid'] = uuidutils.generate_uuid()
@@ -2421,7 +3085,7 @@ class Connection(api.Connection):
                 session.flush()
             except db_exc.DBDuplicateEntry:
                 raise exception.NodeHistoryAlreadyExists(uuid=values['uuid'])
-            return history
+        return history
 
     @oslo_db_api.retry_on_deadlock
     def destroy_node_history_by_uuid(self, history_uuid):
@@ -2433,18 +3097,24 @@ class Connection(api.Connection):
                 raise exception.NodeHistoryNotFound(history=history_uuid)
 
     def get_node_history_by_id(self, history_id):
-        query = model_query(models.NodeHistory).filter_by(id=history_id)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.NodeHistory).filter_by(
+                    id=history_id)
+                res = query.one()
         except NoResultFound:
             raise exception.NodeHistoryNotFound(history=history_id)
+        return res
 
     def get_node_history_by_uuid(self, history_uuid):
-        query = model_query(models.NodeHistory).filter_by(uuid=history_uuid)
         try:
-            return query.one()
+            with _session_for_read() as session:
+                query = session.query(models.NodeHistory).filter_by(
+                    uuid=history_uuid)
+                res = query.one()
         except NoResultFound:
             raise exception.NodeHistoryNotFound(history=history_uuid)
+        return res
 
     def get_node_history_list(self, limit=None, marker=None,
                               sort_key='created_at', sort_dir='asc'):
@@ -2453,8 +3123,8 @@ class Connection(api.Connection):
 
     def get_node_history_by_node_id(self, node_id, limit=None, marker=None,
                                     sort_key=None, sort_dir=None):
-        query = model_query(models.NodeHistory)
-        query = query.where(models.NodeHistory.node_id == node_id)
+        query = sa.select(models.NodeHistory) \
+            .where(models.NodeHistory.node_id == node_id)
         return _paginate_query(models.NodeHistory, limit, marker,
                                sort_key, sort_dir, query)
 
@@ -2516,6 +3186,7 @@ class Connection(api.Connection):
                         # ordered ascending originally.
             return final_set
 
+    @wrap_sqlite_retry
     def bulk_delete_node_history_records(self, entries):
         with _session_for_write() as session:
             # Uses input entry list, selects entries matching those ids
@@ -2530,7 +3201,7 @@ class Connection(api.Connection):
                 models.NodeHistory.id.in_(entries)
             ).delete(synchronize_session=False)
 
-    def count_nodes_in_provision_state(self, state):
+    def count_nodes_in_provision_state(self, state, conductor_group=None):
         if not isinstance(state, list):
             state = [state]
         with _session_for_read() as session:
@@ -2542,29 +3213,36 @@ class Connection(api.Connection):
             # literally have the DB do *all* of the world, so no
             # client side ops occur. The column is also indexed,
             # which means this will be an index based response.
-            return session.scalar(
-                sa.select(
-                    sa.func.count(models.Node.id)
-                ).filter(
-                    or_(
-                        models.Node.provision_state == v for v in state
-                    )
+            query = sa.select(
+                sa.func.count(models.Node.id)
+            ).filter(
+                or_(
+                    models.Node.provision_state == v for v in state
                 )
             )
+            if conductor_group is not None:
+                query = query.filter(
+                    models.Node.conductor_group == conductor_group
+                )
+            res = session.scalar(query)
+        return res
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def create_node_inventory(self, values):
         inventory = models.NodeInventory()
         inventory.update(values)
         with _session_for_write() as session:
-            try:
-                session.add(inventory)
-                session.flush()
-            except db_exc.DBDuplicateEntry:
-                raise exception.NodeInventoryAlreadyExists(
-                    id=values['id'])
-            return inventory
+            session.query(
+                models.NodeInventory
+            ).filter(
+                models.NodeInventory.node_id == values['node_id']
+            ).delete()
+            session.add(inventory)
+            session.flush()
+        return inventory
 
+    @wrap_sqlite_retry
     @oslo_db_api.retry_on_deadlock
     def destroy_node_inventory_by_node_id(self, node_id):
         with _session_for_write() as session:
@@ -2573,18 +3251,252 @@ class Connection(api.Connection):
             count = query.delete()
             if count == 0:
                 raise exception.NodeInventoryNotFound(
-                    node_id=node_id)
-
-    def get_node_inventory_by_id(self, inventory_id):
-        query = model_query(models.NodeInventory).filter_by(id=inventory_id)
-        try:
-            return query.one()
-        except NoResultFound:
-            raise exception.NodeInventoryNotFound(inventory=inventory_id)
+                    node=node_id)
 
     def get_node_inventory_by_node_id(self, node_id):
-        query = model_query(models.NodeInventory).filter_by(node_id=node_id)
+        with _session_for_read() as session:
+            # Note(masghar): The most recent node inventory is extracted
+            # (as per the created_at field). This is because previously, it was
+            # possible to add more than one inventory per node into the
+            # database, due to there being no unique constraint on the node_id
+            # column in the node_inventory table. Now, all previous node
+            # inventories are deleted before a new one is added using
+            # create_node_inventory. However, some databases would already
+            # contain multiple node inventories due to the prior
+            # implementation. Hence the most recent one is being retrieved.
+            query = session.query(
+                models.NodeInventory
+            ).filter_by(
+                node_id=node_id
+            ).order_by(
+                models.NodeInventory.created_at.desc()
+            )
+            res = query.first()
+
+        if res is None:
+            raise exception.NodeInventoryNotFound(node=node_id)
+        return res
+
+    def get_shard_list(self):
+        """Return a list of shards.
+
+        :returns: A list of dicts containing the keys name and count.
+        """
+        # Note(JayF): This should never be a large enough list to require
+        #             pagination. Furthermore, it wouldn't really be a sensible
+        #             thing to paginate as the data it's fetching can mutate.
+        #             So we just aren't even going to try.
+        shard_list = []
+        with _session_for_read() as session:
+            res = session.execute(
+                # Note(JayF): SQLAlchemy counts are notoriously slow because
+                #             sometimes they will use a subquery. Be careful
+                #             before changing this to use any magic.
+                sa.text(
+                    "SELECT count(id), shard from nodes group by shard;"
+                )).fetchall()
+
+            if res:
+                res.sort(key=lambda x: x[0], reverse=True)
+                for shard in res:
+                    shard_list.append(
+                        {"name": str(shard[1]), "count": shard[0]}
+                    )
+
+        return shard_list
+
+    @wrap_sqlite_retry
+    def create_firmware_component(self, values):
+        """Create a FirmwareComponent record for a given node.
+
+        :param values: a dictionary with the necessary information to create
+            a FirmwareComponent.
+
+                     ::
+
+                      {
+                        'component': String,
+                        'initial_version': String,
+                        'current_version': String,
+                        'last_version_flashed': String
+                      }
+        :returns: A FirmwareComponent object.
+        :raises: FirmwareComponentAlreadyExists if any  of the component
+            records already exists.
+        """
+
+        fw_component = models.FirmwareComponent()
+        fw_component.update(values)
+
         try:
-            return query.one()
+            with _session_for_write() as session:
+                session.add(fw_component)
+                session.flush()
+        except db_exc.DBDuplicateEntry:
+            raise exception.FirmwareComponentAlreadyExists(
+                name=values['component'], node=values['node_id'])
+        return fw_component
+
+    @wrap_sqlite_retry
+    def update_firmware_component(self, node_id, component, values):
+        """Update a FirmwareComponent record.
+
+        :param node_id: The node id.
+        :param component: The component of the node to update.
+        :param values: A dictionary with the new information about the
+            FirmwareComponent.
+
+                     ::
+
+                      {
+                        'current_version': String,
+                        'last_version_flashed': String
+                      }
+        :returns: A FirmwareComponent object.
+        :raises: FirmwareComponentNotFound the component
+            is not found.
+        """
+        with _session_for_write() as session:
+            query = session.query(models.FirmwareComponent)
+            query = query.filter_by(node_id=node_id, component=component)
+
+            try:
+                ref = query.with_for_update().one()
+            except NoResultFound:
+                raise exception.FirmwareComponentNotFound(
+                    node=node_id, name=component)
+
+            ref.update(values)
+            session.flush()
+        return ref
+
+    def get_firmware_component(self, node_id, name):
+        """Retrieve Firmware Component.
+
+        :param node_id: The node id.
+        :param name: name of Firmware component.
+        :returns: The FirmwareComponent object.
+        :raises: NodeNotFound if the node is not found.
+        :raises: FirmwareComponentNotFound if the FirmwareComponent
+            is not found.
+        """
+
+        with _session_for_read() as session:
+            self._check_node_exists(session, node_id)
+            query = session.query(models.FirmwareComponent).filter_by(
+                node_id=node_id, component=name)
+            try:
+                ref = query.one()
+            except NoResultFound:
+                raise exception.FirmwareComponentNotFound(
+                    node=node_id, name=name)
+        return ref
+
+    def get_firmware_component_list(self, node_id):
+        """Retrieve Firmware Components of a given node.
+
+        :param node_id: The node id.
+        :returns: A list of FirmwareComponent objects.
+        :raises: NodeNotFound if the node is not found.
+        """
+
+        with _session_for_read() as session:
+            self._check_node_exists(session, node_id)
+            result = (session.query(models.FirmwareComponent)
+                      .filter_by(node_id=node_id)
+                      .all())
+        return result
+
+    def get_child_node_ids_by_parent_uuid(
+            self, node_uuid, exclude_dedicated_power=False):
+        with _session_for_read() as session:
+            nodes = []
+            res = session.execute(sa.select(
+                models.Node.id,
+                models.Node.driver_info
+            ).where(models.Node.parent_node == node_uuid)).all()
+            for r in res:
+                # NOTE(TheJulia): Dtantsur has noted we don't typically
+                # evaluate content data inside of the db api, and that
+                # we typically have the caller do it. We should likely
+                # refactor this, at some point for consistency if
+                # we're okay with the likely additional overhead
+                # to post filter an an initial result set.
+                if (exclude_dedicated_power
+                    and r[1].get('has_dedicated_power_supply')):
+                    continue
+                nodes.append(r[0])
+            return nodes
+
+    def create_inspection_rule(self, values):
+        """Create new rule"""
+        inspection_rule = models.InspectionRule()
+        inspection_rule.update(values)
+
+        with _session_for_write() as session:
+            try:
+                session.add(inspection_rule)
+                session.flush()
+            except db_exc.DBDuplicateEntry:
+                raise exception.InspectionRuleAlreadyExists(
+                    uuid=values['uuid'])
+        return inspection_rule
+
+    def update_inspection_rule(self, rule_uuid, values):
+        """Update an existing inspection rule.
+
+        :param values: Dict of values to update with.
+        :param rule_id: The rule id.
+        """
+        with _session_for_write() as session:
+            query = session.query(models.InspectionRule).filter_by(
+                uuid=rule_uuid)
+            try:
+                ref = query.with_for_update().one()
+            except NoResultFound:
+                raise exception.InspectionRuleNotFound(
+                    rule=rule_uuid)
+            ref.update(values)
+        return ref
+
+    def _get_inspection_rule(self, field, value):
+        """Helper method for retrieving an inspection rule."""
+        query = sa.select(models.InspectionRule).where(field == value)
+        try:
+            with _session_for_read() as session:
+                res = session.execute(query).one()[0]
+            return res
         except NoResultFound:
-            raise exception.NodeInventoryNotFound(node_id=node_id)
+            raise exception.InspectionRuleNotFound(rule=value)
+
+    def get_inspection_rule_by_uuid(self, inspection_rule_uuid):
+        return self._get_inspection_rule(models.InspectionRule.uuid,
+                                         inspection_rule_uuid)
+
+    def get_inspection_rule_by_id(self, inspection_rule_id):
+        return self._get_inspection_rule(models.InspectionRule.id,
+                                         inspection_rule_id)
+
+    def get_inspection_rule_list(self, limit=None, marker=None, filters=None,
+                                 sort_key=None, sort_dir=None):
+        query = (sa.select(models.InspectionRule))
+        if filters is None:
+            filters = dict()
+        supported_filters = {'phase', 'scope'}
+        unsupported_filters = set(filters).difference(supported_filters)
+        if unsupported_filters:
+            msg = _("SqlAlchemy API does not support "
+                    "filtering by %s") % ', '.join(unsupported_filters)
+            raise ValueError(msg)
+        for field in filters:
+            query = query.filter_by(**{field: filters[field]})
+        return _paginate_query(models.InspectionRule, limit, marker,
+                               sort_key, sort_dir, query)
+
+    def destroy_inspection_rule(self, inspection_rule_id):
+        with _session_for_write() as session:
+            count = session.query(models.InspectionRule).filter_by(
+                id=inspection_rule_id).delete()
+            if count == 0:
+                raise exception.InspectionRuleNotFound(
+                    rule=inspection_rule_id)

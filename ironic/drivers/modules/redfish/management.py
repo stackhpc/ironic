@@ -14,19 +14,24 @@
 #    under the License.
 
 import collections
+from datetime import timezone
+import time
 from urllib.parse import urlparse
 
-from ironic_lib import metrics_utils
+from dateutil import parser
 from oslo_log import log
-from oslo_utils import importutils
 from oslo_utils import timeutils
+import sushy
+import tenacity
 
 from ironic.common import boot_devices
 from ironic.common import boot_modes
 from ironic.common import components
 from ironic.common import exception
+from ironic.common import health_states
 from ironic.common.i18n import _
 from ironic.common import indicator_states
+from ironic.common import metrics_utils
 from ironic.common import states
 from ironic.common import utils
 from ironic.conductor import periodics
@@ -36,61 +41,116 @@ from ironic.conf import CONF
 from ironic.drivers import base
 from ironic.drivers.modules import boot_mode_utils
 from ironic.drivers.modules import deploy_utils
+from ironic.drivers.modules.redfish import boot as redfish_boot
 from ironic.drivers.modules.redfish import firmware_utils
 from ironic.drivers.modules.redfish import utils as redfish_utils
 
 LOG = log.getLogger(__name__)
 METRICS = metrics_utils.get_metrics_logger(__name__)
 
-sushy = importutils.try_import('sushy')
+BOOT_MODE_CONFIG_INTERVAL = 15
 
-if sushy:
-    BOOT_DEVICE_MAP = {
-        sushy.BOOT_SOURCE_TARGET_PXE: boot_devices.PXE,
-        sushy.BOOT_SOURCE_TARGET_HDD: boot_devices.DISK,
-        sushy.BOOT_SOURCE_TARGET_CD: boot_devices.CDROM,
-        sushy.BOOT_SOURCE_TARGET_BIOS_SETUP: boot_devices.BIOS
-    }
+BOOT_OVERRIDE_ENABLED = 'enabled'
 
-    BOOT_DEVICE_MAP_REV = {v: k for k, v in BOOT_DEVICE_MAP.items()}
-    # Previously we used sushy constants in driver_internal_info. This mapping
-    # is provided for backward compatibility, taking into account that sushy
-    # constants will change from strings to enums.
-    BOOT_DEVICE_MAP_REV_COMPAT = dict(
-        BOOT_DEVICE_MAP_REV,
-        pxe=sushy.BOOT_SOURCE_TARGET_PXE,
-        hdd=sushy.BOOT_SOURCE_TARGET_HDD,
-        cd=sushy.BOOT_SOURCE_TARGET_CD,
-        **{'bios setup': sushy.BOOT_SOURCE_TARGET_BIOS_SETUP}
-    )
+BOOT_OVERRIDE_TARGET = 'target'
 
-    BOOT_MODE_MAP = {
-        sushy.BOOT_SOURCE_MODE_UEFI: boot_modes.UEFI,
-        sushy.BOOT_SOURCE_MODE_BIOS: boot_modes.LEGACY_BIOS
-    }
+BOOT_OVERRIDE_MODE = 'mode'
 
-    BOOT_MODE_MAP_REV = {v: k for k, v in BOOT_MODE_MAP.items()}
+BOOT_DEVICE_MAP = {
+    sushy.BOOT_SOURCE_TARGET_PXE: boot_devices.PXE,
+    sushy.BOOT_SOURCE_TARGET_HDD: boot_devices.DISK,
+    sushy.BOOT_SOURCE_TARGET_CD: boot_devices.CDROM,
+    sushy.BOOT_SOURCE_TARGET_BIOS_SETUP: boot_devices.BIOS,
+    sushy.BOOT_SOURCE_TARGET_UEFI_HTTP: boot_devices.UEFIHTTP
+}
 
-    BOOT_DEVICE_PERSISTENT_MAP = {
-        sushy.BOOT_SOURCE_ENABLED_CONTINUOUS: True,
-        sushy.BOOT_SOURCE_ENABLED_ONCE: False
-    }
+BOOT_DEVICE_MAP_REV = {v: k for k, v in BOOT_DEVICE_MAP.items()}
+# Previously we used sushy constants in driver_internal_info. This mapping
+# is provided for backward compatibility, taking into account that sushy
+# constants will change from strings to enums.
+BOOT_DEVICE_MAP_REV_COMPAT = dict(
+    BOOT_DEVICE_MAP_REV,
+    pxe=sushy.BOOT_SOURCE_TARGET_PXE,
+    hdd=sushy.BOOT_SOURCE_TARGET_HDD,
+    cd=sushy.BOOT_SOURCE_TARGET_CD,
+    **{'bios setup': sushy.BOOT_SOURCE_TARGET_BIOS_SETUP}
+)
 
-    BOOT_DEVICE_PERSISTENT_MAP_REV = {v: k for k, v in
-                                      BOOT_DEVICE_PERSISTENT_MAP.items()}
+VMEDIA_DEVICES_MAP = {
+    sushy.VIRTUAL_MEDIA_CD: boot_devices.CDROM,
+    sushy.VIRTUAL_MEDIA_FLOPPY: boot_devices.FLOPPY,
+    sushy.VIRTUAL_MEDIA_USBSTICK: boot_devices.DISK
+}
 
-    INDICATOR_MAP = {
-        sushy.INDICATOR_LED_LIT: indicator_states.ON,
-        sushy.INDICATOR_LED_OFF: indicator_states.OFF,
-        sushy.INDICATOR_LED_BLINKING: indicator_states.BLINKING,
-        sushy.INDICATOR_LED_UNKNOWN: indicator_states.UNKNOWN
-    }
+VMEDIA_DEVICES_MAP_REV = {v: k for k, v in VMEDIA_DEVICES_MAP.items()}
 
-    INDICATOR_MAP_REV = {
-        v: k for k, v in INDICATOR_MAP.items()}
+BOOT_MODE_MAP = {
+    sushy.BOOT_SOURCE_MODE_UEFI: boot_modes.UEFI,
+    sushy.BOOT_SOURCE_MODE_BIOS: boot_modes.LEGACY_BIOS
+}
+
+BOOT_MODE_MAP_REV = {v: k for k, v in BOOT_MODE_MAP.items()}
+
+BOOT_DEVICE_PERSISTENT_MAP = {
+    sushy.BOOT_SOURCE_ENABLED_CONTINUOUS: True,
+    sushy.BOOT_SOURCE_ENABLED_ONCE: False
+}
+
+BOOT_DEVICE_PERSISTENT_MAP_REV = {v: k for k, v in
+                                  BOOT_DEVICE_PERSISTENT_MAP.items()}
+
+VENDORS_REQUIRING_FULL_BOOT_REQUEST = [
+    "american megatrends international",
+    "ami",
+    "asrockrack",
+    "redfish_compatible"
+]
+
+INDICATOR_MAP = {
+    sushy.INDICATOR_LED_LIT: indicator_states.ON,
+    sushy.INDICATOR_LED_OFF: indicator_states.OFF,
+    sushy.INDICATOR_LED_BLINKING: indicator_states.BLINKING,
+    sushy.INDICATOR_LED_UNKNOWN: indicator_states.UNKNOWN
+}
+
+INDICATOR_MAP_REV = {
+    v: k for k, v in INDICATOR_MAP.items()}
+
+HEALTH_MAP = {
+    sushy.HEALTH_OK: health_states.HealthState.OK,
+    sushy.HEALTH_WARNING: health_states.HealthState.WARNING,
+    sushy.HEALTH_CRITICAL: health_states.HealthState.CRITICAL,
+}
 
 
-def _set_boot_device(task, system, device, persistent=False):
+_FIRMWARE_UPDATE_ARGS = {
+    'firmware_images': {
+        'description': (
+            'A list of firmware images to apply.'),
+        'required': True
+    }}
+
+
+def _is_during_post_error(exc):
+    """Check if a Sushy exception is an 'UnableToModifyDuringSystemPOST'.
+
+    HPE iLO BMCs reject boot device changes while the system is in POST
+    (Power-On Self-Test), typically after a firmware update or reboot.
+
+    :param exc: An exception instance
+    :returns: True if this is a POST-related error, False otherwise
+    """
+    if not isinstance(exc, sushy.exceptions.BadRequestError):
+        return False
+    is_post_error = 'UnableToModifyDuringSystemPOST' in str(exc)
+    if is_post_error:
+        LOG.debug('Detected UnableToModifyDuringSystemPOST error from BMC, '
+                  'will trigger retry logic. Error: %s', exc)
+    return is_post_error
+
+
+def _set_boot_device(task, system, device, persistent=False,
+                     http_boot_url=None):
     """An internal routine to set the boot device.
 
     :param task: a task from TaskManager.
@@ -99,7 +159,13 @@ def _set_boot_device(task, system, device, persistent=False):
     :param persistent: Boolean value. True if the boot device will
                        persist to all future boots, False if not.
                        Default: False.
+    :param http_boot_url: A string value to be sent to the sushy library,
+                          which is sent to the BMC as the url to boot from.
     :raises: SushyError on an error from the Sushy library
+    Vendor-specific logic:
+    - Vendors listed in VENDORS_REQUIRING_FULL_BOOT_REQUEST:
+      Require setting full boot parameters
+      (mode, enabled, target) even if unchanged.
     """
 
     # The BMC handling of the persistent setting is vendor specific.
@@ -109,6 +175,13 @@ def _set_boot_device(task, system, device, persistent=False):
     # persistent setting must be set when setting the boot device
     # (see https://storyboard.openstack.org/#!/story/2008547).
     vendor = task.node.properties.get('vendor', None)
+    LOG.debug("Vendor : %(vendor)s node %(uuid)s",
+              {'vendor': vendor, 'uuid': task.node.uuid})
+    requires_full_boot_request = (
+        vendor and any(vendor_id in vendor.lower()
+                       for vendor_id in
+                       VENDORS_REQUIRING_FULL_BOOT_REQUEST)
+    )
     if vendor and vendor.lower() == 'supermicro':
         enabled = BOOT_DEVICE_PERSISTENT_MAP_REV[persistent]
         LOG.debug('Setting BootSourceOverrideEnable to %(enable)s '
@@ -116,13 +189,58 @@ def _set_boot_device(task, system, device, persistent=False):
                   {'enable': enabled, 'node': task.node.uuid})
     else:
         desired_enabled = BOOT_DEVICE_PERSISTENT_MAP_REV[persistent]
-        current_enabled = system.boot.get('enabled')
-
+        current_enabled = system.boot.get(BOOT_OVERRIDE_ENABLED)
         # NOTE(etingof): this can be racy, esp if BMC is not RESTful
         enabled = (desired_enabled
                    if desired_enabled != current_enabled else None)
+
+    # Logging callback for retry attempts (closure captures task)
+    def _log_post_boot_retry(retry_state):
+        LOG.warning('BMC is in POST, unable to modify boot device for '
+                    'node %(node)s. Retrying in %(delay).1f seconds '
+                    '(attempt %(attempt)d/%(total)d)',
+                    {'node': task.node.uuid,
+                     'delay': retry_state.next_action.sleep,
+                     'attempt': retry_state.attempt_number,
+                     'total': CONF.redfish.post_boot_retry_attempts})
+
+    @tenacity.retry(
+        retry=tenacity.retry_if_exception(_is_during_post_error),
+        stop=tenacity.stop_after_attempt(CONF.redfish.post_boot_retry_attempts),
+        wait=tenacity.wait_exponential(
+            multiplier=1,
+            min=CONF.redfish.post_boot_retry_delay,
+            max=CONF.redfish.post_boot_retry_delay * 6),
+        before_sleep=_log_post_boot_retry,
+        reraise=True)
+    def _do_set_boot_options():
+        # NOTE(TheJulia): In sushy, it is uri, due to the convention used
+        # in the standard. URL is used internally in ironic.
+        if requires_full_boot_request:
+            # Some vendors require sending all boot parameters every time
+            desired_mode = system.boot.get(BOOT_OVERRIDE_MODE) \
+                or sushy.BOOT_SOURCE_MODE_UEFI
+
+            LOG.debug('Vendor "%(vendor)s" requires full boot settings. '
+                      'Sending: mode=%(mode)s, enabled=%(enabled)s, '
+                      'target=%(target)s for node %(node)s',
+                      {'vendor': vendor, 'mode': desired_mode,
+                       'enabled': desired_enabled,
+                       'target': device, 'node': task.node.uuid})
+            system.set_system_boot_options(
+                device,
+                mode=desired_mode,
+                enabled=desired_enabled,
+                http_boot_uri=http_boot_url
+            )
+        else:
+            LOG.debug('Sending minimal Redfish boot device change for '
+                      'node %(node)s', {'node': task.node.uuid})
+            system.set_system_boot_options(device, enabled=enabled,
+                                           http_boot_uri=http_boot_url)
+
     try:
-        system.set_system_boot_options(device, enabled=enabled)
+        _do_set_boot_options()
     except sushy.exceptions.SushyError as e:
         if enabled == sushy.BOOT_SOURCE_ENABLED_CONTINUOUS:
             # NOTE(dtantsur): continuous boot device settings have been
@@ -135,7 +253,8 @@ def _set_boot_device(task, system, device, persistent=False):
                       'falling back to one-time boot settings',
                       {'error': e, 'node': task.node.uuid})
             system.set_system_boot_options(
-                device, enabled=sushy.BOOT_SOURCE_ENABLED_ONCE)
+                device, enabled=sushy.BOOT_SOURCE_ENABLED_ONCE,
+                http_boot_uri=http_boot_url)
             LOG.warning('Could not set persistent boot device to '
                         '%(dev)s for node %(node)s, using one-time '
                         'boot device instead',
@@ -149,18 +268,6 @@ def _set_boot_device(task, system, device, persistent=False):
 
 
 class RedfishManagement(base.ManagementInterface):
-
-    def __init__(self):
-        """Initialize the Redfish management interface.
-
-        :raises: DriverLoadError if the driver can't be loaded due to
-            missing dependencies
-        """
-        super(RedfishManagement, self).__init__()
-        if not sushy:
-            raise exception.DriverLoadError(
-                driver='redfish',
-                reason=_('Unable to import the sushy library'))
 
     def get_properties(self):
         """Return the properties of the interface.
@@ -243,6 +350,8 @@ class RedfishManagement(base.ManagementInterface):
         """
         utils.pop_node_nested_field(
             task.node, 'driver_internal_info', 'redfish_boot_device')
+        http_boot_url = utils.pop_node_nested_field(
+            task.node, 'driver_internal_info', 'redfish_uefi_http_url')
         task.node.save()
 
         system = redfish_utils.get_system(task.node)
@@ -250,7 +359,7 @@ class RedfishManagement(base.ManagementInterface):
         try:
             _set_boot_device(
                 task, system, BOOT_DEVICE_MAP_REV[device],
-                persistent=persistent)
+                persistent=persistent, http_boot_url=http_boot_url)
         except sushy.exceptions.SushyError as e:
             error_msg = (_('Redfish set boot device failed for node '
                            '%(node)s. Error: %(error)s') %
@@ -287,9 +396,12 @@ class RedfishManagement(base.ManagementInterface):
 
         """
         system = redfish_utils.get_system(task.node)
-        return {'boot_device': BOOT_DEVICE_MAP.get(system.boot.get('target')),
-                'persistent': BOOT_DEVICE_PERSISTENT_MAP.get(
-                    system.boot.get('enabled'))}
+        return {
+            'boot_device': BOOT_DEVICE_MAP.get(
+                system.boot.get(BOOT_OVERRIDE_TARGET)),
+            'persistent': BOOT_DEVICE_PERSISTENT_MAP.get(
+                system.boot.get(BOOT_OVERRIDE_ENABLED))
+        }
 
     def get_supported_boot_modes(self, task):
         """Get a list of the supported boot modes.
@@ -319,9 +431,54 @@ class RedfishManagement(base.ManagementInterface):
         """
         system = redfish_utils.get_system(task.node)
 
-        try:
-            system.set_system_boot_options(mode=BOOT_MODE_MAP_REV[mode])
+        vendor = task.node.properties.get('vendor', None)
+        requires_full_boot_request = (
+            vendor and any(vendor_id in vendor.lower()
+                           for vendor_id in
+                           VENDORS_REQUIRING_FULL_BOOT_REQUEST)
+        )
 
+        LOG.debug('Requested %(vendor)s to set boot mode'
+                  ' to "%(mode)s" for node %(node)s',
+                  {'mode': mode, 'node': task.node.uuid, 'vendor': vendor})
+
+        # NOTE(dtantsur): check the readability of the current mode before
+        # modifying anything. I suspect it can become None transiently after
+        # the update, while we need to know if it is supported *at all*.
+        get_mode_unsupported = (system.boot.get(BOOT_OVERRIDE_MODE) is None)
+
+        desired_mode = BOOT_MODE_MAP_REV[mode]
+        LOG.debug('Current boot mode read from Redfish for '
+                  'node %(node)s is: %(mode)s',
+                  {'node': task.node.uuid,
+                   'mode': desired_mode})
+
+        try:
+
+            if requires_full_boot_request:
+                current_enabled = system.boot.get(BOOT_OVERRIDE_ENABLED) \
+                    or sushy.BOOT_SOURCE_ENABLED_ONCE
+                current_target = system.boot.get(BOOT_OVERRIDE_TARGET) \
+                    or sushy.BOOT_SOURCE_TARGET_PXE
+
+                LOG.debug('Vendor "%(vendor)s" requires full boot settings. '
+                          'Sending: mode=%(mode)s, enabled=%(enabled)s, '
+                          'target=%(target)s for node %(node)s',
+                          {'vendor': vendor, 'mode': desired_mode,
+                           'enabled': current_enabled, 'node': task.node.uuid,
+                           'target': current_target
+                           })
+
+                system.set_system_boot_options(
+                    mode=desired_mode,
+                    enabled=current_enabled,
+                    target=current_target
+                )
+            else:
+                LOG.debug('Sending minimal Redfish boot mode '
+                          'change for node %(node)s',
+                          {'node': task.node.uuid})
+                system.set_system_boot_options(mode=desired_mode)
         except sushy.exceptions.SushyError as e:
             error_msg = (_('Setting boot mode to %(mode)s '
                            'failed for node %(node)s. '
@@ -334,7 +491,7 @@ class RedfishManagement(base.ManagementInterface):
             # getting or setting the boot mode. When setting failed and the
             # mode attribute is missing from the boot field, raising
             # UnsupportedDriverExtension will allow the deploy to continue.
-            if system.boot.get('mode') is None:
+            if get_mode_unsupported:
                 LOG.info(_('Attempt to set boot mode on node %(node)s '
                            'failed to set boot mode as the node does not '
                            'appear to support overriding the boot mode. '
@@ -343,6 +500,67 @@ class RedfishManagement(base.ManagementInterface):
                 raise exception.UnsupportedDriverExtension(
                     driver=task.node.driver, extension='set_boot_mode')
             raise exception.RedfishError(error=error_msg)
+
+        # NOTE(dtantsur): this case is rather hypothetical, but in our own
+        # emulator, it's possible that mode is constantly set to None, while
+        # the request to change the mode succeeds.
+        if get_mode_unsupported:
+            LOG.warning('The request to set boot mode for node %(node)s to '
+                        '%(value)s has succeeded, but the current mode is '
+                        'not known. Skipping reboot and assuming '
+                        'the operation has succeeded.',
+                        {'node': task.node.uuid, 'value': mode})
+            return
+
+        self._wait_for_boot_mode(task, system, mode)
+        LOG.info('Boot mode for node %(node)s has been set to '
+                 '%(value)s', {'node': task.node.uuid, 'value': mode})
+
+    def _wait_for_boot_mode(self, task, system, mode):
+        system.refresh(force=True)
+
+        # NOTE(dtantsur/janders): at least Dell machines change boot mode via
+        # a BIOS configuration job. A reboot is needed to apply it.
+        if system.boot.get(BOOT_OVERRIDE_MODE) == BOOT_MODE_MAP_REV[mode]:
+            LOG.debug('Node %(node)s is already configured with requested '
+                      'boot mode %(new_value)s.',
+                      {'node': task.node.uuid,
+                       'new_value': BOOT_MODE_MAP_REV[mode]})
+            return
+
+        LOG.info('Rebooting node %(node)s to change boot mode from '
+                 '%(old_value)s to %(new_value)s',
+                 {'node': task.node.uuid,
+                  'old_value': system.boot.get(BOOT_OVERRIDE_MODE),
+                  'new_value': BOOT_MODE_MAP_REV[mode]})
+
+        old_power_state = task.driver.power.get_power_state(task)
+        manager_utils.node_power_action(task, states.REBOOT)
+
+        if CONF.redfish.boot_mode_config_timeout:
+            threshold = time.time() + CONF.redfish.boot_mode_config_timeout
+            while (time.time() <= threshold
+                   and system.boot.get(BOOT_OVERRIDE_MODE)
+                   != BOOT_MODE_MAP_REV[mode]):
+                LOG.debug('Still waiting for boot mode of node %(node)s '
+                          'to become %(value)s, current is %(current)s',
+                          {'node': task.node.uuid,
+                           'value': BOOT_MODE_MAP_REV[mode],
+                           'current': system.boot.get(BOOT_OVERRIDE_MODE)})
+                time.sleep(BOOT_MODE_CONFIG_INTERVAL)
+                system.refresh(force=True)
+
+            if system.boot.get(BOOT_OVERRIDE_MODE) != BOOT_MODE_MAP_REV[mode]:
+                msg = (_('Timeout reached while waiting for boot mode of '
+                         'node %(node)s to become %(value)s, '
+                         'current is %(current)s')
+                       % {'node': task.node.uuid,
+                          'value': BOOT_MODE_MAP_REV[mode],
+                          'current': system.boot.get(BOOT_OVERRIDE_MODE)})
+                LOG.error(msg)
+                raise exception.RedfishError(error=msg)
+
+        manager_utils.node_power_action(task, old_power_state)
 
     def get_boot_mode(self, task):
         """Get the current boot mode for a node.
@@ -358,13 +576,129 @@ class RedfishManagement(base.ManagementInterface):
         """
         system = redfish_utils.get_system(task.node)
 
-        return BOOT_MODE_MAP.get(system.boot.get('mode'))
+        return BOOT_MODE_MAP.get(system.boot.get(BOOT_OVERRIDE_MODE))
 
     @staticmethod
     def _sensor2dict(resource, *fields):
-        return {field: getattr(resource, field)
-                for field in fields
-                if hasattr(resource, field)}
+        return {
+            field: attr.value if hasattr(attr, 'value') else attr
+            for field in fields
+            if hasattr(resource, field)
+            for attr in [getattr(resource, field)]
+        }
+
+    @base.clean_step(priority=0, abortable=False, argsinfo={
+        'target_datetime': {
+            'description': ('The datetime to set in ISO8601 format. If '
+                            'omitted, the current conductor UTC time is '
+                            'used.'),
+            'required': False
+        },
+        'datetime_local_offset': {
+            'description': 'The local time offset from UTC',
+            'required': False
+        }
+    })
+    @task_manager.require_exclusive_lock
+    def set_bmc_clock(self, task, target_datetime=None,
+                      datetime_local_offset=None):
+        """Set the BMC clock using Redfish Manager resource.
+
+        :param task: a TaskManager instance containing the node to act on.
+        :param target_datetime: The datetime to set in ISO8601 format.
+                                Defaults to the current conductor UTC time.
+        :param datetime_local_offset: The local time offset from UTC (optional)
+        :raises: RedfishError if the operation fails
+        """
+        try:
+            system = redfish_utils.get_system(task.node)
+            manager = redfish_utils.get_manager(task.node, system)
+            if target_datetime is None:
+                target_datetime = timeutils.utcnow().replace(
+                    tzinfo=timezone.utc).isoformat()
+            # if the Redfish manager interface does not have microseconds,
+            # we cannot send microseconds in our update so strip them out
+            if not parser.isoparse(manager.datetime).microsecond:
+                target_datetime = parser.isoparse(target_datetime).replace(
+                    microsecond=0).isoformat()
+            LOG.debug("Setting BMC clock to %s (offset: %s)",
+                      target_datetime, datetime_local_offset)
+            manager._conn.timeout = 30
+            manager.set_datetime(
+                target_datetime,
+                datetime_local_offset
+            )
+
+            manager.refresh()
+            if manager.datetime != target_datetime:
+                raise exception.RedfishError(
+                    "BMC clock update failed: mismatch after setting datetime")
+
+            LOG.info(
+                "Successfully updated BMC clock for node %s",
+                task.node.uuid
+            )
+        except Exception as e:
+            LOG.exception("BMC clock update failed: %s", e)
+            raise exception.RedfishError(error=str(e))
+
+    @base.verify_step(priority=1)
+    @task_manager.require_exclusive_lock
+    def verify_bmc_clock(self, task):
+        """Verify and auto-set the BMC clock to the current UTC time.
+
+        This step compares the system UTC time to the BMC's Redfish datetime.
+        If the difference exceeds 1 second, it attempts to sync the time.
+        Verification fails only if the BMC time remains incorrect
+        after the update.
+        """
+        if not CONF.redfish.enable_verify_bmc_clock:
+            LOG.info("Skipping BMC clock verify step: disabled via config")
+            return
+
+        try:
+            local_time = timeutils.utcnow().replace(tzinfo=timezone.utc)
+            system = redfish_utils.get_system(task.node)
+            manager = redfish_utils.get_manager(task.node, system)
+            manager.refresh()
+
+            manager_time = parser.isoparse(manager.datetime)
+            # if the Redfish manager interface does not have microseconds,
+            # we cannot send microseconds in our update so strip them out
+            if not manager_time.microsecond:
+                local_time = local_time.replace(microsecond=0)
+            system_time = local_time.isoformat()
+
+            LOG.debug("BMC time: %s, Local time: %s",
+                      manager_time, local_time)
+            LOG.debug("manager.datetime_local_offset: %s",
+                      manager.datetimelocaloffset)
+
+            # Fail if the BMC clock differs from system time
+            # by more than 1 second
+            if abs((manager_time - local_time).total_seconds()) > 1:
+                LOG.info("BMC clock is out of sync. Updating...")
+                offset = "+00:00"
+                if manager.datetimelocaloffset == offset:
+                    offset = None
+                manager.set_datetime(system_time,
+                                     datetime_local_offset=offset)
+                manager.refresh()
+
+                updated_time = parser.isoparse(manager.datetime)
+                if abs((updated_time - local_time).total_seconds()) > 1:
+                    raise exception.RedfishError(
+                        "BMC clock still incorrect after update")
+
+            LOG.info("BMC clock update successful for node %s",
+                     task.node.uuid)
+
+        except Exception as e:
+            LOG.exception("BMC clock auto-update failed during verify: %s", e)
+            raise exception.NodeVerifyFailure(
+                node=getattr(task.node, 'uuid', 'unknown'),
+                reason="BMC clock verify step failed: %s" % str(e)
+            )
 
     @classmethod
     def _get_sensors_fan(cls, chassis):
@@ -421,10 +755,6 @@ class RedfishManagement(base.ManagementInterface):
                 'line_input_voltage', 'last_power_output_watts',
                 'serial_number')
             sensor.update(cls._sensor2dict(power.status, 'state', 'health'))
-            sensor.update(cls._sensor2dict(
-                power.input_ranges, 'minimum_voltage',
-                'maximum_voltage', 'minimum_frequency_hz',
-                'maximum_frequency_hz', 'output_wattage'))
             unique_name = '%s:%s@%s' % (
                 power.identity, chassis.power.identity,
                 chassis.identity)
@@ -433,44 +763,114 @@ class RedfishManagement(base.ManagementInterface):
         return sensors
 
     @classmethod
-    def _get_sensors_drive(cls, system):
-        """Get storage drive sensors reading.
+    def _get_sensor_drive(cls, drive, storage_identity, system_identity):
+        """Get sensor data for a single drive.
 
-        :param chassis: Redfish `system` object
-        :returns: returns a dict of sensor data.
+        :param drive: Individual drive or device object
+        :param storage_identity: Identity of the parent storage/simple_storage
+        :param system_identity: Identity of the parent system
+        :returns: tuple of (unique_name, sensor_data)
         """
-        sensors = {}
+        sensor = cls._sensor2dict(
+            drive, 'name', 'model', 'capacity_bytes')
+        sensor.update(cls._sensor2dict(
+            drive.status, 'state', 'health'))
 
-        for storage in system.simple_storage.get_members():
-            for drive in storage.devices:
-                sensor = cls._sensor2dict(
-                    drive, 'name', 'model', 'capacity_bytes')
-                sensor.update(
-                    cls._sensor2dict(drive.status, 'state', 'health'))
-                unique_name = '%s:%s@%s' % (
-                    drive.name, storage.identity, system.identity)
-                sensors[unique_name] = sensor
+        # Some vendors (e.g., HPE) omit State from Drive Status
+        # If drive is reporting health status, assume enabled
+        if not sensor.get('state') and sensor.get('health'):
+            sensor['state'] = 'Enabled'
 
-        return sensors
+        unique_name = '%s:%s@%s' % (
+            drive.name, storage_identity, system_identity)
+
+        return unique_name, sensor
 
     def get_sensors_data(self, task):
         """Get sensors data.
 
+        Collects sensor data from chassis (fans, temperature, power) and
+        storage (drives) with minimal redfish API calls.
+
         :param task: a TaskManager instance.
-        :raises: FailedToGetSensorData when getting the sensor data fails.
-        :raises: FailedToParseSensorData when parsing sensor data fails.
-        :raises: InvalidParameterValue if required parameters
-                 are missing.
-        :raises: MissingParameterValue if a required parameter is missing.
         :returns: returns a dict of sensor data grouped by sensor type.
         """
-        node = task.node
+        # Note for dev: This function is called frequently (e.g 60s)
+        # So we must be careful about introducing new Redfish API
+        # calls as they tend to be slow. Depending on vendor
+        # this function may take up to 20s to finish.
 
+        # We are leveraging $expand the as much as possible
+        # So if you need to make additional call, first check
+        # if calling with expand already has your data.
+        node = task.node
         sensors = collections.defaultdict(dict)
 
+        # 1 API call to get Chassis and Storage Links
         system = redfish_utils.get_system(node)
 
-        for chassis in system.chassis:
+        # Collect hardware metadata
+        baremetal_fields = {
+            'Manufacturer': system.manufacturer,
+            'Model': system.model,
+            'UUID': system.uuid
+        }
+        sensors['Extra'] = baremetal_fields
+
+        # Get chassis with expanded data and process sensors
+        chassis_data = self._process_chassis_sensors(node, system)
+        sensors['Fan'].update(chassis_data['Fan'])
+        sensors['Temperature'].update(chassis_data['Temperature'])
+        sensors['Power'].update(chassis_data['Power'])
+
+        # Process storage sensors (drives)
+        # Prioritize SimpleStorage as it requires fewer API calls
+        drive_data = {}
+        simple_storage_available = False
+        try:
+            # SimpleStorage has drive data inline (1 API call)
+            drive_data = self._process_simple_storage_sensors(
+                node, system)
+            simple_storage_available = True
+        except sushy.exceptions.MissingAttributeError:
+            pass
+
+        # Fall back to Storage only if SimpleStorage is not available
+        if not simple_storage_available:
+            try:
+                # Storage requires following drive links (1+M calls)
+                drive_data = self._process_storage_sensors(
+                    node, system)
+            except sushy.exceptions.MissingAttributeError:
+                LOG.debug("Storage not available for node %s", node.uuid)
+
+        sensors['Drive'].update(drive_data.get('Drive', {}))
+
+        return sensors
+
+    def _process_chassis_sensors(self, node, system):
+        """Process all chassis sensors using single expanded.
+
+        Process all chassis sensors (Fan, Temperature, Power) using single
+        expanded Redfish API call.
+
+        :param node: Ironic node object
+        :param system: Redfish System object
+        :returns: Dictionary with Fan, Temperature, and Power sensor data
+        """
+
+        sensors = {'Fan': {}, 'Temperature': {}, 'Power': {}}
+
+        try:
+            # 1 API call to get all chassis with expanded data
+            chassis_list = system.chassis_expanded
+            # Use first chassis if only one available, otherwise use first one
+            chassis = chassis_list[0] if chassis_list else None
+
+            if not chassis:
+                LOG.debug("No chassis found for node %s", node.uuid)
+                return sensors
+
             try:
                 sensors['Fan'].update(self._get_sensors_fan(chassis))
 
@@ -496,17 +896,114 @@ class RedfishManagement(base.ManagementInterface):
                           "%(node)s: %(error)s", {'node': node.uuid,
                                                   'error': exc})
 
+        except Exception as exc:
+            LOG.debug("Failed reading expanded chassis information for "
+                      "node %(node)s: %(error)s",
+                      {'node': node.uuid, 'error': exc})
+
+        return sensors
+
+    def _process_storage_sensors(self, node, system):
+        """Process all storage sensors using storage expansion optimization.
+
+        Processes all storage sensors (Drive) with expand call.
+        Extracts only the available drive links from the expanded
+        storage collection and processes them directly.
+
+        :param node: Ironic node object
+        :param system: Redfish System object
+        :returns: Dictionary with Drive sensor data
+        """
+        storage_sensors = {'Drive': {}}
+
+        # Get system identity from driver info
+        system_identity = system.path.split('/')[-1]
+
         try:
-            sensors['Drive'].update(self._get_sensors_drive(system))
+            drives = {}
+            # 1 API call to get all the available Drives uri using $expand
+            storage_collection_expanded = system.storage_expanded
+
+            # Process drives from all storage controllers
+            # M API calls (M is the number of drives)
+            for storage in storage_collection_expanded.get_members():
+                try:
+                    if storage.drives_identities:
+                        # Process drives from Storage
+                        for drive in storage.drives:
+                            unique_name, sensor = self._get_sensor_drive(
+                                drive, storage.identity, system_identity)
+                            drives[unique_name] = sensor
+
+                except Exception as drive_exc:
+                    LOG.debug("Failed to process drives from storage %s: %s",
+                              storage.identity, drive_exc)
+                    continue
+
+            storage_sensors['Drive'].update(drives)
 
         except sushy.exceptions.SushyError as exc:
             LOG.debug("Failed reading drive information for node "
                       "%(node)s: %(error)s", {'node': node.uuid,
                                               'error': exc})
 
-        LOG.debug("Gathered sensor data: %(sensors)s", {'sensors': sensors})
+        return storage_sensors
 
-        return sensors
+    def _process_simple_storage_sensors(self, node, system):
+        """Process drive sensors from SimpleStorage.
+
+        SimpleStorage provides drive data inline, requiring only 1 API call
+        instead of following individual drive links like Storage.
+
+        :param node: Ironic node object
+        :param system: Redfish System object
+        :returns: Dictionary with Drive sensor data
+        """
+        simple_storage_sensors = {'Drive': {}}
+
+        # Get system identity from driver info
+        system_identity = system.path.split('/')[-1]
+
+        try:
+            drives = {}
+            # 1 API call to get all SimpleStorage with devices expanded
+            simple_storage_collection_expanded = system.simple_storage_expanded
+
+            # Process devices from all simple storage controllers
+            for simple_storage in (
+                    simple_storage_collection_expanded.get_members()):
+                try:
+                    # Process devices directly from SimpleStorage
+                    for device in simple_storage.devices:
+                        # Skip devices without capacity (e.g., backplanes,
+                        # enclosures). These are physical infrastructure, not
+                        # storage drives. Including them causes Prometheus
+                        # label inconsistency errors since they lack fields
+                        # like capacity_bytes that actual drives have.
+                        if not device.capacity_bytes:
+                            continue
+
+                        unique_name, sensor = self._get_sensor_drive(
+                            device, simple_storage.identity, system_identity)
+                        drives[unique_name] = sensor
+
+                except Exception as device_exc:
+                    LOG.debug("Failed to process devices from simple "
+                              "storage %s: %s",
+                              simple_storage.identity, device_exc)
+                    continue
+
+            simple_storage_sensors['Drive'].update(drives)
+
+        except sushy.exceptions.MissingAttributeError:
+            # Re-raise MissingAttributeError so caller can fall back to Storage
+            raise
+        except sushy.exceptions.SushyError as exc:
+            LOG.debug("Failed reading simple storage information for node "
+                      "%(node)s: %(error)s", {'node': node.uuid,
+                                              'error': exc})
+
+        return simple_storage_sensors
 
     @task_manager.require_exclusive_lock
     def inject_nmi(self, task):
@@ -529,6 +1026,30 @@ class RedfishManagement(base.ManagementInterface):
                                                   'error': e})
             LOG.error(error_msg)
             raise exception.RedfishError(error=error_msg)
+
+    def get_node_health(self, task):
+        """Get the current health status for a node.
+
+        Retrieves the hardware health status from the Redfish System resource.
+        The health status represents the overall condition of the server
+        hardware, including components like processors, memory, fans,
+        power supplies, storage, etc.
+
+        :param task: A task from TaskManager.
+        :raises: RedfishConnectionError when it fails to connect to Redfish
+        :raises: RedfishError on an error from the Sushy library
+        :returns: One of :mod:`ironic.common.health_states` constants
+                  (OK, WARNING, CRITICAL) or None if health status is
+                  not available.
+        """
+        system = redfish_utils.get_system(task.node)
+
+        # Try to get health status from system.status
+        if system.status and system.status.health:
+            return HEALTH_MAP.get(system.status.health)
+
+        # Health status not available
+        return None
 
     def get_supported_indicators(self, task, component=None):
         """Get a map of the supported indicators (e.g. LEDs).
@@ -610,11 +1131,14 @@ class RedfishManagement(base.ManagementInterface):
 
         try:
             if (component in (None, components.DISK)
-                    and system.simple_storage
-                    and system.simple_storage.drives):
+                    and system.storage):
                 indicators[components.DISK] = {
-                    drive.uuid: properties
-                    for drive in system.simple_storage.drives
+                    # NOTE(vanou) There is no uuid property in Drive resource.
+                    # There is no guarantee Id property of Drive is unique
+                    # across all drives attached to server.
+                    ':'.join([storage.identity, drive.identity]): properties
+                    for storage in system.storage.get_members()
+                    for drive in storage.drives
                     if drive.indicator_led
                 }
 
@@ -656,13 +1180,14 @@ class RedfishManagement(base.ManagementInterface):
                         return
 
             elif (component == components.DISK
-                  and system.simple_storage
-                  and system.simple_storage.drives):
-                for drive in system.simple_storage.drives:
-                    if drive.uuid == indicator:
-                        drive.set_indicator_led(
-                            INDICATOR_MAP_REV[state])
-                        return
+                  and system.storage and len(indicator.split(':')) == 2):
+                for storage in system.storage.get_members():
+                    if storage.identity == indicator.split(':')[0]:
+                        for drive in storage.drives:
+                            if drive.identity == indicator.split(':')[1]:
+                                drive.set_indicator_led(
+                                    INDICATOR_MAP_REV[state])
+                                return
 
         except sushy.exceptions.SushyError as e:
             error_msg = (_('Redfish set %(component)s indicator %(indicator)s '
@@ -708,11 +1233,12 @@ class RedfishManagement(base.ManagementInterface):
                         return INDICATOR_MAP[chassis.indicator_led]
 
             if (component == components.DISK
-                    and system.simple_storage
-                    and system.simple_storage.drives):
-                for drive in system.simple_storage.drives:
-                    if drive.uuid == indicator:
-                        return INDICATOR_MAP[drive.indicator_led]
+                    and system.storage and len(indicator.split(':')) == 2):
+                for storage in system.storage.get_members():
+                    if storage.identity == indicator.split(':')[0]:
+                        for drive in storage.drives:
+                            if drive.identity == indicator.split(':')[1]:
+                                return INDICATOR_MAP[drive.indicator_led]
 
         except sushy.exceptions.SushyError as e:
             error_msg = (_('Redfish get %(component)s indicator %(indicator)s '
@@ -733,7 +1259,9 @@ class RedfishManagement(base.ManagementInterface):
     def detect_vendor(self, task):
         """Detects and returns the hardware vendor.
 
-        Uses the System's Manufacturer field.
+        Uses the Service Root's Vendor field to identify the BMC firmware
+        vendor. Falls back to the System's Manufacturer field if Vendor
+        is not available in the Service Root.
 
         :param task: A task from TaskManager.
         :raises: InvalidParameterValue if an invalid component, indicator
@@ -743,16 +1271,16 @@ class RedfishManagement(base.ManagementInterface):
         :returns: String representing the BMC reported Vendor or
                   Manufacturer, otherwise returns None.
         """
+        vendor = redfish_utils.get_root_vendor(task.node)
+        if vendor:
+            return vendor
         return redfish_utils.get_system(task.node).manufacturer
 
     @METRICS.timer('RedfishManagement.update_firmware')
-    @base.clean_step(priority=0, abortable=False, argsinfo={
-        'firmware_images': {
-            'description': (
-                'A list of firmware images to apply.'
-            ),
-            'required': True
-        }})
+    @base.clean_step(priority=0, abortable=False,
+                     argsinfo=_FIRMWARE_UPDATE_ARGS)
+    @base.service_step(priority=0, abortable=False,
+                       argsinfo=_FIRMWARE_UPDATE_ARGS)
     def update_firmware(self, task, firmware_images):
         """Updates the firmware on the node.
 
@@ -763,6 +1291,11 @@ class RedfishManagement(base.ManagementInterface):
         """
         firmware_utils.validate_update_firmware_args(firmware_images)
         node = task.node
+
+        LOG.warning(_(
+            "The 'management' interface is deprecated for updating firmware, "
+            "please migrate to the 'firmware' interface for updating firmware."
+        ))
 
         LOG.debug('Updating firmware on node %(node_uuid)s with firmware '
                   '%(firmware_images)s',
@@ -858,8 +1391,12 @@ class RedfishManagement(base.ManagementInterface):
 
             LOG.info('Firmware updates completed for node %(node)s',
                      {'node': node.uuid})
-
-            manager_utils.notify_conductor_resume_clean(task)
+            if task.node.clean_step:
+                manager_utils.notify_conductor_resume_clean(task)
+            elif task.node.service_step:
+                manager_utils.notify_conductor_resume_service(task)
+            elif task.node.deploy_step:
+                manager_utils.notify_conductor_resume_deploy(task)
         else:
             firmware_updates.pop(0)
             self._apply_firmware_update(node,
@@ -887,7 +1424,10 @@ class RedfishManagement(base.ManagementInterface):
     @periodics.node_periodic(
         purpose='checking if async firmware update failed',
         spacing=CONF.redfish.firmware_update_fail_interval,
-        filters={'reserved': False, 'provision_state': states.CLEANFAIL,
+        filters={'reserved': False,
+                 'provision_state_in': {states.CLEANFAIL,
+                                        states.SERVICEFAIL,
+                                        states.DEPLOYFAIL},
                  'maintenance': True},
         predicate_extra_fields=['driver_internal_info'],
         predicate=lambda n: n.driver_internal_info.get('firmware_updates'),
@@ -909,7 +1449,10 @@ class RedfishManagement(base.ManagementInterface):
     @periodics.node_periodic(
         purpose='checking async firmware update tasks',
         spacing=CONF.redfish.firmware_update_status_interval,
-        filters={'reserved': False, 'provision_state': states.CLEANWAIT},
+        filters={'reserved': False,
+                 'provision_state_in': {states.CLEANWAIT,
+                                        states.SERVICEWAIT,
+                                        states.DEPLOYWAIT}},
         predicate_extra_fields=['driver_internal_info'],
         predicate=lambda n: n.driver_internal_info.get('firmware_updates'),
     )
@@ -1085,11 +1628,20 @@ class RedfishManagement(base.ManagementInterface):
             runtime error.
         :raises: UnsupportedDriverExtension if secure boot is
                  not supported by the hardware.
-        :returns: Boolean
+        :returns: Boolean or None if status cannot be retrieved
         """
         system = redfish_utils.get_system(task.node)
         try:
             return system.secure_boot.enabled
+        except sushy.exceptions.AccessError as e:
+            if 'OemLicenseNotPassed' in str(e):
+                # NOTE(cid): Supermicro gear requires a license to report
+                # secure boot status.
+                LOG.info("Secure boot status request through Redfish failed "
+                         "for node %(node)s: %(error)s",
+                         {'node': task.node.uuid, 'error': e})
+                return None
+            raise
         except sushy.exceptions.MissingAttributeError:
             raise exception.UnsupportedDriverExtension(
                 driver=task.node.driver, extension='get_secure_boot_state')
@@ -1120,7 +1672,7 @@ class RedfishManagement(base.ManagementInterface):
                      '%(value)s', {'node': task.node.uuid, 'value': state})
             return
 
-        boot_mode = system.boot.get('mode')
+        boot_mode = system.boot.get(BOOT_OVERRIDE_MODE)
         if boot_mode == sushy.BOOT_SOURCE_MODE_BIOS:
             # NOTE(dtantsur): the case of disabling secure boot when boot mode
             # is legacy should be covered by the check above.
@@ -1137,9 +1689,53 @@ class RedfishManagement(base.ManagementInterface):
                    % {'node': task.node.uuid, 'value': state, 'exc': exc})
             LOG.error(msg)
             raise exception.RedfishError(error=msg)
-        else:
-            LOG.info('Secure boot state for node %(node)s has been set to '
-                     '%(value)s', {'node': task.node.uuid, 'value': state})
+
+        self._wait_for_secure_boot(task, sb, state)
+        LOG.info('Secure boot state for node %(node)s has been set to '
+                 '%(value)s', {'node': task.node.uuid, 'value': state})
+
+    def _wait_for_secure_boot(self, task, sb, state):
+        # NOTE(dtantsur): at least Dell machines change secure boot status via
+        # a BIOS configuration job. A reboot is needed to apply it.
+
+        def _try_refresh():
+            try:
+                sb.refresh(force=True)
+            except sushy.exceptions.ServerSideError:
+                return False  # sushy already does logging, just return
+            else:
+                return True
+
+        if _try_refresh() and sb.enabled == state:
+            return
+
+        LOG.info('Rebooting node %(node)s to change secure boot state to '
+                 '%(value)s', {'node': task.node.uuid, 'value': state})
+
+        old_power_state = task.driver.power.get_power_state(task)
+        manager_utils.node_power_action(task, states.REBOOT)
+
+        if CONF.redfish.boot_mode_config_timeout:
+            threshold = time.time() + CONF.redfish.boot_mode_config_timeout
+            while time.time() <= threshold and sb.enabled != state:
+                LOG.debug(
+                    'Still waiting for secure boot state of node %(node)s '
+                    'to become %(value)s, current is %(current)s',
+                    {'node': task.node.uuid, 'value': state,
+                     'current': sb.enabled})
+                time.sleep(BOOT_MODE_CONFIG_INTERVAL)
+                _try_refresh()
+
+            if sb.enabled != state:
+                msg = (_('Timeout reached while waiting for secure boot state '
+                         'of node %(node)s to become %(state)s, '
+                         'current is %(current)s')
+                       % {'node': task.node.uuid, 'state': state,
+                          'current': sb.enabled})
+                LOG.error(msg)
+                raise exception.RedfishError(error=msg)
+
+        manager_utils.node_power_action(task, old_power_state)
 
     def _reset_keys(self, task, reset_type):
         system = redfish_utils.get_system(task.node)
@@ -1197,12 +1793,62 @@ class RedfishManagement(base.ManagementInterface):
         :raises: RedfishError on an error from the Sushy library
         :returns: A list of MAC addresses for the node
         """
+        system = redfish_utils.get_system(task.node)
         try:
-            system = redfish_utils.get_system(task.node)
             return list(redfish_utils.get_enabled_macs(task, system))
+        # NOTE(janders) we should handle MissingAttributeError separately
+        # from other SushyErrors - some servers (e.g. some Cisco UCSB and UCSX
+        # blades) are missing EthernetInterfaces attribute yet could be
+        # provisioned successfully if MAC information is provided manually AND
+        # this exception is caught and handled accordingly.
+        except sushy.exceptions.MissingAttributeError as exc:
+            LOG.warning('Cannot get MAC addresses for node %(node)s: %(exc)s',
+                        {'node': task.node.uuid, 'exc': exc})
+        # if the exception is not a MissingAttributeError, raise it
         except sushy.exceptions.SushyError as exc:
             msg = (_('Failed to get network interface information on node '
                      '%(node)s: %(exc)s')
                    % {'node': task.node.uuid, 'exc': exc})
             LOG.error(msg)
             raise exception.RedfishError(error=msg)
+
+    def get_virtual_media(self, task):
+        """Get all virtual media devices from the node.
+
+            :param task: A task from TaskManager.
+
+        """
+        LOG.info('Called redfish.management.get_virtual_media,'
+                 'for the node=%(node)s',
+                 {'node': task.node.uuid})
+        return redfish_boot.get_vmedia(task)
+
+    @task_manager.require_exclusive_lock
+    def attach_virtual_media(self, task, device_type, image_url):
+        """Attach a virtual media device to the node.
+
+            :param task: A task from TaskManager.
+            :param device_type: A device type from
+                :data:`ironic.common.boot_devices.VMEDIA_DEVICES`.
+            :param image_url: URL of the image to attach, HTTP or HTTPS.
+
+        """
+        redfish_boot.insert_vmedia(task, image_url,
+                                   VMEDIA_DEVICES_MAP_REV[device_type])
+
+    @task_manager.require_exclusive_lock
+    def detach_virtual_media(self, task, device_types=None):
+        """Detach some or all virtual media devices from the node.
+
+            :param task: A task from TaskManager.
+            :param device_types: A list of device types from
+                :data:`ironic.common.boot_devices.VMEDIA_DEVICES`.
+                If not provided, all devices are detached.
+
+        """
+        if device_types is None:
+            redfish_boot.eject_vmedia(task)
+        else:
+            for device_type in device_types:
+                redfish_boot.eject_vmedia(task,
+                                          VMEDIA_DEVICES_MAP_REV[device_type])

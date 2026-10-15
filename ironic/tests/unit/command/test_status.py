@@ -1,0 +1,230 @@
+# Copyright (c) 2018 NEC, Corp.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+from unittest import mock
+
+from oslo_db import sqlalchemy
+from oslo_upgradecheck.upgradecheck import Code
+from oslo_utils import uuidutils
+from sqlalchemy.engine import url as sa_url
+
+from ironic.command import dbsync
+from ironic.command import status
+from ironic.tests.unit.db import base as db_base
+
+
+class TestUpgradeChecks(db_base.DbTestCase):
+
+    def setUp(self):
+        super(TestUpgradeChecks, self).setUp()
+        self.cmd = status.Checks()
+
+    def test__check_obj_versions(self):
+        check_result = self.cmd._check_obj_versions()
+        self.assertEqual(Code.SUCCESS, check_result.code)
+
+    @mock.patch.object(dbsync.DBCommand, 'check_obj_versions', autospec=True)
+    def test__check_obj_versions_bad(self, mock_check):
+        msg = 'This is bad'
+        mock_check.return_value = msg
+        check_result = self.cmd._check_obj_versions()
+        self.assertEqual(Code.FAILURE, check_result.code)
+        self.assertEqual(msg, check_result.details)
+
+    def test__check_allocations_table_ok(self):
+        check_result = self.cmd._check_allocations_table()
+        self.assertEqual(Code.SUCCESS,
+                         check_result.code)
+
+    def _create_mock_context_manager(self, return_self=True):
+        mock_obj = mock.Mock()
+        if return_self:
+            val = mock_obj
+        else:
+            val = mock.Mock()
+        mock_obj.__enter__ = mock.Mock(return_value=val)
+        mock_obj.__exit__ = mock.Mock()
+        return mock_obj
+
+    @mock.patch.object(sqlalchemy.enginefacade.reader,
+                       'get_engine', autospec=True)
+    def test__check_allocations_table_latin1(self, mock_reader):
+        mock_engine = mock.Mock()
+        mock_res = mock.Mock()
+        mock_engine.url = sa_url.make_url(
+            'mysql+pymysql://ironic:pass@192.0.2.10/ironic')
+        mock_res.all.return_value = (
+            '... ENGINE=InnoDB DEFAULT CHARSET=latin1',
+        )
+        mock_conn = self._create_mock_context_manager(True)
+        mock_trans = self._create_mock_context_manager(False)
+        mock_engine.connect.return_value = mock_conn
+        mock_conn.execute.return_value = mock_res
+        mock_conn.begin.return_value = mock_trans
+        mock_reader.return_value = mock_engine
+        check_result = self.cmd._check_allocations_table()
+        self.assertEqual(Code.WARNING,
+                         check_result.code)
+        expected_msg = ('The Allocations table is not using UTF8MB4 '
+                        'encoding. Ironic requires UTF8MB4 (4-byte UTF-8) '
+                        'character encoding for full Unicode support. '
+                        'Please run "ironic-dbsync upgrade" to migrate to '
+                        'UTF8MB4. This requires MySQL 8.0+ or MariaDB 10.3+.')
+        self.assertEqual(expected_msg, check_result.details)
+
+    @mock.patch.object(sqlalchemy.enginefacade.reader,
+                       'get_engine', autospec=True)
+    def test__check_allocations_table_utf8mb3(self, mock_reader):
+        """Test that legacy utf8 (utf8mb3) triggers a warning."""
+        mock_engine = mock.Mock()
+        mock_res = mock.Mock()
+        mock_engine.url = sa_url.make_url(
+            'mysql+pymysql://ironic:pass@192.0.2.10/ironic')
+        mock_res.all.return_value = (
+            '... ENGINE=InnoDB DEFAULT CHARSET=utf8',
+        )
+        mock_conn = self._create_mock_context_manager(True)
+        mock_trans = self._create_mock_context_manager(False)
+        mock_engine.connect.return_value = mock_conn
+        mock_conn.execute.return_value = mock_res
+        mock_conn.begin.return_value = mock_trans
+        mock_reader.return_value = mock_engine
+        check_result = self.cmd._check_allocations_table()
+        self.assertEqual(Code.WARNING,
+                         check_result.code)
+        expected_msg = ('The Allocations table is not using UTF8MB4 '
+                        'encoding. Ironic requires UTF8MB4 (4-byte UTF-8) '
+                        'character encoding for full Unicode support. '
+                        'Please run "ironic-dbsync upgrade" to migrate to '
+                        'UTF8MB4. This requires MySQL 8.0+ or MariaDB 10.3+.')
+        self.assertEqual(expected_msg, check_result.details)
+
+    @mock.patch.object(sqlalchemy.enginefacade.reader,
+                       'get_engine', autospec=True)
+    def test__check_allocations_table_myiasm(self, mock_reader):
+        mock_engine = mock.Mock()
+        mock_res = mock.Mock()
+        mock_engine.url = sa_url.make_url(
+            'mysql+pymysql://ironic:pass@192.0.2.10/ironic')
+        mock_res.all.return_value = (
+            '... ENGINE=MyIASM DEFAULT CHARSET=utf8mb4',
+        )
+        mock_conn = self._create_mock_context_manager(True)
+        mock_trans = self._create_mock_context_manager(False)
+        mock_engine.connect.return_value = mock_conn
+        mock_conn.execute.return_value = mock_res
+        mock_conn.begin.return_value = mock_trans
+        mock_reader.return_value = mock_engine
+        check_result = self.cmd._check_allocations_table()
+        self.assertEqual(Code.WARNING,
+                         check_result.code)
+        expected_msg = ('The engine used by MySQL for the allocations '
+                        'table is not the intended engine for the Ironic '
+                        'database tables to use. This may have been a '
+                        'result of an error with the table creation schema. '
+                        'This may require Database Administrator '
+                        'intervention and downtime to dump, modify the '
+                        'table engine to utilize InnoDB, and reload the '
+                        'allocations table to utilize the InnoDB engine.')
+        self.assertEqual(expected_msg, check_result.details)
+
+    @mock.patch.object(sqlalchemy.enginefacade.reader,
+                       'get_engine', autospec=True)
+    def test__check_allocations_table_myiasm_both(self, mock_reader):
+        mock_engine = mock.Mock()
+        mock_res = mock.Mock()
+        mock_engine.url = sa_url.make_url(
+            'mysql+pymysql://ironic:pass@192.0.2.10/ironic')
+        mock_res.all.return_value = (
+            '... ENGINE=MyIASM DEFAULT CHARSET=latin1',
+        )
+        mock_conn = self._create_mock_context_manager(True)
+        mock_trans = self._create_mock_context_manager(False)
+        mock_engine.connect.return_value = mock_conn
+        mock_conn.execute.return_value = mock_res
+        mock_conn.begin.return_value = mock_trans
+        mock_reader.return_value = mock_engine
+        check_result = self.cmd._check_allocations_table()
+        self.assertEqual(Code.WARNING,
+                         check_result.code)
+        expected_msg = ('The Allocations table is not using UTF8MB4 '
+                        'encoding. Ironic requires UTF8MB4 (4-byte UTF-8) '
+                        'character encoding for full Unicode support. '
+                        'Please run "ironic-dbsync upgrade" to migrate to '
+                        'UTF8MB4. This requires MySQL 8.0+ or MariaDB 10.3+. '
+                        'Additionally: '
+                        'The engine used by MySQL for the allocations '
+                        'table is not the intended engine for the Ironic '
+                        'database tables to use. This may have been a '
+                        'result of an error with the table creation schema. '
+                        'This may require Database Administrator '
+                        'intervention and downtime to dump, modify the '
+                        'table engine to utilize InnoDB, and reload the '
+                        'allocations table to utilize the InnoDB engine.')
+        self.assertEqual(expected_msg, check_result.details)
+
+
+class TestUpgradeChecksOwnerMismatch(db_base.DbTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.cmd = status.Checks()
+
+    def test_correct_nodes(self):
+        parents = [
+            # Parent without an owner
+            {'uuid': uuidutils.generate_uuid()},
+            # Parent with an owner
+            {'uuid': uuidutils.generate_uuid(),
+             'owner': 'abcd'},
+        ]
+        children = [
+            {'parent_node': parents[0]['uuid']},
+            {'parent_node': parents[1]['uuid'],
+             'owner': parents[1]['owner']},
+        ]
+        for node in parents + children:
+            self.dbapi.create_node(node)
+
+        result = self.cmd._check_parent_child_owners()
+        self.assertEqual(Code.SUCCESS, result.code)
+
+    def test_mismatch(self):
+        parents = [
+            # Parent without an owner
+            {'uuid': uuidutils.generate_uuid()},
+            # Parent with an owner
+            {'uuid': uuidutils.generate_uuid(),
+             'owner': 'abcd'},
+        ]
+        children = [
+            # Owned child of a parent without owner
+            {'uuid': uuidutils.generate_uuid(),
+             'parent_node': parents[0]['uuid'],
+             'owner': 'abcd'},
+            # Child of an owned node without owner
+            {'uuid': uuidutils.generate_uuid(),
+             'parent_node': parents[1]['uuid']},
+            # Mismatched owners
+            {'uuid': uuidutils.generate_uuid(),
+             'parent_node': parents[1]['uuid'],
+             'owner': parents[1]['owner'] + 'bad'},
+        ]
+        for node in parents + children:
+            self.dbapi.create_node(node)
+
+        result = self.cmd._check_parent_child_owners()
+        self.assertEqual(Code.WARNING, result.code)
+        for child in children:
+            self.assertIn(child['uuid'], result.details)

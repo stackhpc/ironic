@@ -20,8 +20,6 @@ import os
 import shlex
 from urllib import parse as urlparse
 
-from ironic_lib import metrics_utils
-from ironic_lib import utils as irlib_utils
 from oslo_concurrency import processutils
 from oslo_log import log
 from oslo_utils import strutils
@@ -34,8 +32,10 @@ from ironic.common import exception
 from ironic.common import faults
 from ironic.common.i18n import _
 from ironic.common import images
+from ironic.common import metrics_utils
 from ironic.common import states
 from ironic.common import utils
+from ironic.conductor import configdrive_utils
 from ironic.conductor import steps as conductor_steps
 from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
@@ -105,6 +105,23 @@ def _parse_ansible_driver_info(node, action='deploy'):
 
 
 def _get_python_interpreter(node):
+    if not CONF.ansible.allow_node_python_interpreter_override:
+        # NOTE(TheJulia): the interpreter is passed as a global Ansible
+        # extra-var and therefore also selects the interpreter used for the
+        # task delegated to the conductor (running under the ironic-conductor
+        # service account). A node's owner must not be able to steer that, so
+        # when overrides are disabled we reject the driver_info value outright
+        # rather than silently ignoring it, which would be puzzling to the
+        # caller. Only the conductor-configured interpreter is honored.
+        if node.driver_info.get('ansible_python_interpreter'):
+            raise exception.InvalidParameterValue(
+                _('The per-node "ansible_python_interpreter" value in the '
+                  'driver_info of node %(node)s cannot be used because '
+                  'overriding the interpreter via driver_info is disabled by '
+                  '[ansible]allow_node_python_interpreter_override. Remove '
+                  'the value from driver_info, or ask the operator to enable '
+                  'the override.') % {'node': node.uuid})
+        return CONF.ansible.default_python_interpreter
     return node.driver_info.get('ansible_python_interpreter',
                                 CONF.ansible.default_python_interpreter)
 
@@ -133,6 +150,11 @@ def _run_playbook(node, name, extra_vars, key, tags=None, notags=None):
     root = _get_playbooks_path(node)
     playbook = os.path.join(root, name)
     inventory = os.path.join(root, 'inventory')
+    # NOTE(TheJulia): all node-supplied data is namespaced under the 'ironic'
+    # key so it cannot masquerade as a top-level (reserved) Ansible variable.
+    # The interpreter below is the only top-level variable we emit; it must be
+    # sourced from a trusted location (see _get_python_interpreter) because it
+    # is applied globally, including to the task delegated to the conductor.
     ironic_vars = {'ironic': extra_vars}
     python_interpreter = _get_python_interpreter(node)
     if python_interpreter:
@@ -263,6 +285,12 @@ def _add_ssl_image_options(image):
     if CONF.ansible.image_store_certfile and CONF.ansible.image_store_keyfile:
         image['client_cert'] = CONF.ansible.image_store_certfile
         image['client_key'] = CONF.ansible.image_store_keyfile
+    if CONF.webserver_tls_minimum_version:
+        image['tls_minimum_version'] = (
+            CONF.webserver_tls_minimum_version)
+    if CONF.webserver_tls_ciphers:
+        image['tls_ciphers'] = (
+            CONF.webserver_tls_ciphers)
 
 
 def _prepare_variables(task):
@@ -284,7 +312,7 @@ def _prepare_variables(task):
             image['checksum'] = 'md5:%s' % checksum
     _add_ssl_image_options(image)
     variables = {'image': image}
-    configdrive = manager_utils.get_configdrive_image(task.node)
+    configdrive = configdrive_utils.get_configdrive_image(task.node)
     if configdrive:
         if urlparse.urlparse(configdrive).scheme in ('http', 'https'):
             cfgdrv_type = 'url'
@@ -390,6 +418,19 @@ class AnsibleDeploy(agent_base.HeartbeatMixin,
         props.update(agent_base.VENDOR_PROPERTIES)
         return props
 
+    def supports_deploy(self, task):
+        """Check if deploy is supported for the given node by this interface.
+
+        Ansible deploy is appropriate when any driver_info key starting
+        with ``ansible_`` is present, indicating the node has been
+        configured for Ansible-based deployment.
+
+        :param task: A TaskManager instance containing the node to act on.
+        :returns: True if the node has ansible-specific driver_info keys.
+        """
+        return any(key.startswith('ansible_')
+                   for key in task.node.driver_info)
+
     @METRICS.timer('AnsibleDeploy.validate')
     def validate(self, task):
         """Validate the driver-specific Node deployment info."""
@@ -405,6 +446,10 @@ class AnsibleDeploy(agent_base.HeartbeatMixin,
         deploy_utils.check_for_missing_params(params, error_msg)
         # validate root device hints, proper exceptions are raised from there
         _parse_root_device_hints(node)
+        # reject a per-node interpreter override when it is not permitted,
+        # raising InvalidParameterValue from here so the caller gets a clear
+        # failure instead of a silently ignored value at deploy time
+        _get_python_interpreter(node)
         # TODO(pas-ha) validate that all playbooks and ssh key (if set)
         # are pointing to actual files
 
@@ -511,8 +556,7 @@ class AnsibleDeploy(agent_base.HeartbeatMixin,
         task.driver.boot.clean_up_ramdisk(task)
         provider = dhcp_factory.DHCPFactory()
         provider.clean_dhcp(task)
-        irlib_utils.unlink_without_raise(
-            _get_configdrive_path(task.node.uuid))
+        utils.unlink_without_raise(_get_configdrive_path(task.node.uuid))
 
     def take_over(self, task):
         LOG.error("Ansible deploy does not support take over. "

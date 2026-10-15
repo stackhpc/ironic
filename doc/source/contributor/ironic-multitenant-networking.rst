@@ -3,8 +3,10 @@ Ironic multitenant networking and DevStack
 ==========================================
 
 This guide will walk you through using OpenStack Ironic/Neutron with the ML2
-``networking-generic-switch`` plugin.
-
+``networking-generic-switch`` plugin. The intent is to provide context in
+order to help contributors who may be trying to use networking-generic-switch.
+This is *not* intended for production use, but purely for development
+purposes.
 
 Using VMs as baremetal servers
 ==============================
@@ -13,6 +15,7 @@ This scenario shows how to setup Devstack to use Ironic/Neutron integration
 with VMs as baremetal servers and ML2 ``networking-generic-switch``
 that interacts with OVS.
 
+.. _DevstackMTNetwork:
 
 DevStack Configuration
 ----------------------
@@ -104,7 +107,7 @@ configured in Neutron.
 
     # The parameters below represent the minimum possible values to create
     # functional nodes.
-    IRONIC_VM_SPECS_RAM=1024
+    IRONIC_VM_SPECS_RAM=2500
     IRONIC_VM_SPECS_DISK=10
 
     # Size of the ephemeral partition in GB. Use 0 for no ephemeral partition.
@@ -126,3 +129,47 @@ configured in Neutron.
     LOGFILE=$HOME/devstack.log
     LOGDIR=$HOME/logs
     IRONIC_VM_LOG_DIR=$HOME/ironic-bm-logs
+
+Use of Switch Simulators
+------------------------
+
+The devstack plugin has logic to enable to exercising of simulated network
+switches. This support in devstack exists to aid developers in verification
+of networking-generic-switch or other ML2 plugin behavior, and is *not*
+intended to be used to actually exercise the end behavior of the virtalized
+switch.
+
+To be very specific: This is not for Continuous Integration. Switch simulators
+are exceptionally slow and are designed largely for users to ping across,
+not attempt to perform deployments of machines across.
+
+Generally, the starting point is to leverage the ``IRONIC_NETWORK_SIMULATOR``
+setting and set it to a supported value. However, due to vendor limitations
+on accessing product firmware artifacts, you may need to perform some initial
+downloads of artifacts and even update filenames in the devstack plugin if
+you need to leverage a different version. Thinking of the simulator,
+you should mentally model it as an appliance.
+
+Currently supported by the devstack plugin:
+
+ * cisco_nexus9k - Cisco Nexus 9000 series virtual switch simulator. This
+   requires access to Cisco's Nexus switch simulator downloads, which you
+   must download, and place in /opt/stack on the host upon which you are
+   executing devstack.
+ * force10_9 - Dell Force10 OS9 based switches utilizing the OS9 simulator
+   installation ISO image. Devstack is able to download this file.
+ * force10_10 - Dell Force10 OS10 (SmartFabric) switches utilizing a user
+   downloaded switch simulator zip file. The simulator package must be
+   downloaded and extracted into /opt/stack for this to be leveraged.
+
+.. warning::
+   The support for these switch simulators in the devstack plugin generally
+   revolves around the use of versioned files and downloads. You will likely
+   need to consult the devstack plugin source if you wish to leverage this
+   functionality.
+
+The plugin generally work by attempting to plug the Virtual Machines used
+for CI testing through to networking for the virtual switch appliance, while
+also attaching the switch to the general networking of the host devstack is
+running on, and establishing the necessary configuration so
+networking-generic-switch may access the device and assert configuration.

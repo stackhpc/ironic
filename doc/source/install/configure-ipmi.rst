@@ -26,7 +26,7 @@ IPMI is a relatively old protocol and may require additional set up on the
 hardware side that the Bare Metal service cannot do automatically:
 
 #. Make sure IPMI is enabled and the account you use have the permissions
-   to change power and boot devices. By default the adminstrator rights are
+   to change power and boot devices. By default the administrator rights are
    expected, you can change it: see :ref:`ipmi-priv-level`.
 
 #. Make sure the cipher suites are configured for maximum security. Suite 17 is
@@ -77,25 +77,26 @@ Collecting sensor data
 ~~~~~~~~~~~~~~~~~~~~~~
 
 Bare Metal service supports sending IPMI sensor data to Telemetry with
-certain hardware types, such as ``ipmi``, ``ilo`` and ``irmc``.  By default,
+certain hardware types, such as ``ipmi``.  By default,
 support for sending IPMI sensor data to Telemetry is disabled. If you want
 to enable it, you should make the following two changes in ``ironic.conf``:
 
 .. code-block:: ini
 
-    [conductor]
+    [sensor_data]
     send_sensor_data = true
     [oslo_messaging_notifications]
     driver = messagingv2
 
 If you want to customize the sensor types which will be sent to Telemetry,
-change the ``send_sensor_data_types`` option. For example, the below
+change the ``[sensor_data] data_types`` option. For example, the below
 settings will send information about temperature, fan, voltage from sensors
 to the Telemetry service:
 
 .. code-block:: ini
 
-    send_sensor_data_types=Temperature,Fan,Voltage
+    [sensor_data]
+    data_types=Temperature,Fan,Voltage
 
 Supported sensor types are defined by the Telemetry service, currently
 these are ``Temperature``, ``Fan``, ``Voltage``, ``Current``.

@@ -29,6 +29,28 @@ class TestV1Routing(api_base.BaseApiTest):
                                                     mock.ANY,
                                                     mock.ANY)
 
+    def test_microversion_headers(self):
+        # Check root endpoint
+        response = self.app.head('/')
+        self.assertEqual(200, response.status_int)
+        self.assertIn('X-OpenStack-Ironic-API-Minimum-Version',
+                      response.headers)
+        self.assertIn('X-OpenStack-Ironic-API-Maximum-Version',
+                      response.headers)
+
+        self._check_version.reset_mock()
+
+        # Check v1 endpoint
+        response = self.app.head('/v1')
+        self.assertEqual(200, response.status_int)
+        self.assertIn('X-OpenStack-Ironic-API-Minimum-Version',
+                      response.headers)
+        self.assertIn('X-OpenStack-Ironic-API-Maximum-Version',
+                      response.headers)
+
+        # -check_version should be called only once
+        self.assertEqual(1, self._check_version.call_count)
+
     def test_min_version(self):
         response = self.get_json(
             '/',
@@ -84,6 +106,12 @@ class TestV1Routing(api_base.BaseApiTest):
             })
         self.assertEqual({
             'id': 'v1',
+            'inspection_rules': [
+                {'href': 'http://localhost/v1/inspection_rules/',
+                 'rel': 'self'},
+                {'href': 'http://localhost/inspection_rules/',
+                 'rel': 'bookmark'}
+            ],
             'links': [
                 {'href': 'http://localhost/v1/', 'rel': 'self'},
                 {'href': 'https://docs.openstack.org//ironic/latest'
@@ -112,6 +140,12 @@ class TestV1Routing(api_base.BaseApiTest):
             'conductors': [
                 {'href': 'http://localhost/v1/conductors/', 'rel': 'self'},
                 {'href': 'http://localhost/conductors/', 'rel': 'bookmark'}
+            ],
+            'continue_inspection': [
+                {'href': 'http://localhost/v1/continue_inspection/',
+                 'rel': 'self'},
+                {'href': 'http://localhost/continue_inspection/',
+                 'rel': 'bookmark'}
             ],
             'deploy_templates': [
                 {'href': 'http://localhost/v1/deploy_templates/',
@@ -147,9 +181,19 @@ class TestV1Routing(api_base.BaseApiTest):
                 {'href': 'http://localhost/v1/ports/', 'rel': 'self'},
                 {'href': 'http://localhost/ports/', 'rel': 'bookmark'}
             ],
+            'shards': [
+                {'href': 'http://localhost/v1/shards/', 'rel': 'self'},
+                {'href': 'http://localhost/shards/', 'rel': 'bookmark'}
+            ],
             'volume': [
                 {'href': 'http://localhost/v1/volume/', 'rel': 'self'},
                 {'href': 'http://localhost/volume/', 'rel': 'bookmark'}
+            ],
+            'runbooks': [
+                {'href': 'http://localhost/v1/runbooks/',
+                 'rel': 'self'},
+                {'href': 'http://localhost/runbooks/',
+                 'rel': 'bookmark'}
             ]
         }, response)
 

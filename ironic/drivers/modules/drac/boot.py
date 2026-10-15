@@ -15,7 +15,7 @@
 # under the License.
 
 from oslo_log import log
-from oslo_utils import importutils
+import sushy
 
 from ironic.common import boot_devices
 from ironic.drivers.modules.drac import utils as drac_utils
@@ -23,8 +23,6 @@ from ironic.drivers.modules.redfish import boot as redfish_boot
 from ironic.drivers.modules.redfish import utils as redfish_utils
 
 LOG = log.getLogger(__name__)
-
-sushy = importutils.try_import('sushy')
 
 
 class DracRedfishVirtualMediaBoot(redfish_boot.RedfishVirtualMediaBoot):
@@ -63,14 +61,66 @@ class DracRedfishVirtualMediaBoot(redfish_boot.RedfishVirtualMediaBoot):
     via OEM action call implemented in Dell sushy OEM extension package.
     """
 
-    if sushy:
-        VIRTUAL_MEDIA_DEVICES = {
-            boot_devices.FLOPPY: sushy.VIRTUAL_MEDIA_FLOPPY,
-            boot_devices.CDROM: sushy.VIRTUAL_MEDIA_CD
-        }
+    VIRTUAL_MEDIA_DEVICES = {
+        boot_devices.FLOPPY: sushy.VIRTUAL_MEDIA_FLOPPY,
+        boot_devices.CDROM: sushy.VIRTUAL_MEDIA_CD
+    }
 
     def _validate_vendor(self, task, managers):
         pass  # assume people are doing the right thing
+
+    @staticmethod
+    def _get_idrac_version_from_model(model):
+        """Extract iDRAC version from the hardware model string.
+
+        :param model: The hardware model string from the manager.
+        :returns: The iDRAC version as an integer, or None if unable to
+                  determine.
+        """
+        if not model:
+            return None
+
+        try:
+            generation = int(model[:2])
+            # Map hardware generation to iDRAC version
+            if generation > 16:
+                return 10  # iDRAC 10
+            elif generation in (16, 15, 14):
+                return 9   # iDRAC 9
+            elif generation in (12, 13):
+                return 8   # iDRAC 8
+            else:
+                return None  # Unknown or unsupported version
+        except (ValueError, TypeError):
+            LOG.debug("Unable to parse iDRAC version from model string: %s",
+                      model)
+            return None
+
+    def _get_acceptable_media_id(self, task, resource):
+        """Get acceptable virtual media IDs for iDRAC systems.
+
+        For iDRAC10 systems, only virtual media ID "1" is acceptable
+        for virtual media insertion due to hardware limitations.
+
+        :param task: A TaskManager instance containing the node to act on.
+        :param resource: A redfish resource (System or Manager) containing
+            virtual media.
+        :returns: "1" for iDRAC10 systems, None otherwise.
+        """
+        # In case the resource is System, we need to check the managers
+        if resource.managers:
+            for manager in resource.managers:
+                # Check the iDRAC version based on the hardware model
+                if manager.model:
+                    idrac_version = self._get_idrac_version_from_model(
+                        manager.model)
+                    if idrac_version == 10:
+                        return "1"
+            return None
+        else:
+            # In case the resource is Manager, we don't need to check anything.
+            # iDRAC10 doesn't have Virtual Media in Managers, so we ignore.
+            return None
 
     @classmethod
     def _set_boot_device(cls, task, device, persistent=False):

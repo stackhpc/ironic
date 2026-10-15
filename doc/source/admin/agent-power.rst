@@ -17,22 +17,22 @@ How it works
 The expected workflow is as follows:
 
 #. The node is discovered by manually powering it on and gets the
-   `manual-management` hardware type and `agent` power interface.
+   ``manual-management`` hardware type and ``agent`` power interface.
 
    If discovery is not used, a node can be enrolled through the API and then
    powered on manually.
 
-#. The operator moves the node to `manageable`. It works because the `agent`
+#. The operator moves the node to ``manageable``. It works because the ``agent``
    power only requires to be able to connect to the agent.
 
-#. The operator moves the node to `available`. Cleaning happens normally via
-   the already running agent. If reboot is needed, it is done by telling the
+#. The operator moves the node to ``available``. Cleaning happens normally via
+   the already running agent. If a reboot is needed, it is done by telling the
    agent to reboot the node in-band.
 
 #. A user deploys the node. Deployment happens normally via the already
    running agent.
 
-#. In the end of the deployment, the node is rebooted via the reboot command
+#. At the end of the deployment, the node is rebooted via the reboot command
    instead of power off+on.
 
 Enabling
@@ -59,10 +59,6 @@ As usual with the ``noop`` management, enable the networking boot fallback:
    [pxe]
    enable_netboot_fallback = true
 
-If using discovery, :ironic-inspector-doc:`configure discovery in
-ironic-inspector <user/usage.html#discovery>` with the default driver set
-to ``manual-management``.
-
 Limitations
 ===========
 
@@ -70,7 +66,7 @@ Limitations
 
 * Undeploy and rescue are not supported, you need to add BMC credentials first.
 
-* If any errors happens in the process, recovery will likely require BMC
+* If any errors happen in the process, recovery will likely require BMC
   credentials.
 
 * Only rebooting is possible through the API, power on/off commands will fail.

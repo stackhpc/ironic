@@ -12,7 +12,7 @@ architectures.
 Components
 ----------
 
-As explained in :doc:`../get_started`, the Bare Metal service has three
+As explained in :doc:`../get_started`, the Bare Metal service has four
 components.
 
 * The Bare Metal API service (``ironic-api``) should be deployed in a similar
@@ -23,6 +23,10 @@ components.
   provisioning logic lives. The following considerations are the most
   important when deciding on the way to deploy it:
 
+  .. tip::
+     For large deployments, consider :doc:`../../admin/availability-zones`
+     to understand conductor groups and shards for resource partitioning.
+
   * The conductor manages a certain proportion of nodes, distributed to it
     via a hash ring. This includes constantly polling these nodes for their
     current power state and hardware sensor data (if enabled and supported
@@ -31,9 +35,9 @@ components.
   * The conductor needs access to the `management controller`_ of each node
     it manages.
 
-  * The conductor co-exists with TFTP (for PXE) and/or HTTP (for iPXE) services
-    that provide the kernel and ramdisk to boot the nodes. The conductor
-    manages them by writing files to their root directories.
+  * The conductor co-exists with TFTP (for PXE) and/or HTTP (for HTTPBoot and
+    iPXE) services that provide the kernel and ramdisk to boot the nodes.
+    The conductor manages them by writing files to their root directories.
 
   * If serial console is used, the conductor launches console processes
     locally. If the ``nova-serialproxy`` service (part of the Compute service)
@@ -42,6 +46,14 @@ components.
 
   * There must be mutual connectivity between the conductor and the nodes
     being deployed or cleaned. See Networking_ for details.
+
+* The NoVNC graphical console proxy service (``ironic-novncproxy``) can be
+  optionally run to enable connecting to graphical consoles for hosts which
+  have a supported console driver. Like (``ironic-api``) it needs to be deployed
+  like other control plane services, allowing users to access the NoVNC interface
+  via a web browser. Additionally it also like (``ironic-conductor``) in requiring
+  access to the management network to connect to the graphical console managed
+  by the host BMC.
 
 * The provisioning ramdisk which runs the ``ironic-python-agent`` service
   on start up.
@@ -79,10 +91,9 @@ driver has to support is as follows:
 
 Once you make sure that the hardware supports these capabilities, you need to
 find a suitable driver. Most of enterprise-grade hardware has support for
-IPMI_ and thus can utilize :doc:`/admin/drivers/ipmitool`. Some newer hardware
-also supports :doc:`/admin/drivers/redfish`. Several vendors
-provide more specific drivers that usually provide additional capabilities.
-Check :doc:`/admin/drivers` to find the most suitable one.
+IPMI_ and thus can utilize :doc:`/admin/drivers/ipmitool`. Hardware produced
+after 2020 also tends to support :doc:`/admin/drivers/redfish`, although the
+implementation quality and available features vary between vendors.
 
 .. _refarch-common-boot:
 
@@ -93,11 +104,18 @@ The boot interface of a node manages booting of both the deploy ramdisk and
 the user instances on the bare metal node. The deploy interface orchestrates
 the deployment and defines how the image gets transferred to the target disk.
 
-The main alternatives are to use PXE/iPXE or virtual media - see
-:doc:`/admin/interfaces/boot` for a detailed explanation. If a virtual media
-implementation is available for the hardware, it is recommended using it
-for better scalability and security. Otherwise, it is recommended to use iPXE,
-when it is supported by target hardware.
+The main alternatives are to use network boot (PXE, iPXE, UEFI HTTP boot) or
+virtual media - see :doc:`/admin/interfaces/boot` for a detailed explanation.
+
+If a virtual media implementation is available for the hardware, it is
+recommended using it for better scalability and security. The largest
+bottleneck in this case is the performance of the BMC network, where all
+virtual media images will be transferred.
+
+Otherwise, it is recommended to use UEFI HTTP boot or iPXE, when it is
+supported by target hardware. The BMC network is not an issue in this case, but
+the requirement of DHCP on a shared L2 broadcast domain will limit the number
+of simultaneously running processes to maximum a few dozens.
 
 Hardware specifications
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -115,9 +133,7 @@ characteristics of hardware itself. However, keep in mind that
 
 * The machines should have enough RAM to fit the deployment/cleaning ramdisk
   to run. The minimum varies greatly depending on the way the ramdisk was
-  built. For example, *tinyipa*, the TinyCoreLinux-based ramdisk used in the
-  CI, only needs 400 MiB of RAM, while ramdisks built by *diskimage-builder*
-  may require 3 GiB or more.
+  built. Ramdisks built by *diskimage-builder* typically require 3 GiB or more.
 
 Image types
 -----------
@@ -169,13 +185,18 @@ networks.
   to the provisioning/cleaning/rescuing network.
 
   .. note::
-      Only two endpoints need to be exposed there::
+      Only these endpoints need to be exposed there::
 
         GET /v1/lookup
         POST /v1/heartbeat/[a-z0-9\-]+
+        POST /v1/continue_inspection
 
-      You may want to limit access from this network to only these endpoints,
-      and make these endpoint not accessible from other networks.
+      You may want to limit access from this network to only these
+      endpoints. If you run separate API instances for public and
+      provisioning traffic (a split-horizon deployment), set
+      ``[api] enable_ramdisk_endpoints = False`` on the
+      public-facing instances to disable these endpoints there.
+      See :doc:`/admin/security` for details.
 
 * If the ``pxe`` boot interface (or any boot interface based on it) is used,
   then the baremetal nodes should have untagged (access mode) connectivity
@@ -233,6 +254,8 @@ conductors. When a conductor is considered offline, its nodes are taken over by
 other conductors. As a result of this, you need at least 2 conductor hosts
 for an HA deployment.
 
+.. _refarch-conductor-scaling:
+
 Performance
 ^^^^^^^^^^^
 
@@ -251,11 +274,6 @@ required number of conductors in a deployment depends on several factors:
 * the maximum number of bare metal nodes that are provisioned simultaneously
   (see the ``max_concurrent_builds`` option for the Compute service).
 
-We recommend a target of **100** bare metal nodes per conductor for maximum
-reliability and performance. There is some tolerance for a larger number per
-conductor. However, it was reported [1]_ [2]_ that reliability degrades when
-handling approximately 300 bare metal nodes per conductor.
-
 Disk space
 ^^^^^^^^^^
 
@@ -265,21 +283,20 @@ the space requirements are different:
 
 * The deployment kernel and ramdisk are always cached during the deployment.
 
-* When ``[agent]image_download_source`` is set to ``http`` and Glance is used,
+* When :oslo.config:option:`agent.image_download_source` is set to ``http`` and Glance is used,
   the conductor will download instances images locally to serve them from its
   HTTP server. Use ``swift`` to publish images using temporary URLs and convert
   them on the node's side.
 
-  When ``[agent]image_download_source`` is set to ``local``, it will happen
+  When :oslo.config:option:`agent.image_download_source` is set to ``local``, it will happen
   even for HTTP(s) URLs. For standalone case use ``http`` to avoid unnecessary
   caching of images.
 
   In both cases a cached image is converted to raw if ``force_raw_images``
   is ``True`` (the default).
 
-  .. note::
-    ``image_download_source`` can also be provided in the node's
-    ``driver_info`` or ``instance_info``. See :ref:`image_download_source`.
+  See :ref:`image_download_source` and :ref:`stream_raw_images` for more
+  details.
 
 * When network boot is used, the instance image kernel and ramdisk are cached
   locally while the instance is active.
@@ -290,8 +307,73 @@ the space requirements are different:
     The caching can be configured via the ``image_cache_size`` and
     ``image_cache_ttl`` configuration options in the ``pxe`` group.
 
+Nodes per conductor
+^^^^^^^^^^^^^^^^^^^
+
+We recommend a target of **300** bare metal nodes per conductor for maximum
+reliability and performance. This is a very safe bet across different
+configurations and drivers. Long time ago, it was reported [1]_ [2]_ that
+reliability may degrade after this number, but these findings don't necessarily
+apply to modern Ironic, especially now that it no longer relies on Eventlet and
+green threads.
+
+Anecdotally, more recent versions can handle 800-1000 with per conductor with
+minimum site-specific optimizations. To handle a much higher number of
+machines, you need to scale your cluster horizontally, and/or apply performance
+tuning.
+
+For scaling, consider using :doc:`../../admin/availability-zones`
+strategies such as conductor groups to distribute load across multiple
+conductors, or even multiple Ironic deployments for complete isolation.
+
+To get a higher nodes-per-conductor ratio, consider these tricks:
+
+- Prefer Redfish or other HTTP-based drivers to using IPMI.
+
+  IPMI is UDP-based and is therefore more prone to transient networking issues
+  and behaves poorly on heavily congested networks. The Ironic implementation
+  executes ``ipmitool``, which is also less performant than pure HTTP(s) calls.
+
+- Prefer virtual media boot over a performant BMC network to using network boot
+  (see `boot interface`_).
+
+  If network boot is required, prefer UEFI HTTP boot or iPXE to plain PXE,
+  since the latter requires downloading a pretty large IPA image over TFTP.
+
+- Serve raw images directly from Swift or from an external HTTP server using
+  ``image_download_source`` as described in `disk space`_.
+
+- Always batch both enrollment of new nodes or deployments of instances. 50
+  parallel processes seems to be a good starting point in practice.
+
+- Significantly decrease frequency of various periodic processes, including the
+  :doc:`power synchronization loop </admin/power-sync>`. Turn off periodic
+  tasks for feature you don't use (e.g. firmware upgrades, BIOS settings).
+  Check :doc:`configuration </configuration/config>` for relevant options.
+
+  Do not enable drivers and interfaces that you're not planning to use (some of
+  them require additional periodic tasks).
+
+- If operating an OpenStack cloud with a busy messaging bus, check if using
+  JSON RPC makes the API more responsive. For a single-conductor Ironic,
+  compare the all-in-one ``ironic`` script against using WSGI and RPC.
+
+- See :doc:`tuning guide </admin/tuning>` for memory and database tuning.
+
+Some Metal3_ users have reported successfully deploying up to 3500 nodes per
+single Ironic API+conductor process by using a combination of these tricks.
+If unsure, start with 300 and work your way from there.
+
+.. _Metal3: https://metal3.io/
 .. [1] http://lists.openstack.org/pipermail/openstack-dev/2017-June/118033.html
 .. [2] http://lists.openstack.org/pipermail/openstack-dev/2017-June/118327.html
+
+ironic-novncproxy
+~~~~~~~~~~~~~~~~~
+
+The NoVNC proxy service is stateless, and thus can be scaled horizontally. Any
+load balancing or reverse proxy architecture also needs to support websockets,
+as this is how the VNC traffic communicates with the service.
 
 Other services
 ~~~~~~~~~~~~~~

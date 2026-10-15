@@ -12,6 +12,7 @@
 
 from oslo_utils import strutils
 from oslo_utils import uuidutils
+from oslo_utils import versionutils
 from oslo_versionedobjects import base as object_base
 
 from ironic.common import exception
@@ -23,7 +24,11 @@ from ironic.objects import fields as object_fields
 @base.IronicObjectRegistry.register
 class NodeHistory(base.IronicObject, object_base.VersionedObjectDictCompat):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Relevant methods changed to be remotable methods.
+    # Version 1.2: Added project field.
+    # Version 1.3: Added state, target_provision_state,
+    #              and duration_seconds fields.
+    VERSION = '1.3'
 
     dbapi = dbapi.get_instance()
 
@@ -33,16 +38,17 @@ class NodeHistory(base.IronicObject, object_base.VersionedObjectDictCompat):
         'conductor': object_fields.StringField(nullable=True),
         'event': object_fields.StringField(nullable=True),
         'user': object_fields.StringField(nullable=True),
+        'project': object_fields.StringField(nullable=True),
         'node_id': object_fields.IntegerField(nullable=True),
         'event_type': object_fields.StringField(nullable=True),
         'severity': object_fields.StringField(nullable=True),
+        'state': object_fields.StringField(nullable=True),
+        'target_provision_state': object_fields.StringField(nullable=True),
+        'duration_seconds': object_fields.IntegerField(nullable=True),
     }
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get(cls, context, history_ident):
         """Get a history based on its id or uuid.
 
@@ -59,11 +65,8 @@ class NodeHistory(base.IronicObject, object_base.VersionedObjectDictCompat):
         else:
             raise exception.InvalidIdentity(identity=history_ident)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_id(cls, context, history_id):
         """Get a NodeHistory object by its integer ID.
 
@@ -78,11 +81,8 @@ class NodeHistory(base.IronicObject, object_base.VersionedObjectDictCompat):
         history = cls._from_db_object(context, cls(), db_history)
         return history
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_uuid(cls, context, uuid):
         """Get a NodeHistory object by its UUID.
 
@@ -97,11 +97,8 @@ class NodeHistory(base.IronicObject, object_base.VersionedObjectDictCompat):
         history = cls._from_db_object(context, cls(), db_history)
         return history
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def list(cls, context, limit=None, marker=None, sort_key=None,
              sort_dir=None):
         """Return a list of NodeHistory objects.
@@ -122,11 +119,8 @@ class NodeHistory(base.IronicObject, object_base.VersionedObjectDictCompat):
                                                        sort_dir=sort_dir)
         return cls._from_db_object_list(context, db_histories)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def list_by_node_id(cls, context, node_id, limit=None, marker=None,
                         sort_key=None, sort_dir=None):
         """Return a list of NodeHistory objects belongs to a given node ID.
@@ -147,10 +141,6 @@ class NodeHistory(base.IronicObject, object_base.VersionedObjectDictCompat):
             sort_dir=sort_dir)
         return cls._from_db_object_list(context, db_histories)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
     def create(self, context=None):
         """Create a NodeHistory record in the DB.
 
@@ -165,10 +155,6 @@ class NodeHistory(base.IronicObject, object_base.VersionedObjectDictCompat):
         db_history = self.dbapi.create_node_history(values)
         self._from_db_object(self._context, self, db_history)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
     def destroy(self, context=None):
         """Delete the NodeHistory from the DB.
 
@@ -182,3 +168,33 @@ class NodeHistory(base.IronicObject, object_base.VersionedObjectDictCompat):
         """
         self.dbapi.destroy_node_history_by_uuid(self.uuid)
         self.obj_reset_changes()
+
+    def _convert_to_version(self, target_version,
+                            remove_unavailable_fields=True):
+        """Convert the object instance to requested target version."""
+        super(NodeHistory, self)._convert_to_version(
+            target_version,
+            remove_unavailable_fields=remove_unavailable_fields)
+
+        target_version = versionutils.convert_version_to_tuple(target_version)
+
+        # Version 1.3 added 'state', 'target_provision_state',
+        # and 'duration_seconds'
+        if target_version < (1, 3):
+            fields_to_remove = [
+                'state', 'target_provision_state', 'duration_seconds'
+            ]
+            for field in fields_to_remove:
+                if self.obj_attr_is_set(field):
+                    if remove_unavailable_fields:
+                        delattr(self, field)
+                    else:
+                        setattr(self, field, None)
+
+        # Version 1.2 added 'project'
+        if target_version < (1, 2):
+            if self.obj_attr_is_set('project'):
+                if remove_unavailable_fields:
+                    delattr(self, 'project')
+                else:
+                    setattr(self, 'project', None)

@@ -14,12 +14,15 @@
 #    under the License.
 
 from oslo_config import cfg
+import osprofiler.opts
 
 from ironic.conf import agent
+from ironic.conf import agent_containers
 from ironic.conf import anaconda
 from ironic.conf import ansible
 from ironic.conf import api
 from ironic.conf import audit
+from ironic.conf import cifs
 from ironic.conf import cinder
 from ironic.conf import conductor
 from ironic.conf import console
@@ -27,35 +30,40 @@ from ironic.conf import database
 from ironic.conf import default
 from ironic.conf import deploy
 from ironic.conf import dhcp
+from ironic.conf import disk_utils
 from ironic.conf import dnsmasq
 from ironic.conf import drac
+from ironic.conf import exception
+from ironic.conf import fake
 from ironic.conf import glance
 from ironic.conf import healthcheck
-from ironic.conf import ibmc
-from ironic.conf import ilo
 from ironic.conf import inspector
 from ironic.conf import inventory
 from ironic.conf import ipmi
-from ironic.conf import irmc
+from ironic.conf import ironic_networking
+from ironic.conf import json_rpc
+from ironic.conf import mdns
 from ironic.conf import metrics
-from ironic.conf import metrics_statsd
-from ironic.conf import molds
 from ironic.conf import neutron
+from ironic.conf import nfs
 from ironic.conf import nova
+from ironic.conf import oci
 from ironic.conf import pxe
 from ironic.conf import redfish
+from ironic.conf import sensor_data
 from ironic.conf import service_catalog
-from ironic.conf import snmp
 from ironic.conf import swift
-from ironic.conf import xclarity
+from ironic.conf import vnc
 
 CONF = cfg.CONF
 
 agent.register_opts(CONF)
+agent_containers.register_opts(CONF)
 anaconda.register_opts(CONF)
 ansible.register_opts(CONF)
 api.register_opts(CONF)
 audit.register_opts(CONF)
+cifs.register_opts(CONF)
 cinder.register_opts(CONF)
 conductor.register_opts(CONF)
 console.register_opts(CONF)
@@ -64,23 +72,31 @@ default.register_opts(CONF)
 deploy.register_opts(CONF)
 drac.register_opts(CONF)
 dhcp.register_opts(CONF)
+disk_utils.register_opts(CONF)
 dnsmasq.register_opts(CONF)
+exception.register_opts(CONF)
+fake.register_opts(CONF)
 glance.register_opts(CONF)
 healthcheck.register_opts(CONF)
-ibmc.register_opts(CONF)
-ilo.register_opts(CONF)
 inspector.register_opts(CONF)
 inventory.register_opts(CONF)
 ipmi.register_opts(CONF)
-irmc.register_opts(CONF)
+ironic_networking.register_opts(CONF)
+# Register default json_rpc group used for conductor
+json_rpc.register_opts(CONF)
+# Register a separate json_rpc group for ironic networking specific settings
+json_rpc.register_opts(CONF, group='ironic_networking_json_rpc')
+mdns.register_opts(CONF)
 metrics.register_opts(CONF)
-metrics_statsd.register_opts(CONF)
-molds.register_opts(CONF)
 neutron.register_opts(CONF)
+nfs.register_opts(CONF)
 nova.register_opts(CONF)
+oci.register_opts(CONF)
 pxe.register_opts(CONF)
 redfish.register_opts(CONF)
+sensor_data.register_opts(CONF)
 service_catalog.register_opts(CONF)
-snmp.register_opts(CONF)
 swift.register_opts(CONF)
-xclarity.register_opts(CONF)
+vnc.register_opts(CONF)
+
+osprofiler.opts.set_defaults(cfg.CONF)

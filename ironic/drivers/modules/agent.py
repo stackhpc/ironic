@@ -12,20 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 from urllib import parse as urlparse
 
-from ironic_lib import metrics_utils
 from oslo_log import log
-from oslo_utils import units
+from oslo_utils import strutils
+import tenacity
 
+from ironic.common import async_steps
+from ironic.common import boot_devices
+from ironic.common import boot_modes
 from ironic.common import exception
 from ironic.common.glance_service import service_utils
 from ironic.common.i18n import _
+from ironic.common import image_service
 from ironic.common import images
+from ironic.common import metrics_utils
+from ironic.common import oci_registry as oci
 from ironic.common import raid
 from ironic.common import states
 from ironic.common import utils
+from ironic.conductor import configdrive_utils
 from ironic.conductor import deployments
+from ironic.conductor import steps as conductor_steps
 from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
 from ironic.conf import CONF
@@ -34,6 +43,7 @@ from ironic.drivers.modules import agent_base
 from ironic.drivers.modules import agent_client
 from ironic.drivers.modules import boot_mode_utils
 from ironic.drivers.modules import deploy_utils
+from ironic.drivers import utils as driver_utils
 
 
 LOG = log.getLogger(__name__)
@@ -89,46 +99,6 @@ PARTITION_IMAGE_LABELS = ('kernel', 'ramdisk', 'root_gb', 'root_mb', 'swap_mb',
                           'ephemeral_mb', 'ephemeral_format', 'configdrive',
                           'preserve_ephemeral', 'image_type',
                           'deploy_boot_mode')
-
-
-@METRICS.timer('check_image_size')
-def check_image_size(task):
-    """Check if the requested image is larger than the ram size.
-
-    :param task: a TaskManager instance containing the node to act on.
-    :raises: InvalidParameterValue if size of the image is greater than
-        the available ram size.
-    """
-    node = task.node
-    properties = node.properties
-    image_source = node.instance_info.get('image_source')
-    image_disk_format = node.instance_info.get('image_disk_format')
-    # skip check if 'memory_mb' is not defined
-    if 'memory_mb' not in properties:
-        LOG.debug('Skip the image size check as memory_mb is not '
-                  'defined in properties on node %s.', node.uuid)
-        return
-
-    image_show = images.image_show(task.context, image_source)
-    if CONF.agent.stream_raw_images and (image_show.get('disk_format') == 'raw'
-                                         or image_disk_format == 'raw'):
-        LOG.debug('Skip the image size check since the image is going to be '
-                  'streamed directly onto the disk for node %s', node.uuid)
-        return
-
-    memory_size = int(properties.get('memory_mb'))
-    image_size = int(image_show['size'])
-    reserved_size = CONF.agent.memory_consumed_by_agent
-    if (image_size + (reserved_size * units.Mi)) > (memory_size * units.Mi):
-        msg = (_('Memory size is too small for requested image, if it is '
-                 'less than (image size + reserved RAM size), will break '
-                 'the IPA deployments. Image size: %(image_size)d MiB, '
-                 'Memory size: %(memory_size)d MiB, Reserved size: '
-                 '%(reserved_size)d MiB.')
-               % {'image_size': image_size / units.Mi,
-                  'memory_size': memory_size,
-                  'reserved_size': reserved_size})
-        raise exception.InvalidParameterValue(msg)
 
 
 @METRICS.timer('validate_image_proxies')
@@ -195,12 +165,100 @@ def validate_http_provisioning_configuration(node):
         '[deploy]http_root': CONF.deploy.http_root,
         '[deploy]http_image_subdir': CONF.deploy.http_image_subdir
     }
-    error_msg = _('Node %s failed to validate http provisoning. Some '
+    error_msg = _('Node %s failed to validate http provisioning. Some '
                   'configuration options were missing') % node.uuid
     deploy_utils.check_for_missing_params(params, error_msg)
 
 
-class CustomAgentDeploy(agent_base.AgentBaseMixin, agent_base.AgentDeployMixin,
+def soft_power_off(task, client=None):
+    """Power off the node using the agent API."""
+    if client is None:
+        client = agent_client.get_client(task)
+
+    wait = CONF.agent.post_deploy_get_power_state_retry_interval
+    attempts = CONF.agent.post_deploy_get_power_state_retries + 1
+
+    @tenacity.retry(stop=tenacity.stop_after_attempt(attempts),
+                    retry=(tenacity.retry_if_result(
+                        lambda state: state != states.POWER_OFF)
+                        | tenacity.retry_if_exception_type(Exception)),
+                    wait=tenacity.wait_fixed(wait),
+                    reraise=True)
+    def _wait_until_powered_off(task):
+        return task.driver.power.get_power_state(task)
+
+    try:
+        client.power_off(task.node)
+    except Exception as e:
+        LOG.warning('Failed to soft power off node %(node_uuid)s. '
+                    '%(cls)s: %(error)s',
+                    {'node_uuid': task.node.uuid,
+                     'cls': e.__class__.__name__, 'error': e},
+                    exc_info=not isinstance(
+                        e, exception.IronicException))
+
+    # NOTE(dtantsur): in rare cases it may happen that the power
+    # off request comes through but we never receive the response.
+    # Check the power state before trying to force off.
+    try:
+        _wait_until_powered_off(task)
+    except Exception:
+        LOG.warning('Failed to soft power off node %(node_uuid)s '
+                    'in at least %(timeout)d seconds. Forcing '
+                    'hard power off and proceeding.',
+                    {'node_uuid': task.node.uuid,
+                     'timeout': (wait * (attempts - 1))})
+        manager_utils.node_power_action(task, states.POWER_OFF)
+
+
+def set_boot_to_disk(task, target_boot_mode=None):
+    """Boot a node to disk.
+
+    This is a helper method to reduce duplication of code around
+    handling vendor specifics for setting boot modes between multiple
+    deployment interfaces inside of Ironic.
+
+    :param task: A Taskmanager object.
+    :param target_boot_mode: The target boot_mode, defaults to UEFI.
+    """
+    if not target_boot_mode:
+        target_boot_mode = boot_modes.UEFI
+    node = task.node
+    try:
+        persistent = True
+        # NOTE(TheJulia): We *really* only should be doing this in bios
+        # boot mode. In UEFI this might just get disregarded, or cause
+        # issues/failures.
+        if node.driver_info.get('force_persistent_boot_device',
+                                'Default') == 'Never':
+            persistent = False
+
+        vendor = task.node.properties.get('vendor', None)
+        if not (vendor and vendor.lower() == 'lenovo'
+                and target_boot_mode == 'uefi'):
+            # Lenovo hardware is modeled on a "just update"
+            # UEFI nvram model of use, and if multiple actions
+            # get requested, you can end up in cases where NVRAM
+            # changes are deleted as the host "restores" to the
+            # backup. For more information see
+            # https://bugs.launchpad.net/ironic/+bug/2053064
+            # NOTE(TheJulia): We likely just need to do this with
+            # all hosts in uefi mode, but libvirt VMs don't handle
+            # nvram only changes *and* this pattern is known to generally
+            # work for Ironic operators.
+            deploy_utils.try_set_boot_device(task, boot_devices.DISK,
+                                             persistent=persistent)
+    except Exception as e:
+        msg = (_("Failed to change the boot device to %(boot_dev)s "
+                 "when deploying node %(node)s: %(error)s") %
+               {'boot_dev': boot_devices.DISK, 'node': node.uuid,
+                'error': e})
+        agent_base.log_and_raise_deployment_error(task, msg, exc=e)
+
+
+class CustomAgentDeploy(agent_base.AgentBaseMixin,
+                        agent_base.HeartbeatMixin,
+                        agent_base.AgentOobStepsMixin,
                         base.DeployInterface):
     """A deploy interface that relies on a custom agent to deploy.
 
@@ -240,6 +298,55 @@ class CustomAgentDeploy(agent_base.AgentBaseMixin, agent_base.AgentDeployMixin,
         # Validate the root device hints
         deploy_utils.get_root_device_for_deploy(task.node)
 
+    @METRICS.timer('CustomAgentDeploy.get_deploy_steps')
+    def get_deploy_steps(self, task):
+        """Get the list of deploy steps from the agent.
+
+        :param task: a TaskManager object containing the node
+        :raises InstanceDeployFailure: if the deploy steps are not yet
+            available (cached), for example, when a node has just been
+            enrolled and has not been deployed yet.
+        :returns: A list of deploy step dictionaries
+        """
+        steps = super().get_deploy_steps(task)[:]
+        ib_steps = agent_base.get_steps(task, 'deploy', interface='deploy')
+        # NOTE(dtantsur): we allow in-band steps to be shadowed by out-of-band
+        # ones, see the docstring of execute_deploy_step for details.
+        steps += [step for step in ib_steps
+                  # FIXME(dtantsur): nested loops are not too efficient
+                  if not conductor_steps.find_step(steps, step)]
+        return steps
+
+    @METRICS.timer('CustomAgentDeploy.execute_deploy_step')
+    def execute_deploy_step(self, task, step):
+        """Execute a deploy step.
+
+        We're trying to find a step among both out-of-band and in-band steps.
+        In case of duplicates, out-of-band steps take priority. This property
+        allows having an out-of-band deploy step that calls into
+        a corresponding in-band step after some preparation (e.g. with
+        additional input).
+
+        :param task: a TaskManager object containing the node
+        :param step: a deploy step dictionary to execute
+        :raises: InstanceDeployFailure if the agent does not return a command
+            status
+        :returns: states.DEPLOYWAIT to signify the step will be completed async
+        """
+        agent_running = task.node.driver_internal_info.get(
+            'agent_cached_deploy_steps')
+        oob_steps = self.deploy_steps
+
+        if conductor_steps.find_step(oob_steps, step):
+            return super().execute_deploy_step(task, step)
+        elif not agent_running:
+            raise exception.InstanceDeployFailure(
+                _('Deploy step %(step)s has not been found. Available '
+                  'out-of-band steps: %(oob)s. Agent is not running.') %
+                {'step': step, 'oob': oob_steps})
+        else:
+            return agent_base.execute_step(task, step, 'deploy')
+
     @METRICS.timer('CustomAgentDeploy.deploy')
     @base.deploy_step(priority=100)
     @task_manager.require_exclusive_lock
@@ -266,13 +373,14 @@ class CustomAgentDeploy(agent_base.AgentBaseMixin, agent_base.AgentDeployMixin,
         elif task.driver.storage.should_write_image(task):
             # Check if the driver has already performed a reboot in a previous
             # deploy step.
-            if not task.node.driver_internal_info.get('deployment_reboot'):
-                manager_utils.node_power_action(task, states.REBOOT)
-            task.node.del_driver_internal_info('deployment_reboot')
+            already_rebooted = task.node.del_driver_internal_info(
+                async_steps.DEPLOYMENT_REBOOT)
             task.node.save()
+            if not already_rebooted:
+                manager_utils.node_power_action(task, states.REBOOT)
             return states.DEPLOYWAIT
 
-    @METRICS.timer('CustomAgentDeployMixin.prepare_instance_boot')
+    @METRICS.timer('CustomAgentDeploy.prepare_instance_boot')
     @base.deploy_step(priority=60)
     @task_manager.require_exclusive_lock
     def prepare_instance_boot(self, task):
@@ -287,7 +395,63 @@ class CustomAgentDeploy(agent_base.AgentBaseMixin, agent_base.AgentDeployMixin,
                       '%(node)s. %(cls)s: %(error)s',
                       {'node': task.node.uuid,
                        'cls': e.__class__.__name__, 'error': e})
-            msg = _('Failed to prepare instance for booting')
+            msg = _('Failed to prepare instance for booting: %s') % e
+            agent_base.log_and_raise_deployment_error(task, msg, exc=e)
+
+    @METRICS.timer('CustomAgentDeploy.tear_down_agent')
+    @base.deploy_step(priority=40)
+    @task_manager.require_exclusive_lock
+    def tear_down_agent(self, task):
+        """A deploy step to tear down the agent.
+
+        :param task: a TaskManager object containing the node
+        """
+        node = task.node
+
+        if CONF.agent.deploy_logs_collect == 'always':
+            driver_utils.collect_ramdisk_logs(node)
+
+        # Whether ironic should power off the node via out-of-band or
+        # in-band methods
+        oob_power_off = strutils.bool_from_string(
+            node.driver_info.get('deploy_forces_oob_reboot', False))
+        can_power_on = (states.POWER_ON in
+                        task.driver.power.get_supported_power_states(task))
+
+        client = agent_client.get_client(task)
+        try:
+            if node.disable_power_off:
+                LOG.info("Node %s does not support power off, locking "
+                         "down the agent", node.uuid)
+                client.lockdown(node)
+            elif not can_power_on:
+                LOG.info('Power interface of node %s does not support '
+                         'power on, using reboot to switch to the instance',
+                         node.uuid)
+                client.sync(node)
+                manager_utils.node_power_action(task, states.REBOOT)
+            elif not oob_power_off:
+                soft_power_off(task, client)
+            else:
+                # Flush the file system prior to hard rebooting the node
+                result = client.sync(node)
+                error = result.get('faultstring')
+                if error:
+                    if 'Unknown command' in error:
+                        error = _('The version of the IPA ramdisk used in '
+                                  'the deployment do not support the '
+                                  'command "sync"')
+                    LOG.warning(
+                        'Failed to flush the file system prior to hard '
+                        'rebooting the node %(node)s: %(error)s',
+                        {'node': node.uuid, 'error': error})
+
+                manager_utils.node_power_action(task, states.POWER_OFF)
+        except Exception as e:
+            msg = (_('Error rebooting node %(node)s after deploy. '
+                     '%(cls)s: %(error)s') %
+                   {'node': node.uuid, 'cls': e.__class__.__name__,
+                    'error': e})
             agent_base.log_and_raise_deployment_error(task, msg, exc=e)
 
     def _update_instance_info(self, task):
@@ -334,7 +498,7 @@ class CustomAgentDeploy(agent_base.AgentBaseMixin, agent_base.AgentDeployMixin,
                 LOG.debug('The agent for node %(node)s has recently checked '
                           'in, and the node power will remain unmodified.',
                           {'node': task.node.uuid})
-            else:
+            elif not node.disable_power_off:
                 # Powering off node to setup networking for port and
                 # ensure that the state is reset if it is inadvertently
                 # on for any unknown reason.
@@ -364,10 +528,11 @@ class CustomAgentDeploy(agent_base.AgentBaseMixin, agent_base.AgentDeployMixin,
                 # Alternatively, we could be in a fast track deployment
                 # and again, we should have nothing to do here.
                 return
-        if node.provision_state in (states.ACTIVE, states.UNRESCUING):
+        if node.provision_state in (states.ACTIVE, states.UNRESCUING,
+                                    states.ADOPTING):
             # Call is due to conductor takeover
             task.driver.boot.prepare_instance(task)
-        elif node.provision_state != states.ADOPTING:
+        else:
             if node.provision_state not in (states.RESCUING, states.RESCUEWAIT,
                                             states.RESCUE, states.RESCUEFAIL):
                 self._update_instance_info(task)
@@ -404,7 +569,6 @@ class AgentDeploy(CustomAgentDeploy):
         task.node.instance_info = (
             deploy_utils.build_instance_info_for_deploy(task))
         task.node.save()
-        check_image_size(task)
 
     @METRICS.timer('AgentDeploy.validate')
     def validate(self, task):
@@ -454,7 +618,8 @@ class AgentDeploy(CustomAgentDeploy):
         # NOTE(dtantsur): glance images contain a checksum; for file images we
         # will recalculate the checksum anyway.
         if (not service_utils.is_glance_image(image_source)
-                and not image_source.startswith('file://')):
+                and not image_source.startswith('file://')
+                and not image_source.startswith('oci://')):
 
             def _raise_missing_checksum_exception(node):
                 raise exception.MissingParameterValue(_(
@@ -483,7 +648,7 @@ class AgentDeploy(CustomAgentDeploy):
             LOG.warning("The boot_option capability has been deprecated, "
                         "please unset it for node %s", node.uuid)
 
-    @METRICS.timer('AgentDeployMixin.write_image')
+    @METRICS.timer('AgentDeploy.write_image')
     @base.deploy_step(priority=80)
     @task_manager.require_exclusive_lock
     def write_image(self, task):
@@ -507,6 +672,16 @@ class AgentDeploy(CustomAgentDeploy):
             'stream_raw_images': CONF.agent.stream_raw_images,
         }
 
+        if (CONF.deploy.image_server_auth_strategy != 'noauth'
+                and image_service.is_host_auth_permitted(
+                    node.instance_info['image_url'])):
+            image_info['image_server_auth_strategy'] = \
+                CONF.deploy.image_server_auth_strategy
+            image_info['image_server_user'] = \
+                CONF.deploy.image_server_user
+            image_info['image_server_password'] = \
+                CONF.deploy.image_server_password
+
         if node.instance_info.get('image_checksum'):
             image_info['checksum'] = node.instance_info['image_checksum']
 
@@ -516,6 +691,11 @@ class AgentDeploy(CustomAgentDeploy):
                 'image_os_hash_algo']
             image_info['os_hash_value'] = node.instance_info[
                 'image_os_hash_value']
+
+        if node.instance_info.get('image_request_authorization_secret'):
+            ah = node.instance_info.get('image_request_authorization_secret')
+            ah = base64.standard_b64encode(ah.encode())
+            image_info['image_request_authorization'] = ah
 
         proxies = {}
         for scheme in ('http', 'https'):
@@ -542,7 +722,7 @@ class AgentDeploy(CustomAgentDeploy):
             if disk_label is not None:
                 image_info['disk_label'] = disk_label
 
-        configdrive = manager_utils.get_configdrive_image(node)
+        configdrive = configdrive_utils.get_configdrive_image(node)
         if configdrive:
             # FIXME(dtantsur): remove this duplication once IPA is ready:
             # https://review.opendev.org/c/openstack/ironic-python-agent/+/790471
@@ -557,7 +737,7 @@ class AgentDeploy(CustomAgentDeploy):
         return agent_base.execute_step(task, new_step, 'deploy',
                                        client=client)
 
-    @METRICS.timer('AgentDeployMixin.prepare_instance_boot')
+    @METRICS.timer('AgentDeploy.prepare_instance_boot')
     @base.deploy_step(priority=60)
     @task_manager.require_exclusive_lock
     def prepare_instance_boot(self, task):
@@ -615,8 +795,263 @@ class AgentDeploy(CustomAgentDeploy):
         else:
             manager_utils.node_set_boot_device(task, 'disk', persistent=True)
 
-        # Remove symbolic link when deploy is done.
-        deploy_utils.remove_http_instance_symlink(task.node.uuid)
+        # Remove symbolic link and image when deploy is done.
+        deploy_utils.destroy_http_instance_images(task.node)
+
+    @METRICS.timer('AgentDeploy.prepare_instance_to_boot')
+    def prepare_instance_to_boot(self, task, root_uuid, efi_sys_uuid,
+                                 prep_boot_part_uuid=None):
+        """Prepares instance to boot.
+
+        :param task: a TaskManager object containing the node
+        :param root_uuid: the UUID for root partition
+        :param efi_sys_uuid: the UUID for the efi partition
+        :raises: InvalidState if fails to prepare instance
+        """
+
+        node = task.node
+        # Install the boot loader
+        self.configure_local_boot(
+            task, root_uuid=root_uuid,
+            efi_system_part_uuid=efi_sys_uuid,
+            prep_boot_part_uuid=prep_boot_part_uuid)
+
+        try:
+            task.driver.boot.prepare_instance(task)
+        except Exception as e:
+            LOG.error('Preparing instance for booting failed for instance '
+                      '%(instance)s. %(cls)s: %(error)s',
+                      {'instance': node.instance_uuid,
+                       'cls': e.__class__.__name__, 'error': e})
+            msg = _('Failed to prepare instance for booting: %s') % e
+            agent_base.log_and_raise_deployment_error(task, msg, exc=e)
+
+    @METRICS.timer('AgentDeploy.configure_local_boot')
+    def configure_local_boot(self, task, root_uuid=None,
+                             efi_system_part_uuid=None,
+                             prep_boot_part_uuid=None):
+        """Helper method to configure local boot on the node.
+
+        This method triggers bootloader installation on the node.
+        On successful installation of bootloader, this method sets the
+        node to boot from disk.
+
+        :param task: a TaskManager object containing the node
+        :param root_uuid: The UUID of the root partition. This is used
+            for identifying the partition which contains the image deployed
+            or None in case of whole disk images which we expect to already
+            have a bootloader installed.
+        :param efi_system_part_uuid: The UUID of the efi system partition.
+            This is used only in uefi boot mode.
+        :param prep_boot_part_uuid: The UUID of the PReP Boot partition.
+            This is used only for booting ppc64* hardware.
+        :raises: InstanceDeployFailure if bootloader installation failed or
+            on encountering error while setting the boot device on the node.
+        """
+        node = task.node
+        # Almost never taken into account on agent side, just used for softraid
+        # Can be useful with whole_disk_images
+        target_boot_mode = boot_mode_utils.get_boot_mode(task.node)
+        LOG.debug('Configuring local boot for node %s', node.uuid)
+
+        # If the target RAID configuration is set to 'software' for the
+        # 'controller', we need to trigger the installation of grub on
+        # the holder disks of the desired Software RAID.
+        internal_info = node.driver_internal_info
+        raid_config = node.target_raid_config
+        logical_disks = raid_config.get('logical_disks', [])
+        software_raid = False
+        for logical_disk in logical_disks:
+            if logical_disk.get('controller') == 'software':
+                LOG.debug('Node %s has a Software RAID configuration',
+                          node.uuid)
+                software_raid = True
+                break
+
+        # For software RAID try to get the UUID of the root fs from the
+        # image's metadata (via Glance). Fall back to the driver internal
+        # info in case it is not available (e.g. not set or there's no Glance).
+        if software_raid:
+            root_uuid = node.instance_info.get('image_rootfs_uuid')
+            if not root_uuid:
+                image_source = node.instance_info.get('image_source')
+                try:
+                    context = task.context
+                    # TODO(TheJulia): Uhh, is_admin likely needs to be
+                    # addressed in Xena as undesirable behavior may
+                    # result, or just outright break in an entirely
+                    # system scoped configuration.
+                    context.is_admin = True
+                    glance = image_service.GlanceImageService(
+                        context=context)
+                    image_info = glance.show(image_source)
+                    image_properties = image_info.get('properties')
+                    root_uuid = image_properties['rootfs_uuid']
+                    LOG.debug('Got rootfs_uuid from Glance: %s '
+                              '(node %s)', root_uuid, node.uuid)
+                except Exception as e:
+                    LOG.warning(
+                        'Could not get \'rootfs_uuid\' property for '
+                        'image %(image)s from Glance for node %(node)s. '
+                        '%(cls)s: %(error)s.',
+                        {'image': image_source, 'node': node.uuid,
+                         'cls': e.__class__.__name__, 'error': e})
+                    root_uuid = internal_info.get('root_uuid_or_disk_id')
+                    LOG.debug('Got rootfs_uuid from driver internal info: '
+                              '%s (node %s)', root_uuid, node.uuid)
+
+        # For whole disk images it is not necessary that the root_uuid
+        # be provided since the bootloaders on the disk will be used
+        whole_disk_image = internal_info.get('is_whole_disk_image')
+        if (software_raid or (root_uuid and not whole_disk_image)
+                or (whole_disk_image
+                    and boot_mode_utils.get_boot_mode(node) == 'uefi')):
+            LOG.debug('Installing the bootloader for node %(node)s on '
+                      'partition %(part)s, EFI system partition %(efi)s',
+                      {'node': node.uuid, 'part': root_uuid,
+                       'efi': efi_system_part_uuid})
+            client = agent_client.get_client(task)
+            result = client.install_bootloader(
+                node, root_uuid=root_uuid,
+                efi_system_part_uuid=efi_system_part_uuid,
+                prep_boot_part_uuid=prep_boot_part_uuid,
+                target_boot_mode=target_boot_mode,
+                software_raid=software_raid
+            )
+            if result['command_status'] == 'FAILED':
+                msg = (_("Failed to install a bootloader when "
+                         "deploying node %(node)s: %(error)s") %
+                       {'node': node.uuid,
+                        'error': agent_client.get_command_error(result)})
+                agent_base.log_and_raise_deployment_error(task, msg)
+
+        set_boot_to_disk(task, target_boot_mode)
+        LOG.info('Local boot successfully configured for node %s', node.uuid)
+
+
+class BootcAgentDeploy(CustomAgentDeploy):
+    """Interface for deploy-related actions."""
+
+    @METRICS.timer('AgentBootcDeploy.validate')
+    def validate(self, task):
+        """Validate the driver-specific Node deployment info.
+
+        This method validates whether the properties of the supplied node
+        contain the required information for this driver to deploy images to
+        the node.
+
+        :param task: a TaskManager instance
+        :raises: MissingParameterValue, if any of the required parameters are
+            missing.
+        :raises: InvalidParameterValue, if any of the parameters have invalid
+            value.
+        """
+        super().validate(task)
+
+        node = task.node
+
+        image_source = node.instance_info.get('image_source')
+        if not image_source or not image_source.startswith('oci://'):
+            raise exception.InvalidImageRef(image_href=image_source)
+
+    @METRICS.timer('AgentBootcDeploy.execute_bootc_install')
+    @base.deploy_step(priority=80)
+    @task_manager.require_exclusive_lock
+    def execute_bootc_install(self, task):
+        node = task.node
+        image_source = node.instance_info.get('image_source')
+        # FIXME(TheJulia): We likely, either need to grab/collect creds
+        # and pass them along in the step call, or initialize the client.
+        # bootc runs in the target container as well, so ... hmmm
+        configdrive = configdrive_utils.get_configdrive_image(node)
+
+        img_auth = image_service.get_image_service_auth_override(task.node)
+
+        if not img_auth:
+            fqdn = urlparse.urlparse(image_source).netloc
+            img_auth = oci.RegistrySessionHelper.get_token_from_config(
+                fqdn)
+        else:
+            # Internally, image data is a username and password. When a
+            # distinct username is present, the credential is basic auth
+            # style, so reconstruct the "username:password" pair which the
+            # agent then base64 encodes into the podman authfile "auth"
+            # field. Otherwise, the password field already holds the
+            # pre-shared token or docker config.json "auth" value and is
+            # transmitted as-is.
+            username = img_auth.get('username')
+            password = img_auth.get('password')
+            if username:
+                img_auth = '%s:%s' % (username, password)
+            else:
+                img_auth = password
+        if img_auth:
+            # This is not encryption, but obfustication.
+            img_auth = base64.standard_b64encode(img_auth.encode())
+        # Now switch into the corresponding in-band deploy step and let the
+        # result be polled normally.
+        new_step = {'interface': 'deploy',
+                    'step': 'execute_bootc_install',
+                    'args': {'image_source': image_source,
+                             'configdrive': configdrive,
+                             'oci_pull_secret': img_auth}}
+        client = agent_client.get_client(task)
+        return agent_base.execute_step(task, new_step, 'deploy',
+                                       client=client)
+
+    @METRICS.timer('AgentBootcDeploy.set_boot_to_disk')
+    @base.deploy_step(priority=60)
+    @task_manager.require_exclusive_lock
+    def set_boot_to_disk(self, task):
+        """Sets the node to boot from disk.
+
+        In some cases, other steps may handle aspects like bootloaders
+        and UEFI NVRAM entries required to boot. That leaves one last
+        aspect, resetting the node to boot from disk.
+
+        This primarily exists for compatibility reasons of flow
+        for Ironic, but we know some BMCs *really* need to be
+        still told to boot from disk. The exception to this is
+        Lenovo hardware, where we skip the action because it
+        can create a UEFI NVRAM update failure case, which
+        reverts the NVRAM state to "last known good configuration".
+
+        :param task: A Taskmanager object.
+        """
+        # Call the helper to de-duplicate code.
+        set_boot_to_disk(task)
+
+    def supports_deploy(self, task):
+        """Check if deploy is supported for the given node by this interface.
+
+        :param task: A TaskManager instance containing the node to act on.
+        :returns: True if the image_source has an oci:// URL scheme
+                  and repository introspection shows it is a bootc image.
+        """
+        node = task.node
+        image_source = node.instance_info.get('image_source')
+        if image_source and not image_source.startswith('oci://'):
+            return False
+
+        # Detect if the container image is actually a bootc image, which
+        # requires changing the deploy interface
+        try:
+            oci = image_service.OciImageService()
+            image_auth = image_service.get_image_service_auth_override(
+                node)
+            oci.set_image_auth(image_source, image_auth)
+
+            image_download_source = deploy_utils.get_image_download_source(
+                node)
+            image_info = oci.identify_specific_image(
+                image_source, image_download_source,
+                node.properties.get('cpu_arch')
+            )
+            return image_info.get('image_disk_format') == 'bootc'
+        except Exception as e:
+            LOG.error('Failed to detect bootc image for node %(node)s: '
+                      '%(err)s', {'node': node.uuid, 'err': e})
+            return False
 
 
 class AgentRAID(base.RAIDInterface):
@@ -657,6 +1092,8 @@ class AgentRAID(base.RAIDInterface):
         return agent_base.get_steps(task, 'deploy', interface='raid')
 
     @METRICS.timer('AgentRAID.apply_configuration')
+    @base.service_step(priority=0,
+                       argsinfo=_RAID_APPLY_CONFIGURATION_ARGSINFO)
     @base.deploy_step(priority=0,
                       argsinfo=_RAID_APPLY_CONFIGURATION_ARGSINFO)
     def apply_configuration(self, task, raid_config,
@@ -814,24 +1251,23 @@ class AgentRescue(base.RescueInterface):
         :raises: any boot interface's prepare_ramdisk exceptions.
         :returns: Returns states.RESCUEWAIT
         """
-        manager_utils.node_power_action(task, states.POWER_OFF)
-        # NOTE(TheJulia): Revealing that the power is off at any time can
-        # cause external power sync to decide that the node must be off.
-        # This may result in a post-rescued instance being turned off
-        # unexpectedly after rescue has started.
-        # TODO(TheJulia): Once we have power/state callbacks to nova,
-        # the reset of the power_state can be removed.
-        task.node.power_state = states.POWER_ON
-        task.node.save()
+        with driver_utils.power_off_and_on(task):
+            # NOTE(TheJulia): Revealing that the power is off at any time can
+            # cause external power sync to decide that the node must be off.
+            # This may result in a post-rescued instance being turned off
+            # unexpectedly after rescue has started.
+            # TODO(TheJulia): Once we have power/state callbacks to nova,
+            # the reset of the power_state can be removed.
+            task.node.power_state = states.POWER_ON
+            task.node.save()
 
-        task.driver.boot.clean_up_instance(task)
-        with manager_utils.power_state_for_network_configuration(task):
-            task.driver.network.unconfigure_tenant_networks(task)
-            task.driver.network.add_rescuing_network(task)
-        if CONF.agent.manage_agent_boot:
-            # prepare_ramdisk will set the boot device
-            deploy_utils.prepare_agent_boot(task)
-        manager_utils.node_power_action(task, states.POWER_ON)
+            task.driver.boot.clean_up_instance(task)
+            with manager_utils.power_state_for_network_configuration(task):
+                task.driver.network.unconfigure_tenant_networks(task)
+                task.driver.network.add_rescuing_network(task)
+            if CONF.agent.manage_agent_boot:
+                # prepare_ramdisk will set the boot device
+                deploy_utils.prepare_agent_boot(task)
 
         return states.RESCUEWAIT
 
@@ -849,22 +1285,20 @@ class AgentRescue(base.RescueInterface):
         :raises: any boot interface's prepare_instance exceptions.
         :returns: Returns states.ACTIVE
         """
-        manager_utils.node_power_action(task, states.POWER_OFF)
+        with driver_utils.power_off_and_on(task):
+            # NOTE(TheJulia): Revealing that the power is off at any time can
+            # cause external power sync to decide that the node must be off.
+            # This may result in a post-rescued instance being turned off
+            # unexpectedly after unrescue.
+            # TODO(TheJulia): Once we have power/state callbacks to nova,
+            # the reset of the power_state can be removed.
+            task.node.power_state = states.POWER_ON
+            task.node.save()
 
-        # NOTE(TheJulia): Revealing that the power is off at any time can
-        # cause external power sync to decide that the node must be off.
-        # This may result in a post-rescued insance being turned off
-        # unexpectedly after unrescue.
-        # TODO(TheJulia): Once we have power/state callbacks to nova,
-        # the reset of the power_state can be removed.
-        task.node.power_state = states.POWER_ON
-        task.node.save()
-
-        self.clean_up(task)
-        with manager_utils.power_state_for_network_configuration(task):
-            task.driver.network.configure_tenant_networks(task)
-        task.driver.boot.prepare_instance(task)
-        manager_utils.node_power_action(task, states.POWER_ON)
+            self.clean_up(task)
+            with manager_utils.power_state_for_network_configuration(task):
+                task.driver.network.configure_tenant_networks(task)
+            task.driver.boot.prepare_instance(task)
 
         return states.ACTIVE
 

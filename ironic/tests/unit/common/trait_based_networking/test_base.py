@@ -1,0 +1,549 @@
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+import ironic.common.exception as exc
+import ironic.common.trait_based_networking.base as tbn
+
+from ironic.common import context
+from ironic.tests import base
+import ironic.tests.unit.common.trait_based_networking.utils as tbn_test_utils
+from ironic.tests.unit.objects import utils as obj_utils
+
+import itertools
+
+
+class TraitBasedNetworkingBaseTestCase(base.TestCase):
+    def test_filter_expression_str_representation(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.PORT_ADDRESS, tbn.Comparator.EQUALITY, "test"
+        )
+        self.assertEqual("port.address == 'test'", str(exp))
+
+    def test_filter_object_missing_attribute_doesnt_match(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.PORT_ADDRESS, tbn.Comparator.EQUALITY, "test"
+        )
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(address=None))
+        net = tbn_test_utils.FauxNetwork()
+        self.assertFalse(exp.eval(obj, net))
+
+    def test_portgroup_from_ironic_portgroup(self):
+        # Use a real Portgroup object, which has no vendor field.
+        ironic_pg = obj_utils.get_test_portgroup(
+            context.get_admin_context(), id=5, category="cat",
+            physical_network="physnet1")
+        pg = tbn.Portgroup.from_ironic_portgroup(ironic_pg)
+
+        self.assertEqual(5, pg.id)
+        self.assertEqual(ironic_pg.uuid, pg.uuid)
+        self.assertEqual(ironic_pg.address, pg.address)
+        self.assertEqual("cat", pg.category)
+        self.assertEqual("physnet1", pg.physical_network)
+        self.assertIsNone(pg.vendor)
+        self.assertFalse(pg.dynamic_portgroup)
+
+    def test_filter_port_vendor_on_portgroup_doesnt_match(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.PORT_VENDOR, tbn.Comparator.EQUALITY, "clover"
+        )
+        ironic_pg = obj_utils.get_test_portgroup(
+            context.get_admin_context(), id=5)
+        pg = tbn.Portgroup.from_ironic_portgroup(ironic_pg)
+        net = tbn_test_utils.FauxNetwork()
+        self.assertFalse(exp.eval(pg, net))
+
+    def test_filter_comparator_eval_unset_variable_never_matches(self):
+        ironic_pg = obj_utils.get_test_portgroup(
+            context.get_admin_context(), id=5)
+        pg = tbn.Portgroup.from_ironic_portgroup(ironic_pg)
+        port = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(category=None))
+        net = tbn_test_utils.FauxNetwork()
+
+        for comparator in tbn.Comparator:
+            exp = tbn.SingleExpression(
+                tbn.Variables.PORT_VENDOR, comparator, "clover")
+            self.assertFalse(exp.eval(pg, net), str(comparator))
+
+            exp = tbn.SingleExpression(
+                tbn.Variables.PORT_CATEGORY, comparator, "cat")
+            self.assertFalse(exp.eval(port, net), str(comparator))
+
+    def test_filter_comparator_eval_equality(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.PORT_ADDRESS, tbn.Comparator.EQUALITY, "test"
+        )
+
+        obj = tbn.Port.from_ironic_port(tbn_test_utils.FauxPortLikeObject())
+        net = tbn_test_utils.FauxNetwork()
+        self.assertTrue(exp.eval(obj, net))
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(address="bad")
+        )
+        self.assertFalse(exp.eval(obj, net))
+
+    def test_filter_comparator_eval_inequality(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.PORT_ADDRESS, tbn.Comparator.INEQUALITY, "test"
+        )
+
+        obj = tbn.Port.from_ironic_port(tbn_test_utils.FauxPortLikeObject())
+        net = tbn_test_utils.FauxNetwork()
+        self.assertFalse(exp.eval(obj, net))
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(address="bad")
+        )
+        self.assertTrue(exp.eval(obj, net))
+
+    def test_filter_comparator_eval_greater_than_or_equal(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.PORT_CATEGORY, tbn.Comparator.GT_OR_EQ, "test"
+        )
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(category="test2")
+        )
+        net = tbn_test_utils.FauxNetwork()
+        self.assertTrue(exp.eval(obj, net))
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(category="test")
+        )
+        self.assertTrue(exp.eval(obj, net))
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(category="abcd")
+        )
+        self.assertFalse(exp.eval(obj, net))
+
+    def test_filter_comparator_eval_greater_than(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.PORT_CATEGORY, tbn.Comparator.GT, "test"
+        )
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(category="test2")
+        )
+        net = tbn_test_utils.FauxNetwork()
+        self.assertTrue(exp.eval(obj, net))
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(category="test")
+        )
+        self.assertFalse(exp.eval(obj, net))
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(category="abcd")
+        )
+        self.assertFalse(exp.eval(obj, net))
+
+    def test_filter_comparator_eval_less_than_or_equal(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.NETWORK_NAME, tbn.Comparator.LT_OR_EQ, "test"
+        )
+        port = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject()
+        )
+
+        net = tbn.Network("fake_id", "test2", frozenset())
+        self.assertFalse(exp.eval(port, net))
+
+        net = tbn.Network("fake_id", "test", frozenset())
+        self.assertTrue(exp.eval(port, net))
+
+        net = tbn.Network("fake_id", "abcd", frozenset())
+        self.assertTrue(exp.eval(port, net))
+
+    def test_filter_comparator_eval_less_than(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.NETWORK_NAME, tbn.Comparator.LT, "test"
+        )
+        port = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject()
+        )
+
+        net = tbn.Network("fake_id", "test2", frozenset())
+        self.assertFalse(exp.eval(port, net))
+
+        net = tbn.Network("fake_id", "test", frozenset())
+        self.assertFalse(exp.eval(port, net))
+
+        net = tbn.Network("fake_id", "abcd", frozenset())
+        self.assertTrue(exp.eval(port, net))
+
+    def test_filter_comparator_eval_prefix_match(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.PORT_VENDOR, tbn.Comparator.PREFIX_MATCH, "some"
+        )
+        net = tbn_test_utils.FauxNetwork()
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(vendor="some_vendor")
+        )
+        self.assertTrue(exp.eval(obj, net))
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(vendor="another_vendor")
+        )
+        self.assertFalse(exp.eval(obj, net))
+
+    def test_filter_comparator_eval_prefix_match_bad_variable_type(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.PORT_IS_PORT, tbn.Comparator.PREFIX_MATCH, "some"
+        )
+        net = tbn_test_utils.FauxNetwork()
+
+        obj = tbn.Port.from_ironic_port(tbn_test_utils.FauxPortLikeObject())
+        self.assertTrue(obj.is_port())
+        self.assertRaises(exc.TraitBasedNetworkingException,
+                          exp.eval, obj, net)
+
+    def test_filter_comparator_eval_equality_network_tags(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.NETWORK_TAGS, tbn.Comparator.EQUALITY, "storage"
+        )
+        port = tbn.Port.from_ironic_port(tbn_test_utils.FauxPortLikeObject())
+
+        net = tbn.Network("fake_id", "test", frozenset({"storage", "other"}))
+        self.assertTrue(exp.eval(port, net))
+
+        net = tbn.Network("fake_id", "test", frozenset({"other"}))
+        self.assertFalse(exp.eval(port, net))
+
+    def test_filter_comparator_eval_inequality_network_tags(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.NETWORK_TAGS, tbn.Comparator.INEQUALITY, "storage"
+        )
+        port = tbn.Port.from_ironic_port(tbn_test_utils.FauxPortLikeObject())
+
+        net = tbn.Network("fake_id", "test", frozenset({"storage"}))
+        self.assertFalse(exp.eval(port, net))
+
+        net = tbn.Network("fake_id", "test", frozenset({"other"}))
+        self.assertTrue(exp.eval(port, net))
+
+    def test_filter_comparator_eval_prefix_match_network_tags(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.NETWORK_TAGS, tbn.Comparator.PREFIX_MATCH, "stor"
+        )
+        port = tbn.Port.from_ironic_port(tbn_test_utils.FauxPortLikeObject())
+
+        net = tbn.Network("fake_id", "test", frozenset({"storage"}))
+        self.assertTrue(exp.eval(port, net))
+
+        net = tbn.Network("fake_id", "test", frozenset({"other"}))
+        self.assertFalse(exp.eval(port, net))
+
+    def test_filter_comparator_eval_network_tags_ordering_unsupported(self):
+        exp = tbn.SingleExpression(
+            tbn.Variables.NETWORK_TAGS, tbn.Comparator.GT, "storage"
+        )
+        port = tbn.Port.from_ironic_port(tbn_test_utils.FauxPortLikeObject())
+        net = tbn.Network("fake_id", "test", frozenset({"storage"}))
+
+        self.assertRaises(exc.TBNComparatorCollectionTypeMismatch,
+                          exp.eval, port, net)
+
+    def test_network_from_vif_info_defaults_tags_to_empty_frozenset(self):
+        net = tbn.Network.from_vif_info({'id': 'fake_id'})
+        self.assertEqual(frozenset(), net.tags)
+
+    def test_filter_operator_eval_and(self):
+        exp = tbn.CompoundExpression(
+            tbn.FunctionExpression(tbn.Variables.PORT_IS_PORT),
+            tbn.Operator.AND,
+            tbn.FunctionExpression(tbn.Variables.PORT_IS_PORT),
+        )
+        net = tbn_test_utils.FauxNetwork()
+
+        obj = tbn.Port.from_ironic_port(tbn_test_utils.FauxPortLikeObject())
+        self.assertTrue(exp.eval(obj, net))
+
+        obj = tbn.Portgroup.from_ironic_portgroup(
+            tbn_test_utils.FauxPortLikeObject())
+        self.assertFalse(exp.eval(obj, net))
+
+    def test_filter_operator_eval_or(self):
+        exp = tbn.CompoundExpression(
+            tbn.FunctionExpression(tbn.Variables.PORT_IS_PORT),
+            tbn.Operator.OR,
+            tbn.FunctionExpression(tbn.Variables.PORT_IS_PORT),
+        )
+        net = tbn_test_utils.FauxNetwork()
+        obj = tbn.Port.from_ironic_port(tbn_test_utils.FauxPortLikeObject())
+        self.assertTrue(exp.eval(obj, net))
+
+        obj = tbn.Portgroup.from_ironic_portgroup(
+            tbn_test_utils.FauxPortLikeObject())
+        self.assertFalse(exp.eval(obj, net))
+
+        exp = tbn.CompoundExpression(
+            tbn.FunctionExpression(tbn.Variables.PORT_IS_PORT),
+            tbn.Operator.OR,
+            tbn.FunctionExpression(tbn.Variables.PORT_IS_PORTGROUP),
+        )
+        obj = tbn.Port.from_ironic_port(tbn_test_utils.FauxPortLikeObject())
+        self.assertTrue(exp.eval(obj, net))
+
+    def test_filter_operator_eval_or_short_circuits(self):
+        # The right expression would raise if evaluated (PREFIX_MATCH
+        # requires a string variable, but port.is_port is a method). Since
+        # the left expression already satisfies the OR, the right side must
+        # never be evaluated.
+        left = tbn.SingleExpression(
+            tbn.Variables.PORT_CATEGORY, tbn.Comparator.EQUALITY, "cat")
+        right = tbn.SingleExpression(
+            tbn.Variables.PORT_IS_PORT, tbn.Comparator.PREFIX_MATCH, "some")
+        exp = tbn.CompoundExpression(left, tbn.Operator.OR, right)
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(category="cat"))
+        net = tbn_test_utils.FauxNetwork()
+        self.assertTrue(exp.eval(obj, net))
+
+    def test_filter_operator_eval_and_short_circuits(self):
+        # The right expression would raise if evaluated. Since the left
+        # expression already fails the AND, the right side must never be
+        # evaluated.
+        left = tbn.SingleExpression(
+            tbn.Variables.PORT_CATEGORY, tbn.Comparator.EQUALITY, "nope")
+        right = tbn.SingleExpression(
+            tbn.Variables.PORT_IS_PORT, tbn.Comparator.PREFIX_MATCH, "some")
+        exp = tbn.CompoundExpression(left, tbn.Operator.AND, right)
+
+        obj = tbn.Port.from_ironic_port(
+            tbn_test_utils.FauxPortLikeObject(category="cat"))
+        net = tbn_test_utils.FauxNetwork()
+        self.assertFalse(exp.eval(obj, net))
+
+    def test_attach_port_equality(self):
+        self.assertEqual(
+            tbn.AttachPort(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORT,
+                    tbn.FilterExpression.parse(
+                        "port.vendor == 'clover'")
+                ),
+                "fake_node_uuid",
+                "fake_port_uuid",
+                "fake_network_id"),
+            tbn.AttachPort(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORT,
+                    tbn.FilterExpression.parse(
+                        "port.vendor == 'clover'")
+                ),
+                "fake_node_uuid",
+                "fake_port_uuid",
+                "fake_network_id")
+        )
+        self.assertNotEqual(
+            tbn.AttachPort(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORT,
+                    tbn.FilterExpression.parse(
+                        "port.vendor == 'clover'")
+                ),
+                "fake_node_uuid",
+                "fake_port_uuid",
+                "fake_network_id"),
+            tbn.AttachPort(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORT,
+                    tbn.FilterExpression.parse(
+                        "port.vendor == 'clover'")
+                ),
+                "real_node_uuid",
+                "fake_port_uuid",
+                "fake_network_id")
+        )
+
+    def test_attach_portgroup_equality(self):
+        self.assertEqual(
+            tbn.AttachPortgroup(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORTGROUP,
+                    tbn.FilterExpression.parse(
+                        "port.vendor == 'clover'")
+                ),
+                "fake_node_uuid",
+                "fake_portgroup_uuid",
+                "fake_network_id"),
+
+            tbn.AttachPortgroup(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORTGROUP,
+                    tbn.FilterExpression.parse(
+                        "port.vendor == 'clover'")
+                ),
+                "fake_node_uuid",
+                "fake_portgroup_uuid",
+                "fake_network_id")
+        )
+
+        self.assertNotEqual(
+            tbn.AttachPortgroup(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORTGROUP,
+                    tbn.FilterExpression.parse(
+                        "port.vendor == 'clover'")
+                ),
+                "fake_node_uuid",
+                "fake_portgroup_uuid",
+                "fake_network_id"),
+            tbn.AttachPortgroup(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORTGROUP,
+                    tbn.FilterExpression.parse(
+                        "port.vendor == 'clover'")
+                ),
+                "fake_node_uuid",
+                "real_portgroup_uuid",
+                "fake_network_id"),
+        )
+
+    def test_rendered_actions_type_mismatch_equality(self):
+        types = [
+            tbn.RenderedAction(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORT,
+                    tbn.FilterExpression.parse("port.vendor == 'cogwork'")),
+                "fake_node_uuid"
+            ),
+            tbn.AttachPort(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORT,
+                    tbn.FilterExpression.parse("port.vendor == 'cogwork'")),
+                "fake_network_id",
+                "fake_port_uuid",
+                "fake_network_id"
+            ),
+            tbn.AttachPortgroup(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORTGROUP,
+                    tbn.FilterExpression.parse("port.vendor == 'cogwork'")),
+                "fake_node_uuid",
+                "fake_portgroup_uuid",
+                "fake_network_id"
+            ),
+            tbn.NoMatch(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORTGROUP,
+                    tbn.FilterExpression.parse("port.vendor == 'cogwork'")),
+                "fake_node_uuid",
+                "didn't match"
+            )
+        ]
+
+        # Make sure we can compare differing types of RenderedActions and not
+        # blow up. Inequal types of RenderedActions must not evaluate as equal
+        # with __eq__/==.
+        for prod in itertools.product(types, repeat=2):
+            if type(prod[0]) is type(prod[1]):
+                self.assertEqual(prod[0], prod[1])
+            else:
+                self.assertNotEqual(prod[0], prod[1])
+
+    def test_attach_class_hierarchy(self):
+        attach_port = tbn.AttachPort(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORT,
+                    tbn.FilterExpression.parse("port.vendor == 'cogwork'")),
+                "fake_node_uuid",
+                "fake_port_uuid",
+                "fake_network_id")
+        self.assertEqual("fake_port_uuid", attach_port.portlike_uuid())
+
+        attach_portgroup = tbn.AttachPortgroup(
+                tbn.TraitAction(
+                    "CUSTOM_TRAIT",
+                    tbn.Actions.ATTACH_PORTGROUP,
+                    tbn.FilterExpression.parse("port.vendor == 'cogwork'")),
+                "fake_node_uuid",
+                "fake_portgroup_uuid",
+                "fake_network_id")
+
+        self.assertEqual("fake_portgroup_uuid",
+                         attach_portgroup.portlike_uuid())
+
+    def test_trait_action_validate(self):
+        gaps = tbn.TraitAction(
+                "CUSTOM_TRAIT",
+                tbn.Actions.GROUP_AND_ATTACH_PORTS,
+                tbn.FilterExpression.parse("port.vendor == 'cogwork'"),
+                2,
+                2)
+        valid, reason = gaps.validate()
+        self.assertTrue(valid)
+        self.assertEqual(reason, "")
+
+        gaps = tbn.TraitAction(
+                "CUSTOM_TRAIT",
+                tbn.Actions.GROUP_AND_ATTACH_PORTS,
+                tbn.FilterExpression.parse("port.vendor == 'cogwork'"),
+                0,
+                2)
+        valid, reason = gaps.validate()
+        self.assertFalse(valid)
+        self.assertEqual(reason,
+                         "group_and_attach_ports must have a min_count of "
+                         f"{tbn.DEFAULT_GROUP_AND_ATTACH_MIN_COUNT} or "
+                         "greater. Got '0'.")
+
+        gaps = tbn.TraitAction(
+                "CUSTOM_TRAIT",
+                tbn.Actions.GROUP_AND_ATTACH_PORTS,
+                tbn.FilterExpression.parse("port.vendor == 'cogwork'"),
+                2,
+                1)
+        valid, reason = gaps.validate()
+        self.assertFalse(valid)
+        self.assertEqual(reason,
+                         "group_and_attach_ports must have a max_count "
+                         "greater or equal to it's min_count. min_count "
+                         f"is '{gaps.min_count}' while max_count is "
+                         f"'{gaps.max_count}'.")
+
+    def test_actions_to_str(self):
+        trait_action = tbn.TraitAction(
+            "CUSTOM_TRAIT",
+            tbn.Actions.GROUP_AND_ATTACH_PORTS,
+            tbn.FilterExpression.parse("port.vendor == 'cogwork'"),
+            0, 2)
+        actions = [
+            tbn.AttachPort(trait_action, "fake_node_uuid", "fake_port_uuid",
+                           "fake_net_id"),
+            tbn.AttachPortgroup(trait_action, "fake_node_uuid",
+                                "fake_port_uuid", "fake_net_id"),
+            tbn.GroupAndAttachPorts(trait_action, "fake_node_uuid",
+                                    ['port1', 'port2'], "fake_net_id"),
+            tbn.NoMatch(trait_action, "fake_node_uuid", "no match!")
+        ]
+        for action in actions:
+            self.assertIsNotNone(str(action))

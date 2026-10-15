@@ -1,0 +1,1227 @@
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+
+import copy
+import os
+import ssl
+import tempfile
+from unittest import mock
+
+import fixtures
+from keystoneauth1 import loading as ks_loading
+from oslo_config import cfg
+import oslo_messaging
+import webob
+
+from ironic.common import exception
+from ironic.common.json_rpc import client
+from ironic.common.json_rpc import server
+from ironic.common import wsgi_service
+from ironic.conf import json_rpc
+from ironic.tests.base import TestCase
+
+CONF = cfg.CONF
+
+json_rpc.register_opts(CONF, 'some_other_json_rpc')
+CONF.register_opts(
+    ks_loading.get_auth_plugin_conf_options('http_basic'),
+    'json_rpc')
+
+
+class FakeContext(server.EmptyContext):
+
+    request_id = 'abcd'
+
+
+class FakeManager(object):
+
+    def success(self, context, x, y=0):
+        assert isinstance(context, FakeContext)
+        assert context.user_name == 'admin'
+        return x - y
+
+    def no_result(self, context):
+        assert isinstance(context, FakeContext)
+        return None
+
+    def no_context(self):
+        return 42
+
+    def fail(self, context, message):
+        assert isinstance(context, FakeContext)
+        raise exception.IronicException(message)
+
+    @oslo_messaging.expected_exceptions(exception.BadRequest)
+    def expected(self, context, message):
+        assert isinstance(context, FakeContext)
+        raise exception.BadRequest(message)
+
+    def crash(self, context):
+        raise RuntimeError('boom')
+
+    def copy(self, context, data):
+        return copy.deepcopy(data)
+
+    def init_host(self, context):
+        assert False, "This should not be exposed"
+
+    def _private(self, context):
+        assert False, "This should not be exposed"
+
+    # This should not be exposed either
+    value = 42
+
+
+class FakeSerializer:
+
+    def serialize_entity(self, context, entity):
+        return entity
+
+    def deserialize_entity(self, context, data):
+        return data
+
+
+class TestService(TestCase):
+
+    def setUp(self):
+        super(TestService, self).setUp()
+        self.config(auth_strategy='noauth', group='json_rpc')
+        self.server_mock = self.useFixture(fixtures.MockPatch(
+            'cheroot.wsgi.Server', autospec=True)).mock
+
+        server_instance = self.server_mock.return_value
+        server_instance.requests = mock.MagicMock()
+
+        self.serializer = FakeSerializer()
+        self.service = server.WSGIService(FakeManager(), self.serializer,
+                                          FakeContext)
+        self.app = self.service._application
+        self.ctx = {'user_name': 'admin'}
+
+    def _request(self, name=None, params=None, expected_error=None,
+                 request_id='abcd', **kwargs):
+        body = {
+            'jsonrpc': '2.0',
+        }
+        if request_id is not None:
+            body['id'] = request_id
+        if name is not None:
+            body['method'] = name
+        if params is not None:
+            body['params'] = params
+        if 'json_body' not in kwargs:
+            kwargs['json_body'] = body
+        kwargs.setdefault('method', 'POST')
+        kwargs.setdefault('headers', {'Content-Type': 'application/json'})
+
+        request = webob.Request.blank("/", **kwargs)
+        response = request.get_response(self.app)
+        self.assertEqual(response.status_code,
+                         expected_error or (200 if request_id else 204))
+        if request_id is not None:
+            if expected_error:
+                self.assertEqual(expected_error,
+                                 response.json_body['error']['code'])
+            else:
+                return response.json_body
+        else:
+            return response.text
+
+    def _check(self, body, result=None, error=None, request_id='abcd'):
+        self.assertEqual('2.0', body.pop('jsonrpc'))
+        self.assertEqual(request_id, body.pop('id'))
+        if error is not None:
+            self.assertEqual({'error': error}, body)
+        else:
+            self.assertEqual({'result': result}, body)
+
+    def _setup_http_basic(self):
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+            f.write('myName:$2y$05$lE3eGtyj41jZwrzS87KTqe6.'
+                    'JETVCWBkc32C63UP2aYrGoYOEpbJm\n\n\n')
+        self.addCleanup(os.remove, f.name)
+        self.config(http_basic_auth_user_file=f.name, group='json_rpc')
+        self.config(auth_strategy='http_basic', group='json_rpc')
+        self.config(username='myUser', group='json_rpc')
+        self.config(password='myPassword', group='json_rpc')
+        self.service = server.WSGIService(FakeManager(), self.serializer,
+                                          FakeContext)
+        self.app = self.server_mock.call_args.kwargs['wsgi_app']
+
+    def test_http_basic_not_authenticated(self):
+        self._setup_http_basic()
+        self._request('success', {'context': self.ctx, 'x': 42},
+                      request_id=None, expected_error=401)
+
+    def test_http_basic(self):
+        self._setup_http_basic()
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': 'Basic bXlOYW1lOm15UGFzc3dvcmQ='
+        }
+        body = self._request('success', {'context': self.ctx, 'x': 42},
+                             headers=headers)
+        self._check(body, result=42)
+
+    def test_success(self):
+        body = self._request('success', {'context': self.ctx, 'x': 42})
+        self._check(body, result=42)
+
+    def test_success_no_result(self):
+        body = self._request('no_result', {'context': self.ctx})
+        self._check(body, result=None)
+
+    def test_notification(self):
+        body = self._request('no_result', {'context': self.ctx},
+                             request_id=None)
+        self.assertEqual('', body)
+
+    def test_no_context(self):
+        body = self._request('no_context')
+        self._check(body, result=42)
+
+    def test_non_json_body(self):
+        for body in (b'', b'???', b"\xc3\x28"):
+            request = webob.Request.blank("/", method='POST', body=body)
+            response = request.get_response(self.app)
+            self._check(
+                response.json_body,
+                error={
+                    'message': server.ParseError._msg_fmt,
+                    'code': -32700,
+                },
+                request_id=None)
+
+    def test_invalid_requests(self):
+        bodies = [
+            # Invalid requests with request ID.
+            {'method': 'no_result', 'id': 'abcd',
+             'params': {'context': self.ctx}},
+            {'jsonrpc': '2.0', 'id': 'abcd', 'params': {'context': self.ctx}},
+            # These do not count as notifications, since they're malformed.
+            {'method': 'no_result', 'params': {'context': self.ctx}},
+            {'jsonrpc': '2.0', 'params': {'context': self.ctx}},
+            42,
+            # We do not implement batched requests.
+            [],
+            [{'jsonrpc': '2.0', 'method': 'no_result',
+              'params': {'context': self.ctx}}],
+        ]
+        for body in bodies:
+            body = self._request(json_body=body)
+            self._check(
+                body,
+                error={
+                    'message': server.InvalidRequest._msg_fmt,
+                    'code': -32600,
+                },
+                request_id=body.get('id'))
+
+    def test_malformed_context(self):
+        body = self._request(json_body={'jsonrpc': '2.0', 'id': 'abcd',
+                                        'method': 'no_result',
+                                        'params': {'context': 42}})
+        self._check(
+            body,
+            error={
+                'message': 'Context must be a dictionary, if provided',
+                'code': -32602,
+            })
+
+    def test_expected_failure(self):
+        body = self._request('fail', {'context': self.ctx,
+                                      'message': 'some error'})
+        self._check(body,
+                    error={
+                        'message': 'some error',
+                        'code': 500,
+                        'data': {
+                            'class': 'ironic.common.exception.IronicException'
+                        }
+                    })
+
+    def test_expected_failure_oslo(self):
+        # Check that exceptions wrapped by oslo's expected_exceptions get
+        # unwrapped correctly.
+        body = self._request('expected', {'context': self.ctx,
+                                          'message': 'some error'})
+        self._check(body,
+                    error={
+                        'message': 'some error',
+                        'code': 400,
+                        'data': {
+                            'class': 'ironic.common.exception.Invalid'
+                        }
+                    })
+
+    @mock.patch.object(server.LOG, 'exception', autospec=True)
+    def test_unexpected_failure(self, mock_log):
+        body = self._request('crash', {'context': self.ctx})
+        self._check(body,
+                    error={
+                        'message': 'boom',
+                        'code': 500,
+                    })
+        self.assertTrue(mock_log.called)
+
+    def test_method_not_found(self):
+        body = self._request('banana', {'context': self.ctx})
+        self._check(body,
+                    error={
+                        'message': 'Method banana was not found',
+                        'code': -32601,
+                    })
+
+    def test_no_deny_methods(self):
+        for name in ('__init__', '_private', 'init_host', 'value'):
+            body = self._request(name, {'context': self.ctx})
+            self._check(body,
+                        error={
+                            'message': 'Method %s was not found' % name,
+                            'code': -32601,
+                        })
+
+    def test_missing_argument(self):
+        body = self._request('success', {'context': self.ctx})
+        # The exact error message depends on the Python version
+        self.assertEqual(-32602, body['error']['code'])
+        self.assertNotIn('result', body)
+
+    def test_method_not_post(self):
+        self._request('success', {'context': self.ctx, 'x': 42},
+                      method='GET', expected_error=405)
+
+    def test_authenticated(self):
+        self.config(auth_strategy='keystone', group='json_rpc')
+        self.config(www_authenticate_uri='http://localhost:5000',
+                    group='keystone_authtoken')
+        self.service = server.WSGIService(FakeManager(), self.serializer,
+                                          FakeContext)
+        self.app = self.server_mock.call_args.kwargs['wsgi_app']
+        self._request('success', {'context': self.ctx, 'x': 42},
+                      expected_error=401)
+
+    def test_authenticated_with_allowed_role(self):
+        self.config(auth_strategy='keystone', group='json_rpc')
+        self.config(www_authenticate_uri='http://localhost:5000',
+                    group='keystone_authtoken')
+        self.config(allowed_roles=['allowed', 'ignored'], group='json_rpc')
+        self.service = server.WSGIService(FakeManager(), self.serializer,
+                                          FakeContext)
+        self.app = self.server_mock.call_args.kwargs['wsgi_app']
+        self._request('success', {'context': self.ctx, 'x': 42},
+                      expected_error=401,
+                      headers={'Content-Type': 'application/json',
+                               'X-Roles': 'allowed,denied'})
+
+    def test_authenticated_no_admin_role(self):
+        self.config(auth_strategy='keystone', group='json_rpc')
+        self.config(www_authenticate_uri='http://localhost:5000',
+                    group='keystone_authtoken')
+        self._request('success', {'context': self.ctx, 'x': 42},
+                      expected_error=403)
+
+    def test_authenticated_no_allowed_role(self):
+        self.config(auth_strategy='keystone', group='json_rpc')
+        self.config(www_authenticate_uri='http://localhost:5000',
+                    group='keystone_authtoken')
+        self.config(allowed_roles=['allowed', 'ignored'], group='json_rpc')
+        self._request('success', {'context': self.ctx, 'x': 42},
+                      expected_error=403,
+                      headers={'Content-Type': 'application/json',
+                               'X-Roles': 'denied,notallowed'})
+
+    @mock.patch.object(server.LOG, 'debug', autospec=True)
+    def test_mask_secrets(self, mock_log):
+        data = {'ipmi_username': 'admin', 'ipmi_password': 'secret'}
+        node = self.serializer.serialize_entity(self.ctx, data)
+        body = self._request('copy', {'context': self.ctx, 'data': data})
+        self.assertIsNone(body.get('error'))
+        node = self.serializer.deserialize_entity(self.ctx, body['result'])
+        logged_params = mock_log.call_args_list[0][0][2]
+        logged_node = logged_params['data']
+        self.assertEqual({'ipmi_username': 'admin', 'ipmi_password': '***'},
+                         logged_node)
+        logged_resp = mock_log.call_args_list[1][0][2]
+        self.assertEqual({'ipmi_username': 'admin', 'ipmi_password': '***'},
+                         logged_resp)
+        # The result is not affected, only logging
+        self.assertEqual(data, node)
+
+    def test_deeply_nested_payload_rejected_by_middleware(self):
+        """Verify deep payloads are rejected before json.loads().
+
+        The JsonDepthMiddleware wraps the JSON-RPC application and
+        rejects payloads that exceed the configured nesting depth
+        with HTTP 400, preventing a RecursionError in the JSON
+        parser from crashing the worker process.
+        """
+        from ironic.api.middleware import json_depth
+
+        body = b'[' * 10000
+        request = webob.Request.blank("/", method='POST', body=body)
+        request.content_type = 'application/json'
+        wrapped_app = json_depth.JsonDepthMiddleware(
+            self.app, max_depth=25)
+        response = request.get_response(wrapped_app)
+        self.assertEqual(400, response.status_int)
+        self.assertIn(b'nested too deeply', response.body)
+
+
+class TestServiceTLS(TestCase):
+
+    def setUp(self):
+        super(TestServiceTLS, self).setUp()
+        self.config(auth_strategy='noauth', group='json_rpc')
+        self.server_mock = self.useFixture(fixtures.MockPatch(
+            'cheroot.wsgi.Server', autospec=True)).mock
+        server_instance = self.server_mock.return_value
+        server_instance.requests = mock.MagicMock()
+        self.serializer = FakeSerializer()
+
+    @mock.patch.object(wsgi_service, 'validate_cert_paths',
+                       autospec=True)
+    @mock.patch.object(wsgi_service.cheroot_ssl,
+                       'BuiltinSSLAdapter', autospec=True)
+    def test_json_rpc_tls_minimum_version(
+            self, mock_ssl_adapter, mock_validate):
+        self.config(use_ssl=True, group='json_rpc')
+        self.config(cert_file='/path/to/cert',
+                    group='json_rpc')
+        self.config(key_file='/path/to/key',
+                    group='json_rpc')
+        self.config(server_tls_minimum_version='1.3',
+                    group='json_rpc')
+
+        mock_context = mock.Mock()
+        mock_ssl_adapter.return_value.context = mock_context
+
+        server.WSGIService(
+            FakeManager(), self.serializer, FakeContext
+        )
+
+        mock_ssl_adapter.assert_called_once_with(
+            certificate='/path/to/cert',
+            private_key='/path/to/key',
+            ciphers=None
+        )
+        self.assertEqual(
+            ssl.TLSVersion.TLSv1_3,
+            mock_context.minimum_version
+        )
+
+    @mock.patch.object(wsgi_service, 'validate_cert_paths',
+                       autospec=True)
+    @mock.patch.object(wsgi_service.cheroot_ssl,
+                       'BuiltinSSLAdapter', autospec=True)
+    def test_json_rpc_tls_ciphers(self, mock_ssl_adapter,
+                                  mock_validate):
+        self.config(use_ssl=True, group='json_rpc')
+        self.config(cert_file='/path/to/cert',
+                    group='json_rpc')
+        self.config(key_file='/path/to/key',
+                    group='json_rpc')
+        self.config(server_tls_ciphers='ECDHE+AESGCM',
+                    group='json_rpc')
+
+        mock_context = mock.Mock()
+        mock_ssl_adapter.return_value.context = mock_context
+
+        server.WSGIService(
+            FakeManager(), self.serializer, FakeContext
+        )
+
+        mock_ssl_adapter.assert_called_once_with(
+            certificate='/path/to/cert',
+            private_key='/path/to/key',
+            ciphers='ECDHE+AESGCM'
+        )
+        # Default TLS 1.3 minimum is still applied
+        self.assertEqual(
+            ssl.TLSVersion.TLSv1_3,
+            mock_context.minimum_version
+        )
+
+    @mock.patch.object(wsgi_service, 'validate_cert_paths',
+                       autospec=True)
+    @mock.patch.object(wsgi_service.cheroot_ssl,
+                       'BuiltinSSLAdapter', autospec=True)
+    def test_json_rpc_tls_all_options(
+            self, mock_ssl_adapter, mock_validate):
+        self.config(use_ssl=True, group='json_rpc')
+        self.config(cert_file='/path/to/cert',
+                    group='json_rpc')
+        self.config(key_file='/path/to/key',
+                    group='json_rpc')
+        self.config(server_tls_minimum_version='1.3',
+                    group='json_rpc')
+        self.config(server_tls_ciphers='ECDHE+AESGCM',
+                    group='json_rpc')
+
+        mock_context = mock.Mock()
+        mock_ssl_adapter.return_value.context = mock_context
+
+        server.WSGIService(
+            FakeManager(), self.serializer, FakeContext
+        )
+
+        mock_ssl_adapter.assert_called_once_with(
+            certificate='/path/to/cert',
+            private_key='/path/to/key',
+            ciphers='ECDHE+AESGCM'
+        )
+        self.assertEqual(
+            ssl.TLSVersion.TLSv1_3,
+            mock_context.minimum_version
+        )
+
+    @mock.patch.object(wsgi_service, 'validate_cert_paths',
+                       autospec=True)
+    @mock.patch.object(wsgi_service.cheroot_ssl,
+                       'BuiltinSSLAdapter', autospec=True)
+    def test_json_rpc_tls_minimum_version_1_2(
+            self, mock_ssl_adapter, mock_validate):
+        self.config(use_ssl=True, group='json_rpc')
+        self.config(cert_file='/path/to/cert',
+                    group='json_rpc')
+        self.config(key_file='/path/to/key',
+                    group='json_rpc')
+        self.config(server_tls_minimum_version='1.2',
+                    group='json_rpc')
+
+        mock_context = mock.Mock()
+        mock_ssl_adapter.return_value.context = mock_context
+
+        server.WSGIService(
+            FakeManager(), self.serializer, FakeContext
+        )
+
+        self.assertEqual(
+            ssl.TLSVersion.TLSv1_2,
+            mock_context.minimum_version
+        )
+
+    @mock.patch.object(wsgi_service, 'validate_cert_paths',
+                       autospec=True)
+    @mock.patch.object(wsgi_service.cheroot_ssl,
+                       'BuiltinSSLAdapter', autospec=True)
+    def test_json_rpc_tls_defaults_with_ssl(
+            self, mock_ssl_adapter, mock_validate):
+        """Default TLS 1.3 minimum is applied with SSL on."""
+        self.config(use_ssl=True, group='json_rpc')
+        self.config(cert_file='/path/to/cert',
+                    group='json_rpc')
+        self.config(key_file='/path/to/key',
+                    group='json_rpc')
+
+        mock_context = mock.Mock()
+        mock_ssl_adapter.return_value.context = mock_context
+
+        server.WSGIService(
+            FakeManager(), self.serializer, FakeContext
+        )
+
+        mock_ssl_adapter.assert_called_once_with(
+            certificate='/path/to/cert',
+            private_key='/path/to/key',
+            ciphers=None
+        )
+        # Default TLS 1.3 minimum is always applied
+        self.assertEqual(
+            ssl.TLSVersion.TLSv1_3,
+            mock_context.minimum_version
+        )
+
+    @mock.patch.object(wsgi_service.cheroot_ssl,
+                       'BuiltinSSLAdapter', autospec=True)
+    def test_json_rpc_tls_options_ignored_when_ssl_disabled(
+            self, mock_ssl_adapter):
+        """TLS hardening options have no effect with SSL off."""
+        self.config(use_ssl=False, group='json_rpc')
+        self.config(server_tls_minimum_version='1.3',
+                    group='json_rpc')
+        self.config(server_tls_ciphers='ECDHE+AESGCM',
+                    group='json_rpc')
+
+        server.WSGIService(
+            FakeManager(), self.serializer, FakeContext
+        )
+
+        # SSL adapter should never be created when SSL is off
+        mock_ssl_adapter.assert_not_called()
+
+    @mock.patch.object(wsgi_service, 'validate_cert_paths',
+                       autospec=True)
+    @mock.patch.object(wsgi_service.cheroot_ssl,
+                       'BuiltinSSLAdapter', autospec=True)
+    def test_json_rpc_tls_min_version_logged(
+            self, mock_ssl_adapter, mock_validate):
+        """LOG.info is emitted when TLS min version is set."""
+        self.config(use_ssl=True, group='json_rpc')
+        self.config(cert_file='/path/to/cert',
+                    group='json_rpc')
+        self.config(key_file='/path/to/key',
+                    group='json_rpc')
+        self.config(server_tls_minimum_version='1.3',
+                    group='json_rpc')
+
+        mock_context = mock.Mock()
+        mock_ssl_adapter.return_value.context = mock_context
+
+        with mock.patch.object(
+            wsgi_service.LOG, 'info', autospec=True
+        ) as mock_log:
+            server.WSGIService(
+                FakeManager(), self.serializer, FakeContext
+            )
+            mock_log.assert_any_call(
+                "TLS minimum version set to %s for %s",
+                '1.3', 'ironic-json-rpc'
+            )
+
+    @mock.patch.object(wsgi_service, 'validate_cert_paths',
+                       autospec=True)
+    @mock.patch.object(wsgi_service.cheroot_ssl,
+                       'BuiltinSSLAdapter', autospec=True)
+    def test_json_rpc_tls_ciphers_logged(
+            self, mock_ssl_adapter, mock_validate):
+        """LOG.info is emitted when TLS ciphers are set."""
+        self.config(use_ssl=True, group='json_rpc')
+        self.config(cert_file='/path/to/cert',
+                    group='json_rpc')
+        self.config(key_file='/path/to/key',
+                    group='json_rpc')
+        self.config(server_tls_ciphers='ECDHE+AESGCM',
+                    group='json_rpc')
+
+        mock_context = mock.Mock()
+        mock_ssl_adapter.return_value.context = mock_context
+
+        with mock.patch.object(
+            wsgi_service.LOG, 'info', autospec=True
+        ) as mock_log:
+            server.WSGIService(
+                FakeManager(), self.serializer, FakeContext
+            )
+            mock_log.assert_any_call(
+                "TLS ciphers configured for %s",
+                'ironic-json-rpc'
+            )
+
+    @mock.patch.object(wsgi_service, 'validate_cert_paths',
+                       autospec=True)
+    @mock.patch.object(wsgi_service.cheroot_ssl,
+                       'BuiltinSSLAdapter', autospec=True)
+    @mock.patch('oslo_service.sslutils.is_enabled',
+                return_value=True, autospec=True)
+    def test_json_rpc_ssl_legacy_group_with_tls_options(
+            self, mock_is_enabled, mock_ssl_adapter,
+            mock_validate):
+        """TLS options work with legacy [ssl] cert path."""
+        self.config(use_ssl=True, group='json_rpc')
+        self.config(server_tls_minimum_version='1.3',
+                    group='json_rpc')
+        self.config(server_tls_ciphers='ECDHE+AESGCM',
+                    group='json_rpc')
+        from oslo_service import sslutils
+        sslutils.register_opts(cfg.CONF)
+        self.config(cert_file='/path/to/cert',
+                    group='ssl')
+        self.config(key_file='/path/to/key',
+                    group='ssl')
+
+        mock_context = mock.Mock()
+        mock_ssl_adapter.return_value.context = mock_context
+
+        server.WSGIService(
+            FakeManager(), self.serializer, FakeContext
+        )
+
+        mock_ssl_adapter.assert_called_once_with(
+            certificate='/path/to/cert',
+            private_key='/path/to/key',
+            ciphers='ECDHE+AESGCM'
+        )
+        self.assertEqual(
+            ssl.TLSVersion.TLSv1_3,
+            mock_context.minimum_version
+        )
+
+    def test_json_rpc_ssl_missing_cert_raises(self):
+        """use_ssl=True without cert/key raises RuntimeError."""
+        self.config(use_ssl=True, group='json_rpc')
+
+        self.assertRaises(
+            RuntimeError,
+            server.WSGIService,
+            FakeManager(), self.serializer, FakeContext
+        )
+
+
+@mock.patch.object(client, '_get_session', autospec=True)
+class TestClient(TestCase):
+
+    def setUp(self):
+        super(TestClient, self).setUp()
+        self.serializer = FakeSerializer()
+        self.client = client.Client(self.serializer)
+        self.context = FakeContext({'user_name': 'admin'})
+        self.ctx_json = self.context.to_dict()
+
+    def test_can_send_version(self, mock_session):
+        self.assertTrue(self.client.can_send_version('1.42'))
+        self.client = client.Client(self.serializer, version_cap='1.42')
+        self.assertTrue(self.client.can_send_version('1.42'))
+        self.assertTrue(self.client.can_send_version('1.0'))
+        self.assertFalse(self.client.can_send_version('1.99'))
+        self.assertFalse(self.client.can_send_version('2.0'))
+
+    def test_call_success(self, mock_session):
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        cctx = self.client.prepare('foo.example.com')
+        self.assertEqual('example.com', cctx.host)
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+        mock_session.return_value.post.assert_called_once_with(
+            'http://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json},
+                  'id': self.context.request_id})
+
+    def test_call_ipv4_success(self, mock_session):
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        cctx = self.client.prepare('foo.192.0.2.1')
+        self.assertEqual('192.0.2.1', cctx.host)
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+        mock_session.return_value.post.assert_called_once_with(
+            'http://192.0.2.1:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json},
+                  'id': self.context.request_id})
+
+    def test_call_ipv6_success(self, mock_session):
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        cctx = self.client.prepare('foo.2001:db8::1')
+        self.assertEqual('2001:db8::1', cctx.host)
+        self.assertEqual(8089, cctx.port)
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+        mock_session.return_value.post.assert_called_once_with(
+            'http://[2001:db8::1]:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json},
+                  'id': self.context.request_id})
+
+    def test_call_ipv6_success_rfc2732(self, mock_session):
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        cctx = self.client.prepare('foo.[2001:db8::1]:8192')
+        self.assertEqual('2001:db8::1', cctx.host)
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+        mock_session.return_value.post.assert_called_once_with(
+            'http://[2001:db8::1]:8192',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json},
+                  'id': self.context.request_id})
+
+    def test_call_success_with_version(self, mock_session):
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        cctx = self.client.prepare('foo.example.com:8192', version='1.42')
+        self.assertEqual('example.com', cctx.host)
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+        mock_session.return_value.post.assert_called_once_with(
+            'http://example.com:8192',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json,
+                             'rpc.version': '1.42'},
+                  'id': self.context.request_id})
+
+    def test_call_success_with_version_and_cap(self, mock_session):
+        self.client = client.Client(self.serializer, version_cap='1.99')
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        cctx = self.client.prepare('foo.example.com', version='1.42')
+        self.assertEqual('example.com', cctx.host)
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+        mock_session.return_value.post.assert_called_once_with(
+            'http://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json,
+                             'rpc.version': '1.42'},
+                  'id': self.context.request_id})
+
+    def test_call_with_ssl(self, mock_session):
+        self.config(use_ssl=True, group='json_rpc')
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        cctx = self.client.prepare('foo.example.com')
+        self.assertEqual('example.com', cctx.host)
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+        mock_session.return_value.post.assert_called_once_with(
+            'https://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json},
+                  'id': self.context.request_id})
+
+    def test_call_with_client_ssl(self, mock_session):
+        self.config(use_ssl=False, client_use_ssl=True, group='json_rpc')
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        cctx = self.client.prepare('foo.example.com')
+        self.assertEqual('example.com', cctx.host)
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+        mock_session.return_value.post.assert_called_once_with(
+            'https://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json},
+                  'id': self.context.request_id})
+
+    def test_cast_success(self, mock_session):
+        cctx = self.client.prepare('foo.example.com')
+        self.assertEqual('example.com', cctx.host)
+        result = cctx.cast(self.context, 'do_something', answer=42)
+        self.assertIsNone(result)
+        mock_session.return_value.post.assert_called_once_with(
+            'http://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json}})
+
+    def test_cast_success_with_version(self, mock_session):
+        cctx = self.client.prepare('foo.example.com', version='1.42')
+        self.assertEqual('example.com', cctx.host)
+        result = cctx.cast(self.context, 'do_something', answer=42)
+        self.assertIsNone(result)
+        mock_session.return_value.post.assert_called_once_with(
+            'http://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json,
+                             'rpc.version': '1.42'}})
+
+    def test_group_specific_port_and_ssl(self, mock_session):
+        # Configure a different group with custom port and TLS
+        self.config(port=8192, client_use_ssl=True,
+                    group='some_other_json_rpc')
+
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+
+        grp_client = client.Client(self.serializer,
+                                   conf_group='some_other_json_rpc')
+        cctx = grp_client.prepare('foo.example.com')
+        self.assertEqual('example.com', cctx.host)
+        # Should use https and group port 8192
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+        mock_session.return_value.post.assert_called_once_with(
+            'https://example.com:8192',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json},
+                  'id': self.context.request_id})
+
+    def test_call_failure(self, mock_session):
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'error': {
+                'code': 418,
+                'message': 'I am a teapot',
+                'data': {
+                    'class': 'ironic.common.exception.Invalid'
+                }
+            }
+        }
+        cctx = self.client.prepare('foo.example.com')
+        self.assertEqual('example.com', cctx.host)
+        # Make sure that the class is restored correctly for expected errors.
+        exc = self.assertRaises(exception.BadRequest,
+                                cctx.call,
+                                self.context, 'do_something', answer=42)
+        # Code from the body has priority over one in the class.
+        self.assertEqual(418, exc.code)
+        self.assertIn('I am a teapot', str(exc))
+        mock_session.return_value.post.assert_called_once_with(
+            'http://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json},
+                  'id': self.context.request_id})
+
+    def test_call_unexpected_failure(self, mock_session):
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'error': {
+                'code': 500,
+                'message': 'AttributeError',
+            }
+        }
+        cctx = self.client.prepare('foo.example.com')
+        self.assertEqual('example.com', cctx.host)
+        exc = self.assertRaises(exception.IronicException,
+                                cctx.call,
+                                self.context, 'do_something', answer=42)
+        self.assertEqual(500, exc.code)
+        self.assertIn('Unexpected error', str(exc))
+        mock_session.return_value.post.assert_called_once_with(
+            'http://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json},
+                  'id': self.context.request_id})
+
+    def test_call_failure_with_foreign_class(self, mock_session):
+        # This should not happen, but provide an additional safeguard
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'error': {
+                'code': 500,
+                'message': 'AttributeError',
+                'data': {
+                    'class': 'AttributeError'
+                }
+            }
+        }
+        cctx = self.client.prepare('foo.example.com')
+        self.assertEqual('example.com', cctx.host)
+        exc = self.assertRaises(exception.IronicException,
+                                cctx.call,
+                                self.context, 'do_something', answer=42)
+        self.assertEqual(500, exc.code)
+        self.assertIn('Unexpected error', str(exc))
+        mock_session.return_value.post.assert_called_once_with(
+            'http://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json},
+                  'id': self.context.request_id})
+
+    def test_cast_failure(self, mock_session):
+        # Cast cannot return normal failures, but make sure we ignore them even
+        # if server sends something in violation of the protocol (or because
+        # it's a low-level error like HTTP Forbidden).
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'error': {
+                'code': 418,
+                'message': 'I am a teapot',
+                'data': {
+                    'class': 'ironic.common.exception.IronicException'
+                }
+            }
+        }
+        cctx = self.client.prepare('foo.example.com')
+        self.assertEqual('example.com', cctx.host)
+        result = cctx.cast(self.context, 'do_something', answer=42)
+        self.assertIsNone(result)
+        mock_session.return_value.post.assert_called_once_with(
+            'http://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'answer': 42, 'context': self.ctx_json}})
+
+    def test_call_failure_with_version_and_cap(self, mock_session):
+        self.client = client.Client(self.serializer, version_cap='1.42')
+        cctx = self.client.prepare('foo.example.com', version='1.99')
+        self.assertRaisesRegex(RuntimeError,
+                               "requested version 1.99, maximum allowed "
+                               "version is 1.42",
+                               cctx.call, self.context, 'do_something',
+                               answer=42)
+        self.assertFalse(mock_session.return_value.post.called)
+
+    @mock.patch.object(client.LOG, 'debug', autospec=True)
+    def test_mask_secrets(self, mock_log, mock_session):
+        request = {
+            'redfish_username': 'admin',
+            'redfish_password': 'passw0rd'
+        }
+        body = """{
+            "jsonrpc": "2.0",
+            "result": {
+                "driver_info": {
+                    "ipmi_username": "admin",
+                    "ipmi_password": "passw0rd"
+                }
+            }
+        }"""
+        response = mock_session.return_value.post.return_value
+        response.text = body
+        cctx = self.client.prepare('foo.example.com')
+        cctx.cast(self.context, 'do_something', node=request)
+        mock_session.return_value.post.assert_called_once_with(
+            'http://example.com:8089',
+            json={'jsonrpc': '2.0',
+                  'method': 'do_something',
+                  'params': {'node': request, 'context': self.ctx_json}})
+        self.assertEqual(2, mock_log.call_count)
+        node = mock_log.call_args_list[0][0][3]['params']['node']
+        self.assertEqual(node, {'redfish_username': 'admin',
+                                'redfish_password': '***'})
+        resp_text = mock_log.call_args_list[1][0][3]
+        self.assertEqual(body.replace('passw0rd', '***'), resp_text)
+
+    @mock.patch.object(client.LOG, 'debug', autospec=True)
+    def test_debug_log_request_id_only_with_request_id(self, mock_log,
+                                                       mock_session):
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        self.context.request_id = 'req-1234'
+        cctx = self.client.prepare('foo.example.com')
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+
+        # Check that only request_id is logged, not full request/response
+        self.assertEqual(2, mock_log.call_count)
+
+        # First call should log the request with request_id only
+        first_call_args = mock_log.call_args_list[0][0]
+        self.assertIn('request_id', first_call_args[0])
+        self.assertEqual('do_something', first_call_args[1])
+        self.assertIn('example.com:8089', first_call_args[2])
+        self.assertEqual(self.context.request_id, first_call_args[3])
+
+        # Second call should log successful completion with request_id
+        second_call_args = mock_log.call_args_list[1][0]
+        self.assertIn('completed successfully', second_call_args[0])
+        self.assertEqual('do_something', second_call_args[1])
+        self.assertIn('example.com:8089', second_call_args[2])
+        self.assertEqual(self.context.request_id, second_call_args[3])
+
+    @mock.patch.object(client.LOG, 'debug', autospec=True)
+    def test_debug_log_request_id_only_without_request_id(self, mock_log,
+                                                          mock_session):
+        self.config(debug_log_request_id_only=True, group='json_rpc')
+        # Create context without request_id
+        context_without_id = FakeContext({'user_name': 'admin'})
+        context_without_id.request_id = None
+        context_without_id.to_dict()
+
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        response.text = '{"jsonrpc": "2.0", "result": 42}'
+
+        cctx = self.client.prepare('foo.example.com')
+        result = cctx.call(context_without_id, 'do_something', answer=42)
+        self.assertEqual(42, result)
+
+        # Check that full request/response is logged when no request_id
+        self.assertEqual(2, mock_log.call_count)
+
+        # First call should log full request body since no request_id
+        first_call_args = mock_log.call_args_list[0][0]
+        self.assertIn('RPC', first_call_args[0])
+        self.assertIn('with', first_call_args[0])
+        # Should contain the masked request body
+        logged_body = first_call_args[3]
+        self.assertIn('do_something', str(logged_body))
+        self.assertIn('answer', str(logged_body))
+
+        # Second call should log full response since no request_id
+        second_call_args = mock_log.call_args_list[1][0]
+        self.assertIn('returned', second_call_args[0])
+
+    @mock.patch.object(client.LOG, 'debug', autospec=True)
+    def test_debug_log_request_id_only_disabled(self, mock_log, mock_session):
+        self.config(debug_log_request_id_only=False, group='json_rpc')
+        response = mock_session.return_value.post.return_value
+        response.json.return_value = {
+            'jsonrpc': '2.0',
+            'result': 42
+        }
+        response.text = '{"jsonrpc": "2.0", "result": 42}'
+
+        cctx = self.client.prepare('foo.example.com')
+        result = cctx.call(self.context, 'do_something', answer=42)
+        self.assertEqual(42, result)
+
+        # Check that full request/response is logged when option is disabled
+        self.assertEqual(2, mock_log.call_count)
+
+        # Should always log full request/response when disabled
+        first_call_args = mock_log.call_args_list[0][0]
+        self.assertIn('RPC', first_call_args[0])
+        self.assertIn('with', first_call_args[0])
+        logged_body = first_call_args[3]
+        self.assertIn('do_something', str(logged_body))
+
+        second_call_args = mock_log.call_args_list[1][0]
+        self.assertIn('returned', second_call_args[0])
+
+    @mock.patch.object(client.LOG, 'debug', autospec=True)
+    def test_debug_log_request_id_only_with_exception(self, mock_log,
+                                                      mock_session):
+        self.config(debug_log_request_id_only=True, group='json_rpc')
+        mock_session.return_value.post.side_effect = RuntimeError(
+            'Connection failed')
+        self.context.request_id = 'req-1234'
+        cctx = self.client.prepare('foo.example.com')
+        self.assertRaises(RuntimeError, cctx.call, self.context,
+                          'do_something', answer=42)
+
+        # Check that exception logging uses request_id only format
+        self.assertEqual(2, mock_log.call_count)
+
+        # First call should log the request with request_id
+        first_call_args = mock_log.call_args_list[0][0]
+        self.assertIn('request_id', first_call_args[0])
+
+        # Second call should log the failure with request_id
+        second_call_args = mock_log.call_args_list[1][0]
+        self.assertIn('failed', second_call_args[0])
+        self.assertIn('request_id', second_call_args[0])
+        self.assertEqual(self.context.request_id, second_call_args[3])
+
+
+@mock.patch('ironic.common.json_rpc.client.keystone', autospec=True)
+class TestSession(TestCase):
+
+    def setUp(self):
+        super(TestSession, self).setUp()
+        client._SESSIONS.clear()
+
+    def test_noauth(self, mock_keystone):
+        self.config(auth_strategy='noauth', group='json_rpc')
+        session = client._get_session()
+
+        mock_keystone.get_auth.assert_called_once_with('json_rpc')
+        auth = mock_keystone.get_auth.return_value
+
+        mock_keystone.get_session.assert_called_once_with(
+            'json_rpc', auth=auth)
+
+        internal_session = mock_keystone.get_session.return_value
+
+        mock_keystone.get_adapter.assert_called_once_with(
+            'json_rpc',
+            session=internal_session,
+            additional_headers={
+                'Content-Type': 'application/json'
+            })
+        self.assertEqual(mock_keystone.get_adapter.return_value, session)
+
+    def test_keystone(self, mock_keystone):
+        self.config(auth_strategy='keystone', group='json_rpc')
+        session = client._get_session()
+
+        mock_keystone.get_auth.assert_called_once_with('json_rpc')
+        auth = mock_keystone.get_auth.return_value
+
+        mock_keystone.get_session.assert_called_once_with(
+            'json_rpc', auth=auth)
+
+        internal_session = mock_keystone.get_session.return_value
+
+        mock_keystone.get_adapter.assert_called_once_with(
+            'json_rpc',
+            session=internal_session,
+            additional_headers={
+                'Content-Type': 'application/json'
+            })
+        self.assertEqual(mock_keystone.get_adapter.return_value, session)
+
+    def test_http_basic(self, mock_keystone):
+        self.config(auth_strategy='http_basic', group='json_rpc')
+        self.config(username='myName', group='json_rpc')
+        self.config(password='myPassword', group='json_rpc')
+        session = client._get_session()
+
+        mock_keystone.get_auth.assert_called_once_with('json_rpc')
+        auth = mock_keystone.get_auth.return_value
+        mock_keystone.get_session.assert_called_once_with(
+            'json_rpc', auth=auth)
+
+        internal_session = mock_keystone.get_session.return_value
+
+        mock_keystone.get_adapter.assert_called_once_with(
+            'json_rpc',
+            session=internal_session,
+            additional_headers={
+                'Content-Type': 'application/json'
+            })
+        self.assertEqual(mock_keystone.get_adapter.return_value, session)
+
+    def test_group_noauth(self, mock_keystone):
+        client._SESSIONS.clear()
+        self.config(auth_strategy='noauth', group='some_other_json_rpc')
+        session = client._get_session('some_other_json_rpc')
+
+        mock_keystone.get_auth.assert_called_once_with('some_other_json_rpc')
+        auth = mock_keystone.get_auth.return_value
+
+        mock_keystone.get_session.assert_called_once_with(
+            'some_other_json_rpc', auth=auth)
+
+        internal_session = mock_keystone.get_session.return_value
+
+        mock_keystone.get_adapter.assert_called_once_with(
+            'some_other_json_rpc',
+            session=internal_session,
+            additional_headers={
+                'Content-Type': 'application/json'
+            })
+        self.assertEqual(mock_keystone.get_adapter.return_value, session)

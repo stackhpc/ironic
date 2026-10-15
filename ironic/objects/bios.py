@@ -25,7 +25,8 @@ from ironic.objects import fields as object_fields
 class BIOSSetting(base.IronicObject):
     # Version 1.0: Initial version
     # Version 1.1: Added registry
-    VERSION = '1.1'
+    # Version 1.2: Relevant methods changed to be remotable methods.
+    VERSION = '1.2'
 
     dbapi = dbapi.get_instance()
 
@@ -49,10 +50,7 @@ class BIOSSetting(base.IronicObject):
         'upper_bound': object_fields.IntegerField(nullable=True)
     }
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def create(self, context=None):
         """Create a BIOS Setting record in DB.
 
@@ -74,10 +72,7 @@ class BIOSSetting(base.IronicObject):
             values['node_id'], [settings], values['version'])
         self._from_db_object(self._context, self, db_bios_setting[0])
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def save(self, context=None):
         """Save BIOS Setting update in DB.
 
@@ -100,11 +95,8 @@ class BIOSSetting(base.IronicObject):
             values['node_id'], [settings], values['version'])
         self._from_db_object(self._context, self, updated_bios_setting[0])
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get(cls, context, node_id, name):
         """Get a BIOS Setting based on its node_id and name.
 
@@ -118,11 +110,8 @@ class BIOSSetting(base.IronicObject):
         db_bios_setting = cls.dbapi.get_bios_setting(node_id, name)
         return cls._from_db_object(context, cls(), db_bios_setting)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def delete(cls, context, node_id, name):
         """Delete a BIOS Setting based on its node_id and name.
 
@@ -142,9 +131,6 @@ class BIOSSetting(base.IronicObject):
         the same, older, or newer than the version of the object. This is
         used for DB interactions as well as for serialization/deserialization.
 
-        Version 1.1: remove registry field for unsupported versions if
-            remove_unavailable_fields is True.
-
         :param target_version: the desired version of the object
         :param remove_unavailable_fields: True to remove fields that are
             unavailable in the target version; set this to True when
@@ -153,26 +139,25 @@ class BIOSSetting(base.IronicObject):
         """
         target_version = versionutils.convert_version_to_tuple(target_version)
 
-        for field in self.get_registry_fields():
+        for field in self.registry_fields:
             field_is_set = self.obj_attr_is_set(field)
             if target_version >= (1, 1):
                 # target version supports the major/minor specified
                 if not field_is_set:
                     # set it to its default value if it is not set
                     setattr(self, field, None)
+            # target version does not support the field, and it is set
             elif field_is_set:
-                # target version does not support the field, and it is set
                 if remove_unavailable_fields:
                     # (De)serialising: remove unavailable fields
                     delattr(self, field)
-                elif self.registry:
-                    setattr(self, field, None)
 
 
 @base.IronicObjectRegistry.register
 class BIOSSettingList(base.IronicObjectListBase, base.IronicObject):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Relevant methods changed to be remotable methods.
+    VERSION = '1.1'
 
     dbapi = dbapi.get_instance()
 
@@ -180,11 +165,8 @@ class BIOSSettingList(base.IronicObjectListBase, base.IronicObject):
         'objects': object_fields.ListOfObjectsField('BIOSSetting'),
     }
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def create(cls, context, node_id, settings):
         """Create a list of BIOS Setting records in DB.
 
@@ -205,13 +187,10 @@ class BIOSSettingList(base.IronicObjectListBase, base.IronicObject):
         db_setting_list = cls.dbapi.create_bios_setting_list(
             node_id, settings, version)
         return object_base.obj_make_list(
-            context, cls(), BIOSSetting, db_setting_list)
+            context, cls(), db_setting_list)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def save(cls, context, node_id, settings):
         """Save a list of BIOS Setting updates in DB.
 
@@ -232,13 +211,10 @@ class BIOSSettingList(base.IronicObjectListBase, base.IronicObject):
         updated_setting_list = cls.dbapi.update_bios_setting_list(
             node_id, settings, version)
         return object_base.obj_make_list(
-            context, cls(), BIOSSetting, updated_setting_list)
+            context, cls(), updated_setting_list)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def delete(cls, context, node_id, names):
         """Delete BIOS Settings based on node_id and names.
 
@@ -250,11 +226,8 @@ class BIOSSettingList(base.IronicObjectListBase, base.IronicObject):
         """
         cls.dbapi.delete_bios_setting_list(node_id, names)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_node_id(cls, context, node_id):
         """Get BIOS Setting based on node_id.
 
@@ -265,13 +238,10 @@ class BIOSSettingList(base.IronicObjectListBase, base.IronicObject):
         """
         node_bios_setting = cls.dbapi.get_bios_setting_list(node_id)
         return object_base.obj_make_list(
-            context, cls(), BIOSSetting, node_bios_setting)
+            context, cls(), node_bios_setting)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def sync_node_setting(cls, context, node_id, settings):
         """Returns lists of create/update/delete/unchanged settings.
 

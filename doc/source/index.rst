@@ -1,3 +1,10 @@
+.. meta::
+   :description: Ironic OpenStack bare metal provisioning service documentation. Install, configure, and manage physical servers in cloud environments with comprehensive guides and API references.
+   :keywords: ironic, openstack, bare metal, physical servers, provisioning, cloud infrastructure, IPMI, PXE, hardware management
+   :author: OpenStack Ironic Team
+   :robots: index, follow
+   :canonical: https://docs.openstack.org/ironic/latest/
+
 ==================================
 Welcome to Ironic's documentation!
 ==================================
@@ -19,15 +26,36 @@ be managed as though they were virtual machines.
 This documentation is continually updated and may not represent the state of
 the project at any specific prior release. To access documentation for a
 previous release of ironic, append the OpenStack release name to the URL; for
-example, the ``ocata`` release is available at
-https://docs.openstack.org/ironic/ocata/.
+example, the ``2025.1`` release is available at
+https://docs.openstack.org/ironic/2025.1/.
 
 Found a bug in one of our projects? Please see :doc:`/contributor/bugs`.
 
 Would like to engage with the community? See :doc:`/contributor/community`.
 
-Installation Guide
-==================
+Getting Started
+===============
+
+Not sure where to begin? Find the goal that best matches yours and start with the
+recommended guide.
+
+.. list-table::
+  :widths: 60, 40
+  :header-rows: 1
+
+  * - If your goal with ironic is:
+    - Start here:
+  * - Understand and evaluate ironic for my organization
+    - :doc:`Deployment scenarios & how to choose </install/deployment-scenarios>`
+  * - Install ironic standalone for a small number of nodes
+    - :doc:`Standalone installation guide </install/standalone>`
+  * - Use Ansible to install and configure nodes
+    - `Bifrost documentation <https://docs.openstack.org/bifrost/latest/>`_
+  * - Use ironic with other OpenStack components
+    - :doc:`Integration with other OpenStack services </install/configure-integration>`
+
+Ironic Installation Guide
+=========================
 
 .. toctree::
   :maxdepth: 2
@@ -36,13 +64,20 @@ Installation Guide
   install/standalone
   admin/upgrade-guide
 
-User Guide
-==========
+Ironic User Guide
+=================
 
 .. toctree::
   :maxdepth: 3
 
   user/index
+
+.. toctree::
+  :maxdepth: 1
+
+  API Concept Guide <contributor/webapi>
+  API Reference for Ironic <https://docs.openstack.org/api-ref/baremetal/>
+  API Version History <contributor/webapi-version-history>
 
 Administrator Guide
 ===================
@@ -55,52 +90,65 @@ Administrator Guide
 .. toctree::
   :maxdepth: 2
 
-  admin/index
-
-Configuration Guide
-===================
+  admin/features
 
 .. toctree::
   :maxdepth: 2
 
-  configuration/index
-
-Bare Metal API References
-=========================
-
-Ironic's REST API has changed since its first release, and continues to evolve
-to meet the changing needs of the community.  Here we provide a conceptual
-guide as well as more detailed reference documentation.
-
-.. toctree::
-  :maxdepth: 1
-
-  API Concept Guide <contributor/webapi>
-  API Reference (latest) <https://docs.openstack.org/api-ref/baremetal/>
-  API Version History <contributor/webapi-version-history>
-
-Command References
-==================
-
-Here are references for commands not elsewhere documented.
+  admin/operation
 
 .. toctree::
   :maxdepth: 2
 
   cli/index
 
+.. toctree::
+  :maxdepth: 2
+
+  configuration/index
+
+.. toctree::
+  :maxdepth: 2
+
+  admin/architecture
+
+* `Release Notes <https://docs.openstack.org/releasenotes/ironic/>`_
+
+.. toctree::
+  :hidden:
+
+  admin/index
+
 Contributor Guide
+=================
+
+.. toctree::
+   :maxdepth: 3
+
+   contributor/index
+
+.. toctree::
+   :maxdepth: 3
+
+   contributor/documentation-contributing
+
+Support Resources
 =================
 
 .. toctree::
    :maxdepth: 2
 
-   contributor/index
+   support/index
 
-Release Notes
-=============
+.. only:: html
 
-`Release Notes <https://docs.openstack.org/releasenotes/ironic/>`_
+References
+==========
+
+.. toctree::
+   :maxdepth: 2
+
+   references/index
 
 .. only:: html
 

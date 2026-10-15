@@ -1,9 +1,14 @@
 values:
   skip_reason: "These are fake reference values for YAML templating"
+  # Project scoped admin token
+  project_admin_headers: &project_admin_headers
+    X-Auth-Token: 'owner-admin-token'
+    X-Roles: admin,manager,member,reader
+    X-Project-Id: 70e5e25a-2ca2-4cb1-8ae8-7d8739cee205
   # System scoped admin token
   admin_headers: &admin_headers
     X-Auth-Token: 'baremetal-admin-token'
-    X-Roles: admin
+    X-Roles: admin,member,reader
     OpenStack-System-Scope: all
   # System scoped other member token.
   scoped_member_headers: &scoped_member_headers
@@ -21,15 +26,21 @@ values:
   other_admin_headers: &other_admin_headers
     X-Auth-Token: 'other-admin-token'
     X-Project-ID: a1111111111111111111111111111111
-    X-Roles: admin
+    X-Roles: admin,member,reader
     X-Project-Name: 'other-project'
   service_headers: &service_headers
     X-Auth-Token: 'baremetal-service-token'
     X-Roles: service
     OpenStack-System-Scope: all
+  service_project_headers: &service_project_headers
+    X-Auth-Toke: 'service-project-token'
+    X-Roles: 'service'
+    X-Project-Name: 'service'
+    X-Project-ID: c11111111111111111111111111111
   owner_project_id: &owner_project_id '{owner_project_id}'
   other_project_id: &other_project_id '{other_project_id}'
   node_ident: &node_ident '{node_ident}'
+  allocated_node_ident: &allocated_node_ident 22e26c0b-03f2-4d2e-ae87-c02d7f33c000
 
 # Nodes - https://docs.openstack.org/api-ref/baremetal/?expanded=#nodes-nodes
 
@@ -110,6 +121,34 @@ nodes_get_service:
   assert_list_length:
     nodes: 3
   assert_status: 200
+
+nodes_get_service_project:
+  path: '/v1/nodes'
+  method: get
+  headers: *service_project_headers
+  assert_list_length:
+    nodes: 3
+  assert_status: 200
+  enable_service_project: true
+
+nodes_get_service_project_disabled:
+  path: '/v1/nodes'
+  method: get
+  headers: *service_project_headers
+  assert_list_length:
+    nodes: 0
+  assert_status: 200
+  enable_service_project: false
+
+nodes_get_service_project_admin:
+  path: '/v1/nodes'
+  method: get
+  headers: *service_project_headers
+  assert_list_length:
+    nodes: 0
+  assert_status: 200
+  service_project: admin
+  enable_service_project: true
 
 nodes_get_other_admin:
   path: '/v1/nodes'
@@ -199,6 +238,21 @@ nodes_node_ident_patch_member:
   body: *extra_patch
   assert_status: 503
 
+nodes_node_ident_patch_service:
+  path: '/v1/nodes/{node_ident}'
+  method: patch
+  headers: *service_headers
+  body: *extra_patch
+  assert_status: 503
+
+nodes_node_ident_patch_service_project:
+  path: '/v1/nodes/{node_ident}'
+  method: patch
+  headers: *service_project_headers
+  body: *extra_patch
+  assert_status: 503
+  enable_service_project: true
+
 nodes_node_ident_patch_reader:
   path: '/v1/nodes/{node_ident}'
   method: patch
@@ -246,6 +300,19 @@ nodes_validate_get_member:
   method: get
   headers: *scoped_member_headers
   assert_status: 503
+
+nodes_validate_get_service:
+  path: '/v1/nodes/{node_ident}/validate'
+  method: get
+  headers: *service_headers
+  assert_status: 503
+
+nodes_validate_get_service_project:
+  path: '/v1/nodes/{node_ident}/validate'
+  method: get
+  headers: *service_project_headers
+  assert_status: 503
+  enable_service_project: true
 
 nodes_validate_get_reader:
   path: '/v1/nodes/{node_ident}/validate'
@@ -814,6 +881,14 @@ nodes_vifs_post_service:
   assert_status: 503
   body: *vif_body
 
+nodes_vifs_post_service_project:
+  path: '/v1/nodes/{node_ident}/vifs'
+  method: post
+  headers: *service_project_headers
+  assert_status: 503
+  body: *vif_body
+  enable_service_project: true
+
 # This calls the conductor, hence not status 403.
 nodes_vifs_node_vif_ident_delete_admin:
   path: '/v1/nodes/{node_ident}/vifs/{vif_ident}'
@@ -1003,6 +1078,26 @@ nodes_portgroups_get_reader:
   headers: *reader_headers
   assert_status: 200
 
+nodes_portgroups_get_service:
+  path: '/v1/nodes/{node_ident}/portgroups'
+  method: get
+  headers: *service_headers
+  assert_status: 200
+
+nodes_portgroups_get_service_project:
+  path: '/v1/nodes/{node_ident}/portgroups'
+  method: get
+  headers: *service_project_headers
+  assert_status: 200
+  enable_service_project: true
+
+nodes_portgroups_get_service_project_disabled:
+  path: '/v1/nodes/{node_ident}/portgroups'
+  method: get
+  headers: *service_project_headers
+  assert_status: 404
+  enable_service_project: false
+
 nodes_portgroups_detail_get_admin:
   path: '/v1/nodes/{node_ident}/portgroups/detail'
   method: get
@@ -1021,6 +1116,25 @@ nodes_portgroups_detail_get_reader:
   headers: *reader_headers
   assert_status: 200
 
+nodes_portgroups_detail_get_service:
+  path: '/v1/nodes/{node_ident}/portgroups/detail'
+  method: get
+  headers: *service_headers
+  assert_status: 200
+
+nodes_portgroups_detail_get_service_project:
+  path: '/v1/nodes/{node_ident}/portgroups/detail'
+  method: get
+  headers: *service_project_headers
+  assert_status: 200
+  enable_service_project: true
+
+nodes_portgroups_detail_get_service_project_disabled:
+  path: '/v1/nodes/{node_ident}/portgroups/detail'
+  method: get
+  headers: *service_project_headers
+  assert_status: 404
+
 # Ports - https://docs.openstack.org/api-ref/baremetal/#ports-ports
 
 ports_get_admin:
@@ -1028,6 +1142,33 @@ ports_get_admin:
   method: get
   headers: *admin_headers
   assert_status: 200
+  assert_list_length:
+    ports: 1
+
+ports_get_service:
+  path: '/v1/ports'
+  method: get
+  headers: *service_headers
+  assert_status: 200
+  assert_list_length:
+    ports: 1
+
+ports_get_service_project:
+  path: '/v1/ports'
+  method: get
+  headers: *service_project_headers
+  assert_status: 200
+  assert_list_length:
+    ports: 1
+  enable_service_project: true
+
+ports_get_service_project_disabled:
+  path: '/v1/ports'
+  method: get
+  headers: *service_project_headers
+  assert_status: 200
+  assert_list_length:
+    ports: 0
 
 ports_get_member:
   path: '/v1/ports'
@@ -1257,6 +1398,14 @@ volume_get_service:
   headers: *service_headers
   assert_status: 200
 
+volume_get_service_project:
+  path: '/v1/volume'
+  method: get
+  headers: *service_project_headers
+  assert_status: 200
+  assert_list_length:
+  enable_service_project: true
+
 # Volume connectors
 
 volume_connectors_get_admin:
@@ -1282,6 +1431,24 @@ volume_connectors_get_service:
   method: get
   headers: *service_headers
   assert_status: 200
+
+volume_connectors_get_service_project:
+  path: '/v1/volume/connectors'
+  method: get
+  headers: *service_project_headers
+  assert_status: 200
+  assert_list_length:
+    connectors: 1
+  enable_service_project: true
+
+volume_connectors_get_service_project_disable:
+  path: '/v1/volume/connectors'
+  method: get
+  headers: *service_project_headers
+  assert_status: 200
+  assert_list_length:
+    connectors: 0
+  enable_service_project: false
 
 # NOTE(TheJulia): This ends up returning a 400 due to the
 # UUID not already being in ironic.
@@ -1317,6 +1484,14 @@ volume_connectors_post_service:
   headers: *service_headers
   assert_status: 201
   body: *volume_connector_body
+
+volume_connectors_post_service_project:
+  path: '/v1/volume/connectors'
+  method: post
+  headers: *service_project_headers
+  assert_status: 201
+  body: *volume_connector_body
+  enable_service_project: true
 
 volume_volume_connector_id_get_admin:
   path: '/v1/volume/connectors/{volume_connector_ident}'
@@ -1418,7 +1593,7 @@ volume_targets_get_service:
   assert_status: 200
 
 # NOTE(TheJulia): Because we can't seem to get the uuid
-# to load from an existing uuid, since we're not subsituting
+# to load from an existing uuid, since we're not substituting
 # it, this will return with 400 due to the ID not matching.
 volume_targets_post_admin:
   path: '/v1/volume/targets'
@@ -1441,6 +1616,53 @@ volume_targets_post_member:
     volume_type: iscsi
     boot_index: 2
     volume_id: 'test-id2'
+
+volume_targets_post_service:
+  path: '/v1/volume/targets'
+  method: post
+  headers: *service_headers
+  assert_status: 201
+  body:
+    node_uuid: 1be26c0b-03f2-4d2e-ae87-c02d7f33c123
+    volume_type: iscsi
+    boot_index: 2
+    volume_id: 'test-id2'
+
+volume_targets_post_service_project:
+  path: '/v1/volume/targets'
+  method: post
+  headers: *service_project_headers
+  assert_status: 201
+  body:
+    node_uuid: 1be26c0b-03f2-4d2e-ae87-c02d7f33c123
+    volume_type: iscsi
+    boot_index: 2
+    volume_id: 'test-id2'
+  enable_service_project: true
+
+volume_targets_post_service_project_disabled:
+  path: '/v1/volume/targets'
+  method: post
+  headers: *service_project_headers
+  assert_status: 403
+  body:
+    node_uuid: 1be26c0b-03f2-4d2e-ae87-c02d7f33c123
+    volume_type: iscsi
+    boot_index: 2
+    volume_id: 'test-id2'
+
+volume_targets_post_service_project_admin:
+  path: '/v1/volume/targets'
+  method: post
+  headers: *service_project_headers
+  assert_status: 403
+  body:
+    node_uuid: 1be26c0b-03f2-4d2e-ae87-c02d7f33c123
+    volume_type: iscsi
+    boot_index: 2
+    volume_id: 'test-id2'
+  service_project: admin
+  enable_service_project: true
 
 volume_targets_post_reader:
   path: '/v1/volume/targets'
@@ -1475,7 +1697,7 @@ volume_volume_target_id_get_service:
 
 # NOTE(TheJulia): This triggers a call to the conductor and
 # thus will fail, but does not return a 403 which means success.
-volume_volume_target_id_patch_admin:
+volume_volume_target_id_patch_admin_extra:
   path: '/v1/volume/targets/{volume_target_ident}'
   method: patch
   body: &volume_target_patch
@@ -1499,12 +1721,20 @@ volume_volume_target_id_patch_reader:
   headers: *reader_headers
   assert_status: 403
 
-volume_volume_target_id_patch_service:
+volume_volume_target_id_patch_service_disabled:
   path: '/v1/volume/targets/{volume_target_ident}'
   method: patch
   body: *volume_target_patch
   headers: *service_headers
   assert_status: 503
+
+volume_volume_target_id_patch_service:
+  path: '/v1/volume/targets/{volume_target_ident}'
+  method: patch
+  body: *volume_target_patch
+  headers: *service_project_headers
+  assert_status: 503
+  enable_service_project: true
 
 volume_volume_target_id_delete_admin:
   path: '/v1/volume/targets/{volume_target_ident}'
@@ -1743,7 +1973,7 @@ drivers_vendor_passthru_delete_admin:
   headers: *admin_headers
   assert_status: 404
 
-drivers_vendor_passthru_delete_reader:
+drivers_vendor_passthru_delete_member:
   path: '/v1/drivers/{driver_name}/vendor_passthru?method=test'
   method: delete
   headers: *scoped_member_headers
@@ -2289,3 +2519,249 @@ node_history_get_entry_service:
   method: get
   headers: *service_headers
   assert_status: 200
+
+# Shard support
+shard_get_shards:
+  path: '/v1/shards'
+  method: get
+  headers: *reader_headers
+  assert_status: 200
+
+shard_patch_set_node_shard:
+  path: '/v1/nodes/{node_ident}'
+  method: patch
+  headers: *admin_headers
+  body: &replace_shard
+    - op: replace
+      path: /shard
+      value: 'TestShard'
+  assert_status: 503
+
+shard_patch_set_node_shard_disallowed:
+  path: '/v1/nodes/{node_ident}'
+  method: patch
+  headers: *scoped_member_headers
+  body: *replace_shard
+  assert_status: 403
+
+# Update node parent_node field - baremetal:node:update:parent_node
+
+parent_node_patch_by_admin:
+  path: '/v1/nodes/{node_ident}'
+  method: patch
+  headers: *admin_headers
+  body: &patch_parent_node
+    - op: replace
+      path: /parent_node
+      value: *allocated_node_ident
+  assert_status: 503
+
+parent_node_patch_by_member:
+  path: '/v1/nodes/{node_ident}'
+  method: patch
+  headers: *scoped_member_headers
+  body: *patch_parent_node
+  assert_status: 503
+
+parent_node_patch_by_reader:
+  path: '/v1/nodes/{node_ident}'
+  method: patch
+  headers: *reader_headers
+  body: *patch_parent_node
+  assert_status: 403
+
+# Node Firmware  - baremetal:node:firmware:get
+
+nodes_firmware_component_get_admin:
+  path: '/v1/nodes/{node_ident}/firmware'
+  method: get
+  headers: *admin_headers
+  assert_status: 200
+
+nodes_firmware_component_get_member:
+  path: '/v1/nodes/{node_ident}/firmware'
+  method: get
+  headers: *scoped_member_headers
+  assert_status: 200
+
+nodes_firmware_component_get_reader:
+  path: '/v1/nodes/{node_ident}/firmware'
+  method: get
+  headers: *reader_headers
+  assert_status: 200
+
+# Runbooks - https://docs.openstack.org/api-ref/baremetal/#runbooks-templates
+
+runbooks_post_admin:
+  path: '/v1/runbooks'
+  method: post
+  body: &runbook_body
+    name: 'CUSTOM_NAME'
+    steps:
+      - interface: 'raid'
+        step: 'noop'
+        args: {}
+        order: 0
+  headers: *admin_headers
+  assert_status: 201
+
+runbooks_post_member:
+  path: '/v1/runbooks'
+  method: post
+  body: *runbook_body
+  headers: *scoped_member_headers
+  assert_status: 201
+
+runbooks_post_reader:
+  path: '/v1/runbooks'
+  method: post
+  body: *runbook_body
+  headers: *reader_headers
+  assert_status: 403
+
+runbooks_get_admin:
+  path: '/v1/runbooks'
+  method: get
+  headers: *admin_headers
+  assert_status: 200
+
+runbooks_get_member:
+  path: '/v1/runbooks'
+  method: get
+  headers: *scoped_member_headers
+  assert_status: 200
+
+runbooks_get_reader:
+  path: '/v1/runbooks'
+  method: get
+  headers: *reader_headers
+  assert_status: 200
+
+runbooks_runbook_id_get_admin:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: get
+  headers: *admin_headers
+  assert_status: 200
+
+runbooks_runbook_id_get_member:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: get
+  headers: *scoped_member_headers
+  assert_status: 200
+
+runbooks_runbook_id_get_reader:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: get
+  headers: *reader_headers
+  assert_status: 200
+
+runbooks_runbook_id_patch_admin:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: &runbook_name_patch
+    - op: replace
+      path: /name
+      value: 'CUSTOM_NAME'
+  headers: *admin_headers
+  assert_status: 200
+
+runbooks_runbook_id_patch_member:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_name_patch
+  headers: *scoped_member_headers
+  assert_status: 200
+
+runbooks_runbook_id_patch_reader:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_name_patch
+  headers: *reader_headers
+  assert_status: 403
+
+runbooks_runbook_id_patch_public_admin:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: &runbook_public_patch
+    - op: replace
+      path: /public
+      value: true
+  headers: *admin_headers
+  assert_status: 200
+
+runbooks_runbook_id_patch_public_member:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_public_patch
+  headers: *scoped_member_headers
+  assert_status: 200
+
+runbooks_runbook_id_patch_public_reader:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_public_patch
+  headers: *reader_headers
+  assert_status: 403
+
+runbooks_runbook_id_patch_owner_admin:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: &runbook_owner_patch
+    - op: replace
+      path: /owner
+      value: 'new_owner'
+  headers: *admin_headers
+  assert_status: 200
+
+runbooks_runbook_id_patch_owner_member:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_owner_patch
+  headers: *scoped_member_headers
+  assert_status: 200
+
+runbooks_runbook_id_patch_owner_reader:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_owner_patch
+  headers: *reader_headers
+  assert_status: 403
+
+runbooks_runbook_id_delete_admin:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: delete
+  headers: *admin_headers
+  assert_status: 204
+
+runbooks_runbook_id_delete_member:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: delete
+  headers: *scoped_member_headers
+  assert_status: 204
+
+runbooks_runbook_id_delete_reader:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: delete
+  headers: *reader_headers
+  assert_status: 403
+
+runbooks_post_project_admin:
+  path: '/v1/runbooks'
+  method: post
+  body: *runbook_body
+  headers: *project_admin_headers
+  assert_status: 201
+
+public_runbooks_post_admin:
+  path: '/v1/runbooks'
+  method: post
+  body: &runbook_body_public
+    name: 'CUSTOM_NAME'
+    public: true
+    steps:
+      - interface: 'raid'
+        step: 'noop'
+        args: {}
+        order: 0
+  headers: *admin_headers
+  assert_status: 201

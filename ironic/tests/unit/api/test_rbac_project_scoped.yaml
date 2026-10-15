@@ -24,7 +24,7 @@
 # they can determine that something is special, something is different,
 # and from there try to determine *what* it is. The key in their case
 # is the ID values, but they don't know that from the outside.
-# This is also why thid party admins should get 200s and empty lists,
+# This is also why third party admins should get 200s and empty lists,
 # again the database query should be filtered. Third party admin,
 # in essence serves as the primary negative test.
 #
@@ -84,9 +84,8 @@ values:
     X-Roles: service
   owner_project_id: &owner_project_id 70e5e25a-2ca2-4cb1-8ae8-7d8739cee205
   lessee_project_id: &lessee_project_id f11853c7-fa9c-4db3-a477-c9d8e0dbbf13
-  owned_node_ident: &owned_node_ident f11853c7-fa9c-4db3-a477-c9d8e0dbbf13
+  owned_node_ident: &owned_node_ident 1ab63b9e-66d7-4cd7-8618-dddd0f9f7881
   lessee_node_ident: &lessee_node_ident 38d5abed-c585-4fce-a57e-a2ffc2a2ec6f
-
 # Nodes - https://docs.openstack.org/api-ref/baremetal/?expanded=#nodes-nodes
 
 # Based on nodes_post_admin test.
@@ -488,7 +487,7 @@ owner_member_can_patch_all_the_things:
       value: "43"
   assert_status: 503
 
-# FIXME(TheJulia): This should be with member privilges below.
+# FIXME(TheJulia): This should be with member privileges below.
 owner_member_can_change_lessee:
   path: '/v1/nodes/{owner_node_ident}'
   method: patch
@@ -582,7 +581,7 @@ owner_manager_cannot_change_owner:
 # This is not an explicitly restricted item, it falls
 # to generalized update capability, which oddly makes
 # a lot of sense in this case. It is a flag to prevent
-# accidential erasure/removal of the node.
+# accidental erasure/removal of the node.
 
 lessee_member_can_set_protected:
   path: '/v1/nodes/{lessee_node_ident}'
@@ -1370,6 +1369,80 @@ service_cannot_change_provision_state:
   body: *provision_body
   assert_status: 404
 
+# The following tests fail on lock checking, which is fine,
+# as it demonstrates we're past API RBAC policy checking...
+# And these checks center around secondary policies, so the
+# what we send is more important.
+owner_member_can_set_provision_state_clean:
+  path: '/v1/nodes/{owner_node_ident}/states/provision'
+  method: put
+  headers: *owner_member_headers
+  body: &provision_body_clean_steps
+    target: clean
+    clean_steps:
+      - interface: deploy
+        step: update_firmware
+        args:
+          foo: bar
+        priority: 99
+  assert_status: 409
+
+owner_reader_cannot_set_provision_state_clean:
+  path: '/v1/nodes/{owner_node_ident}/states/provision'
+  method: put
+  headers: *owner_reader_headers
+  body: *provision_body_clean_steps
+  assert_status: 403
+
+lessee_admin_can_set_provision_state_clean:
+  path: '/v1/nodes/{lessee_node_ident}/states/provision'
+  method: put
+  headers: *lessee_admin_headers
+  body: *provision_body_clean_steps
+  assert_status: 409
+
+lessee_member_cannot_set_provision_state_clean:
+  path: '/v1/nodes/{lessee_node_ident}/states/provision'
+  method: put
+  headers: *lessee_member_headers
+  body: *provision_body_clean_steps
+  assert_status: 403
+
+owner_member_can_set_provision_state_service:
+  path: '/v1/nodes/{owner_node_ident}/states/provision'
+  method: put
+  headers: *owner_member_headers
+  body: &provision_body_service_steps
+    target: service
+    clean_steps:
+      - interface: deploy
+        step: update_firmware
+        args:
+          foo: bar
+        priority: 99
+  assert_status: 409
+
+owner_reader_cannot_set_provision_state_service:
+  path: '/v1/nodes/{owner_node_ident}/states/provision'
+  method: put
+  headers: *owner_reader_headers
+  body: *provision_body_service_steps
+  assert_status: 403
+
+lessee_admin_can_set_provision_state_service:
+  path: '/v1/nodes/{lessee_node_ident}/states/provision'
+  method: put
+  headers: *lessee_admin_headers
+  body: *provision_body_service_steps
+  assert_status: 409
+
+lessee_member_cannot_set_provision_state_service:
+  path: '/v1/nodes/{lessee_node_ident}/states/provision'
+  method: put
+  headers: *lessee_member_headers
+  body: *provision_body_service_steps
+  assert_status: 403
+
 # Raid configuration
 
 owner_admin_can_set_raid_config:
@@ -1412,7 +1485,7 @@ owner_member_can_set_raid_config:
   body: *raid_body
   assert_status: 503
 
-owner_member_can_set_raid_config:
+service_owner_can_set_raid_config:
   path: '/v1/nodes/{lessee_node_ident}/states/raid'
   method: put
   headers: *service_headers_owner_project
@@ -1851,7 +1924,7 @@ owner_reader_get_traits:
   headers: *owner_reader_headers
   assert_status: 200
 
-owner_reader_get_traits:
+owner_reader_get_traits_service:
   path: '/v1/nodes/{owner_node_ident}/traits'
   method: get
   headers: *service_headers_owner_project
@@ -1928,7 +2001,7 @@ third_party_admin_cannot_put_traits:
   assert_status: 404
   body: *traits_body
 
-third_party_admin_cannot_put_traits:
+third_party_admin_cannot_put_traits_service:
   path: '/v1/nodes/{lessee_node_ident}/traits'
   method: put
   headers: *service_headers
@@ -2395,6 +2468,30 @@ third_party_admin_cannot_modify_portgroup:
   body: *portgroup_patch_body
   assert_status: 404
 
+owner_admin_cannot_rehome_portgroup:
+  path: '/v1/portgroups/{owner_portgroup_ident}'
+  method: patch
+  headers: *owner_admin_headers
+  body: &other_node_portgroup_patch_body
+    - op: replace
+      path: /node_uuid
+      value: 573208e5-cd41-4e26-8f06-ef44022b3793
+  assert_status: 400
+
+owner_manager_cannot_rehome_portgroup:
+  path: '/v1/portgroups/{owner_portgroup_ident}'
+  method: patch
+  headers: *owner_manager_headers
+  body: *other_node_portgroup_patch_body
+  assert_status: 400
+
+owner_service_cannot_rehome_portgroup:
+  path: '/v1/portgroups/{owner_portgroup_ident}'
+  method: patch
+  headers: *service_headers_owner_project
+  body: *other_node_portgroup_patch_body
+  assert_status: 400
+
 owner_admin_can_delete_portgroup:
   path: '/v1/portgroups/{owner_portgroup_ident}'
   method: delete
@@ -2695,6 +2792,30 @@ owner_admin_can_delete_port:
   headers: *owner_admin_headers
   assert_status: 503
 
+owner_admin_cannot_rehome_port:
+  path: '/v1/ports/{owner_port_ident}'
+  method: patch
+  headers: *owner_admin_headers
+  body: &other_node_port_patch_body
+    - op: replace
+      path: /node_uuid
+      value: 573208e5-cd41-4e26-8f06-ef44022b3793
+  assert_status: 400
+
+owner_manager_cannot_rehome_port:
+  path: '/v1/ports/{owner_port_ident}'
+  method: patch
+  headers: *owner_manager_headers
+  body: *other_node_port_patch_body
+  assert_status: 400
+
+owner_service_cannot_rehome_port:
+  path: '/v1/ports/{owner_port_ident}'
+  method: patch
+  headers: *service_headers_owner_project
+  body: *other_node_port_patch_body
+  assert_status: 400
+
 owner_manager_can_delete_port:
   path: '/v1/ports/{owner_port_ident}'
   method: delete
@@ -2911,7 +3032,7 @@ third_party_admin_cannot_get_volume_connector:
   headers: *third_party_admin_headers
   assert_status: 404
 
-lessee_member_cannot_patch_volume_connectors:
+lessee_member_cannot_patch_volume_connectors_extra:
   path: '/v1/volume/connectors/{volume_connector_ident}'
   method: patch
   headers: *lessee_member_headers
@@ -2970,6 +3091,30 @@ third_party_admin_cannot_patch_volume_connectors:
   headers: *third_party_admin_headers
   body: *connector_patch_body
   assert_status: 404
+
+owner_admin_cannot_rehome_volume_connector:
+  path: '/v1/volume/connectors/{volume_connector_ident}'
+  method: patch
+  headers: *owner_admin_headers
+  body: &other_node_connector_patch_body
+    - op: replace
+      path: /node_uuid
+      value: 573208e5-cd41-4e26-8f06-ef44022b3793
+  assert_status: 400
+
+owner_manager_cannot_rehome_volume_connector:
+  path: '/v1/volume/connectors/{volume_connector_ident}'
+  method: patch
+  headers: *owner_manager_headers
+  body: *other_node_connector_patch_body
+  assert_status: 400
+
+owner_service_cannot_rehome_volume_connector:
+  path: '/v1/volume/connectors/{volume_connector_ident}'
+  method: patch
+  headers: *service_headers_owner_project
+  body: *other_node_connector_patch_body
+  assert_status: 400
 
 owner_admin_can_delete_volume_connectors:
   path: '/v1/volume/connectors/{volume_connector_ident}'
@@ -3172,6 +3317,30 @@ service_cannot_patch_volume_target:
   headers: *service_headers
   assert_status: 404
 
+owner_admin_cannot_rehome_volume_target:
+  path: '/v1/volume/targets/{volume_target_ident}'
+  method: patch
+  headers: *owner_admin_headers
+  body: &other_node_target_patch_body
+    - op: replace
+      path: /node_uuid
+      value: 573208e5-cd41-4e26-8f06-ef44022b3793
+  assert_status: 400
+
+owner_manager_cannot_rehome_volume_target:
+  path: '/v1/volume/targets/{volume_target_ident}'
+  method: patch
+  headers: *owner_manager_headers
+  body: *other_node_target_patch_body
+  assert_status: 400
+
+owner_service_cannot_rehome_volume_target:
+  path: '/v1/volume/targets/{volume_target_ident}'
+  method: patch
+  headers: *service_headers_owner_project
+  body: *other_node_target_patch_body
+  assert_status: 400
+
 owner_admin_can_delete_volume_target:
   path: '/v1/volume/targets/{volume_target_ident}'
   method: delete
@@ -3184,7 +3353,7 @@ owner_manager_can_delete_volume_target:
   headers: *owner_manager_headers
   assert_status: 503
 
-owner_manager_can_delete_volume_target:
+owner_manager_can_delete_volume_target_service:
   path: '/v1/volume/targets/{volume_target_ident}'
   method: delete
   headers: *service_headers_owner_project
@@ -3384,19 +3553,19 @@ owner_reader_cannot_get_conductors:
   path: '/v1/conductors'
   method: get
   headers: *owner_reader_headers
-  assert_status: 500
+  assert_status: 403
 
 lessee_reader_cannot_get_conductors:
   path: '/v1/conductors'
   method: get
   headers: *lessee_reader_headers
-  assert_status: 500
+  assert_status: 403
 
 third_party_admin_cannot_get_conductors:
   path: '/v1/conductors'
   method: get
   headers: *third_party_admin_headers
-  assert_status: 500
+  assert_status: 403
 
 # Allocations - https://docs.openstack.org/api-ref/baremetal/#allocations-allocations
 
@@ -3532,7 +3701,7 @@ third_party_admin_cannot_create_allocation_with_candidates_not_owned:
   assert_status: 400
 
 owner_admin_can_create_allocation_with_their_uuid:
-  # NOTE(TheJulia): Owner/Lessee are equivelent in
+  # NOTE(TheJulia): Owner/Lessee are equivalent in
   # this context, so testing only one is fine.
   path: '/v1/allocations'
   method: post
@@ -3632,19 +3801,19 @@ owner_reader_cannot_get_deploy_templates:
   path: '/v1/deploy_templates'
   method: get
   headers: *owner_reader_headers
-  assert_status: 500
+  assert_status: 403
 
 lessee_reader_cannot_get_deploy_templates:
   path: '/v1/deploy_templates'
   method: get
   headers: *lessee_reader_headers
-  assert_status: 500
+  assert_status: 403
 
 third_party_admin_cannot_get_deploy_templates:
   path: '/v1/deploy_templates'
   method: get
   headers: *third_party_admin_headers
-  assert_status: 500
+  assert_status: 403
 
 third_party_admin_cannot_post_deploy_template:
   path: '/v1/deploy_templates'
@@ -3657,20 +3826,20 @@ third_party_admin_cannot_post_deploy_template:
         args: {}
         priority: 0
   headers: *third_party_admin_headers
-  assert_status: 500
+  assert_status: 403
 
 service_cannot_get_deploy_templates:
   path: '/v1/deploy_templates'
   method: get
   headers: *service_headers
-  assert_status: 500
+  assert_status: 403
 
 service_cannot_post_deploy_template:
   path: '/v1/deploy_templates'
   method: post
   body: *deploy_template
   headers: *service_headers
-  assert_status: 500
+  assert_status: 403
 
 # Chassis endpoints - https://docs.openstack.org/api-ref/baremetal/#chassis-chassis
 
@@ -3822,7 +3991,7 @@ third_party_admin_cannot_get_node_history:
   headers: *third_party_admin_headers
   assert_status: 404
 
-node_history_get_entry_admin:
+node_history_get_entry_third_party_admin:
   path: '/v1/nodes/{owner_node_ident}/history/{owned_history_ident}'
   method: get
   headers: *third_party_admin_headers
@@ -3871,3 +4040,443 @@ lessee_node_inventory_get_reader:
   method: get
   headers: *lessee_reader_headers
   assert_status: 404
+
+# Shard support - system scoped req'd to set on a node or view via /v1/shards
+shard_get_shards_disallowed:
+  path: '/v1/shards'
+  method: get
+  headers: *owner_reader_headers
+  assert_status: 403
+
+shard_patch_set_node_shard_disallowed:
+  path: '/v1/nodes/{owner_node_ident}'
+  method: patch
+  headers: *owner_admin_headers
+  body:
+    - op: replace
+      path: /shard
+      value: 'TestShard'
+  assert_status: 403
+
+# Create node with parent_node field
+
+admin_can_create_node_with_parent:
+  path: '/v1/nodes'
+  method: post
+  headers: *owner_admin_headers
+  body:
+    driver: fake
+    parent_node: *owned_node_ident
+  assert_status: 503
+
+admin_cannot_create_node_with_non_existing_parent:
+  path: '/v1/nodes'
+  method: post
+  headers: *owner_admin_headers
+  body:
+    driver: fake
+    parent_node: 'f11853c7-fa9c-4db3-a477-c9d8e0dbbf13'
+  assert_status: 400
+
+admin_cannot_create_node_with_parent_they_cannot_see:
+  path: '/v1/nodes'
+  method: post
+  headers: *owner_admin_headers
+  body:
+    driver: fake
+    parent_node: '{node_ident}'
+  assert_status: 400
+
+# Update node parent_node field - baremetal:node:update:parent_node
+
+parent_node_patch_by_admin:
+  path: '/v1/nodes/{lessee_node_ident}'
+  method: patch
+  headers: *owner_admin_headers
+  body: &patch_parent_node
+    - op: replace
+      path: /parent_node
+      value: *owned_node_ident
+  assert_status: 403
+
+parent_node_patch_by_member:
+  path: '/v1/nodes/{lessee_node_ident}'
+  method: patch
+  headers: *owner_member_headers
+  body: *patch_parent_node
+  assert_status: 403
+
+parent_node_patch_by_reader:
+  path: '/v1/nodes/{lessee_node_ident}'
+  method: patch
+  headers: *owner_reader_headers
+  body: *patch_parent_node
+  assert_status: 403
+
+parent_node_patch_by_manager:
+  path: '/v1/nodes/{lessee_node_ident}'
+  method: patch
+  headers: *owner_manager_headers
+  body: *patch_parent_node
+  assert_status: 403
+
+parent_node_patch_by_cannot_see_node:
+  # Avoid exposing whether the node exists if not authorized
+  path: '/v1/nodes/{lessee_node_ident}'
+  method: patch
+  headers: *owner_admin_headers
+  body:
+    - op: replace
+      path: /parent_node
+      value: 'f11853c7-fa9c-4db3-a477-c9d8e0dbbf13'
+  assert_status: 403
+
+parent_node_children_can_get_list_of_children:
+  path: '/v1/nodes/{owner_node_ident}/children'
+  method: get
+  headers: *owner_reader_headers
+  assert_status: 200
+  assert_list_length:
+    children: 1
+
+lessee_cannot_get_a_nodes_children:
+  path: '/v1/nodes/{owner_node_ident}/children'
+  method: get
+  headers: *lessee_reader_headers
+  assert_status: 404
+
+# Node Firmware
+
+owner_reader_can_get_firmware_components:
+  path: '/v1/nodes/{owner_node_ident}/firmware'
+  method: get
+  headers: *owner_reader_headers
+  assert_status: 200
+
+lessee_reader_can_get_firmware_components:
+  path: '/v1/nodes/{lessee_node_ident}/firmware'
+  method: get
+  headers: *lessee_reader_headers
+  assert_status: 200
+
+third_party_admin_cannot_get_firmware_components:
+  path: '/v1/nodes/{owner_node_ident}/firmware'
+  method: get
+  headers: *third_party_admin_headers
+  assert_status: 404
+
+service_can_get_firmware_components_owner_project:
+  path: '/v1/nodes/{owner_node_ident}/firmware'
+  method: get
+  headers: *service_headers_owner_project
+  assert_status: 200
+
+service_cannot_get_firmware_components:
+  path: '/v1/nodes/{owner_node_ident}/firmware'
+  method: get
+  headers: *service_headers
+  assert_status: 404
+
+# Runbooks - https://docs.openstack.org/api-ref/baremetal/#runbooks-templates
+
+runbooks_post_admin:
+  path: '/v1/runbooks'
+  method: post
+  body: &runbook_body
+    name: 'CUSTOM_NAME'
+    steps:
+      - interface: 'raid'
+        step: 'noop'
+        args: {}
+        order: 0
+  headers: *owner_admin_headers
+  assert_status: 201
+
+runbooks_post_manager:
+  path: '/v1/runbooks'
+  method: post
+  body: *runbook_body
+  headers: *owner_manager_headers
+  assert_status: 201
+
+service_post_runbook:
+  path: '/v1/runbooks'
+  method: post
+  body: *runbook_body
+  headers: *service_headers_owner_project
+  assert_status: 201
+
+third_party_admin_post_runbook:
+  path: '/v1/runbooks'
+  method: post
+  body: *runbook_body
+  headers: *third_party_admin_headers
+  assert_status: 201
+
+runbooks_post_public_admin:
+  path: '/v1/runbooks'
+  method: post
+  body: &runbook_body_public
+    name: 'CUSTOM_NAME'
+    public: true
+    steps:
+      - interface: 'raid'
+        step: 'noop'
+        args: {}
+        order: 0
+  headers: *owner_admin_headers
+  assert_status: 400
+
+runbooks_post_public_manager:
+  path: '/v1/runbooks'
+  method: post
+  body: *runbook_body_public
+  headers: *owner_manager_headers
+  assert_status: 400
+
+runbooks_post_public_service:
+  path: '/v1/runbooks'
+  method: post
+  body: *runbook_body_public
+  headers: *owner_admin_headers
+  assert_status: 400
+
+runbooks_patch_admin:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: &runbook_patch
+    - op: replace
+      path: /name
+      value: 'CUSTOM_NAME'
+  headers: *owner_admin_headers
+  assert_status: 200
+
+runbooks_patch_manager:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_patch
+  headers: *owner_manager_headers
+  assert_status: 200
+
+service_patch_runbook:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_patch
+  headers: *service_headers_owner_project
+  assert_status: 200
+
+project_admin_delete_runbook:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: delete
+  headers: *owner_admin_headers
+  assert_status: 204
+
+project_manager_delete_runbook:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: delete
+  headers: *owner_manager_headers
+  assert_status: 204
+
+service_get_runbooks:
+  path: '/v1/runbooks'
+  method: get
+  headers: *service_headers_owner_project
+  assert_status: 200
+
+runbooks_project_admin:
+  path: '/v1/runbooks'
+  method: get
+  headers: *owner_admin_headers
+  assert_status: 200
+
+runbooks_runbook_id_get_project_admin:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: get
+  headers: *owner_admin_headers
+  assert_status: 200
+
+project_admin_patch_runbook:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_patch
+  headers: *owner_admin_headers
+  assert_status: 200
+
+runbooks_project_manager:
+  path: '/v1/runbooks'
+  method: get
+  headers: *owner_manager_headers
+  assert_status: 200
+
+runbooks_runbook_id_get_project_manager:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: get
+  headers: *owner_manager_headers
+  assert_status: 200
+
+project_manager_patch_runbook:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_patch
+  headers: *owner_manager_headers
+  assert_status: 200
+
+runbooks_project_member:
+  path: '/v1/runbooks'
+  method: get
+  headers: *owner_member_headers
+  assert_status: 200
+
+runbooks_runbook_id_get_project_member:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: get
+  headers: *owner_member_headers
+  assert_status: 200
+
+runbooks_list_project_reader:
+  path: '/v1/runbooks'
+  method: get
+  headers: *owner_reader_headers
+  assert_status: 200
+
+runbooks_runbook_id_get_project_reader:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: get
+  headers: *owner_reader_headers
+  assert_status: 200
+
+runbooks_list_third_party_admin:
+  path: '/v1/runbooks'
+  method: get
+  headers: *third_party_admin_headers
+  assert_status: 200
+
+project_reader_cannot_post_runbook:
+  path: '/v1/runbooks'
+  method: post
+  body: *runbook_body
+  headers: *owner_reader_headers
+  assert_status: 403
+
+project_reader_cannot_patch_runbook:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_patch
+  headers: *owner_reader_headers
+  assert_status: 403
+
+project_reader_cannot_set_runbook_owner:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: &runbook_owner_patch
+    - op: replace
+      path: /owner
+      value: 'new_owner'
+  headers: *owner_reader_headers
+  assert_status: 403
+
+project_reader_cannot_set_runbook_public:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: &runbook_public_patch
+    - op: replace
+      path: /public
+      value: true
+  headers: *owner_reader_headers
+  assert_status: 403
+
+project_reader_cannot_delete_runbook:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: delete
+  headers: *owner_reader_headers
+  assert_status: 403
+
+project_member_cannot_post_runbook:
+  path: '/v1/runbooks'
+  method: post
+  body: *runbook_body
+  headers: *owner_member_headers
+  assert_status: 403
+
+project_member_cannot_patch_runbook:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_patch
+  headers: *owner_member_headers
+  assert_status: 403
+
+project_member_cannot_set_runbook_owner:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_owner_patch
+  headers: *owner_member_headers
+  assert_status: 403
+
+project_member_cannot_set_runbook_public:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_public_patch
+  headers: *owner_member_headers
+  assert_status: 403
+
+project_member_cannot_delete_runbook:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: delete
+  headers: *owner_member_headers
+  assert_status: 403
+
+project_manager_cannot_set_runbook_owner:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_owner_patch
+  headers: *owner_manager_headers
+  assert_status: 403
+
+project_manager_cannot_set_runbook_public:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_public_patch
+  headers: *owner_manager_headers
+  assert_status: 403
+
+project_admin_cannot_set_runbook_owner:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_owner_patch
+  headers: *owner_admin_headers
+  assert_status: 403
+
+project_admin_cannot_set_runbook_public:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_public_patch
+  headers: *owner_admin_headers
+  assert_status: 403
+
+service_cannot_patch_runbook_owner:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_owner_patch
+  headers: *service_headers_owner_project
+  assert_status: 403
+
+service_cannot_patch_runbook_public:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_public_patch
+  headers: *service_headers_owner_project
+  assert_status: 403
+
+third_party_admin_cannot_patch_runbook_owner:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_owner_patch
+  headers: *third_party_admin_headers
+  assert_status: 403
+
+third_party_admin_cannot_patch_runbook_public:
+  path: '/v1/runbooks/{runbook_ident}'
+  method: patch
+  body: *runbook_public_patch
+  headers: *third_party_admin_headers
+  assert_status: 403

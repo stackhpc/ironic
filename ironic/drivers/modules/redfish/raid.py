@@ -16,14 +16,13 @@
 import itertools
 import math
 
-from ironic_lib import metrics_utils
 from oslo_log import log
-from oslo_utils import importutils
 from oslo_utils import units
+import sushy
 
 from ironic.common import exception
 from ironic.common.i18n import _
-from ironic.common import raid as raid_common
+from ironic.common import metrics_utils
 from ironic.common import raid
 from ironic.common import states
 from ironic.conductor import periodics
@@ -43,7 +42,6 @@ RAID_LEVELS = {
         'min_disks': 1,
         'max_disks': 1000,
         'type': 'simple',
-        'volume_type': 'NonRedundant',
         'raid_type': 'RAID0',
         'overhead': 0
     },
@@ -51,7 +49,6 @@ RAID_LEVELS = {
         'min_disks': 2,
         'max_disks': 2,
         'type': 'simple',
-        'volume_type': 'Mirrored',
         'raid_type': 'RAID1',
         'overhead': 1
     },
@@ -59,7 +56,6 @@ RAID_LEVELS = {
         'min_disks': 3,
         'max_disks': 1000,
         'type': 'simple',
-        'volume_type': 'StripedWithParity',
         'raid_type': 'RAID5',
         'overhead': 1
     },
@@ -67,37 +63,30 @@ RAID_LEVELS = {
         'min_disks': 4,
         'max_disks': 1000,
         'type': 'simple',
-        'volume_type': 'StripedWithParity',
         'raid_type': 'RAID6',
         'overhead': 2
     },
     '1+0': {
         'type': 'spanned',
-        'volume_type': 'SpannedMirrors',
         'raid_type': 'RAID10',
         'span_type': '1'
     },
     '5+0': {
         'type': 'spanned',
-        'volume_type': 'SpannedStripesWithParity',
         'raid_type': 'RAID50',
         'span_type': '5'
     },
     '6+0': {
         'type': 'spanned',
-        'volume_type': 'SpannedStripesWithParity',
         'raid_type': 'RAID60',
         'span_type': '6'
     }
 }
 
-sushy = importutils.try_import('sushy')
-
-if sushy:
-    PROTOCOL_MAP = {
-        sushy.PROTOCOL_TYPE_SAS: raid.SAS,
-        sushy.PROTOCOL_TYPE_SATA: raid.SATA
-    }
+PROTOCOL_MAP = {
+    sushy.PROTOCOL_TYPE_SAS: raid.SAS,
+    sushy.PROTOCOL_TYPE_SATA: raid.SATA
+}
 
 
 def convert_drive_units(logical_disks, node):
@@ -135,8 +124,7 @@ def get_physical_disks(node):
     try:
         collection = system.storage
         for storage in collection.get_members():
-            controller = (storage.storage_controllers[0]
-                          if storage.storage_controllers else None)
+            controller = redfish_utils.get_first_controller(storage)
             if controller and controller.raid_types == []:
                 continue
             disks.extend(storage.drives)
@@ -300,12 +288,14 @@ def _calculate_volume_props(logical_disk, physical_disks, free_space_bytes,
         logical_disk['raid_level'], selected_disks, free_space_bytes,
         spans_count=spans_count)
 
+    original_size_bytes = logical_disk['size_bytes']
     if logical_disk['size_bytes'] == 'MAX':
         if max_volume_size_bytes == 0:
             error_msg = _("size set to 'MAX' but could not allocate physical "
                           "disk space")
             raise exception.RedfishError(error=error_msg)
 
+        original_size_bytes = 'MAX'
         logical_disk['size_bytes'] = max_volume_size_bytes
     elif max_volume_size_bytes < logical_disk['size_bytes']:
         error_msg = _('The physical disk space (%(max_vol_size)s bytes) is '
@@ -317,6 +307,8 @@ def _calculate_volume_props(logical_disk, physical_disks, free_space_bytes,
 
     disk_usage = _volume_usage_per_disk_bytes(logical_disk, selected_disks,
                                               spans_count=spans_count)
+
+    logical_disk['size_bytes'] = original_size_bytes
 
     for disk in selected_disks:
         if free_space_bytes[disk] < disk_usage:
@@ -600,8 +592,7 @@ def _get_storage_controller(node, system, physical_disks):
     collection = system.storage
     for storage in collection.get_members():
         # Using first controller as expecting only one
-        controller = (storage.storage_controllers[0]
-                      if storage.storage_controllers else None)
+        controller = redfish_utils.get_first_controller(storage)
         if controller and controller.raid_types == []:
             continue
         for drive in storage.drives:
@@ -618,17 +609,24 @@ def _drive_path(storage, drive_id):
 def _construct_volume_payload(
         node, storage, raid_controller, physical_disks, raid_level, size_bytes,
         disk_name=None, span_length=None, span_depth=None):
-    payload = {'Encrypted': False,
-               'VolumeType': RAID_LEVELS[raid_level]['volume_type'],
-               'RAIDType': RAID_LEVELS[raid_level]['raid_type'],
-               'CapacityBytes': size_bytes}
+    payload = {
+        'RAIDType': RAID_LEVELS[raid_level]['raid_type'],
+    }
+
+    # NOTE(cid): Omit CapacityBytes when size_bytes is 'MAX' to let the
+    # Redfish controller calculate the optimal size, accounting for metadata
+    # overhead. See bug/2132936 for more details.
+    if size_bytes != 'MAX':
+        payload['CapacityBytes'] = size_bytes
     if physical_disks:
         payload['Links'] = {
             "Drives": [{"@odata.id": _drive_path(storage, d)} for d in
                        physical_disks]
         }
+    if disk_name:
+        payload['Name'] = disk_name
     LOG.debug('Payload for RAID logical disk creation on node %(node_uuid)s: '
-              '%(payload)r', {'node': node.uuid, 'payload': payload})
+              '%(payload)r', {'node_uuid': node.uuid, 'payload': payload})
     return payload
 
 
@@ -694,8 +692,18 @@ def update_raid_config(node):
     system = redfish_utils.get_system(node)
     logical_disks = []
     vol_no_raid_type = []
+    controllers_total = 0
+    controllers_queried = 0
     for stor in system.storage.get_members():
-        for vol in stor.volumes.get_members():
+        controllers_total += 1
+        try:
+            volumes = stor.volumes.get_members()
+        except sushy.exceptions.MissingAttributeError:
+            LOG.debug('Storage controller %s has no Volumes collection, '
+                      'skipping', stor.identity)
+            continue
+        controllers_queried += 1
+        for vol in volumes:
             if vol.raid_type:
                 logical_disk = {
                     'id': vol.identity,
@@ -715,17 +723,14 @@ def update_raid_config(node):
                     "type: %(vol_no_raid_type)s",
                     {'vol_no_raid_type': ", ".join(vol_no_raid_type)})
 
-    raid_common.update_raid_info(node, {'logical_disks': logical_disks})
+    if controllers_total and not controllers_queried:
+        LOG.warning('No storage controllers with a Volumes collection found '
+                    'for node %s', node.uuid)
+
+    raid.update_raid_info(node, {'logical_disks': logical_disks})
 
 
 class RedfishRAID(base.RAIDInterface):
-
-    def __init__(self):
-        super(RedfishRAID, self).__init__()
-        if sushy is None:
-            raise exception.DriverLoadError(
-                driver='redfish',
-                reason=_("Unable to import the sushy library"))
 
     def get_properties(self):
         """Return the properties of the interface.
@@ -752,6 +757,8 @@ class RedfishRAID(base.RAIDInterface):
             raise exception.InvalidParameterValue(
                 _('interface type `scsi` not supported by Redfish RAID'))
 
+    @base.service_step(priority=0,
+                       argsinfo=base.RAID_APPLY_CONFIGURATION_ARGSINFO)
     @base.deploy_step(priority=0,
                       argsinfo=base.RAID_APPLY_CONFIGURATION_ARGSINFO)
     def apply_configuration(self, task, raid_config, create_root_volume=True,
@@ -850,6 +857,7 @@ class RedfishRAID(base.RAIDInterface):
 
     @base.clean_step(priority=0)
     @base.deploy_step(priority=0)
+    @base.service_step(priority=0)
     def delete_configuration(self, task):
         """Delete RAID configuration on the node.
 
@@ -1102,7 +1110,7 @@ class RedfishRAID(base.RAIDInterface):
                     physical_disks=logical_disk['physical_disks'],
                     raid_level=logical_disk['raid_level'],
                     size_bytes=logical_disk['size_bytes'],
-                    disk_name=logical_disk.get('name'),
+                    disk_name=logical_disk.get('volume_name'),
                     span_length=logical_disk.get('span_length'),
                     span_depth=logical_disk.get('span_depth'),
                     error_handler=self.volume_create_error_handler)
@@ -1142,15 +1150,19 @@ class RedfishRAID(base.RAIDInterface):
         any_left = False
         try:
             for storage in system.storage.get_members():
-                controller = (storage.storage_controllers[0]
-                              if storage.storage_controllers else None)
+                controller = redfish_utils.get_first_controller(storage)
                 controller_id = None
                 if controller:
                     controller_id = storage.identity
-                iter_volumes = iter(storage.volumes.get_members())
+                try:
+                    iter_volumes = iter(storage.volumes.get_members())
+                except sushy.exceptions.MissingAttributeError:
+                    LOG.debug('Storage controller %(ctrl)s on node %(node)s '
+                              'has no Volumes collection, skipping',
+                              {'ctrl': storage.identity, 'node': node.uuid})
+                    continue
                 for volume in iter_volumes:
-                    if (volume.raid_type or volume.volume_type not in
-                            [None, sushy.VOLUME_TYPE_RAW_DEVICE]):
+                    if volume.raid_type:
                         if controller_id not in vols_to_delete:
                             vols_to_delete[controller_id] = []
                         apply_time = self._get_apply_time(
@@ -1162,7 +1174,7 @@ class RedfishRAID(base.RAIDInterface):
                             # deleted to avoid failures where only 1 request
                             # per controller can be submitted for non-immediate
                             break
-                any_left = any(iter_volumes)
+                any_left = any_left or any(iter_volumes)
         except sushy.exceptions.SushyError as exc:
             error_msg = _('Cannot get the list of volumes to delete for node '
                           '%(node_uuid)s. Reason: %(error)s.' %

@@ -1,3 +1,10 @@
+.. meta::
+   :description: Secure Ironic bare metal deployments. Authentication, authorization, secure boot, network security, and compliance considerations for production environments.
+   :keywords: ironic security, bare metal security, secure boot, authentication, authorization, network security, compliance, production security
+   :author: OpenStack Ironic Team
+   :robots: index, follow
+   :audience: security engineers, compliance officers
+
 .. _security:
 
 =================
@@ -19,57 +26,79 @@ OpenStack deployment.
 
 .. TODO: add "Multi-tenancy Considerations" section
 
+Image Checksums
+===============
+
+Ironic has long provided a capacity to supply and check a checksum for disk
+images being deployed. However, one aspect which Ironic has not asserted is
+"Why?" in terms of "Is it for security?" or "Is it for data integrity?".
+
+The answer is both to ensure a higher level of security with remote
+image files, *and* provide faster feedback should a image being transferred
+happens to be corrupted.
+
+Normally checksums are verified by the ``ironic-python-agent`` **OR** the
+deployment interface responsible for overall deployment operation. That being
+said, not *every* deployment interface relies on disk images which have
+checksums, and those deployment interfaces are for specific use cases which
+Ironic users leverage, outside of the "general" use case capabilities provided
+by the ``direct`` deployment interface.
+
+.. NOTE::
+   Use of the node ``instance_info/image_checksum`` field is discouraged
+   for integrated OpenStack Users as usage of the matching Glance Image
+   Service field is also deprecated. That being said, Ironic retains this
+   feature by popular demand while also enabling also retain simplified
+   operator interaction.
+   The newer field values supported by Glance are also specifically
+   supported by Ironic as ``instance_info/image_os_hash_value`` for
+   checksum values and ``instance_info/image_os_hash_algo`` field for
+   the checksum algorithm.
+
+.. WARNING::
+   Setting a checksum value to a URL is supported, *however* doing this is
+   making a "tradeoff" with security as the remote checksum *can* change.
+   Conductor support this functionality can be disabled using the
+   :oslo.config:option:`conductor.disable_support_for_checksum_files` setting.
 
 REST API: user roles and policy settings
 ========================================
 
-.. WARNING::
-   This information is presently in flux as of the Wallaby release with the
-   implementation of ``Secure RBAC`` where ``system`` and ``project``
-   scoped requests are able to be parsed and default access controls support
-   a delineation of roles and responsibilities through the roles.
-   Please see :doc:`/admin/secure-rbac`.
+By default, users are authenticated and authorization details are provided to
+Ironic as part web API's operating security model and interaction with
+keystone.
 
-Beginning with the Newton (6.1.0) release, the Bare Metal service allows
-operators significant control over API access:
+Default REST API user roles and policy settings have evolved, starting in the
+Wallaby development cycle, into a model often referred to in the OpenStack
+community as ``Secure RBAC``. This model is intended balance usability, while
+leaning towards a secure-by-default state. You can find more information on
+this at :doc:`/admin/secure-rbac`.
 
-* Access may be restricted to each method (GET, PUT, etc) for each
-  REST resource. Defaults are provided with the release and defined in code.
-* Access may be divided between an "administrative" role with full access and
-  "observer" role with read-only access. By default, these roles are assigned
-  the names ``baremetal_admin`` and ``baremetal_observer``, respectively.
-* By default, passwords and instance secrets are hidden in ``driver_info`` and
-  ``instance_info``, respectively. In case of debugging or diagnosing, the
-  behavior can be overridden by changing the policy file. To allow password
-  in ``driver_info`` unmasked for users with administrative privileges, apply
-  following changes to policy configuration file::
+Operators may choose to override default, in-code, Role Based Access Control
+policies by utilizing override policies, which you can learn about at
+:doc:`/configuration/policy`.
 
-    "show_password": "rule:is_admin"
+Conductor Operation
+-------------------
 
-  And restart the Bare Metal API service to take effect. Please check
-  :doc:`/configuration/policy` for more details.
-
-Prior to the Newton (6.1.0) release, the Bare Metal service only supported two
-policy options:
-
-* API access may be secured by a simple policy rule: users with administrative
-  privileges may access all API resources, whereas users without administrative
-  privileges may only access public API resources.
-* Passwords contained in the ``driver_info`` field may be hidden from all API
-  responses with the ``show_password`` policy setting. This defaults to always
-  hide passwords, regardless of the user's role. You can override it with
-  policy configuration as described above.
-
+Ironic relies upon the REST API to validate, authenticate, and authorize user
+requests and interactions. While the conductor service *can* be operated with
+the REST API in a single process, the normal operating mode is as separate
+services either connected to a Message bus or use of an authenticated JSON-RPC
+endpoint.
 
 Multi-tenancy
 =============
 
-There are two aspects of multitenancy to consider when evaluating a deployment
-of the Bare Metal Service: interactions between tenants on the network, and
-actions one tenant can take on a machine that will affect the next tenant.
+There are three aspects of multitenancy to consider when evaluating a
+deployment of the Bare Metal Service: interactions between tenants on the
+network, actions one tenant can take on a machine that will affect the next
+tenant, and the API-level access granted to projects through a node's
+``owner`` and ``lessee`` fields.
 
 Network Interactions
 --------------------
+
 Interactions between tenants' workloads running simultaneously on separate
 servers include, but are not limited to: IP spoofing, packet sniffing, and
 network man-in-the-middle attacks.
@@ -93,6 +122,34 @@ BIOS or reflash firmware or peripheral devices. This can be addressed through
 customizing the utility ramdisk used during the "cleaning" phase. See details in
 the `Firmware security`_ section.
 
+Access Delegation: Owners and Lessees
+-------------------------------------
+
+A node may be exposed to a project through the node's ``owner`` or
+``lessee`` field, and the two fields imply very different levels of trust.
+
+An owning project is a delegated administrator of the node. With the
+default policies, every user holding the ``member`` role in an owning
+project can update the node's BMC address and credentials, access its
+serial console, run arbitrary cleaning and service steps, and lease the
+node to other projects. In many environments, the owning project may
+also have physical access to the machines. A node owner should be
+treated as trusted infrastructure staff, and Ironic does not fully
+isolate the nodes of one owner from the nodes of another owner.
+
+A lessee project is a user of the hardware, in many environments a
+completely untrusted customer, and receives far more limited access by
+default.
+
+.. warning::
+   Access through these fields is granted to *every* user holding the
+   relevant role in the project. Avoid setting a project with broad
+   membership as a node's ``owner``; a dedicated project with strictly
+   limited membership is highly advisable.
+
+See the :ref:`trust model description <secure-rbac-trust-model>` in
+:doc:`/admin/secure-rbac` for full details, and
+:doc:`/admin/node-multitenancy` for configuring multi-tenant access.
 
 Firmware security
 =================
@@ -142,9 +199,68 @@ Additional references:
 UEFI secure boot mode
 =====================
 
+Secure Boot is an interesting topic because exists at an intersection of
+hardware, security, vendors, and what you are willing to put in place to in
+terms of process, controls, or further mechanisms to enable processes and
+capabilities.
+
+At a high level, Secure Boot is where an artifact such as an operating system
+kernel or Preboot eXecution Environment (PXE) binary is read by the UEFI
+firmware, and executed if the artifact is signed with a trusted key.
+Once a piece of code has been loaded and executed, it may read more bytecode
+in and verify additional signed artifacts which were signed utilizing
+different keys.
+
+This is fundamentally how most Linux operating systems boot today. A ``shim``
+loader is signed by an authority, Microsoft, which is generally trusted by
+hardware vendors. The shim loader then loads a boot loader such as Grub, which
+then loads an operating system.
+
+Underlying challenges
+---------------------
+
+A major challenge for Secure Boot is the state of Preboot eXecution
+Environment binaries. Operating System distribution vendors tend not to
+request the authority with the general signing keys to sign these binary
+artifacts. The result of this, is that it is nearly impossible to network
+boot a machine which has Secure Boot enabled.
+
+There are reports in the Open Source community that Microsoft has been willing
+to sign iPXE binaries, however the requirements are a bit steep for Open
+Source and largely means that Vendors would need to shoulder the burden for
+signed iPXE binaries to become common place. The iPXE developers provide
+further `details on their website <https://ipxe.org/appnote/etoken>`_,
+but it provides the details which solidify why we're unlikely to see
+a signed iPXE loader.
+
+That is, unless, you sign iPXE yourself.
+
+Which you can do, but you need to put in place your own key management
+infrastructure and teach the hardware to trust your signature, which is
+no simple feat in itself.
+
+.. NOTE::
+   The utility to manage keys in Linux on a local machine is `mokutil`,
+   however it's modeled for manual invocation. One may be able to manage
+   keys via Baseboard Management Controller, and Ironic may add such
+   capabilities at some point in time.
+
+There is a possibility of utilizing
+`shim <https://wiki.debian.org/SecureBoot#Shim>`_ and Grub2 to network boot
+a machine, however Grub2's capabilities for booting a machine are extremely
+limited when compared to a tool like iPXE. It is also worth noting the bulk
+of Ironic's example configurations utilize iPXE, including whole activities
+like unmanaged hardware introspection with agent inspect interface.
+
+Driver support for Deployment with Secure Boot
+----------------------------------------------
+
 Some hardware types support turning `UEFI secure boot`_ dynamically when
-deploying an instance. Currently these are :doc:`/admin/drivers/ilo`,
-:doc:`/admin/drivers/irmc` and :doc:`/admin/drivers/redfish`.
+deploying an instance. Currently this is :doc:`/admin/drivers/redfish`.
+
+Other drivers, such as :doc:`/admin/drivers/ipmitool`, may be able to be manually
+configured on the host, but as there is not standardization of Secure Boot
+support in the IPMI protocol, you may encounter unexpected behavior.
 
 Support for the UEFI secure boot is declared by adding the ``secure_boot``
 capability in the ``capabilities`` parameter in the ``properties`` field of
@@ -165,18 +281,54 @@ the secure boot capability.
 Compatible images
 -----------------
 
-Use element ``ubuntu-signed`` or ``fedora`` to build signed deploy ISO and
-user images with `diskimage-builder
-<https://pypi.org/project/diskimage-builder>`_.
+Most mainstream and vendor backed Linux based public cloud images are already
+compatible with use of secure boot.
 
-The below command creates files named cloud-image-boot.iso, cloud-image.initrd,
-cloud-image.vmlinuz and cloud-image.qcow2 in the current working directory::
+Using Shim and Grub2 for Secure Boot
+------------------------------------
 
- cd <path-to-diskimage-builder>
- ./bin/disk-image-create -o cloud-image ubuntu-signed baremetal iso
+To utilize Shim and Grub to boot a baremetal node, actions are required
+by the administrator of the Ironic deployment as well as the user of
+Ironic's API.
 
-Ensure the public key of the signed image is loaded into bare metal to deploy
-signed images.
+For the Ironic Administrator
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To enable use of grub to network boot baremetal nodes for activities such
+as managed introspection, node cleaning, and deployment, some configuration
+is required in ironic.conf.::
+
+  [DEFAULT]
+  enabled_boot_interfaces = pxe
+  [pxe]
+  uefi_pxe_config_template = $pybasedir/drivers/modules/pxe_grub_config.template
+  tftp_root = /tftpboot
+  loader_file_paths = bootx64.efi:/usr/lib/shimx64.efi.signed,grubx64.efi:/usr/lib/grub/x86_64-efi-signed/grubnetx64.efi.signed
+
+.. NOTE::
+   You may want to leverage the :oslo.config:option:`pxe.loader_file_paths` feature, which
+   automatically copies boot loaders into the ``tftp_root`` folder, but this
+   functionality is not required if you manually copy the named files into
+   the Preboot eXecution Environment folder(s), by default the [pxe]tftp_root,
+   and [deploy]http_root folders.
+
+.. WARNING::
+   Shim/Grub artifact paths will vary by distribution. The example above is
+   taken from Ironic's Continuous Integration test jobs where this
+   functionality is exercised.
+
+For the Ironic user
+~~~~~~~~~~~~~~~~~~~
+
+To set a node to utilize the ``pxe`` boot_interface, execute the baremetal
+command::
+
+  baremetal node set --boot-interface pxe <node>
+
+Alternatively, if your hardware supports HttpBoot and your Ironic is at
+least 2023.2, you can set the ``http`` boot_interface instead::
+
+  baremetal node set --boot-interface http <node>
 
 Enabling with OpenStack Compute
 -------------------------------
@@ -206,12 +358,15 @@ Enabling standalone
 -------------------
 
 To request secure boot for an instance in standalone mode (without OpenStack
-Compute), you need to add the capability directly to the node's
-``instance_info``::
+Compute), you must explicitly inform Ironic::
 
-  baremetal node set <node> --instance-info capabilities='{"secure_boot": "true"}'
+  baremetal node set secure boot on <node>
 
-.. _UEFI secure boot: https://en.wikipedia.org/wiki/Unified_Extensible_Firmware_Interface#Secure_boot
+Which can also be disabled by exeuting negative form of the command::
+
+  baremetal node set secure boot off <node>
+
+.. _UEFI secure boot: https://en.wikipedia.org/wiki/UEFI#Secure_Boot
 
 Other considerations
 ====================
@@ -226,6 +381,11 @@ the nodes' BMC controllers), provisioning, cleaning (if used) and rescuing
 
 This can be done with physical or logical network isolation, traffic filtering, etc.
 
+While the Ironic project has made strives to enable the API to be utilized
+by end users directly, we still encourage operators to be as mindful as
+possible to ensure appropriate security controls are in place to also restrict
+access to the service.
+
 Management interface technologies
 ---------------------------------
 
@@ -235,6 +395,14 @@ access, it is recommended that you disable IPMI since the IPMI protocol is not
 secure.  If IPMI is enabled, in most cases a local OS administrator is able to
 work in-band with IPMI settings without specifying any credentials, as this
 is a DCMI specification requirement.
+
+Ansible deploy interface
+------------------------
+
+The ``ansible`` deploy interface disables SSH host key checking by
+default because deploy ramdisks generate ephemeral host keys on each
+boot. See :doc:`/admin/drivers/ansible` for details and hardening
+guidance.
 
 Tenant network isolation
 ------------------------
@@ -254,24 +422,451 @@ a node by default, once the node has been provisioned.
 API endpoints for RAM disk use
 ------------------------------
 
-There are `two (unauthorized) endpoints
+There are `three (unauthenticated) endpoints
 <https://docs.openstack.org/api-ref/baremetal/#utility>`_ in the
-Bare Metal API that are intended for use by the ironic-python-agent RAM disk.
-They are not intended for public use.
+Bare Metal API that are intended for use by the ironic-python-agent
+RAM disk. They are not intended for public use.
 
-These endpoints can potentially cause security issues. Access to
-these endpoints from external or untrusted networks should be prohibited.
-An easy way to do this is to:
+* ``GET /v1/lookup`` -- used by IPA to discover which node it is
+  running on and to obtain an agent token.
+* ``POST /v1/heartbeat/{node_ident}`` -- used by IPA to report
+  liveness and progress during deployment and other workflows.
+* ``POST /v1/continue_inspection`` -- used by IPA to submit
+  inspection data.
 
-* set up two groups of API services: one for external requests, the second for
-  deploy RAM disks' requests.
-* to disable unauthorized access to these endpoints in the (first) API services
-  group that serves external requests, the following lines should be
-  added to the
-  :ironic-doc:`policy.yaml file <configuration/sample-policy.html>`::
+These endpoints bypass authentication and can potentially cause
+security issues even though the logic around these endpoints is
+intended to be defensive in nature. In particular, the ``lookup``
+endpoint mints an ``agent_secret_token`` that grants the caller
+the ability to send heartbeats on behalf of that node. Access to
+these endpoints from external or untrusted networks should be
+prohibited. See also :doc:`agent-token` for more information on
+the agent token mechanism and its limitations.
 
-    # Send heartbeats from IPA ramdisk
-    "baremetal:node:ipa_heartbeat": "rule:is_admin"
+The recommended approach is to set up a **split-horizon**
+deployment with two groups of API services:
 
-    # Access IPA ramdisk functions
-    "baremetal:driver:ipa_lookup": "rule:is_admin"
+* A **public-facing** API cluster that serves end-user and
+  service-to-service requests, with ramdisk endpoints disabled.
+* A **backend** API cluster on the provisioning network that
+  accepts requests from RAM disks.
+
+.. warning::
+   A split-horizon deployment (separate public and backend API
+   instances) is **required** regardless of which mechanism you
+   use to disable the endpoints. IPA *must* be able to reach
+   the ramdisk endpoints on the backend API instance in order
+   for deployments, cleaning, and inspection to function.
+   Disabling these endpoints on a single API instance that also
+   serves IPA traffic will prevent Ironic from working.
+
+There are two mechanisms for disabling the ramdisk endpoints on
+the **public-facing** API instances:
+
+**Configuration option (recommended)**
+
+The ``[api] enable_ramdisk_endpoints`` option was added so that
+operators can disable ramdisk endpoints without needing to
+maintain custom policy overrides. Set the following in
+``ironic.conf`` on each public-facing API instance::
+
+    [api]
+    enable_ramdisk_endpoints = False
+
+When disabled, all three endpoints return HTTP 403 (Forbidden).
+This option works regardless of authentication strategy and is
+mutable -- it can be reloaded via ``SIGHUP`` without restarting
+the service.
+
+**Custom policy rules (Keystone only)**
+
+When using Keystone authentication (``auth_strategy=keystone``),
+you can alternatively deny access to these endpoints via custom
+policy rules. However, maintaining custom policy files adds
+operational complexity and the Ironic team recommends the
+configuration option above instead. If you still prefer the
+policy approach, add the following to the
+:ironic-doc:`policy.yaml file <configuration/sample-policy.html>`
+on each **public-facing** API instance::
+
+    # Deny IPA ramdisk node lookup
+    "baremetal:driver:ipa_lookup": "!"
+
+    # Deny IPA ramdisk heartbeat
+    "baremetal:node:ipa_heartbeat": "!"
+
+    # Deny IPA ramdisk continue inspection
+    "baremetal:driver:ipa_continue_inspection": "!"
+
+Do **not** apply these policy overrides to the backend API
+instances; doing so will block IPA and break provisioning
+workflows.
+
+.. note::
+   The policy approach only works when ``auth_strategy`` is set
+   to ``keystone``. When using ``noauth`` or ``http_basic``
+   authentication, policy rules are not evaluated for these
+   endpoints and the ``"!"`` rules have no effect. Use the
+   ``[api] enable_ramdisk_endpoints`` configuration option
+   instead.
+
+Rate Limiting
+-------------
+
+Ironic has a concept of a "concurrent action limit", which allows
+operators to restrict concurrent, long running, destructive actions.
+
+The overall use case this was implemented for was to help provide
+backstop for runaway processes and actions which one may apply to
+an environment, such as batch deletes of nodes. The appropriate
+settings for these settings are the :oslo.config:option:`conductor.max_concurrent_deploy`
+with a default value of 250, and :oslo.config:option:`conductor.max_concurrent_clean`
+with a default value of 50. These settings are reasonable defaults
+for medium to large deployments, but depending on load and usage
+patterns and can be safely tuned to be in line with an operator's
+comfort level.
+
+Memory Limiting
+---------------
+
+Because users of the Ironic API can request activities which
+can consume large amounts of memory, for example, disk image format
+conversions as part of a deployment operations. The Ironic conductor
+service has a minimum memory available check which is executed before
+launching these operations. It defaults to ``1024`` Megabytes, and can
+be tuned using the :oslo.config:option:`DEFAULT.minimum_required_memory` setting.
+
+Operators with a higher level of concurrency may wish to increase the
+default value.
+
+BMC Credentials
+---------------
+
+Due to the nature of Ironic and the use of Baseboard Management Controllers
+to manage physical machines, Ironic has to be supplied with current credentials
+for each node it manages.
+
+Ironic utilizes the credentials to perform actions on behalf of the API user
+in a manor which is both delineated and removes the need for external users
+to know the credentials. With this Ironic also monitors and helps enforce the
+requested power state of the remote machine, as well as to collect any sensor
+data when Ironic is configured to collect such data.
+
+Should the credentials for baremetal nodes under Ironic's management
+need to be changed, the credentials must also be updated in Ironic itself
+by updating the appropriate driver specific credential parameters on each
+baremetal node.
+
+Under a normal sequence of events, Ironic will pickup the new credentials
+for the next management operation which is typically the power state sync.
+If the credentials are wrong or have the wrong level of access, then the node
+will enter a maintenance state automatically and a fault will be recorded.
+For more context on the power state sync and power fault recover, please
+see :doc:`/admin/power-sync`. When this issue has been corrected with the
+credential, modern Ironic users should find the node recover automatically.
+
+.. warning::
+   Operators reusing the same credentials with a centrally managed credential
+   management system with separate BMC configuration should be careful about
+   credential rotations. These operators risk causing the account to access the
+   BMC to be locked out, and should likely explicitly set nodes to ``maintenance``
+   state prior to rotating credentials, and afterward unset the maintenance
+   state. This is to avoid locking out access if the same username is utilized
+   across the credential rotation. An alternative pattern is to create a *new*
+   user, and rotate the nodes in Ironic by resetting the driver specific
+   parameter with the new user name and password.
+
+The Ironic project recommends:
+
+* Unique passwords be used for each baremetal node.
+* Operators leverage good password practices by not reusing the credentials
+  for other tools or systems.
+
+.. _tls-hardening:
+
+TLS Hardening
+=============
+
+When the integrated Ironic API server or JSON-RPC server
+terminates TLS directly (rather than relying on a reverse proxy),
+operators can control TLS protocol versions and cipher suites
+through configuration options.
+
+.. note::
+   These options have no effect when TLS is terminated by an
+   external service such as Apache httpd or HAProxy. In that
+   case, TLS settings should be configured in the reverse proxy.
+
+.. note::
+   These options do not currently affect BMC communications,
+   which are constrained by vendor support rather than anything
+   the Ironic project can directly control. Additional controls
+   may be added in the future.
+
+Configuring TLS for the API
+----------------------------
+
+To enable TLS with hardened settings for the API service, edit
+``/etc/ironic/ironic.conf``:
+
+.. code-block:: ini
+
+   [api]
+   enable_ssl_api = True
+   cert_file = /etc/ironic/ssl/api.crt
+   key_file = /etc/ironic/ssl/api.key
+
+   # Enforce TLS 1.3 minimum (recommended for PQC readiness)
+   tls_minimum_version = 1.3
+
+   # Optionally restrict available ciphers
+   # tls_ciphers = ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM
+
+Configuring TLS for JSON-RPC
+------------------------------
+
+The same options are available for the JSON-RPC service used for
+conductor-to-conductor communication:
+
+.. code-block:: ini
+
+   [json_rpc]
+   use_ssl = True
+   cert_file = /etc/ironic/ssl/json_rpc.crt
+   key_file = /etc/ironic/ssl/json_rpc.key
+   tls_minimum_version = 1.3
+
+Configuring TLS for Agent Connections
+--------------------------------------
+
+The conductor makes outbound HTTPS connections to the
+ironic-python-agent running on nodes. TLS settings for these
+connections are configured in the ``[agent]`` section:
+
+.. code-block:: ini
+
+   [agent]
+   # Enforce TLS 1.3 minimum for agent connections
+   tls_minimum_version = 1.3
+
+   # Optionally restrict available ciphers
+   # tls_ciphers = ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM
+
+.. note::
+   The ironic-python-agent must support the configured minimum
+   TLS version for connections to succeed. Operators are
+   encouraged to utilize an appropriately modern version of the
+   ironic-python-agent within the supported version window of
+   Ironic.
+
+Configuring TLS for the noVNC Proxy
+-----------------------------------
+
+When Ironic's integrated ``ironic-novncproxy`` service is used to
+provide browser-based console access, TLS settings can be
+configured in the ``[vnc]`` section:
+
+.. code-block:: ini
+
+   [vnc]
+   enable_ssl = True
+   cert_file = /etc/ironic/ssl/novncproxy.crt
+   key_file = /etc/ironic/ssl/novncproxy.key
+
+   # Enforce TLS 1.3 minimum (recommended for PQC readiness)
+   tls_minimum_version = 1.3
+
+   # Optionally restrict available ciphers
+   # tls_ciphers = ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM
+
+.. note::
+   The TLS settings above apply to connections between the
+   browser client and the ``ironic-novncproxy`` service. These
+   TLS controls do not extend into the backend VNC console
+   containers, nor do these settings propagate to the overall
+   interaction with the BMC by the container. Operators should
+   ensure that ``ironic-novncproxy`` or ``nova-novncproxy`` can
+   reach the containers over a private management network that
+   is not exposed to end users. The
+   ``[vnc]systemd_container_publish_port`` configuration option
+   controls the IP address and port mapping used to expose the
+   container VNC port to the host.
+
+Configuring TLS for Image Downloads and OCI Registry Connections
+----------------------------------------------------------------
+
+The conductor makes outbound HTTPS connections to remote HTTP
+servers hosting static disk images and to OCI container
+registries serving container image blobs. TLS settings for
+both types of connections are configured in the ``[DEFAULT]``
+section:
+
+.. code-block:: ini
+
+   [DEFAULT]
+   # Enforce TLS 1.3 minimum for outbound HTTPS connections
+   webserver_tls_minimum_version = 1.3
+
+   # Optionally restrict available ciphers
+   # webserver_tls_ciphers = ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM
+
+These settings govern connections to:
+
+* HTTP servers hosting disk images and deployment artifacts
+  (the same connections controlled by ``webserver_verify_ca``
+  and ``webserver_connection_timeout``)
+* OCI container registries when deploying container-based
+  workloads
+
+Configuring TLS for Redfish BMC Connections
+--------------------------------------------
+
+The conductor makes outbound HTTPS connections to Redfish BMCs.
+TLS settings can be configured globally in the ``[redfish]``
+section, and overridden per-node via ``driver_info``:
+
+.. code-block:: ini
+
+   [redfish]
+   # Set a global minimum TLS version for BMC connections
+   # Supported values: 1.1, 1.2, 1.3
+   tls_minimum_version = 1.2
+
+   # Optionally restrict available ciphers
+   # tls_ciphers = ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM
+
+Per-node overrides can be set in the node's ``driver_info``:
+
+.. code-block:: bash
+
+   baremetal node set <node> \
+     --driver-info redfish_tls_minimum_version=1.3 \
+     --driver-info redfish_tls_ciphers=ECDHE+AESGCM
+
+Unlike the API, JSON-RPC, and image download settings, no
+default minimum TLS version is enforced for Redfish connections.
+This is because BMCs are embedded firmware on physical hardware
+where the TLS capabilities vary significantly across vendors
+and generations. Firmware updates may be difficult, risky, or
+unavailable, and the BMC is often the only management interface
+for the machine. Enforcing a default could render hardware
+unmanageable after an Ironic upgrade.
+
+Operators are strongly encouraged to set
+``tls_minimum_version = 1.2`` globally once they have confirmed
+their BMC fleet supports it. Per-node overrides can accommodate
+older hardware that requires weaker TLS:
+
+.. code-block:: bash
+
+   # Allow TLS 1.1 for a specific older BMC
+   baremetal node set <node> \
+     --driver-info redfish_tls_minimum_version=1.1
+
+.. note::
+   TLS 1.0 and 1.1 are deprecated per RFC 8996 and have known
+   vulnerabilities. The ``1.1`` option is provided solely for
+   compatibility with older BMC firmware that does not support
+   TLS 1.2.
+
+Configuring TLS for Ansible Deploy Image Downloads
+----------------------------------------------------
+
+When the Ansible deploy driver is used, image downloads to the
+target node are performed by the ``stream_url`` Ansible module.
+This module respects the same ``[DEFAULT]`` TLS configuration
+options used for webserver and OCI connections:
+
+.. code-block:: ini
+
+   [DEFAULT]
+   # Enforce TLS 1.3 minimum for image downloads to target nodes
+   webserver_tls_minimum_version = 1.3
+
+   # Optionally restrict available ciphers
+   # webserver_tls_ciphers = ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM
+
+.. note::
+   The ``stream_url`` module runs on the target node, not the
+   conductor. The target node's Python environment must have
+   a version of OpenSSL that supports the configured minimum
+   TLS version.
+
+Post-Quantum Cryptography Readiness
+-----------------------------------
+
+Post-Quantum Cryptography (PQC) key exchange mechanisms such as
+ML-KEM (Kyber) are available through TLS 1.3 hybrid key exchange
+groups. Setting ``tls_minimum_version = 1.3`` is the first step
+toward PQC readiness.
+
+PQC cipher suite availability depends on the version of OpenSSL
+installed on the system. When the system OpenSSL supports PQC key
+exchange groups, TLS 1.3 connections will be able to negotiate
+them automatically.
+
+Disk Images
+===========
+
+Ironic relies upon the ``qemu-img`` tool to convert images from a supplied
+disk image format, to a ``raw`` format in order to write the contents of a
+disk image to the remote device.
+
+By default, only ``qcow2`` format is supported for this operation, however there
+have been reports other formats work when so enabled using the
+``[conductor]permitted_image_formats`` configuration option.
+
+
+Ironic takes several steps by default.
+
+#. Ironic checks and compares supplied metadata with a remote authoritative
+   source, such as the Glance Image Service, if available.
+#. Ironic attempts to "fingerprint" the file type based upon available
+   metadata and file structure. A file format which is not known to the image
+   format inspection code may be evaluated as "raw", which means the image
+   would not be passed through ``qemu-img``. When in doubt, use a ``raw``
+   image which you can verify is in the desirable and expected state.
+#. The image then has a set of safety and sanity checks executed which look
+   for unknown or unsafe feature usage in the base format which could permit
+   an attacker to potentially leverage functionality in ``qemu-img`` which
+   should not be utilized. This check, by default, occurs only through images
+   which transverse *through* the conductor.
+#. Ironic then checks if the fingerprint values and metadata values match.
+   If they do not match, the requested image is rejected and the operation
+   fails.
+#. The image is then provided to the ``ironic-python-agent``.
+
+Images which are considered "pass-through", as in they are supplied by an
+API user as a URL, or are translated to a temporary URL via available
+service configuration, are supplied as a URL to the
+``ironic-python-agent``.
+
+Ironic can be configured to intercept this interaction and have the conductor
+download and inspect these items before the ``ironic-python-agent`` will do so,
+however this can increase the temporary disk utilization of the Conductor
+along with network traffic to facilitate the transfer. This check is disabled
+by default, but can be enabled using the
+``[conductor]conductor_always_validates_images`` configuration option.
+
+An option exists which forces all files to be served from the conductor, and
+thus force image inspection before involvement of the ``ironic-python-agent``
+is the use of the ``[agent]image_download_source`` configuration parameter
+when set to ``local`` which proxies all disk images through the conductor.
+This setting is also available in the node ``driver_info`` and
+``instance_info`` fields.
+
+Mitigating Factors to disk images
+---------------------------------
+
+In a fully integrated OpenStack context, Ironic requires images to be set to
+"public" in the Image Service.
+
+A direct API user with sufficient elevated access rights *can* submit a URL
+for the baremetal node ``instance_info`` dictionary field with an
+``image_source`` key value set to a URL. To do so explicitly requires
+elevated (trusted) access rights of a System scoped Member,
+or Project scoped Owner-Member, or a Project scoped Lessee-Admin via
+the ``baremetal:node:update_instance_info`` policy permission rule.
+Before the Wallaby release of OpenStack, this was restricted to
+``admin`` and ``baremetal_admin`` roles and remains similarly restrictive
+in the newer "Secure RBAC" model.

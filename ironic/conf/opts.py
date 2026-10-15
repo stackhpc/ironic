@@ -15,38 +15,50 @@ from oslo_log import log
 import ironic.conf
 
 
+# NOTE(JayF): Please keep this in ABC order by group (with DEFAULT first)
 _opts = [
     ('DEFAULT', ironic.conf.default.list_opts()),
     ('agent', ironic.conf.agent.opts),
+    ('agent_containers', ironic.conf.agent_containers.opts),
+    ('anaconda', ironic.conf.anaconda.opts),
     ('ansible', ironic.conf.ansible.opts),
     ('api', ironic.conf.api.opts),
     ('audit', ironic.conf.audit.opts),
+    ('auto_discovery', ironic.conf.inspector.discovery_opts),
+    ('cifs', ironic.conf.cifs.opts),
     ('cinder', ironic.conf.cinder.list_opts()),
     ('conductor', ironic.conf.conductor.opts),
     ('console', ironic.conf.console.opts),
     ('database', ironic.conf.database.opts),
     ('deploy', ironic.conf.deploy.opts),
     ('dhcp', ironic.conf.dhcp.opts),
+    ('disk_utils', ironic.conf.disk_utils.opts),
     ('drac', ironic.conf.drac.opts),
+    ('errors', ironic.conf.exception.opts),
     ('glance', ironic.conf.glance.list_opts()),
     ('healthcheck', ironic.conf.healthcheck.opts),
-    ('ilo', ironic.conf.ilo.opts),
-    ('inspector', ironic.conf.inspector.list_opts()),
+    ('inspection_rules', ironic.conf.inspector.inspection_rule_opts),
+    ('inspector', ironic.conf.inspector.opts),
     ('inventory', ironic.conf.inventory.opts),
     ('ipmi', ironic.conf.ipmi.opts),
-    ('irmc', ironic.conf.irmc.opts),
-    ('anaconda', ironic.conf.anaconda.opts),
+    ('ironic_networking', ironic.conf.ironic_networking.list_opts()),
+    # Expose the ironic networking-specific JSON-RPC group for sample configs
+    ('ironic_networking_json_rpc', ironic.conf.json_rpc.list_opts()),
+    ('json_rpc', ironic.conf.json_rpc.list_opts()),
+    ('mdns', ironic.conf.mdns.opts),
     ('metrics', ironic.conf.metrics.opts),
-    ('metrics_statsd', ironic.conf.metrics_statsd.opts),
-    ('molds', ironic.conf.molds.opts),
+    ('metrics_statsd', ironic.conf.metrics.statsd_opts),
     ('neutron', ironic.conf.neutron.list_opts()),
+    ('nfs', ironic.conf.nfs.opts),
     ('nova', ironic.conf.nova.list_opts()),
+    ('oci', ironic.conf.oci.opts),
     ('pxe', ironic.conf.pxe.opts),
+    ('pxe_filter', ironic.conf.inspector.pxe_filter_opts),
     ('redfish', ironic.conf.redfish.opts),
+    ('sensor_data', ironic.conf.sensor_data.opts),
     ('service_catalog', ironic.conf.service_catalog.list_opts()),
-    ('snmp', ironic.conf.snmp.opts),
     ('swift', ironic.conf.swift.list_opts()),
-    ('xclarity', ironic.conf.xclarity.opts),
+    ('vnc', ironic.conf.vnc.opts),
 ]
 
 
@@ -77,17 +89,17 @@ def update_opt_defaults():
             # This comes in two flavors
             'oslo.messaging=INFO',
             'oslo_messaging=INFO',
-            'sqlalchemy=WARNING',
             'stevedore=INFO',
-            'eventlet.wsgi.server=INFO',
             'iso8601=WARNING',
             'requests=WARNING',
-            'glanceclient=WARNING',
             'urllib3.connectionpool=WARNING',
             'keystonemiddleware.auth_token=INFO',
             'keystoneauth.session=INFO',
             'openstack=WARNING',
             # Policy logging is not necessarily useless, but very verbose
             'oslo_policy=WARNING',
+            # Concurrency lock logging is not bad, but exceptionally noisy
+            # and typically not needed in debugging Ironic itself.
+            'oslo_concurrency.lockutils=WARNING',
         ]
     )

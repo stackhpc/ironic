@@ -21,7 +21,6 @@ Unit Tests for :py:class:`ironic.conductor.rpcapi.ConductorAPI`.
 import copy
 from unittest import mock
 
-from ironic_lib.json_rpc import client as json_rpc
 from oslo_config import cfg
 import oslo_messaging as messaging
 from oslo_messaging import _utils as messaging_utils
@@ -252,8 +251,13 @@ class RPCAPITestCase(db_base.DbTestCase):
 
         expected_topic = kwargs.get('topic', 'fake-topic')
 
+        # For oslo.messaging the destination host is expressed as
+        # ``server`` (a constant topic + explicit server), rather than
+        # embedded in the topic string.  These tests exercise the
+        # any-conductor case (no per-host topic), so ``server`` is None.
         target = {
             "topic": expected_topic,
+            "server": kwargs.pop('server', None),
             "version": kwargs.pop('version', rpcapi.RPC_API_VERSION)
         }
         expected_msg = copy.deepcopy(kwargs)
@@ -485,6 +489,12 @@ class RPCAPITestCase(db_base.DbTestCase):
         self._test_rpcapi('continue_node_deploy',
                           'cast',
                           version='1.45',
+                          node_id=self.fake_node['uuid'])
+
+    def test_continue_node_service(self):
+        self._test_rpcapi('continue_node_service',
+                          'cast',
+                          version='1.60',
                           node_id=self.fake_node['uuid'])
 
     def test_get_raid_logical_disk_properties(self):
@@ -722,19 +732,17 @@ class RPCAPITestCase(db_base.DbTestCase):
                           allocation='fake-allocation',
                           version='1.48')
 
-    @mock.patch.object(rpc, 'GLOBAL_MANAGER',
-                       spec_set=conductor_manager.ConductorManager)
-    def test_local_call(self, mock_manager):
-        CONF.set_override('host', 'fake.host')
-        rpcapi = conductor_rpcapi.ConductorAPI(topic='fake.topic')
-        rpcapi.create_node(mock.sentinel.context, mock.sentinel.node,
-                           topic='fake.topic.fake.host')
-        mock_manager.create_node.assert_called_once_with(
-            mock.sentinel.context, node_obj=mock.sentinel.node)
+    def test_do_node_service(self):
+        self._test_rpcapi('do_node_service',
+                          'call',
+                          node_id='fake-node',
+                          service_steps={'foo': 'bar'},
+                          disable_ramdisk=False,
+                          version='1.57')
 
     @mock.patch.object(rpc, 'GLOBAL_MANAGER',
                        spec_set=conductor_manager.ConductorManager)
-    def test_local_call_with_rpc_disabled(self, mock_manager):
+    def test_local_call(self, mock_manager):
         CONF.set_override('host', 'fake.host')
         CONF.set_override('rpc_transport', 'none')
         rpcapi = conductor_rpcapi.ConductorAPI(topic='fake.topic')
@@ -746,18 +754,6 @@ class RPCAPITestCase(db_base.DbTestCase):
     @mock.patch.object(rpc, 'GLOBAL_MANAGER',
                        spec_set=conductor_manager.ConductorManager)
     def test_local_call_host_mismatch(self, mock_manager):
-        CONF.set_override('host', 'fake.host')
-        rpcapi = conductor_rpcapi.ConductorAPI(topic='fake.topic')
-        rpcapi.client = mock.Mock(spec_set=json_rpc.Client)
-        rpcapi.create_node(mock.sentinel.context, mock.sentinel.node,
-                           topic='fake.topic.not-fake.host')
-        mock_manager.create_node.assert_not_called()
-        rpcapi.client.prepare.assert_called_once_with(
-            topic='fake.topic.not-fake.host', version=mock.ANY)
-
-    @mock.patch.object(rpc, 'GLOBAL_MANAGER',
-                       spec_set=conductor_manager.ConductorManager)
-    def test_local_call_host_mismatch_with_rpc_disabled(self, mock_manager):
         CONF.set_override('host', 'fake.host')
         CONF.set_override('rpc_transport', 'none')
         rpcapi = conductor_rpcapi.ConductorAPI(topic='fake.topic')
@@ -780,6 +776,7 @@ class RPCAPITestCase(db_base.DbTestCase):
                        spec_set=conductor_manager.ConductorManager)
     def test_local_cast(self, mock_manager):
         CONF.set_override('host', 'fake.host')
+        CONF.set_override('rpc_transport', 'none')
         rpcapi = conductor_rpcapi.ConductorAPI(topic='fake.topic')
         cctxt = rpcapi._prepare_call(topic='fake.topic.fake.host')
         cctxt.cast(mock.sentinel.context, 'create_node',
@@ -792,6 +789,7 @@ class RPCAPITestCase(db_base.DbTestCase):
                        spec_set=conductor_manager.ConductorManager)
     def test_local_cast_error(self, mock_manager, mock_log):
         CONF.set_override('host', 'fake.host')
+        CONF.set_override('rpc_transport', 'none')
         mock_manager.create_node.side_effect = RuntimeError('boom')
         rpcapi = conductor_rpcapi.ConductorAPI(topic='fake.topic')
         cctxt = rpcapi._prepare_call(topic='fake.topic.fake.host')
@@ -809,6 +807,7 @@ class RPCAPITestCase(db_base.DbTestCase):
             raise exception.InvalidParameterValue('sorry')
 
         CONF.set_override('host', 'fake.host')
+        CONF.set_override('rpc_transport', 'none')
         rpcapi = conductor_rpcapi.ConductorAPI(topic='fake.topic')
         mock_manager.create_node.side_effect = fake_create
         self.assertRaisesRegex(exception.InvalidParameterValue, 'sorry',

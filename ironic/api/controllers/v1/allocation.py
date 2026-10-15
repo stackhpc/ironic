@@ -12,7 +12,6 @@
 
 from http import client as http_client
 
-from ironic_lib import metrics_utils
 from oslo_config import cfg
 from oslo_utils import uuidutils
 import pecan
@@ -23,10 +22,14 @@ from ironic.api.controllers import link
 from ironic.api.controllers.v1 import collection
 from ironic.api.controllers.v1 import notification_utils as notify
 from ironic.api.controllers.v1 import utils as api_utils
+from ironic.api.controllers.v1 import versions
 from ironic.api import method
+from ironic.api.schemas.v1 import allocation as schema
+from ironic.api import validation
 from ironic.common import args
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import metrics_utils
 from ironic import objects
 
 
@@ -122,16 +125,6 @@ class AllocationsController(pecan.rest.RestController):
     """REST controller for allocations."""
 
     invalid_sort_key_list = ['extra', 'candidate_nodes', 'traits']
-
-    @pecan.expose()
-    def _route(self, args, request=None):
-        if not api_utils.allow_allocations():
-            msg = _("The API version does not allow allocations")
-            if api.request.method == "GET":
-                raise webob_exc.HTTPNotFound(msg)
-            else:
-                raise webob_exc.HTTPMethodNotAllowed(msg)
-        return super(AllocationsController, self)._route(args, request)
 
     def _get_allocations_collection(self, node_ident=None, resource_class=None,
                                     state=None, owner=None, marker=None,
@@ -245,15 +238,18 @@ class AllocationsController(pecan.rest.RestController):
 
     @METRICS.timer('AllocationsController.get_all')
     @method.expose()
-    @args.validate(node=args.uuid_or_name,
-                   resource_class=args.string,
-                   state=args.string,
-                   marker=args.uuid,
-                   limit=args.integer,
-                   sort_key=args.string,
-                   sort_dir=args.string,
-                   fields=args.string_list,
-                   owner=args.string)
+    @validation.api_version(
+        min_version=versions.MINOR_52_ALLOCATION,
+        message=_('The API version does not allow allocations'),
+    )
+    # TODO(stephenfin): We are currently using this for side-effects to e.g.
+    # convert a CSV string to an array or a string to an integer. We should
+    # probably rename this decorator or provide a separate, simpler decorator.
+    @args.validate(limit=args.integer, fields=args.string_list)
+    @validation.request_query_schema(schema.index_request_query, None, 59)
+    @validation.request_query_schema(schema.index_request_query_v60, 60)
+    @validation.response_body_schema(schema.index_response_body, None, 59)
+    @validation.response_body_schema(schema.index_response_body_v60, 60)
     def get_all(self, node=None, resource_class=None, state=None, marker=None,
                 limit=None, sort_key='id', sort_dir='asc', fields=None,
                 owner=None):
@@ -271,11 +267,22 @@ class AllocationsController(pecan.rest.RestController):
            :fields: fields
            :owner: r_owner
         """
-        owner = api_utils.check_list_policy('allocation', owner)
+        requester = api_utils.check_list_policy('allocation', owner)
 
         self._check_allowed_allocation_fields(fields)
         if owner is not None and not api_utils.allow_allocation_owner():
+            # Requester has asked for an owner field/column match, but
+            # their client version does not support it.
             raise exception.NotAcceptable()
+        if (owner is not None
+                and requester is not None
+                and owner != requester):
+            # The requester is asking about other owner's records.
+            # Naughty!
+            raise exception.NotAuthorized()
+
+        if requester is not None:
+            owner = requester
 
         return self._get_allocations_collection(node, resource_class, state,
                                                 owner, marker, limit,
@@ -284,7 +291,19 @@ class AllocationsController(pecan.rest.RestController):
 
     @METRICS.timer('AllocationsController.get_one')
     @method.expose()
-    @args.validate(allocation_ident=args.uuid_or_name, fields=args.string_list)
+    @validation.api_version(
+        min_version=versions.MINOR_52_ALLOCATION,
+        message=_('The API version does not allow allocations'),
+    )
+    # TODO(stephenfin): We are currently using this for side-effects to e.g.
+    # convert a CSV string to an array or a string to an integer. We should
+    # probably rename this decorator or provide a separate, simpler decorator.
+    @args.validate(fields=args.string_list)
+    @validation.request_parameter_schema(schema.show_request_parameter)
+    @validation.request_query_schema(schema.show_request_query, None, 59)
+    @validation.request_query_schema(schema.show_request_query_v60, 60)
+    @validation.response_body_schema(schema.show_response_body, None, 59)
+    @validation.response_body_schema(schema.show_response_body_v60, 60)
     def get_one(self, allocation_ident, fields=None):
         """Retrieve information about the given allocation.
 
@@ -300,7 +319,6 @@ class AllocationsController(pecan.rest.RestController):
         return convert_with_links(rpc_allocation, fields=fields)
 
     def _authorize_create_allocation(self, allocation):
-
         try:
             # PRE-RBAC this rule was logically restricted, it is more-unlocked
             # post RBAC, but we need to ensure it is not abused.
@@ -317,7 +335,7 @@ class AllocationsController(pecan.rest.RestController):
                 # that if the scope enforcement is not enabled, that
                 # any user can't create an allocation until the deployment
                 # is in a new operating mode *where* owner will be added
-                # automatically if not a privilged user.
+                # automatically if not a privileged user.
         except exception.HTTPForbidden:
             cdict = api.request.context.to_policy_values()
             project = cdict.get('project_id')
@@ -335,7 +353,15 @@ class AllocationsController(pecan.rest.RestController):
     @METRICS.timer('AllocationsController.post')
     @method.expose(status_code=http_client.CREATED)
     @method.body('allocation')
-    @args.validate(allocation=ALLOCATION_VALIDATOR)
+    @validation.api_version(
+        min_version=versions.MINOR_52_ALLOCATION,
+        message=_('The API version does not allow allocations'),
+        exception_class=webob_exc.HTTPMethodNotAllowed,
+    )
+    @validation.request_body_schema(schema.create_request_body, None, 57)
+    @validation.request_body_schema(schema.create_request_body_v58, 58)
+    @validation.response_body_schema(schema.create_response_body, None, 59)
+    @validation.response_body_schema(schema.create_response_body_v60, 60)
     def post(self, allocation):
         """Create a new allocation.
 
@@ -372,7 +398,7 @@ class AllocationsController(pecan.rest.RestController):
                     if req_alloc_owner != project_id:
                         msg = _("Cannot create allocation with an owner "
                                 "Project ID value %(req_owner)s not matching "
-                                "the requestor Project ID %(project)s. "
+                                "the requester Project ID %(project)s. "
                                 "Policy baremetal:allocation:create_restricted"
                                 " is required for this capability."
                                 ) % {'req_owner': req_alloc_owner,
@@ -416,11 +442,12 @@ class AllocationsController(pecan.rest.RestController):
                 if not api_utils.check_policy_true(
                         'baremetal:allocation:create_restricted'):
                     owner = cdict.get('project_id')
-                # Filter the candidate search by the requestor project ID
+                # Filter the candidate search by the requester project ID
                 # if any. The result is processes authenticating with system
                 # scope will not be impacted, where as project scoped requests
                 # will need additional authorization.
-                converted = api.request.dbapi.check_node_list(
+                converted = objects.Allocation.check_node_list(
+                    context,
                     allocation['candidate_nodes'],
                     project=owner)
             except exception.NodeNotFound as exc:
@@ -463,12 +490,23 @@ class AllocationsController(pecan.rest.RestController):
     def _validate_patch(self, patch):
         fields = api_utils.patch_validate_allowed_fields(
             patch, PATCH_ALLOWED_FIELDS)
+        # FIXME(stephenfin): This checks for 'owner', but 'owner' is not one of
+        # the fields in PATCH_ALLOWED_FIELDS?
         self._check_allowed_allocation_fields(fields)
 
     @METRICS.timer('AllocationsController.patch')
     @method.expose()
     @method.body('patch')
-    @args.validate(allocation_ident=args.string, patch=args.patch)
+    @validation.api_version(
+        min_version=versions.MINOR_57_ALLOCATION_UPDATE,
+        message=_('The API version does not allow updating allocations'),
+        exception_class=webob_exc.HTTPMethodNotAllowed,
+    )
+    @validation.request_parameter_schema(schema.update_request_parameter)
+    @validation.request_body_schema(schema.update_request_body, None, 59)
+    @validation.request_body_schema(schema.update_request_body_v60, 60)
+    @validation.response_body_schema(schema.update_response_body, None, 59)
+    @validation.response_body_schema(schema.update_response_body_v60, 60)
     def patch(self, allocation_ident, patch):
         """Update an existing allocation.
 
@@ -477,10 +515,6 @@ class AllocationsController(pecan.rest.RestController):
            :allocation_ident: allocation_ident
            :patch: allocation_patch
         """
-        if not api_utils.allow_allocation_update():
-            raise webob_exc.HTTPMethodNotAllowed(_(
-                "The API version does not allow updating allocations"))
-
         context = api.request.context
         rpc_allocation = api_utils.check_allocation_policy_and_retrieve(
             'baremetal:allocation:update', allocation_ident)
@@ -511,7 +545,12 @@ class AllocationsController(pecan.rest.RestController):
 
     @METRICS.timer('AllocationsController.delete')
     @method.expose(status_code=http_client.NO_CONTENT)
-    @args.validate(allocation_ident=args.uuid_or_name)
+    @validation.api_version(
+        min_version=versions.MINOR_52_ALLOCATION,
+        message=_('The API version does not allow allocations'),
+        exception_class=webob_exc.HTTPMethodNotAllowed,
+    )
+    @validation.request_parameter_schema(schema.delete_request_parameter)
     def delete(self, allocation_ident):
         """Delete an allocation.
 

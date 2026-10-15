@@ -27,7 +27,8 @@ from ironic.objects import notification
 class VolumeTarget(base.IronicObject,
                    object_base.VersionedObjectDictCompat):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Relevant methods changed to be remotable methods.
+    VERSION = '1.1'
 
     dbapi = db_api.get_instance()
 
@@ -42,11 +43,8 @@ class VolumeTarget(base.IronicObject,
         'extra': object_fields.FlexibleDictField(nullable=True),
     }
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get(cls, context, ident):
         """Find a volume target based on its ID or UUID.
 
@@ -65,11 +63,8 @@ class VolumeTarget(base.IronicObject,
         else:
             raise exception.InvalidIdentity(identity=ident)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_id(cls, context, db_id):
         """Find a volume target based on its database ID.
 
@@ -83,11 +78,8 @@ class VolumeTarget(base.IronicObject,
         target = cls._from_db_object(context, cls(), db_target)
         return target
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_uuid(cls, context, uuid):
         """Find a volume target based on its UUID.
 
@@ -101,11 +93,8 @@ class VolumeTarget(base.IronicObject,
         target = cls._from_db_object(context, cls(), db_target)
         return target
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def list(cls, context, limit=None, marker=None,
              sort_key=None, sort_dir=None, project=None):
         """Return a list of VolumeTarget objects.
@@ -127,11 +116,8 @@ class VolumeTarget(base.IronicObject,
                                                       project=project)
         return cls._from_db_object_list(context, db_targets)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def list_by_node_id(cls, context, node_id, limit=None, marker=None,
                         sort_key=None, sort_dir=None, project=None):
         """Return a list of VolumeTarget objects related to a given node ID.
@@ -156,11 +142,8 @@ class VolumeTarget(base.IronicObject,
             project=project)
         return cls._from_db_object_list(context, db_targets)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def list_by_volume_id(cls, context, volume_id, limit=None, marker=None,
                           sort_key=None, sort_dir=None, project=None):
         """Return a list of VolumeTarget objects related to a given volume ID.
@@ -184,10 +167,7 @@ class VolumeTarget(base.IronicObject,
             project=project)
         return cls._from_db_object_list(context, db_targets)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def create(self, context=None):
         """Create a VolumeTarget record in the DB.
 
@@ -206,10 +186,7 @@ class VolumeTarget(base.IronicObject,
         db_target = self.dbapi.create_volume_target(values)
         self._from_db_object(self._context, self, db_target)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def destroy(self, context=None):
         """Delete the VolumeTarget from the DB.
 
@@ -224,10 +201,7 @@ class VolumeTarget(base.IronicObject,
         self.dbapi.destroy_volume_target(self.uuid)
         self.obj_reset_changes()
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def save(self, context=None):
         """Save updates to this VolumeTarget.
 
@@ -249,10 +223,7 @@ class VolumeTarget(base.IronicObject,
         updated_target = self.dbapi.update_volume_target(self.uuid, updates)
         self._from_db_object(self._context, self, updated_target)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def refresh(self, context=None):
         """Loads updates for this VolumeTarget.
 
@@ -315,3 +286,10 @@ class VolumeTargetCRUDPayload(notification.NotificationPayloadBase):
     def __init__(self, target, node_uuid):
         super(VolumeTargetCRUDPayload, self).__init__(node_uuid=node_uuid)
         self.populate_schema(target=target)
+
+    def redact_sensitive_fields(self):
+        # The API gates properties behind
+        # baremetal:volume:view_target_properties: it holds the volume
+        # connection details, CHAP credentials among them.
+        if self.obj_attr_is_set('properties') and self.properties:
+            self.properties = notification.redacted_contents()

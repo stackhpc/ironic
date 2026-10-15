@@ -1,0 +1,36 @@
+FROM quay.io/centos/centos:stream9
+
+ENV FIREFOX_USER=firefox
+ENV FIREFOX_USER_HOME=/home/${FIREFOX_USER}
+
+RUN dnf -y install \
+    epel-release && \
+    dnf -y install \
+    curl-minimal \
+    firefox \
+    dumb-init \
+    iproute \
+    procps \
+    psmisc \
+    python3-requests \
+    x11vnc \
+    xorg-x11-server-Xvfb && \
+    useradd --create-home --home-dir ${FIREFOX_USER_HOME} --shell /bin/bash ${FIREFOX_USER}
+
+ENV DISPLAY_WIDTH=1280
+ENV DISPLAY_HEIGHT=960
+
+ENV APP='fake'
+ENV APP_INFO={}
+ENV READ_ONLY=False
+ENV DEBUG=0
+ENV FIREFOX=firefox
+ENV FIREFOX_PROFILE_DIR=${FIREFOX_USER_HOME}/.ironic-vnc-profile
+ENV EXTENSION_PATH="/usr/share/mozilla/extensions/{ec8030f7-c20a-464f-9b0e-13a3a9e97384}/@ironic-console.openstack.org"
+
+ADD bin/* /usr/local/bin
+ADD drivers /drivers
+ADD extension /usr/share/mozilla/extensions/{ec8030f7-c20a-464f-9b0e-13a3a9e97384}/@ironic-console.openstack.org
+
+ENTRYPOINT ["/usr/bin/dumb-init", "--single-child", "--"]
+CMD ["/usr/local/bin/start-x11vnc.py"]

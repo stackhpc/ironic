@@ -14,7 +14,6 @@
 
 from http import client as http_client
 
-from ironic_lib import metrics_utils
 from oslo_utils import uuidutils
 from pecan import rest
 
@@ -23,10 +22,14 @@ from ironic.api.controllers import link
 from ironic.api.controllers.v1 import collection
 from ironic.api.controllers.v1 import notification_utils as notify
 from ironic.api.controllers.v1 import utils as api_utils
+from ironic.api.controllers.v1 import versions
 from ironic.api import method
+from ironic.api.schemas.v1 import volume_connector as schema
+from ironic.api import validation
 from ironic.common import args
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import metrics_utils
 from ironic import objects
 
 METRICS = metrics_utils.get_metrics_logger(__name__)
@@ -154,10 +157,13 @@ class VolumeConnectorsController(rest.RestController):
 
     @METRICS.timer('VolumeConnectorsController.get_all')
     @method.expose()
+    @validation.api_version(min_version=versions.MINOR_32_VOLUME)
     @args.validate(node=args.uuid_or_name, marker=args.uuid,
                    limit=args.integer, sort_key=args.string,
                    sort_dir=args.string, fields=args.string_list,
                    detail=args.boolean)
+    @validation.request_query_schema(schema.index_request_query)
+    @validation.response_body_schema(schema.index_response_body)
     def get_all(self, node=None, marker=None, limit=None, sort_key='id',
                 sort_dir='asc', fields=None, detail=None, project=None):
         """Retrieve a list of volume connectors.
@@ -199,7 +205,11 @@ class VolumeConnectorsController(rest.RestController):
 
     @METRICS.timer('VolumeConnectorsController.get_one')
     @method.expose()
+    @validation.api_version(min_version=versions.MINOR_32_VOLUME)
     @args.validate(connector_uuid=args.uuid, fields=args.string_list)
+    @validation.request_parameter_schema(schema.show_request_parameter)
+    @validation.request_query_schema(schema.show_request_query)
+    @validation.response_body_schema(schema.show_response_body)
     def get_one(self, connector_uuid, fields=None):
         """Retrieve information about the given volume connector.
 
@@ -209,7 +219,7 @@ class VolumeConnectorsController(rest.RestController):
 
         :returns: API-serializable volume connector object.
 
-        :raises: OperationNotPermitted if accessed with specifying a parent
+        :raises: MalformedRequestURI if accessed with specifying a parent
                  node.
         :raises: VolumeConnectorNotFound if no volume connector exists with
                  the specified UUID.
@@ -221,14 +231,17 @@ class VolumeConnectorsController(rest.RestController):
             target=False)
 
         if self.parent_node_ident:
-            raise exception.OperationNotPermitted()
+            raise exception.MalformedRequestURI()
 
         return convert_with_links(rpc_connector, fields=fields)
 
     @METRICS.timer('VolumeConnectorsController.post')
     @method.expose(status_code=http_client.CREATED)
     @method.body('connector')
+    @validation.api_version(min_version=versions.MINOR_32_VOLUME)
     @args.validate(connector=CONNECTOR_VALIDATOR)
+    @validation.request_body_schema(schema.create_request_body)
+    @validation.response_body_schema(schema.create_response_body)
     def post(self, connector):
         """Create a new volume connector.
 
@@ -236,7 +249,7 @@ class VolumeConnectorsController(rest.RestController):
 
         :returns: API-serializable volume connector object.
 
-        :raises: OperationNotPermitted if accessed with specifying a parent
+        :raises: MalformedRequestURI if accessed with specifying a parent
                  node.
         :raises: VolumeConnectorTypeAndIdAlreadyExists if a volume
                  connector already exists with the same type and connector_id
@@ -263,7 +276,7 @@ class VolumeConnectorsController(rest.RestController):
                                          value=node_uuid)
 
         if self.parent_node_ident:
-            raise exception.OperationNotPermitted()
+            raise exception.MalformedRequestURI()
 
         # NOTE(hshiina): UUID is mandatory for notification payload
         if not connector.get('uuid'):
@@ -287,7 +300,11 @@ class VolumeConnectorsController(rest.RestController):
     @METRICS.timer('VolumeConnectorsController.patch')
     @method.expose()
     @method.body('patch')
+    @validation.api_version(min_version=versions.MINOR_32_VOLUME)
     @args.validate(connector_uuid=args.uuid, patch=args.patch)
+    @validation.request_parameter_schema(schema.update_request_parameter)
+    @validation.request_body_schema(schema.update_request_body)
+    @validation.response_body_schema(schema.update_response_body)
     def patch(self, connector_uuid, patch):
         """Update an existing volume connector.
 
@@ -296,7 +313,7 @@ class VolumeConnectorsController(rest.RestController):
 
         :returns: API-serializable volume connector object.
 
-        :raises: OperationNotPermitted if accessed with specifying a
+        :raises: MalformedRequestURI if accessed with specifying a
                  parent node.
         :raises: PatchError if a given patch can not be applied.
         :raises: VolumeConnectorNotFound if no volume connector exists with
@@ -321,7 +338,7 @@ class VolumeConnectorsController(rest.RestController):
             target=False)
 
         if self.parent_node_ident:
-            raise exception.OperationNotPermitted()
+            raise exception.MalformedRequestURI()
 
         api_utils.patch_validate_allowed_fields(patch, PATCH_ALLOWED_FIELDS)
 
@@ -332,23 +349,16 @@ class VolumeConnectorsController(rest.RestController):
                 raise exception.InvalidUUID(message=message)
 
         connector_dict = rpc_connector.as_dict()
-        # NOTE(smoriya):
-        # 1) Remove node_id because it's an internal value and
+        # NOTE(smoriya): Remove node_id because it's an internal value and
         #    not present in the API object
-        # 2) Add node_uuid
-        rpc_node = api_utils.replace_node_id_with_uuid(connector_dict)
+        connector_dict.pop('node_id', None)
+        # NOTE(dtantsur): Patch won't apply if the field does not exist.
+        connector_dict['node_uuid'] = None
 
+        rpc_node = api_utils.authorize_node_link_patch(
+            rpc_node, patch, 'node_uuid')
         connector_dict = api_utils.apply_jsonpatch(connector_dict, patch)
-
-        try:
-            if connector_dict['node_uuid'] != rpc_node.uuid:
-                rpc_node = objects.Node.get(
-                    api.request.context, connector_dict['node_uuid'])
-        except exception.NodeNotFound as e:
-            # Change error code because 404 (NotFound) is inappropriate
-            # response for a PATCH request to change a Port
-            e.code = http_client.BAD_REQUEST  # BadRequest
-            raise
+        connector_dict['node_uuid'] = rpc_node.uuid
 
         api_utils.patched_validate_with_schema(
             connector_dict, CONNECTOR_SCHEMA, CONNECTOR_VALIDATOR)
@@ -374,13 +384,15 @@ class VolumeConnectorsController(rest.RestController):
 
     @METRICS.timer('VolumeConnectorsController.delete')
     @method.expose(status_code=http_client.NO_CONTENT)
+    @validation.api_version(min_version=versions.MINOR_32_VOLUME)
     @args.validate(connector_uuid=args.uuid)
+    @validation.request_parameter_schema(schema.delete_request_parameter)
     def delete(self, connector_uuid):
         """Delete a volume connector.
 
         :param connector_uuid: UUID of a volume connector.
 
-        :raises: OperationNotPermitted if accessed with specifying a
+        :raises: MalformedRequestURI if accessed with specifying a
                  parent node.
         :raises: NodeLocked if node is locked by another conductor
         :raises: NodeNotFound if the node associated with the connector does
@@ -397,7 +409,7 @@ class VolumeConnectorsController(rest.RestController):
             connector_uuid,
             target=False)
         if self.parent_node_ident:
-            raise exception.OperationNotPermitted()
+            raise exception.MalformedRequestURI()
 
         notify.emit_start_notification(context, rpc_connector, 'delete',
                                        node_uuid=rpc_node.uuid)

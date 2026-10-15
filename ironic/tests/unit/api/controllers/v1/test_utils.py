@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 # Copyright 2013 Red Hat, Inc.
 # All Rights Reserved.
 #
@@ -87,6 +86,62 @@ class TestApiUtils(base.TestCase):
         # Raises an IndexError.
         doc = []
         patch = [{"op": "replace", "path": "/0", "value": 42}]
+        self.assertRaises(exception.PatchError,
+                          utils.apply_jsonpatch, doc, patch)
+
+    def test_apply_jsonpatch_with_tilde(self):
+        """Unescaped tilde fails."""
+        doc = {"foo": {"bar~baz": "value"}}
+        patch = [{"op": "replace", "path": "/foo/bar~baz",
+                  "value": "new_value"}]
+        self.assertRaises(exception.PatchError,
+                          utils.apply_jsonpatch, doc, patch)
+
+    def test_apply_jsonpatch_with_slash(self):
+        """Unescaped forward slash fails."""
+        doc = {"foo": {"bar/baz": "value"}}
+        patch = [{"op": "replace", "path": "/foo/bar/baz",
+                  "value": "new_value"}]
+        self.assertRaises(exception.PatchError,
+                          utils.apply_jsonpatch, doc, patch)
+
+    def test_apply_jsonpatch_with_escaped_tilde(self):
+        """Escaped tilde (~0) should work per RFC 6902."""
+        doc = {"foo": {"bar~baz": "value"}}
+        patch = [{"op": "replace", "path": "/foo/bar~0baz",
+                  "value": "new_value"}]
+        expected = {"foo": {"bar~baz": "new_value"}}
+        result = utils.apply_jsonpatch(doc, patch)
+        self.assertEqual(expected, result)
+
+    def test_apply_jsonpatch_with_escaped_slash(self):
+        """Escaped slash (~1) should work per RFC 6902."""
+        doc = {"foo": {"bar/baz": "value"}}
+        patch = [{"op": "replace", "path": "/foo/bar~1baz",
+                  "value": "new_value"}]
+        expected = {"foo": {"bar/baz": "new_value"}}
+        result = utils.apply_jsonpatch(doc, patch)
+        self.assertEqual(expected, result)
+
+    def test_apply_jsonpatch_with_escaped_complex_path(self):
+        doc = {"foo": {"~bar/baz~": "value"}}
+        patch = [{"op": "replace", "path": "/foo/~0bar~1baz~0",
+                  "value": "new_value"}]
+        expected = {"foo": {"~bar/baz~": "new_value"}}
+        result = utils.apply_jsonpatch(doc, patch)
+        self.assertEqual(expected, result)
+
+    def test_apply_jsonpatch_with_invalid_escape_sequence(self):
+        doc = {"foo": {"bar": "value"}}
+        patch = [{"op": "replace", "path": "/foo/bar~2baz",
+                  "value": "new_value"}]
+        self.assertRaises(exception.PatchError,
+                          utils.apply_jsonpatch, doc, patch)
+
+    def test_apply_jsonpatch_with_incomplete_escape(self):
+        doc = {"foo": {"bar": "value"}}
+        patch = [{"op": "replace", "path": "/foo/bar~",
+                  "value": "new_value"}]
         self.assertRaises(exception.PatchError,
                           utils.apply_jsonpatch, doc, patch)
 
@@ -300,10 +355,12 @@ class TestApiUtils(base.TestCase):
                               validate)
         self.assertIn("big ouch", str(e))
 
-    def test_patch_validate_allowed_fields(self):
-        allowed_fields = ['one', 'two', 'three']
+    @mock.patch.object(api, 'request', autospec=False)
+    def test_patch_validate_allowed_fields(self, mock_request):
+        mock_request.version.minor = 94
+        allowed_fields = ['one', 'two', 'three', 'four/five']
 
-        # patch all
+        # patch all (except 'four/five')
         self.assertEqual(
             {'one', 'two', 'three'},
             utils.patch_validate_allowed_fields([
@@ -319,6 +376,13 @@ class TestApiUtils(base.TestCase):
                 {'path': '/one'},
             ], allowed_fields))
 
+        # patch one (special field not supported)
+        self.assertRaises(
+            exception.Invalid,
+            utils.patch_validate_allowed_fields,
+            [{'path': '/four~1five'}],
+            allowed_fields)
+
         # patch invalid field
         e = self.assertRaises(
             exception.Invalid,
@@ -330,8 +394,31 @@ class TestApiUtils(base.TestCase):
                       "one, two, three", str(e))
 
     @mock.patch.object(api, 'request', autospec=False)
-    def test_sanitize_dict(self, mock_req):
-        mock_req.public_url = 'http://192.0.2.1:5050'
+    def test_patch_validate_allowed_special_fields(self, mock_request):
+        mock_request.version.minor = 98
+        allowed_fields = ['one', 'two', 'three', 'four/five', 'four~five']
+
+        # patch all
+        self.assertEqual(
+            {'one', 'two', 'three', 'four/five', 'four~five'},
+            utils.patch_validate_allowed_fields([
+                {'path': '/one'},
+                {'path': '/two'},
+                {'path': '/three'},
+                {'path': '/four~0five'},
+                {'path': '/four~1five'},
+            ], allowed_fields))
+
+        # patch one (special field)
+        self.assertEqual(
+            {'four/five'},
+            utils.patch_validate_allowed_fields([
+                {'path': '/four~1five'},
+            ], allowed_fields))
+
+    @mock.patch.object(api, 'request', autospec=False)
+    def test_sanitize_dict(self, mock_request):
+        mock_request.public_url = 'http://192.0.2.1:5050'
 
         node = obj_utils.get_test_node(
             self.context,
@@ -929,24 +1016,6 @@ class TestNodeIdent(base.TestCase):
 
         e = self.assertRaises(exception.NodeNotFound,
                               utils.replace_node_uuid_with_id, to_dict)
-        self.assertEqual(400, e.code)
-
-    @mock.patch.object(objects.Node, 'get_by_id', autospec=True)
-    def test_replace_node_id_with_uuid(self, mock_gbi, mock_pr):
-        node = obj_utils.get_test_node(self.context, uuid=self.valid_uuid)
-        mock_gbi.return_value = node
-        to_dict = {'node_id': 1}
-
-        self.assertEqual(node, utils.replace_node_id_with_uuid(to_dict))
-        self.assertEqual({'node_uuid': self.valid_uuid}, to_dict)
-
-    @mock.patch.object(objects.Node, 'get_by_id', autospec=True)
-    def test_replace_node_id_with_uuid_not_found(self, mock_gbi, mock_pr):
-        to_dict = {'node_id': 1}
-        mock_gbi.side_effect = exception.NodeNotFound(node=1)
-
-        e = self.assertRaises(exception.NodeNotFound,
-                              utils.replace_node_id_with_uuid, to_dict)
         self.assertEqual(400, e.code)
 
 
@@ -1854,3 +1923,31 @@ class TestLocalLinkValidation(base.TestCase):
         v = utils.LOCAL_LINK_VALIDATOR
         value = {'network_type': 'invalid'}
         self.assertRaises(exception.Invalid, v, 'l', value)
+
+    def test_local_link_connection_cant_set_only_physical(self):
+        v = utils.LOCAL_LINK_VALIDATOR
+        value = {'port_id': '42',
+                 'vtep-physical-switch': 'jswitch',
+                 'switch_id': '0a:1b:2c:3d:4e:5f'}
+        self.assertRaisesRegex(
+            exception.Invalid,
+            'is a dependency of',
+            v, 'l', value)
+
+    def test_local_link_connection_cant_set_only_logical(self):
+        v = utils.LOCAL_LINK_VALIDATOR
+        value = {'port_id': '42',
+                 'vtep-logical-switch': 'jswitch',
+                 'switch_id': '0a:1b:2c:3d:4e:5f'}
+        self.assertRaisesRegex(
+            exception.Invalid,
+            'is a dependency of',
+            v, 'l', value
+        )
+
+    def test_local_link_connection_set_both_switches(self):
+        v = utils.LOCAL_LINK_VALIDATOR
+        value = {'port_id': '42',
+                 'vtep-logical-switch': 'lswitch',
+                 'vtep-physical-switch': 'pswitch'}
+        self.assertEqual(value, v('l', value))

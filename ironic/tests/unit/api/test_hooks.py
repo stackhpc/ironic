@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -100,6 +99,7 @@ class TestNoExceptionTracebackHook(base.BaseApiTest):
              ' getattr(proxyobj, method)(ctxt, **kwargs)']
     MSG_WITHOUT_TRACE = "Test exception message."
     MSG_WITH_TRACE = MSG_WITHOUT_TRACE + "\n" + "\n".join(TRACE)
+    SKIP_TRACEBACK_OVERRIDE = True  # do not mess with the defaults
 
     def setUp(self):
         super(TestNoExceptionTracebackHook, self).setUp()
@@ -225,11 +225,8 @@ class TestContextHook(base.BaseApiTest):
         ctx.to_policy_values.return_value = policy_dict
         mock_policy.return_value = False
         context_hook.before(reqstate)
-        creds_dict = {'is_public_api': is_public_api}
         if auth_token_info:
-            creds_dict['auth_token_info'] = auth_token_info
-            mock_ctx.from_environ.assert_called_once_with(
-                environ, **creds_dict)
+            mock_ctx.from_environ.assert_called_once_with(environ)
         mock_policy.assert_not_called()
         if auth_strategy == 'noauth':
             self.assertIsNone(ctx.auth_token)
@@ -244,18 +241,6 @@ class TestContextHook(base.BaseApiTest):
 
     def test_context_hook_noauth_token_removed(self):
         self._test_context_hook(auth_strategy='noauth')
-
-    def test_context_hook_after_add_request_id(self):
-        context_hook, reqstate = self._test_context_hook(request_id='fake-id')
-        context_hook.after(reqstate)
-        self.assertEqual('fake-id',
-                         reqstate.response.headers['Openstack-Request-Id'])
-
-    def test_context_hook_after_miss_context(self):
-        response = self.get_json('/bad/path',
-                                 expect_errors=True)
-        self.assertNotIn('Openstack-Request-Id',
-                         response.headers)
 
     def test_context_hook_auth_token_info(self):
         self._test_context_hook(auth_token_info='data-dict')

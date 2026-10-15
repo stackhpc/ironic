@@ -14,52 +14,50 @@ Redfish Inspect Interface
 """
 
 from oslo_log import log
-from oslo_utils import importutils
+from oslo_utils import netutils
 from oslo_utils import units
+import sushy
 
 from ironic.common import boot_modes
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common.inspection_rules import engine
 from ironic.common import states
 from ironic.common import utils
+from ironic.conf import CONF
 from ironic.drivers import base
 from ironic.drivers.modules import inspect_utils
 from ironic.drivers.modules.redfish import utils as redfish_utils
 from ironic.drivers import utils as drivers_utils
-from ironic import objects
 
 LOG = log.getLogger(__name__)
 
-sushy = importutils.try_import('sushy')
+PROCESSOR_INSTRUCTION_SET_MAP = {
+    sushy.InstructionSet.ARM_A32: 'arm',
+    sushy.InstructionSet.ARM_A64: 'aarch64',
+    sushy.InstructionSet.IA_64: 'ia64',
+    sushy.InstructionSet.MIPS32: 'mips',
+    sushy.InstructionSet.MIPS64: 'mips64',
+    sushy.InstructionSet.OEM: None,
+    sushy.InstructionSet.X86: 'i686',
+    sushy.InstructionSet.X86_64: 'x86_64'
+}
 
-if sushy:
-    CPU_ARCH_MAP = {
-        sushy.PROCESSOR_ARCH_x86: 'x86_64',
-        sushy.PROCESSOR_ARCH_IA_64: 'ia64',
-        sushy.PROCESSOR_ARCH_ARM: 'arm',
-        sushy.PROCESSOR_ARCH_MIPS: 'mips',
-        sushy.PROCESSOR_ARCH_OEM: 'oem'
-    }
-
-    BOOT_MODE_MAP = {
-        sushy.BOOT_SOURCE_MODE_UEFI: boot_modes.UEFI,
-        sushy.BOOT_SOURCE_MODE_BIOS: boot_modes.LEGACY_BIOS
-    }
+BOOT_MODE_MAP = {
+    sushy.BOOT_SOURCE_MODE_UEFI: boot_modes.UEFI,
+    sushy.BOOT_SOURCE_MODE_BIOS: boot_modes.LEGACY_BIOS
+}
 
 
 class RedfishInspect(base.InspectInterface):
 
     def __init__(self):
-        """Initialize the Redfish inspection interface.
-
-        :raises: DriverLoadError if the driver can't be loaded due to
-            missing dependencies
-        """
-        super(RedfishInspect, self).__init__()
-        if not sushy:
-            raise exception.DriverLoadError(
-                driver='redfish',
-                reason=_('Unable to import the sushy library'))
+        super().__init__()
+        enabled_hooks = [x.strip()
+                         for x in CONF.redfish.inspection_hooks.split(',')
+                         if x.strip()]
+        self.hooks = inspect_utils.validate_inspection_hooks("redfish",
+                                                             enabled_hooks)
 
     def get_properties(self):
         """Return the properties of the interface.
@@ -102,35 +100,51 @@ class RedfishInspect(base.InspectInterface):
         # get the essential properties and update the node properties
         # with it.
         inspected_properties = task.node.properties
+        inventory = {}
 
         if system.memory_summary and system.memory_summary.size_gib:
-            inspected_properties['memory_mb'] = str(
-                system.memory_summary.size_gib * units.Ki)
+            memory = system.memory_summary.size_gib * units.Ki
+            inspected_properties['memory_mb'] = memory
+            inventory['memory'] = {'physical_mb': memory}
 
-        if system.processors and system.processors.summary:
-            cpus, arch = system.processors.summary
-            if cpus:
-                inspected_properties['cpus'] = cpus
-
-            if arch:
-                try:
-                    inspected_properties['cpu_arch'] = CPU_ARCH_MAP[arch]
-
-                except KeyError:
-                    LOG.warning("Unknown CPU arch %(arch)s discovered "
-                                "for node %(node)s", {'node': task.node.uuid,
-                                                      'arch': arch})
+        # match the inventory data of ironic-inspector / ironic-python-agent
+        # to make existing inspection hooks and rules work by defaulting
+        # the values
+        inventory['cpu'] = {
+            'count': 0,
+            'architecture': '',
+        }
+        proc_info = self._get_processor_info(task, system)
+        inventory['cpu'].update(proc_info)
 
         # TODO(etingof): should we respect root device hints here?
         local_gb = self._detect_local_gb(task, system)
 
         if local_gb:
-            inspected_properties['local_gb'] = str(local_gb)
+            inspected_properties['local_gb'] = local_gb
+
         else:
             LOG.warning("Could not provide a valid storage size configured "
                         "for node %(node)s. Assuming this is a disk-less node",
                         {'node': task.node.uuid})
-            inspected_properties['local_gb'] = '0'
+            inspected_properties['local_gb'] = 0
+
+        if disks := self._get_simple_disks(system):
+            inventory['disks'] = disks
+
+        storage_controllers = self._get_storage_controllers(task, system)
+        if storage_controllers:
+            inventory['storage_controllers'] = storage_controllers
+
+        inventory['interfaces'] = self._get_interface_info(task, system)
+
+        pcie_devices = self._get_pcie_devices(system)
+        if pcie_devices:
+            inventory['pci_devices'] = pcie_devices
+
+        system_vendor = self._get_system_vendor_info(task, system)
+        if system_vendor:
+            inventory['system_vendor'] = system_vendor
 
         if system.boot.mode:
             if not drivers_utils.get_node_capability(task.node, 'boot_mode'):
@@ -139,62 +153,49 @@ class RedfishInspect(base.InspectInterface):
                     {'boot_mode': BOOT_MODE_MAP[system.boot.mode]})
 
                 inspected_properties['capabilities'] = capabilities
+            inventory['boot'] = {'current_boot_mode':
+                                 BOOT_MODE_MAP[system.boot.mode]}
+
+        pxe_port_macs = self._get_pxe_port_macs(task)
+        # existing data format only allows one mac so use that for now
+        if pxe_port_macs:
+            inventory['boot']['pxe_interface'] = pxe_port_macs[0]
+
+        plugin_data = {}
+
+        # Collect LLDP data from Redfish NetworkAdapter Ports
+        # This method can be overridden by vendor-specific implementations
+        lldp_raw_data = self._collect_lldp_data(task, system)
+        if lldp_raw_data:
+            plugin_data['parsed_lldp'] = lldp_raw_data
+            LOG.info('Collected LLDP data for %(count)d interface(s) on '
+                     'node %(node)s',
+                     {'count': len(lldp_raw_data), 'node': task.node.uuid})
+
+        inspect_utils.run_inspection_hooks(task, inventory, plugin_data,
+                                           self.hooks, None)
+        inspect_utils.store_inspection_data(task.node,
+                                            inventory,
+                                            plugin_data,
+                                            task.context)
+        engine.apply_rules(task, inventory, plugin_data, 'main')
 
         valid_keys = self.ESSENTIAL_PROPERTIES
         missing_keys = valid_keys - set(inspected_properties)
         if missing_keys:
             error = (_('Failed to discover the following properties: '
-                       '%(missing_keys)s on node %(node)s'),
+                       '%(missing_keys)s on node %(node)s') %
                      {'missing_keys': ', '.join(missing_keys),
                       'node': task.node.uuid})
             raise exception.HardwareInspectionFailure(error=error)
 
         task.node.properties = inspected_properties
         task.node.save()
-
         LOG.debug("Node properties for %(node)s are updated as "
                   "%(properties)s", {'properties': inspected_properties,
                                      'node': task.node.uuid})
 
-        self._create_ports(task, system)
-
-        pxe_port_macs = self._get_pxe_port_macs(task)
-        if pxe_port_macs is None:
-            LOG.warning("No PXE enabled NIC was found for node "
-                        "%(node_uuid)s.", {'node_uuid': task.node.uuid})
-        else:
-            pxe_port_macs = [macs.lower() for macs in pxe_port_macs]
-
-            ports = objects.Port.list_by_node_id(task.context, task.node.id)
-            if ports:
-                for port in ports:
-                    is_baremetal_pxe_port = (port.address.lower()
-                                             in pxe_port_macs)
-                    if port.pxe_enabled != is_baremetal_pxe_port:
-                        port.pxe_enabled = is_baremetal_pxe_port
-                        port.save()
-                        LOG.info('Port %(port)s having %(mac_address)s '
-                                 'updated with pxe_enabled %(pxe)s for '
-                                 'node %(node_uuid)s during inspection',
-                                 {'port': port.uuid,
-                                  'mac_address': port.address,
-                                  'pxe': port.pxe_enabled,
-                                  'node_uuid': task.node.uuid})
-            else:
-                LOG.warning("No port information discovered "
-                            "for node %(node)s", {'node': task.node.uuid})
-
         return states.MANAGEABLE
-
-    def _create_ports(self, task, system):
-        enabled_macs = redfish_utils.get_enabled_macs(task, system)
-        if enabled_macs:
-            inspect_utils.create_ports_if_not_exist(task, list(enabled_macs))
-        else:
-            LOG.warning("Not attempting to create any port as no NICs "
-                        "were discovered in 'enabled' state for node "
-                        "%(node)s: %(mac_data)s",
-                        {'mac_data': enabled_macs, 'node': task.node.uuid})
 
     def _detect_local_gb(self, task, system):
         simple_storage_size = 0
@@ -271,3 +272,429 @@ class RedfishInspect(base.InspectInterface):
                   If cannot be determined, returns None.
         """
         return None
+
+    def _get_interface_info(self, task, system):
+        """Extract ethernet interface info."""
+
+        ret = []
+        if not system.ethernet_interfaces:
+            return ret
+
+        for eth in system.ethernet_interfaces.get_members():
+            if not netutils.is_valid_mac(eth.mac_address):
+                LOG.warning(_("Ignoring NIC address '%(address)s' for "
+                              "interface %(inf)s on node %(node)s because it "
+                              "is not a valid MAC"),
+                            {'address': eth.mac_address,
+                             'inf': eth.identity,
+                             'node': task.node.uuid})
+                continue
+            mac_address = utils.normalize_mac(eth.mac_address)
+            intf = {
+                'mac_address': mac_address,
+                'name': eth.identity
+            }
+            try:
+                intf['speed_mbps'] = int(eth.speed_mbps)
+            except Exception:
+                pass
+            ret.append(intf)
+        return ret
+
+    def _get_processor_info(self, task, system):
+        # NOTE(JayF): Checking truthiness here is better than checking for None
+        #             because if we have an empty list, we'll raise a
+        #             ValueError.
+        cpu = {}
+
+        if not system.processors:
+            return cpu
+
+        if system.processors.summary:
+            cpu['count'], _ = system.processors.summary
+
+        processor = system.processors.get_members()[0]
+
+        if processor.model is not None:
+            cpu['model_name'] = str(processor.model)
+        if processor.max_speed_mhz is not None:
+            cpu['frequency'] = str(processor.max_speed_mhz)
+        cpu['architecture'] = PROCESSOR_INSTRUCTION_SET_MAP.get(
+            processor.instruction_set) or ''
+
+        return cpu
+
+    def _get_simple_disks(self, system):
+        is_full_storage = False
+        try:
+            storages = system.storage
+            is_full_storage = True
+        except sushy.exceptions.MissingAttributeError:
+            storages = None
+
+        if not storages:
+            try:
+                storages = system.simple_storage
+            except sushy.exceptions.MissingAttributeError:
+                pass
+
+        if not storages:
+            return []
+
+        disks = list()
+        for storage in storages.get_members():
+            if is_full_storage:
+                drives = storage.drives
+            else:
+                drives = storage.devices
+            for drive in drives:
+                disk = {}
+                disk['name'] = drive.name
+                disk['size'] = drive.capacity_bytes
+                if is_full_storage:
+                    disk['vendor'] = drive.manufacturer
+                    disk['model'] = drive.model
+                    disk['serial'] = drive.serial_number
+                    if drive.media_type:
+                        disk['rotational'] = drive.media_type == 'HDD'
+                disks.append(disk)
+        return disks
+
+    def _get_storage_controllers(self, task, system):
+        """Extract storage controller and drive information.
+
+        Collects storage information from all Redfish Storage resources
+        including their sub-controllers and drives.
+
+        :param task: a TaskManager instance.
+        :param system: Sushy system object.
+        :returns: List of storage controller dictionaries.
+        """
+        controllers = []
+
+        try:
+            if not system.storage:
+                return controllers
+            members = system.storage.get_members()
+        except sushy.exceptions.SushyError as ex:
+            LOG.debug('Failed to get storage members for node %(node)s: '
+                      '%(error)s', {'node': task.node.uuid, 'error': ex})
+            return controllers
+
+        for storage in members:
+            controller = self._parse_storage_controller(task, storage)
+            controllers.append(controller)
+
+        return controllers
+
+    def _get_system_vendor_info(self, task, system):
+        """Get system vendor information.
+
+        :param task: a TaskManager instance.
+        :param system: a Redfish system object.
+        :returns: a dictionary of system vendor information.
+        """
+        system_vendor = {}
+        if system.model:
+            system_vendor['product_name'] = str(system.model)
+
+        if system.serial_number:
+            system_vendor['serial_number'] = str(system.serial_number)
+
+        if system.manufacturer:
+            system_vendor['manufacturer'] = str(system.manufacturer)
+
+        if system.uuid:
+            system_vendor['system_uuid'] = str(system.uuid)
+
+        return system_vendor
+
+    @staticmethod
+    def _enum_to_str(value):
+        """Convert an enum value to string, or return as-is."""
+        return value.value if hasattr(value, 'value') else value
+
+    @staticmethod
+    def _status_to_dict(status):
+        """Convert a Sushy StatusField to a serializable dict."""
+        if not status:
+            return None
+        result = {}
+        if hasattr(status, 'health') and status.health is not None:
+            result['health'] = RedfishInspect._enum_to_str(status.health)
+        if hasattr(status, 'state') and status.state is not None:
+            result['state'] = RedfishInspect._enum_to_str(status.state)
+        if (hasattr(status, 'health_rollup')
+                and status.health_rollup is not None):
+            result['health_rollup'] = RedfishInspect._enum_to_str(
+                status.health_rollup)
+        return result or None
+
+    def _parse_storage_controller(self, task, storage):
+        """Parse a single storage resource.
+
+        :param task: a TaskManager instance.
+        :param storage: Sushy Storage object.
+        :returns: Dictionary with storage controller info.
+        """
+        controller = {
+            'id': str(storage.identity) if storage.identity else '',
+            'name': storage.name if hasattr(storage, 'name') else None,
+        }
+
+        # Collect sub-controllers from deprecated StorageControllers list
+        sub_controllers = []
+        try:
+            sc_list = storage.storage_controllers or []
+        except (sushy.exceptions.SushyError, TypeError):
+            sc_list = []
+        for sc in sc_list:
+            try:
+                sc_info = {
+                    'member_id': getattr(sc, 'member_id', None),
+                    'name': getattr(sc, 'name', None),
+                    'raid_types': [
+                        rt.value for rt in
+                        (getattr(sc, 'raid_types', None) or [])],
+                    'speed_gbps': getattr(sc, 'speed_gbps', None),
+                    'controller_protocols': [
+                        p.value for p in
+                        (getattr(sc, 'controller_protocols', None)
+                         or [])],
+                    'device_protocols': [
+                        p.value for p in
+                        (getattr(sc, 'device_protocols', None)
+                         or [])],
+                }
+                status = getattr(sc, 'status', None)
+                if status:
+                    sc_info['status'] = self._status_to_dict(status)
+                sub_controllers.append(sc_info)
+            except (AttributeError, TypeError,
+                    sushy.exceptions.SushyError):
+                LOG.debug('Failed to parse sub-controller on node '
+                          '%(node)s', {'node': task.node.uuid})
+        controller['storage_controllers'] = sub_controllers
+
+        # Collect drives
+        drives = []
+        if hasattr(storage, 'drives'):
+            for drive in storage.drives:
+                try:
+                    drive_info = {
+                        'name': drive.name,
+                        'size': drive.capacity_bytes,
+                        'id': getattr(drive, 'identity', None),
+                        'media_type': getattr(drive, 'media_type',
+                                              None),
+                        'serial_number': getattr(drive, 'serial_number',
+                                                 None),
+                        'manufacturer': getattr(drive, 'manufacturer',
+                                                None),
+                        'model': getattr(drive, 'model', None),
+                        'revision': getattr(drive, 'revision', None),
+                    }
+                    protocol = getattr(drive, 'protocol', None)
+                    if protocol:
+                        drive_info['protocol'] = self._enum_to_str(
+                            protocol)
+                    status = getattr(drive, 'status', None)
+                    if status:
+                        drive_info['status'] = self._status_to_dict(
+                            status)
+                    drives.append(drive_info)
+                except (AttributeError, TypeError,
+                        sushy.exceptions.SushyError):
+                    LOG.debug('Failed to parse drive on node %(node)s',
+                              {'node': task.node.uuid})
+        controller['drives'] = drives
+
+        return controller
+
+    def _get_pcie_devices(self, system):
+        """Extract PCIe device information from Redfish collection.
+
+        :param system: a Redfish system object.
+        :returns: List of PCIe device dictionaries
+        """
+        try:
+            pcie_devices_collection = system.pcie_devices
+        except sushy.exceptions.SushyError:
+            pcie_devices_collection = None
+
+        if pcie_devices_collection is None:
+            return []
+
+        device_list = []
+
+        # Process each PCIe device
+        for pcie_device in pcie_devices_collection.get_members():
+            # Skip devices that don't have functions
+            try:
+                pcie_functions = pcie_device.pcie_functions
+            except sushy.exceptions.SushyError:
+                continue
+
+            # Process each function on this device
+            for pcie_function in pcie_functions.get_members():
+                function_info = self._extract_function_info(pcie_function)
+                if function_info:
+                    device_list.append(function_info)
+
+        return device_list
+
+    def _extract_function_info(self, function):
+        """Extract information from a PCIe function.
+
+        :param function: PCIe function object
+        :returns: Dictionary with function attributes
+        """
+        info = {}
+        # Naming them same as in IPA for compatibility
+        # IPA  has extra bus and numa_node_id which BMC doesn't have.
+        if function.device_class is not None:
+            info['class'] = function.device_class.value
+        if function.device_id is not None:
+            info['product_id'] = function.device_id
+        if function.vendor_id is not None:
+            info['vendor_id'] = function.vendor_id
+        if function.subsystem_id is not None:
+            info['subsystem_id'] = function.subsystem_id
+        if function.subsystem_vendor_id is not None:
+            info['subsystem_vendor_id'] = function.subsystem_vendor_id
+        if function.revision_id is not None:
+            info['revision'] = function.revision_id
+        return info
+
+    def _collect_lldp_data(self, task, system):
+        """Collect LLDP data from Redfish NetworkAdapter Ports.
+
+        This method can be overridden by vendor-specific implementations
+        to provide alternative LLDP data sources (e.g., Dell OEM endpoints).
+
+        Default implementation uses standard Redfish LLDP data from
+        Port.Ethernet.LLDPReceive via Sushy NetworkAdapter/Port resources.
+
+        :param task: A TaskManager instance
+        :param system: Sushy system object
+        :returns: Dict mapping interface names to parsed LLDP data
+                   Format: {'interface_name': {'switch_chassis_id': '..',
+                                               'switch_port_id': '..'}}
+        """
+        parsed_lldp = {}
+
+        try:
+            # Check if chassis exists
+            if not system.chassis:
+                return parsed_lldp
+
+            # Process each chassis
+            for chassis in system.chassis:
+                try:
+                    # Get NetworkAdapters collection
+                    network_adapters = (
+                        chassis.network_adapters.get_members())
+                except sushy.exceptions.SushyError as ex:
+                    LOG.debug('Failed to get network adapters for chassis '
+                              'on node %(node)s: %(error)s',
+                              {'node': task.node.uuid, 'error': ex})
+                    continue
+
+                # Process each NetworkAdapter
+                for adapter in network_adapters:
+                    try:
+                        # Get Ports collection using Sushy
+                        ports = adapter.ports.get_members()
+                    except sushy.exceptions.SushyError as ex:
+                        LOG.debug('Failed to get ports for adapter '
+                                  'on node %(node)s: %(error)s',
+                                  {'node': task.node.uuid, 'error': ex})
+                        continue
+
+                    # Process each Port
+                    for port in ports:
+                        try:
+                            # Check if LLDP data exists using Sushy
+                            if (not port.ethernet
+                                    or not port.ethernet.lldp_receive):
+                                continue
+
+                            lldp_receive = port.ethernet.lldp_receive
+
+                            # Convert directly to parsed LLDP format
+                            lldp_dict = self._convert_lldp_receive_to_dict(
+                                lldp_receive)
+
+                            if not lldp_dict:
+                                continue
+
+                            # Use port identity directly as interface name
+                            if port.identity:
+                                parsed_lldp[port.identity] = lldp_dict
+
+                        except Exception as e:
+                            LOG.debug('Failed to process LLDP data for port '
+                                      '%(port)s on node %(node)s: %(error)s',
+                                      {'port': port.identity,
+                                       'node': task.node.uuid, 'error': e})
+                            continue
+
+        except Exception as e:
+            LOG.warning('Failed to collect standard Redfish LLDP data for '
+                        'node %(node)s: %(error)s',
+                        {'node': task.node.uuid, 'error': e})
+        return parsed_lldp
+
+    def _convert_lldp_receive_to_dict(self, lldp_receive):
+        """Convert Sushy LLDPReceive object directly to parsed dict format.
+
+        :param lldp_receive: Sushy LLDPReceiveField object or dict
+        :returns: Dict with parsed LLDP data or None
+        """
+        lldp_dict = {}
+
+        # Chassis ID
+        chassis_id = self._get_lldp_value(lldp_receive, 'chassis_id',
+                                          'ChassisId')
+        if chassis_id:
+            lldp_dict['switch_chassis_id'] = chassis_id
+
+        # Port ID
+        port_id = self._get_lldp_value(lldp_receive, 'port_id', 'PortId')
+        if port_id:
+            lldp_dict['switch_port_id'] = port_id
+
+        # System Name
+        system_name = self._get_lldp_value(lldp_receive, 'system_name',
+                                           'SystemName')
+        if system_name:
+            lldp_dict['switch_system_name'] = system_name
+
+        # System Description
+        system_description = self._get_lldp_value(lldp_receive,
+                                                  'system_description',
+                                                  'SystemDescription')
+        if system_description:
+            lldp_dict['switch_system_description'] = system_description
+
+        # Management VLAN ID
+        vlan_id = self._get_lldp_value(lldp_receive, 'management_vlan_id',
+                                       'ManagementVlanId')
+        if vlan_id:
+            lldp_dict['switch_vlan_id'] = vlan_id
+
+        return lldp_dict if lldp_dict else None
+
+    def _get_lldp_value(self, lldp_receive, attr_name, json_key):
+        """Get value from LLDP receive, handling both dict and object.
+
+        :param lldp_receive: LLDP data (Sushy object or dict)
+        :param attr_name: Sushy attribute name
+        :param json_key: JSON property name (required)
+        :returns: The value or None
+        """
+        # Being defensive to handle both Sushy object and dict
+        if isinstance(lldp_receive, dict):
+            return lldp_receive.get(json_key)
+        else:
+            return getattr(lldp_receive, attr_name, None)

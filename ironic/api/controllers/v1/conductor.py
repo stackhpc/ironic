@@ -10,7 +10,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from ironic_lib import metrics_utils
 from oslo_log import log
 from oslo_utils import timeutils
 from pecan import rest
@@ -18,10 +17,14 @@ from pecan import rest
 from ironic import api
 from ironic.api.controllers.v1 import collection
 from ironic.api.controllers.v1 import utils as api_utils
+from ironic.api.controllers.v1 import versions
 from ironic.api import method
+from ironic.api.schemas.v1 import conductor as schema
+from ironic.api import validation
 from ironic.common import args
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import metrics_utils
 import ironic.conf
 from ironic import objects
 
@@ -40,8 +43,9 @@ def convert_with_links(rpc_conductor, fields=None, sanitize=True):
         link_resource='conductors',
         link_resource_args=rpc_conductor.hostname
     )
-    conductor['alive'] = not timeutils.is_older_than(
+    recent_heartbeat = not timeutils.is_older_than(
         rpc_conductor.updated_at, CONF.conductor.heartbeat_timeout)
+    conductor['alive'] = rpc_conductor.online and recent_heartbeat
     if fields is not None:
         api_utils.check_for_invalid_fields(fields, conductor)
 
@@ -102,9 +106,12 @@ class ConductorsController(rest.RestController):
 
     @METRICS.timer('ConductorsController.get_all')
     @method.expose()
-    @args.validate(marker=args.name, limit=args.integer, sort_key=args.string,
-                   sort_dir=args.string, fields=args.string_list,
-                   detail=args.boolean)
+    @validation.api_version(min_version=versions.MINOR_49_CONDUCTORS)
+    @args.validate(marker=args.host_port, limit=args.integer,
+                   sort_key=args.string, sort_dir=args.string,
+                   fields=args.string_list, detail=args.boolean)
+    @validation.request_query_schema(schema.index_request_query)
+    @validation.response_body_schema(schema.index_response_body)
     def get_all(self, marker=None, limit=None, sort_key='id', sort_dir='asc',
                 fields=None, detail=None):
         """Retrieve a list of conductors.
@@ -139,7 +146,11 @@ class ConductorsController(rest.RestController):
 
     @METRICS.timer('ConductorsController.get_one')
     @method.expose()
-    @args.validate(hostname=args.name, fields=args.string_list)
+    @validation.api_version(min_version=versions.MINOR_49_CONDUCTORS)
+    @args.validate(hostname=args.host_port, fields=args.string_list)
+    @validation.request_parameter_schema(schema.show_request_parameter)
+    @validation.request_query_schema(schema.show_request_query)
+    @validation.response_body_schema(schema.show_response_body)
     def get_one(self, hostname, fields=None):
         """Retrieve information about the given conductor.
 

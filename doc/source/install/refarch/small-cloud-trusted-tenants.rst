@@ -28,12 +28,9 @@ components participating in the bare metal provisioning:
 
 * The :glance-doc:`Image service <>` provides images for bare metal instances.
 
-The following services can be optionally used by the Bare Metal service:
+The following service can be optionally used by the Bare Metal service:
 
 * The :cinder-doc:`Volume service <>` provides volumes to boot bare metal instances from.
-
-* The :ironic-inspector-doc:`Bare Metal Introspection service <>` simplifies enrolling new bare metal
-  machines by conducting in-band introspection.
 
 Node roles
 ----------
@@ -75,6 +72,9 @@ services provide their public API.
 
 The Bare Metal API will be served to the operators and to the Compute service
 through this network.
+
+The ``ironic-novncproxy`` NoVNC proxy service will serve the graphical console
+user interface via this network.
 
 Public network
 ~~~~~~~~~~~~~~
@@ -122,6 +122,9 @@ of the bare metal nodes must not have access to it.
     :doc:`/admin/drivers` require the *management network* to have access
     to the Object storage service backend.
 
+The ``ironic-novncproxy`` NoVNC proxy service needs access to this network
+to connect to the host BMC graphical console.
+
 Controllers
 -----------
 
@@ -156,6 +159,15 @@ The following components of the Bare Metal service are installed on a
   * *management* for contacting node's BMCs
   * *bare metal* for contacting deployment, cleaning or rescue ramdisks
 
+* The ``ironic-novncproxy`` NoVNC proxy is run directly as a web server
+  process and only serves consoles for bare metal nodes for the adjacent
+  ``ironic-controller``. This means one ``ironic-novncproxy`` needs to be
+  run for each ``ironic-conductor`` process
+
+  The NoVNC proxy has to be served on the *control plane network*. Additionally,
+  it needs to make VNC connections to the console containers initiated by
+  ``ironic-conductor``.
+
 * TFTP and HTTP service for booting the nodes. Each ``ironic-conductor``
   process has to have a matching TFTP and HTTP service. They should be exposed
   only to the *bare metal network* and must not be behind a load balancer.
@@ -173,17 +185,6 @@ The following components of the Bare Metal service are installed on a
   service to assist with binding bare metal ports.
 
   The :ironic-neutron-agent-doc:`ironic-neutron-agent <>` service should be started as well.
-
-* If the Bare Metal introspection is used, its ``ironic-inspector`` process
-  has to be installed on all *controllers*. Each such process works as both
-  Bare Metal Introspection API and conductor service. A load balancer should
-  be used to spread the API load between *controllers*.
-
-  The API has to be served on the *control plane network*. Additionally,
-  it has to be exposed to the *bare metal network* for the ramdisk callback
-  API.
-
-.. TODO(dtantsur): a nice picture to illustrate the above
 
 Shared services
 ~~~~~~~~~~~~~~~

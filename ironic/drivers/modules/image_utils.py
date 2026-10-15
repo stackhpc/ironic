@@ -14,6 +14,7 @@
 #    under the License.
 
 import base64
+import collections
 import functools
 import gzip
 import json
@@ -22,74 +23,98 @@ import shutil
 import tempfile
 from urllib import parse as urlparse
 
-from ironic_lib import utils as ironic_utils
 from oslo_log import log
+from oslo_utils import uuidutils
 
 from ironic.common import exception
 from ironic.common.glance_service import service_utils
 from ironic.common.i18n import _
+from ironic.common import image_publisher
 from ironic.common import images
+from ironic.common import kernel_parameters as kp
 from ironic.common import states
-from ironic.common import swift
 from ironic.common import utils
 from ironic.conf import CONF
+from ironic.drivers import base as drivers_base
 from ironic.drivers.modules import boot_mode_utils
 from ironic.drivers.modules import deploy_utils
 from ironic.drivers.modules import image_cache
+from ironic.drivers.modules import inspect_utils
 from ironic.drivers import utils as driver_utils
+from ironic.objects.node import Node
 
 LOG = log.getLogger(__name__)
 
 
 class ImageHandler(object):
 
-    def __init__(self, driver):
-        self.update_driver_config(driver)
+    def __init__(self, driver, boot=None):
+        """Create an image handler for a node's boot interface.
 
-    def update_driver_config(self, driver):
-        _SWIFT_MAP = {
-            "redfish": {
-                "swift_enabled": CONF.redfish.use_swift,
-                "container": CONF.redfish.swift_container,
-                "timeout": CONF.redfish.swift_object_expiry_timeout,
-                "image_subdir": "redfish",
-                "file_permission": CONF.redfish.file_permission,
-                "kernel_params": CONF.redfish.kernel_append_params
-            },
-            "idrac": {
-                "swift_enabled": CONF.redfish.use_swift,
-                "container": CONF.redfish.swift_container,
-                "timeout": CONF.redfish.swift_object_expiry_timeout,
-                "image_subdir": "redfish",
-                "file_permission": CONF.redfish.file_permission,
-                "kernel_params": CONF.redfish.kernel_append_params
-            },
-            "ilo5": {
-                "swift_enabled": not CONF.ilo.use_web_server_for_images,
-                "container": CONF.ilo.swift_ilo_container,
-                "timeout": CONF.ilo.swift_object_expiry_timeout,
-                "image_subdir": "ilo",
-                "file_permission": CONF.ilo.file_permission,
-                "kernel_params": CONF.ilo.kernel_append_params
-            },
-            "ilo": {
-                "swift_enabled": not CONF.ilo.use_web_server_for_images,
-                "container": CONF.ilo.swift_ilo_container,
-                "timeout": CONF.ilo.swift_object_expiry_timeout,
-                "image_subdir": "ilo",
-                "file_permission": CONF.ilo.file_permission,
-                "kernel_params": CONF.ilo.kernel_append_params
-            },
-        }
+        :param driver: the node's hardware type name. Only used for the
+            legacy, name-keyed fallback and error messages.
+        :param boot: the node's boot interface instance. When it declares
+            :attr:`~ironic.drivers.base.BootInterface.image_publisher_settings`
+            those settings are used directly, so out-of-tree hardware types
+            reusing a supported boot interface work without configuration.
+        """
+        self.update_driver_config(driver, boot=boot)
 
-        self._driver = driver
-        self.swift_enabled = _SWIFT_MAP[driver].get("swift_enabled")
-        self._container = _SWIFT_MAP[driver].get("container")
-        self._timeout = _SWIFT_MAP[driver].get("timeout")
-        self._image_subdir = _SWIFT_MAP[driver].get("image_subdir")
-        self._file_permission = _SWIFT_MAP[driver].get("file_permission")
+    def update_driver_config(self, driver, boot=None):
+        settings = boot.image_publisher_settings if boot else None
+        if settings is None:
+            # Legacy fallback: resolve publisher settings from the hardware
+            # type name. Deprecated in favor of the boot interface declaring
+            # its own image_publisher_settings.
+            settings = self._legacy_settings(driver)
+
+        if settings is None:
+            raise exception.UnsupportedDriverExtension(
+                _("Publishing images is not supported for driver %s") % driver)
+
+        if settings.swift_enabled:
+            self._publisher = image_publisher.SwiftPublisher(
+                container=settings.container,
+                delete_after=settings.timeout)
+        else:
+            self._publisher = image_publisher.LocalPublisher(
+                image_subdir=settings.image_subdir,
+                file_permission=settings.file_permission)
+
         # To get the kernel parameters
-        self.kernel_params = _SWIFT_MAP[driver].get("kernel_params")
+        self.kernel_params = settings.kernel_params
+
+    @staticmethod
+    def _legacy_settings(driver):
+        """Resolve publisher settings from the hardware type name.
+
+        Deprecated fallback for boot interfaces that do not declare
+        :attr:`~ironic.drivers.base.BootInterface.image_publisher_settings`.
+        Retained only so callers passing a bare hardware type name keep
+        working; the boot interface declaring its own settings is the
+        supported path and requires no operator configuration.
+        """
+        # DEPRECATED(TheJulia): This name-keyed fallback map should be
+        # removed before the 2028.1 release. The in-tree redfish boot
+        # interfaces declare their own image_publisher_settings, so this
+        # only serves out-of-tree callers that have not yet migrated.
+        _SWIFT_MAP = {
+            "redfish": drivers_base.ImagePublisherSettings(
+                swift_enabled=CONF.redfish.use_swift,
+                container=CONF.redfish.swift_container,
+                timeout=CONF.redfish.swift_object_expiry_timeout,
+                image_subdir="redfish",
+                file_permission=CONF.redfish.file_permission,
+                kernel_params=CONF.redfish.kernel_append_params),
+            "idrac": drivers_base.ImagePublisherSettings(
+                swift_enabled=CONF.redfish.use_swift,
+                container=CONF.redfish.swift_container,
+                timeout=CONF.redfish.swift_object_expiry_timeout,
+                image_subdir="redfish",
+                file_permission=CONF.redfish.file_permission,
+                kernel_params=CONF.redfish.kernel_append_params),
+        }
+        return _SWIFT_MAP.get(driver)
 
     def unpublish_image(self, object_name):
         """Withdraw the image previously made downloadable.
@@ -100,74 +125,26 @@ class ImageHandler(object):
 
         :param object_name: name of the published file (optional)
         """
-        if self.swift_enabled:
-            container = self._container
-
-            swift_api = swift.SwiftAPI()
-
-            LOG.debug("Cleaning up image %(name)s from Swift container "
-                      "%(container)s", {'name': object_name,
-                                        'container': container})
-
-            try:
-                swift_api.delete_object(container, object_name)
-
-            except exception.SwiftOperationError as exc:
-                LOG.warning("Failed to clean up image %(image)s. Error: "
-                            "%(error)s.", {'image': object_name,
-                                           'error': exc})
-
-        else:
-            published_file = os.path.join(
-                CONF.deploy.http_root, self._image_subdir, object_name)
-
-            ironic_utils.unlink_without_raise(published_file)
+        self._publisher.unpublish(object_name)
 
     @classmethod
-    def unpublish_image_for_node(cls, node, prefix='', suffix=''):
+    def unpublish_image_for_node(cls, task, prefix='', suffix=''):
         """Withdraw the image previously made downloadable.
 
         Depending on ironic settings, removes previously published file
         from where it has been published - Swift or local HTTP server's
         document root.
 
-        :param node: the node for which image was published.
+        :param task: a TaskManager instance containing the node for which
+            the image was published.
         :param prefix: object name prefix.
         :param suffix: object name suffix.
         """
+        node = task.node
         name = _get_name(node, prefix=prefix, suffix=suffix)
-        cls(node.driver).unpublish_image(name)
+        cls(node.driver, task.driver.boot).unpublish_image(name)
         LOG.debug('Removed image %(name)s for node %(node)s',
                   {'node': node.uuid, 'name': name})
-
-    def _append_filename_param(self, url, filename):
-        """Append 'filename=<file>' parameter to given URL.
-
-        Some BMCs seem to validate boot image URL requiring the URL to end
-        with something resembling ISO image file name.
-
-        This function tries to add, hopefully, meaningless 'filename'
-        parameter to URL's query string in hope to make the entire boot image
-        URL looking more convincing to the BMC.
-
-        However, `url` with fragments might not get cured by this hack.
-
-        :param url: a URL to work on
-        :param filename: name of the file to append to the URL
-        :returns: original URL with 'filename' parameter appended
-        """
-        parsed_url = urlparse.urlparse(url)
-        parsed_qs = urlparse.parse_qsl(parsed_url.query)
-
-        has_filename = [x for x in parsed_qs if x[0].lower() == 'filename']
-        if has_filename:
-            return url
-
-        parsed_qs.append(('filename', filename))
-        parsed_url = list(parsed_url)
-        parsed_url[4] = urlparse.urlencode(parsed_qs)
-
-        return urlparse.urlunparse(parsed_url)
 
     def publish_image(self, image_file, object_name, node_http_url=None):
         """Make image file downloadable.
@@ -183,61 +160,9 @@ class ImageHandler(object):
                               from CONF.deploy won't be used.
         :return: a URL to download published file
         """
-
-        if self.swift_enabled:
-            container = self._container
-            timeout = self._timeout
-
-            object_headers = {'X-Delete-After': str(timeout)}
-
-            swift_api = swift.SwiftAPI()
-
-            swift_api.create_object(container, object_name, image_file,
-                                    object_headers=object_headers)
-
-            image_url = swift_api.get_temp_url(container, object_name, timeout)
-            image_url = self._append_filename_param(
-                image_url, os.path.basename(image_file))
-
-        else:
-            public_dir = os.path.join(CONF.deploy.http_root,
-                                      self._image_subdir)
-
-            if not os.path.exists(public_dir):
-                os.mkdir(public_dir, 0o755)
-
-            published_file = os.path.join(public_dir, object_name)
-
-            try:
-                os.link(image_file, published_file)
-                os.chmod(image_file, self._file_permission)
-                try:
-                    utils.execute(
-                        '/usr/sbin/restorecon', '-i', '-R', 'v', public_dir)
-                except FileNotFoundError as exc:
-                    LOG.debug(
-                        "Could not restore SELinux context on "
-                        "%(public_dir)s, restorecon command not found.\n"
-                        "Error: %(error)s",
-                        {'public_dir': public_dir,
-                         'error': exc})
-
-            except OSError as exc:
-                LOG.debug(
-                    "Could not hardlink image file %(image)s to public "
-                    "location %(public)s (will copy it over): "
-                    "%(error)s", {'image': image_file,
-                                  'public': published_file,
-                                  'error': exc})
-
-                shutil.copyfile(image_file, published_file)
-                os.chmod(published_file, self._file_permission)
-
-            http_url = (node_http_url or CONF.deploy.external_http_url
-                        or CONF.deploy.http_url)
-            image_url = os.path.join(http_url, self._image_subdir, object_name)
-
-        return image_url
+        if node_http_url:
+            self._publisher.root_url = node_http_url
+        return self._publisher.publish(image_file, object_name)
 
 
 @image_cache.cleanup(priority=75)
@@ -250,7 +175,9 @@ class ISOImageCache(image_cache.ImageCache):
             # MiB -> B
             cache_size=CONF.deploy.iso_cache_size * 1024 * 1024,
             # min -> sec
-            cache_ttl=CONF.deploy.iso_cache_ttl * 60)
+            cache_ttl=CONF.deploy.iso_cache_ttl * 60,
+            # disable image format inspection and safety checks for ISO
+            disable_validation=True, force_raw=False)
 
 
 def _get_name(node, prefix='', suffix=''):
@@ -270,8 +197,17 @@ def cleanup_iso_image(task):
 
     :param task: A task from TaskManager.
     """
-    ImageHandler.unpublish_image_for_node(task.node, prefix='boot',
+    ImageHandler.unpublish_image_for_node(task, prefix='boot',
                                           suffix='.iso')
+    # Also clean up from NFS/CIFS shares if applicable
+    protocol = task.node.driver_internal_info.get('vmedia_transport_protocol')
+    if protocol:
+        name = _get_name(task.node, prefix='boot', suffix='.iso')
+        proto_upper = protocol.upper()
+        if proto_upper == 'NFS':
+            image_publisher.NFSPublisher().unpublish(name)
+        elif proto_upper in ('CIFS', 'SMB'):
+            image_publisher.CIFSPublisher().unpublish(name)
 
 
 def override_api_url(params):
@@ -279,8 +215,19 @@ def override_api_url(params):
         return params
 
     params = params or {}
-    params[deploy_utils.IPA_URL_PARAM_NAME] = \
-        CONF.deploy.external_callback_url.rstrip('/')
+    override_callback_url = CONF.deploy.external_callback_url.rstrip('/')
+    params[deploy_utils.IPA_URL_PARAM_NAME] = override_callback_url
+
+    inspection_callback = params.pop(inspect_utils.IPA_CALLBACK_PARAM, None)
+    # FIXME(dtantsur): it's much better to stop providing the inspection
+    # callback for built-in inspection, but such a change will require somewhat
+    # newer IPA and thus won't be backportable.
+    if inspection_callback:
+        if inspection_callback.endswith(inspect_utils.CALLBACK_API_ENDPOINT):
+            inspection_callback = inspect_utils.get_inspection_callback(
+                override_callback_url)
+        params[inspect_utils.IPA_CALLBACK_PARAM] = inspection_callback
+
     return params
 
 
@@ -303,7 +250,7 @@ def prepare_floppy_image(task, params=None):
     :raises: SwiftOperationError, if any operation with Swift fails.
     :returns: image URL for the floppy image.
     """
-    object_name = _get_name(task.node, prefix='image')
+    object_name = _get_name(task.node, prefix='image', suffix='.img')
     params = override_api_url(params)
 
     LOG.debug("Trying to create floppy image for node "
@@ -313,9 +260,10 @@ def prepare_floppy_image(task, params=None):
             dir=CONF.tempdir, suffix='.img') as vfat_image_tmpfile_obj:
 
         vfat_image_tmpfile = vfat_image_tmpfile_obj.name
-        images.create_vfat_image(vfat_image_tmpfile, parameters=params)
+        images.create_vfat_image(vfat_image_tmpfile, fs_size_kib=1440,
+                                 parameters=params)
 
-        img_handler = ImageHandler(task.node.driver)
+        img_handler = ImageHandler(task.node.driver, task.driver.boot)
         node_http_url = task.node.driver_info.get("external_http_url")
         image_url = img_handler.publish_image(vfat_image_tmpfile, object_name,
                                               node_http_url)
@@ -334,7 +282,8 @@ def cleanup_floppy_image(task):
 
     :param task: an ironic node object.
     """
-    ImageHandler.unpublish_image_for_node(task.node, prefix='image')
+    ImageHandler.unpublish_image_for_node(task, prefix='image',
+                                          suffix='.img')
 
 
 def prepare_configdrive_image(task, content):
@@ -393,7 +342,7 @@ def prepare_disk_image(task, content, prefix=None):
 
     LOG.debug("Creating a disk image for node %s", task.node.uuid)
 
-    img_handler = ImageHandler(task.node.driver)
+    img_handler = ImageHandler(task.node.driver, task.driver.boot)
     if isinstance(content, str):
         image_url = img_handler.publish_image(content, object_name)
     else:
@@ -403,7 +352,9 @@ def prepare_disk_image(task, content, prefix=None):
             image_tmpfile_obj.flush()
 
             image_tmpfile = image_tmpfile_obj.name
-            image_url = img_handler.publish_image(image_tmpfile, object_name)
+            node_http_url = task.node.driver_info.get("external_http_url")
+            image_url = img_handler.publish_image(image_tmpfile, object_name,
+                                                  node_http_url)
 
     LOG.debug("Created a disk image %(name)s for node %(node)s, "
               "exposed as URL %(url)s", {'node': task.node.uuid,
@@ -419,7 +370,76 @@ def cleanup_disk_image(task, prefix=None):
     :param task: an ironic node object.
     :param prefix: Prefix to use for the object name.
     """
-    ImageHandler.unpublish_image_for_node(task.node, prefix=prefix)
+    ImageHandler.unpublish_image_for_node(task, prefix=prefix)
+
+
+# FIXME(dtantsur): file_name is not node-specific, we should probably replace
+# it with a prefix/suffix pair and pass to _get_name
+def prepare_remote_image(task, image_url, file_name='boot.iso',
+                         download_source='local', cache=None):
+    """Generic function for publishing remote images.
+
+    Given the image provided by the user, generate a URL to pass to the BMC
+    or a remote agent.
+
+    :param task: TaskManager instance.
+    :param image_url: The original URL or a glance UUID.
+    :param file_name: File name to use when publishing.
+    :param download_source: How the image will be published:
+        'http' (via a plain HTTP link, preverving remote links),
+        'local' (via the local HTTP server even if the remote link is HTTP),
+        'swift' (same as 'http', but Glance images are published via Swift
+        temporary URLs).
+    :param cache: Image cache to use. Defaults to the ISO image cache.
+    :return: The new URL (possibly the same as the old one).
+    """
+    scheme = urlparse.urlparse(image_url).scheme.lower()
+    if scheme == 'swift':
+        # FIXME(dtantsur): support swift: scheme for all boot interfaces
+        # by using temporary URLs. Until it's done, return as-is.
+        return image_url
+
+    if (download_source == 'swift'
+            and service_utils.is_glance_image(image_url)):
+        image_url = (
+            images.get_temp_url_for_glance_image(task.context, image_url))
+        # get_temp_url_for_glance_image return an HTTP (or HTTPS - doesn't
+        # matter here) image.
+        scheme = 'http'
+
+    # NFS and CIFS/SMB images cannot be downloaded locally by the conductor;
+    # they are accessed directly by the BMC. Reject local download source.
+    if download_source == 'local' and scheme in ('nfs', 'cifs', 'smb'):
+        raise exception.InvalidParameterValue(
+            _("image_download_source is set to 'local' but the image URL "
+              "%(url)s uses the %(scheme)s protocol which cannot be "
+              "downloaded by the conductor. Set image_download_source to "
+              "'http' or remove it to use the default.")
+            % {'url': image_url, 'scheme': scheme})
+
+    if download_source != 'local':
+        if scheme in ('http', 'https', 'nfs', 'cifs', 'smb'):
+            return image_url
+        LOG.debug("image_download_source set to %(download_source)s but "
+                  "the image is not an HTTP/NFS/CIFS URL: %(image_url)s",
+                  {"image_url": image_url, "download_source": download_source})
+
+    img_handler = ImageHandler(task.node.driver, task.driver.boot)
+    if cache is None:
+        cache = ISOImageCache()
+
+    with tempfile.TemporaryDirectory(dir=CONF.tempdir) as temp_dir:
+        tmp_file = os.path.join(temp_dir, file_name)
+        cache.fetch_image(image_url, tmp_file,
+                          ctx=task.context, force_raw=False)
+        node_http_url = task.node.driver_info.get("external_http_url")
+        return img_handler.publish_image(tmp_file, file_name, node_http_url)
+
+
+def cleanup_remote_image(task, file_name):
+    """Cleanup image created via prepare_remote_image."""
+    ImageHandler(task.node.driver, task.driver.boot).unpublish_image(
+        file_name)
 
 
 def _prepare_iso_image(task, kernel_href, ramdisk_href,
@@ -445,7 +465,7 @@ def _prepare_iso_image(task, kernel_href, ramdisk_href,
     :raises: MissingParameterValue, if any of the required parameters are
         missing.
     :raises: InvalidParameterValue, if any of the parameters have invalid
-        value.
+        value. Or if kernel parameters fail to parse.
     :raises: ImageCreationFailed, if creating ISO image failed.
     """
     if (not kernel_href or not ramdisk_href) and not base_iso:
@@ -466,86 +486,83 @@ def _prepare_iso_image(task, kernel_href, ramdisk_href,
     else:
         download_source = CONF.deploy.ramdisk_image_download_source
 
-    # NOTE(rpittau): if base_iso is defined as http address, we just access
-    # it directly.
-    if base_iso:
-        scheme = urlparse.urlparse(base_iso).scheme.lower()
-        if scheme == 'swift':
-            # FIXME(dtantsur): iLO supports swift: scheme. In the long run we
-            # should support it for all boot interfaces by using temporary
-            # URLs. Until it's done, return base_iso as it is.
-            return base_iso
-
-        if (download_source == 'swift'
-                and service_utils.is_glance_image(base_iso)):
-            base_iso = (
-                images.get_temp_url_for_glance_image(task.context, base_iso))
-            # get_temp_url_for_glance_image return an HTTP (or HTTPS - doesn't
-            # matter here) image.
-            scheme = 'http'
-
-        if download_source != 'local':
-            if scheme in ('http', 'https'):
-                return base_iso
-            LOG.debug("ramdisk_image_download_source set to http but "
-                      "boot_iso is not an HTTP URL: %(boot_iso)s",
-                      {"boot_iso": base_iso})
-
-    img_handler = ImageHandler(task.node.driver)
-
     boot_mode = boot_mode_utils.get_boot_mode(task.node)
+    iso_object_name = _get_name(task.node, prefix='boot', suffix='.iso')
+
+    if base_iso:
+        # NOTE(dtantsur): this should be "params or inject_files", but
+        # params are always populated in the calling code.
+        log_func = LOG.warning if inject_files else LOG.debug
+        log_func('Using pre-built %(boot_mode)s ISO %(iso)s for node '
+                 '%(node)s, custom configuration will not be available',
+                 {'boot_mode': boot_mode, 'node': task.node.uuid,
+                  'iso': base_iso})
+        return prepare_remote_image(task, base_iso,
+                                    file_name=iso_object_name,
+                                    download_source=download_source)
+
+    img_handler = ImageHandler(task.node.driver, task.driver.boot)
+
+    publisher_id = ''
+    if not is_ramdisk_boot:
+        publisher_id = uuidutils.generate_uuid()
 
     with tempfile.TemporaryDirectory(dir=CONF.tempdir) as boot_file_dir:
 
         boot_iso_tmp_file = os.path.join(boot_file_dir, 'boot.iso')
-        if base_iso:
-            # NOTE(dtantsur): this should be "params or inject_files", but
-            # params are always populated in the calling code.
-            log_func = LOG.warning if inject_files else LOG.debug
-            log_func('Using pre-built %(boot_mode)s ISO %(iso)s for node '
-                     '%(node)s, custom configuration will not be available',
-                     {'boot_mode': boot_mode, 'node': task.node.uuid,
-                      'iso': base_iso})
 
-            ISOImageCache().fetch_image(base_iso, boot_iso_tmp_file,
-                                        ctx=task.context, force_raw=False)
-        else:
-            if is_ramdisk_boot:
-                kernel_params = "root=/dev/ram0 text "
-                kernel_params += i_info.get("ramdisk_kernel_arguments", "")
-            else:
-                kernel_params = driver_utils.get_kernel_append_params(
-                    task.node, default=img_handler.kernel_params)
+        kernel_cmd_line = _prepare_kernel_cmd_line(task.node,
+                                                   img_handler.kernel_params,
+                                                   is_ramdisk_boot,
+                                                   publisher_id,
+                                                   root_uuid,
+                                                   params)
 
-            if params:
-                kernel_params = ' '.join(
-                    (kernel_params, ' '.join(
-                        ('%s=%s' % kv) if kv[1] is not None else kv[0]
-                        for kv in params.items())))
+        LOG.debug(
+            "Trying to create %(boot_mode)s ISO image for node %(node)s "
+            "with kernel %(kernel_href)s, ramdisk %(ramdisk_href)s, "
+            "bootloader %(bootloader_href)s and kernel cmd line "
+            "%(kernel_cmd_line)s",
+            {'node': task.node.uuid,
+             'boot_mode': boot_mode,
+             'kernel_href': kernel_href,
+             'ramdisk_href': ramdisk_href,
+             'bootloader_href': bootloader_href,
+             'kernel_cmd_line': str(kernel_cmd_line)})
 
-            LOG.debug(
-                "Trying to create %(boot_mode)s ISO image for node %(node)s "
-                "with kernel %(kernel_href)s, ramdisk %(ramdisk_href)s, "
-                "bootloader %(bootloader_href)s and kernel params %(params)s",
-                {'node': task.node.uuid,
-                 'boot_mode': boot_mode,
-                 'kernel_href': kernel_href,
-                 'ramdisk_href': ramdisk_href,
-                 'bootloader_href': bootloader_href,
-                 'params': kernel_params})
+        if is_ramdisk_boot:
             images.create_boot_iso(
                 task.context, boot_iso_tmp_file,
                 kernel_href, ramdisk_href,
                 esp_image_href=bootloader_href,
-                root_uuid=root_uuid,
-                kernel_params=kernel_params,
+                kernel_cmd_line=kernel_cmd_line,
                 boot_mode=boot_mode,
                 inject_files=inject_files)
 
-        iso_object_name = _get_name(task.node, prefix='boot', suffix='.iso')
+        else:
+            images.create_boot_iso(
+                task.context, boot_iso_tmp_file,
+                kernel_href, ramdisk_href,
+                esp_image_href=bootloader_href,
+                kernel_cmd_line=kernel_cmd_line,
+                boot_mode=boot_mode,
+                inject_files=inject_files,
+                publisher_id=publisher_id)
 
-        image_url = img_handler.publish_image(
-            boot_iso_tmp_file, iso_object_name)
+        protocol = task.node.driver_internal_info.get(
+            'vmedia_transport_protocol')
+
+        if protocol and protocol.upper() in ('NFS', 'CIFS', 'SMB'):
+            if protocol.upper() == 'NFS':
+                publisher = image_publisher.NFSPublisher()
+            else:
+                publisher = image_publisher.CIFSPublisher()
+            image_url = publisher.publish(boot_iso_tmp_file,
+                                          iso_object_name)
+        else:
+            node_http_url = task.node.driver_info.get("external_http_url")
+            image_url = img_handler.publish_image(
+                boot_iso_tmp_file, iso_object_name, node_http_url)
 
     LOG.debug("Created ISO %(name)s in object store for node %(node)s, "
               "exposed as temporary URL "
@@ -554,6 +571,64 @@ def _prepare_iso_image(task, kernel_href, ramdisk_href,
                           'url': image_url})
 
     return image_url
+
+
+def _prepare_kernel_cmd_line(node: Node,
+                             ih_kernel_params: str,
+                             is_ramdisk_boot: bool,
+                             publisher_id: str,
+                             root_uuid: str,
+                             params: dict[str, str]) -> kp.KernelCommandLine:
+    parameters = collections.defaultdict(list)
+    unstructured_params = []
+
+    if is_ramdisk_boot:
+        parameters['root'].append(kp.KernelParameter(
+            kp.ParameterKey('root'),
+            kp.ParameterValue('/dev/ram0')
+        ))
+        parameters['text'].append(
+            kp.KernelParameter(kp.ParameterKey('text'),
+                               kp.ParameterValue('')))
+
+        ramdisk_kernel_args = ""
+        if node.instance_info is not None:
+            ramdisk_kernel_args = \
+                node.instance_info.get("ramdisk_kernel_arguments", "")
+
+        unstructured_params.append(
+            kp.UnstructuredParameters(ramdisk_kernel_args))
+
+    else:
+        unstructured_params.append(
+            kp.UnstructuredParameters(
+                driver_utils.get_kernel_append_params(
+                    node, default=ih_kernel_params)))
+
+    if not is_ramdisk_boot:
+        parameters['ir_pub_id'].append(kp.KernelParameter(
+            kp.ParameterKey('ir_pub_id'), kp.ParameterValue(publisher_id)))
+
+    if root_uuid:
+        parameters['root'].append(kp.KernelParameter(
+            kp.ParameterKey('root'), kp.ParameterValue(f'UUID={root_uuid}')))
+
+    if params is not None:
+        for key, value in params.items():
+            parameters[key].append(
+                kp.KernelParameter(
+                    kp.ParameterKey(key), kp.ParameterValue(value or '')))
+
+    unparsed_kernel_cmd_line = kp.UnsafeKernelCommandLine(
+        parameters=parameters,
+        unstructured_params=unstructured_params,
+        init_args='')
+
+    if CONF.conductor.disable_kernel_parameter_parsing:
+        return unparsed_kernel_cmd_line
+
+    # NOTE(clif): Raises InvalidParameterValue if params fail to parse.
+    return kp.KernelCommandLine.parse(str(unparsed_kernel_cmd_line))
 
 
 def _find_param(param_str, param_dict):
@@ -602,9 +677,16 @@ def prepare_deploy_iso(task, params, mode, d_info):
     iso_str = '%s_iso' % mode
     bootloader_str = 'bootloader'
 
-    kernel_href = _find_param(kernel_str, d_info)
-    ramdisk_href = _find_param(ramdisk_str, d_info)
+    # Get kernel and ramdisk, respecting architecture-specific parameters
+    agent_info = driver_utils.get_agent_kernel_ramdisk(task.node, mode)
+    kernel_href = agent_info.get(kernel_str)
+    ramdisk_href = agent_info.get(ramdisk_str)
     iso_href = _find_param(iso_str, d_info)
+
+    if not d_info.get('bootloader'):
+        d_info['bootloader'] = driver_utils.get_field(
+            task.node, 'bootloader', use_conf=True)
+
     bootloader_href = _find_param(bootloader_str, d_info)
 
     params = override_api_url(params)
@@ -622,14 +704,21 @@ def prepare_deploy_iso(task, params, mode, d_info):
         inject_files[_TLS_CONFIG_TEMPLATE.encode('utf-8')] = \
             'etc/ironic-python-agent.d/ironic-tls.conf'
 
-    network_data = task.driver.network.get_node_network_data(task)
-    if network_data:
-        LOG.debug('Injecting custom network data for node %s',
-                  task.node.uuid)
-        network_data = json.dumps(network_data, indent=2).encode('utf-8')
-        inject_files[network_data] = (
-            'openstack/latest/network_data.json'
-        )
+    # Optionally skip injecting network_data for managed inspection when
+    # inspection on all interfaces is requested.
+    skip_network_data = (
+        task.node.provision_state in (states.INSPECTING, states.INSPECTWAIT)
+        and CONF.inspector.force_dhcp
+    )
+    if not skip_network_data:
+        network_data = task.driver.network.get_node_network_data(task)
+        if network_data:
+            LOG.debug('Injecting custom network data for node %s',
+                      task.node.uuid)
+            network_data = json.dumps(network_data, indent=2).encode('utf-8')
+            inject_files[network_data] = (
+                'openstack/latest/network_data.json'
+            )
 
     return prepare_iso_image(inject_files=inject_files)
 

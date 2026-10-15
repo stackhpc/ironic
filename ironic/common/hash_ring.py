@@ -19,11 +19,12 @@ import time
 from oslo_log import log
 from tooz import hashring
 
+from ironic.common import context
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import utils
 from ironic.conf import CONF
-from ironic.db import api as dbapi
-
+from ironic import objects
 
 LOG = log.getLogger(__name__)
 
@@ -33,14 +34,13 @@ class HashRingManager(object):
     _lock = threading.Lock()
 
     def __init__(self, use_groups=True, cache=True):
-        self.dbapi = dbapi.get_instance()
         self.use_groups = use_groups
         self.cache = cache
 
     @property
     def ring(self):
         interval = CONF.hash_ring_reset_interval
-        limit = time.time() - interval
+        limit = time.monotonic() - interval
 
         if not self.cache:
             return self._load_hash_rings()
@@ -48,7 +48,11 @@ class HashRingManager(object):
         # Hot path, no lock. Using a local variable to avoid races with code
         # changing the class variable.
         hash_rings, updated_at = self.__class__._hash_rings
-        if hash_rings is not None and updated_at >= limit:
+        if (hash_rings is not None
+            and (updated_at >= limit
+                 or utils.is_ironic_using_sqlite())):
+            # Returning the hash ring for us, if it is still valid,
+            # or if we're using sqlite.
             return hash_rings
 
         with self._lock:
@@ -56,14 +60,18 @@ class HashRingManager(object):
             if hash_rings is None or updated_at < limit:
                 LOG.debug('Rebuilding cached hash rings')
                 hash_rings = self._load_hash_rings()
-                self.__class__._hash_rings = hash_rings, time.time()
+                self.__class__._hash_rings = hash_rings, time.monotonic()
                 LOG.debug('Finished rebuilding hash rings, available drivers '
                           'are %s', ', '.join(hash_rings))
             return hash_rings
 
     def _load_hash_rings(self):
         rings = {}
-        d2c = self.dbapi.get_active_hardware_type_dict(
+        # NOTE(TheJulia): Do not use the dbapi interface directly
+        # as hash_ring code is common code with the API, and want
+        # the overall flow respected.
+        d2c = objects.Conductor.get_active_hardware_type_dict(
+            context.get_admin_context(),
             use_groups=self.use_groups)
 
         for driver_name, hosts in d2c.items():

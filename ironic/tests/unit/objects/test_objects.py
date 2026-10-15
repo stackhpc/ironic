@@ -17,7 +17,6 @@ import datetime
 import types
 from unittest import mock
 
-import iso8601
 from oslo_utils import timeutils
 from oslo_versionedobjects import base as object_base
 from oslo_versionedobjects import exception as object_exception
@@ -54,7 +53,8 @@ class MyObj(base.IronicObject, object_base.VersionedObjectDictCompat):
         else:
             setattr(self, attrname, 'loaded!')
 
-    @object_base.remotable_classmethod
+    @classmethod
+    @object_base.remotable
     def query(cls, context):
         obj = cls(context)
         obj.foo = 1
@@ -106,7 +106,8 @@ class MyObj2(object):
     def obj_name(cls):
         return 'MyObj'
 
-    @object_base.remotable_classmethod
+    @classmethod
+    @object_base.remotable
     def get(cls, *args, **kwargs):
         pass
 
@@ -291,7 +292,7 @@ class _TestObject(object):
         self.assertEqual('updated', obj.bar)
 
     def test_base_attributes(self):
-        dt = datetime.datetime(1955, 11, 5, 0, 0, tzinfo=iso8601.UTC)
+        dt = datetime.datetime(1955, 11, 5, 0, 0, tzinfo=datetime.timezone.utc)
         datatime = fields.DateTimeField()
         obj = MyObj(self.context)
         obj.created_at = dt
@@ -676,52 +677,62 @@ class TestObject(_LocalTest, _TestObject):
 # version bump. It is an MD5 hash of the object fields and remotable methods.
 # The fingerprint values should only be changed if there is a version bump.
 expected_object_fingerprints = {
-    'Node': '1.36-8a080e31ba89ca5f09e859bd259b54dc',
+    'Node': '1.44-c9cd729566ab4c6fd69aaa4eaa1386bf',
     'MyObj': '1.5-9459d30d6954bffc7a9afd347a807ca6',
-    'Chassis': '1.3-d656e039fd8ae9f34efc232ab3980905',
-    'Port': '1.11-97bf15b61224f26c65e90f007d78bfd2',
-    'Portgroup': '1.4-71923a81a86743b313b190f5c675e258',
-    'Conductor': '1.3-d3f53e853b4d58cae5bfbd9a8341af4a',
+    'Chassis': '1.4-fe427272d8bad232a8d46e996a5ca42a',
+    'Port': '1.16-f66d781ac2c9e2906531cc523be56141',
+    'Portgroup': '1.9-0c02f589c88ef5a8f60248454783fbbc',
+    'Conductor': '1.6-ed00540fae97aa1c9982f9017c6e8b68',
     'EventType': '1.1-aa2ba1afd38553e3880c267404e8d370',
     'NotificationPublisher': '1.0-51a09397d6c0687771fb5be9a999605d',
-    'NodePayload': '1.16-9298b3aba63ab2b9c3359afd90fb9230',
+    'NodePayload': '1.17-4022bb737b058d426a7ff878b1875e5c',
     'NodeSetPowerStateNotification': '1.0-59acc533c11d306f149846f922739c15',
-    'NodeSetPowerStatePayload': '1.16-d3695780185716e75683ebbba4f8a2e6',
+    'NodeSetPowerStatePayload': '1.17-bde6f731995024e718f42021e50ba7b4',
     'NodeCorrectedPowerStateNotification':
         '1.0-59acc533c11d306f149846f922739c15',
-    'NodeCorrectedPowerStatePayload': '1.16-fdf636b04ba0827ee0c5ec20730b790d',
+    'NodeCorrectedPowerStatePayload': '1.17-6e1766fc690e0403bc0a323c8f6f12b7',
     'NodeSetProvisionStateNotification':
         '1.0-59acc533c11d306f149846f922739c15',
-    'NodeSetProvisionStatePayload': '1.17-4efa07190b276f52fda09d846b4690a8',
-    'VolumeConnector': '1.0-3e0252c0ab6e6b9d158d09238a577d97',
-    'VolumeTarget': '1.0-0b10d663d8dae675900b2c7548f76f5e',
+    'NodeSetProvisionStatePayload': '1.18-ac98c88d6dc8c6c924a415868f0a36e7',
+    'VolumeConnector': '1.1-658527dd56485af9a7375d517b57d5c7',
+    'VolumeTarget': '1.1-ea229476f06db156e87ed547f1c539f4',
     'ChassisCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
     'ChassisCRUDPayload': '1.0-dce63895d8186279a7dd577cffccb202',
     'NodeCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
-    'NodeCRUDPayload': '1.14-abe3a744767e5ada9f8370cf0caa1862',
+    'NodeCRUDPayload': '1.15-9168946f843edd5859464aaa40ad70e0',
     'PortCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
-    'PortCRUDPayload': '1.4-9411a1701077ae9dc0aea27d6bf586fc',
+    'PortCRUDPayload': '1.8-e6234f3aafda0dae874feb6f9ec8715f',
     'NodeMaintenanceNotification': '1.0-59acc533c11d306f149846f922739c15',
     'NodeConsoleNotification': '1.0-59acc533c11d306f149846f922739c15',
     'PortgroupCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
-    'PortgroupCRUDPayload': '1.0-b73c1fecf0cef3aa56bbe3c7e2275018',
+    'PortgroupCRUDPayload': '1.3-0d2b8747f09f71ed84a804aa6888657b',
     'VolumeConnectorCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
     'VolumeConnectorCRUDPayload': '1.0-5e8dbb41e05b6149d8f7bfd4daff9339',
     'VolumeTargetCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
     'VolumeTargetCRUDPayload': '1.0-30dcc4735512c104a3a36a2ae1e2aeb2',
-    'Trait': '1.0-3f26cb70c8a10a3807d64c219453e347',
-    'TraitList': '1.0-33a2e1bb91ad4082f9f63429b77c1244',
-    'BIOSSetting': '1.1-1137db88675a4e2d7f7bcc3a0d52345a',
-    'BIOSSettingList': '1.0-33a2e1bb91ad4082f9f63429b77c1244',
-    'Allocation': '1.1-38937f2854722f1057ec667b12878708',
+    'Trait': '1.1-ae534208fc5ade27700db7202b5b6b82',
+    'TraitList': '1.2-120fedaa212ddbcf9f6148a64c550946',
+    'BIOSSetting': '1.2-a0c2924d8ffef7ed872e48435a569a83',
+    'BIOSSettingList': '1.1-6e606655643a9a5fa116ce771cbebe59',
+    'Allocation': '1.3-91102bce67725a4ee924c6b2f213bcde',
     'AllocationCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
     'AllocationCRUDPayload': '1.1-3c8849932b80380bb96587ff62e8f087',
-    'DeployTemplate': '1.1-4e30c8e9098595e359bb907f095bf1a9',
+    'DeployTemplate': '1.2-8b218ab0b3d30208adc601322abc2c50',
     'DeployTemplateCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
     'DeployTemplateCRUDPayload': '1.0-200857e7e715f58a5b6d6b700ab73a3b',
-    'Deployment': '1.0-ff10ae028c5968f1596131d85d7f5f9d',
-    'NodeHistory': '1.0-9b576c6481071e7f7eac97317fa29418',
-    'NodeInventory': '1.0-97692fec24e20ab02022b9db54e8f539',
+    'Deployment': '1.1-1f326911955bbb1c24cb6ec0a453f6cc',
+    'NodeHistory': '1.3-ab4a2c3403a9faec1d5edcf305344df5',
+    'NodeInventory': '1.1-acc176aeb9358c3866ceecdd13832b44',
+    'FirmwareComponent': '1.2-e12837f714cc05b333ed3f10d2241599',
+    'FirmwareComponentList': '1.1-b1b32f4ead70f94f71913e39ea628eda',
+    'Runbook': '1.2-6d5c9d83e40f8e592625f303770a1903',
+    'RunbookCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
+    'RunbookCRUDPayload': '1.1-a748e09e302311eeabd248ac3ae30edd',
+    'RunbookTrait': '1.0-3c0a019da4a0c2e5e8de78b76cea4ae9',
+    'RunbookTraitList': '1.0-5a30a802eb2f488d4cfbda4aaf9234d6',
+    'InspectionRule': '1.1-6ee14959b85a90a13f3c7b48c53522c7',
+    'InspectionRuleCRUDNotification': '1.0-59acc533c11d306f149846f922739c15',
+    'InspectionRuleCRUDPayload': '1.0-85d1cf2105308534a630299a897bf562',
 }
 
 
@@ -978,6 +989,7 @@ class TestObjectSerializer(test_base.TestCase):
 class TestRegistry(test_base.TestCase):
     @mock.patch('ironic.objects.base.objects', autospec=True)
     def test_hook_chooses_newer_properly(self, mock_objects):
+        del mock_objects.MyObj
         reg = base.IronicObjectRegistry()
         reg.registration_hook(MyObj, 0)
 
@@ -994,6 +1006,7 @@ class TestRegistry(test_base.TestCase):
 
     @mock.patch('ironic.objects.base.objects', autospec=True)
     def test_hook_keeps_newer_properly(self, mock_objects):
+        del mock_objects.MyObj
         reg = base.IronicObjectRegistry()
         reg.registration_hook(MyObj, 0)
 

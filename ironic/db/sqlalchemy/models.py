@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Copyright 2013 Hewlett-Packard Development Company, L.P.
 #
@@ -26,11 +25,12 @@ from oslo_db import options as db_options
 from oslo_db.sqlalchemy import models
 from oslo_db.sqlalchemy import types as db_types
 from sqlalchemy.ext.associationproxy import association_proxy
-from sqlalchemy import Boolean, Column, DateTime, false, Index
-from sqlalchemy import ForeignKey, Integer
+from sqlalchemy import Boolean, Column, DateTime, false, Index, true
+from sqlalchemy import BigInteger, ForeignKey, Integer
 from sqlalchemy import schema, String, Text
 from sqlalchemy import orm
 from sqlalchemy.orm import declarative_base
+from sqlalchemy import types
 
 from ironic.common import exception
 from ironic.common.i18n import _
@@ -39,6 +39,8 @@ from ironic.conf import CONF
 _DEFAULT_SQL_CONNECTION = 'sqlite:///' + path.join('$state_path',
                                                    'ironic.sqlite')
 
+MAX_EVENT_BYTES = 65535
+TRUNCATE_MARKER = " ... [truncated] ... "
 
 db_options.set_defaults(CONF, connection=_DEFAULT_SQL_CONNECTION)
 
@@ -47,9 +49,50 @@ def table_args():
     engine_name = urlparse.urlparse(CONF.database.connection).scheme
     if engine_name == 'mysql':
         return {'mysql_engine': CONF.database.mysql_engine,
-                'mysql_charset': "utf8"}
+                'mysql_charset': "utf8mb4"}
     return None
 
+
+def _truncate_event(event, max_bytes):
+    """Safely truncate a string to fit within a byte limit."""
+    if not event:
+        return event
+
+    encoded = event.encode("utf-8")
+
+    if len(encoded) <= max_bytes:
+        return event
+
+    trim_bytes = TRUNCATE_MARKER.encode("utf-8")
+    available_space = max_bytes - len(trim_bytes)
+
+    # We preserve an equal amount of the start and end of the event
+    # (head and tail) to ensure both the initial action and the
+    # final traceback details are captured within the database
+    # byte limit.
+
+    head_limit = available_space // 2
+    tail_limit = available_space - head_limit
+
+    return (
+        encoded[:head_limit].decode("utf-8", errors="ignore")
+        + TRUNCATE_MARKER
+        + encoded[-tail_limit:].decode("utf-8", errors="ignore")
+    )
+
+class TruncatedText(types.TypeDecorator):
+    """Custom type to truncate text to MySQL's 64k limit."""
+
+    impl = types.Text
+
+    cache_ok = True
+    """Indicates this custom type is safe to cache in SQLAlchemy."""
+
+    def process_bind_param(self, value, dialect):
+        """Process the value and safely truncate it before saving."""
+        if value is not None:
+            return _truncate_event(value, max_bytes=MAX_EVENT_BYTES)
+        return value
 
 class IronicBase(models.TimestampMixin,
                  models.ModelBase):
@@ -134,6 +177,8 @@ class NodeBase(Base):
         Index('reservation_idx', 'reservation'),
         Index('conductor_group_idx', 'conductor_group'),
         Index('resource_class_idx', 'resource_class'),
+        Index('shard_idx', 'shard'),
+        Index('parent_node_idx', 'parent_node'),
         table_args())
     id = Column(Integer, primary_key=True)
     uuid = Column(String(36))
@@ -141,6 +186,7 @@ class NodeBase(Base):
     #             filter on it more efficiently, even though it is
     #             user-settable, and would otherwise be in node.properties.
     instance_uuid = Column(String(36), nullable=True)
+    instance_name = Column(String(255), nullable=True)
     name = Column(String(255), nullable=True)
     chassis_id = Column(Integer, ForeignKey('chassis.id'), nullable=True)
     power_state = Column(String(15), nullable=True)
@@ -198,6 +244,7 @@ class NodeBase(Base):
     boot_interface = Column(String(255), nullable=True)
     console_interface = Column(String(255), nullable=True)
     deploy_interface = Column(String(255), nullable=True)
+    firmware_interface = Column(String(255), nullable=True)
     inspect_interface = Column(String(255), nullable=True)
     management_interface = Column(String(255), nullable=True)
     network_interface = Column(String(255), nullable=True)
@@ -210,9 +257,14 @@ class NodeBase(Base):
     storage_interface = Column(String(255), nullable=True)
     power_interface = Column(String(255), nullable=True)
     vendor_interface = Column(String(255), nullable=True)
-
     boot_mode = Column(String(16), nullable=True)
     secure_boot = Column(Boolean, nullable=True)
+    shard = Column(String(255), nullable=True)
+    parent_node = Column(String(36), nullable=True)
+    service_step = Column(db_types.JsonEncodedDict)
+    disable_power_off = Column(Boolean, nullable=True, default=False,
+                               server_default=false())
+    health = Column(String(32), nullable=True)
 
 
 class Node(NodeBase):
@@ -262,6 +314,11 @@ class Port(Base):
     physical_network = Column(String(64), nullable=True)
     is_smartnic = Column(Boolean, nullable=True, default=False)
     name = Column(String(255), nullable=True)
+    description = Column(String(255), nullable=True)
+    vendor = Column(String(32), nullable=True)
+    category = Column(String(80), nullable=True)
+    available_for_dynamic_portgroup = Column(Boolean, server_default=true(),
+                                             nullable=False)
 
     _node_uuid = orm.relationship(
         "Node",
@@ -292,6 +349,18 @@ class Portgroup(Base):
     standalone_ports_supported = Column(Boolean, default=True)
     mode = Column(String(255))
     properties = Column(db_types.JsonEncodedDict)
+    physical_network = Column(String(64), nullable=True)
+    category = Column(String(80), nullable=True)
+    dynamic_portgroup = Column(Boolean, nullable=True, default=False)
+
+    _node_uuid = orm.relationship(
+        "Node",
+        viewonly=True,
+        primaryjoin="(Node.id == Portgroup.node_id)",
+        lazy="selectin",
+    )
+    node_uuid = association_proxy(
+        "_node_uuid", "uuid", creator=lambda _i: Node(uuid=_i))
 
 
 class NodeTag(Base):
@@ -379,13 +448,13 @@ class BIOSSetting(Base):
     value = Column(Text, nullable=True)
     attribute_type = Column(String(255), nullable=True)
     allowable_values = Column(db_types.JsonEncodedList, nullable=True)
-    lower_bound = Column(Integer, nullable=True)
+    lower_bound = Column(BigInteger, nullable=True)
     max_length = Column(Integer, nullable=True)
     min_length = Column(Integer, nullable=True)
     read_only = Column(Boolean, nullable=True)
     reset_required = Column(Boolean, nullable=True)
     unique = Column(Boolean, nullable=True)
-    upper_bound = Column(Integer, nullable=True)
+    upper_bound = Column(BigInteger, nullable=True)
 
 
 class Allocation(Base):
@@ -399,7 +468,7 @@ class Allocation(Base):
     id = Column(Integer, primary_key=True)
     uuid = Column(String(36), nullable=False)
     name = Column(String(255), nullable=True)
-    node_id = Column(Integer, ForeignKey('nodes.id'), nullable=True)
+    node_id = Column(Integer, nullable=True)
     state = Column(String(15), nullable=False)
     owner = Column(String(255), nullable=True)
     last_error = Column(Text, nullable=True)
@@ -408,8 +477,7 @@ class Allocation(Base):
     candidate_nodes = Column(db_types.JsonEncodedList)
     extra = Column(db_types.JsonEncodedDict)
     # The last conductor to handle this allocation (internal field).
-    conductor_affinity = Column(Integer, ForeignKey('conductors.id'),
-                                nullable=True)
+    conductor_affinity = Column(Integer, nullable=True)
 
 
 class DeployTemplate(Base):
@@ -470,9 +538,13 @@ class NodeHistory(Base):
     conductor = Column(String(255), nullable=True)
     event_type = Column(String(255), nullable=True)
     severity = Column(String(255), nullable=True)
-    event = Column(Text, nullable=True)
-    user = Column(String(32), nullable=True)
+    event = Column(TruncatedText)
+    user = Column(String(64), nullable=True)
+    project = Column(String(80), nullable=True)
     node_id = Column(Integer, ForeignKey('nodes.id'), nullable=True)
+    state = Column(String(255), nullable=True)
+    target_provision_state = Column(String(255), nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
 
 
 class NodeInventory(Base):
@@ -485,6 +557,113 @@ class NodeInventory(Base):
     inventory_data = Column(db_types.JsonEncodedDict(mysql_as_long=True))
     plugin_data = Column(db_types.JsonEncodedDict(mysql_as_long=True))
     node_id = Column(Integer, ForeignKey('nodes.id'), nullable=True)
+
+
+class FirmwareComponent(Base):
+    """Represents the firmware information of a bare metal node."""
+    __tablename__ = "firmware_information"
+    __table_args__ = (
+        schema.UniqueConstraint(
+            'node_id', 'component',
+            name='uniq_nodecomponent0node_id0component'),
+        table_args())
+    id = Column(Integer, primary_key=True)
+    node_id = Column(Integer, ForeignKey('nodes.id'), nullable=False)
+    component = Column(String(255), nullable=False)
+    initial_version = Column(String(255), nullable=False)
+    current_version = Column(String(255), nullable=True)
+    last_version_flashed = Column(String(255), nullable=True)
+    vendor = Column(String(255), nullable=True)
+    model = Column(String(255), nullable=True)
+    serial_number = Column(String(255), nullable=True)
+
+
+class Runbook(Base):
+    """Represents a runbook."""
+
+    __tablename__ = 'runbooks'
+    __table_args__ = (
+        schema.UniqueConstraint('uuid', name='uniq_runbooks0uuid'),
+        schema.UniqueConstraint('name', name='uniq_runbooks0name'),
+        table_args())
+    id = Column(Integer, primary_key=True)
+    uuid = Column(String(36))
+    name = Column(String(255), nullable=False)
+    description = Column(String(255), nullable=True)
+    public = Column(Boolean, default=False)
+    owner = Column(String(255), nullable=True)
+    disable_ramdisk = Column(Boolean, default=False)
+    extra = Column(db_types.JsonEncodedDict)
+    steps: orm.Mapped[List['RunbookStep']] = orm.relationship(  # noqa
+        "RunbookStep",
+        back_populates="runbook",
+        lazy="selectin")
+    traits: orm.Mapped[List['RunbookTrait']] = orm.relationship(  # noqa
+        "RunbookTrait",
+        back_populates="runbook",
+        lazy="selectin")
+
+
+class RunbookStep(Base):
+    """Represents a deployment step in a runbook."""
+
+    __tablename__ = 'runbook_steps'
+    __table_args__ = (
+        Index('runbook_id', 'runbook_id'),
+        Index('runbook_steps_interface_idx', 'interface'),
+        Index('runbook_steps_step_idx', 'step'),
+        table_args())
+    id = Column(Integer, primary_key=True)
+    runbook_id = Column(Integer, ForeignKey('runbooks.id'), nullable=False)
+    interface = Column(String(255), nullable=False)
+    step = Column(String(255), nullable=False)
+    args = Column(db_types.JsonEncodedDict, nullable=False)
+    order = Column(Integer, nullable=False)
+    runbook = orm.relationship(
+        "Runbook",
+        primaryjoin=(
+            'and_(RunbookStep.runbook_id == '
+            'Runbook.id)'),
+        foreign_keys=runbook_id
+    )
+
+
+class RunbookTrait(Base):
+    """Represents a trait associated with a runbook."""
+
+    __tablename__ = 'runbook_traits'
+    __table_args__ = (
+        Index('runbook_traits_idx', 'trait'),
+        table_args())
+    runbook_id = Column(Integer, ForeignKey('runbooks.id'),
+                        primary_key=True, nullable=False)
+    trait = Column(String(255), primary_key=True, nullable=False)
+    runbook = orm.relationship(
+        "Runbook",
+        primaryjoin='and_(RunbookTrait.runbook_id == Runbook.id)',
+        foreign_keys=runbook_id,
+        back_populates="traits"
+    )
+
+
+class InspectionRule(Base):
+    __tablename__ = 'inspection_rules'
+    __table_args__ = (
+        schema.UniqueConstraint('uuid', name='uniq_inspection_rules0uuid'),
+        Index('inspection_rule_scope_idx', 'scope'),
+        Index('inspection_rule_phase_idx', 'phase'),
+        table_args())
+    id = Column(Integer, primary_key=True)
+    uuid = Column(String(36), nullable=False)
+    priority = Column(Integer, nullable=False, default=0)
+    description = Column(String(255), nullable=True)
+    scope = Column(String(255), nullable=True)
+    sensitive = Column(Boolean, default=False)
+    phase = Column(String(16), nullable=True, default='main')
+    conditions = Column(db_types.JsonEncodedList(mysql_as_long=True),
+                        nullable=True)
+    actions = Column(db_types.JsonEncodedList(mysql_as_long=True),
+                     nullable=False)
 
 
 def get_class(model_name):

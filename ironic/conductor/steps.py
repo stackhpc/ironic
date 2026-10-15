@@ -11,13 +11,16 @@
 #    under the License.
 
 import collections
+import time
 
 from oslo_config import cfg
 from oslo_log import log
 
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import policy
 from ironic.common import states
+from ironic.conductor import utils
 from ironic.objects import deploy_template
 
 LOG = log.getLogger(__name__)
@@ -29,8 +32,10 @@ CLEANING_INTERFACE_PRIORITY = {
     # by which interface is implementing the clean step. The clean step of the
     # interface with the highest value here, will be executed first in that
     # case.
-    'power': 5,
-    'management': 4,
+    'vendor': 7,
+    'power': 6,
+    'management': 5,
+    'firmware': 4,
     'deploy': 3,
     'bios': 2,
     'raid': 1,
@@ -43,23 +48,29 @@ DEPLOYING_INTERFACE_PRIORITY = {
     # TODO(rloo): If we think it makes sense to have the interface priorities
     # the same for cleaning & deploying, replace the two with one e.g.
     # 'INTERFACE_PRIORITIES'.
-    'power': 5,
-    'management': 4,
+    'vendor': 7,
+    'power': 6,
+    'management': 5,
+    'firmware': 4,
     'deploy': 3,
     'bios': 2,
     'raid': 1,
 }
+
+SERVICING_INTERFACE_PRIORITY = CLEANING_INTERFACE_PRIORITY.copy()
+SERVICING_INTERFACE_PRIORITY['network'] = 8
 
 VERIFYING_INTERFACE_PRIORITY = {
     # When two verify steps have the same priority, their order is determined
     # by which interface is implementing the verify step. The verifying step of
     # the interface with the highest value here, will be executed first in
     # that case.
-    'power': 12,
-    'management': 11,
-    'boot': 8,
+    'power': 13,
+    'management': 12,
+    'firmware': 11,
     'inspect': 10,
     'deploy': 9,
+    'boot': 8,
     'bios': 7,
     'raid': 6,
     'vendor': 5,
@@ -68,6 +79,20 @@ VERIFYING_INTERFACE_PRIORITY = {
     'console': 2,
     'rescue': 1,
 }
+
+# Reserved step names to to map to methods which need to be
+# called, where node conductor logic wraps a driver's internal
+# logic. Example, removing tokens based upon state before
+# rebooting the node.
+RESERVED_STEP_HANDLER_MAPPING = {
+    'power_on': [utils.node_power_action, states.POWER_ON],
+    'power_off': [utils.node_power_action, states.POWER_OFF],
+    'reboot': [utils.node_power_action, states.REBOOT],
+}
+
+# values to enable declariation of how to handle reserved step names
+USED_HANDLER = 'used_handler'
+EXIT_STEPS = 'exit_steps'
 
 
 def _clean_step_key(step):
@@ -194,14 +219,39 @@ def _get_cleaning_steps(task, enabled=False, sort=True):
                                     sort_step_key=sort_key,
                                     prio_overrides=csp_override)
 
-        LOG.debug("cleaning_steps after applying "
-                  "clean_step_priority_override for node %(node)s: %(step)s",
-                  task.node.uuid, cleaning_steps)
+        LOG.debug('cleaning_steps after applying '
+                  'clean_step_priority_override for node %(node)s: %(steps)s',
+                  {'node': task.node.uuid, 'steps': cleaning_steps})
     else:
         cleaning_steps = _get_steps(task, CLEANING_INTERFACE_PRIORITY,
                                     'get_clean_steps', enabled=enabled,
                                     sort_step_key=sort_key)
     return cleaning_steps
+
+
+def all_steps_disable_ramdisk(task, user_steps):
+    """Check whether every user-requested clean step can run without ramdisk.
+
+    :param task: A TaskManager object
+    :param user_steps: list of user-specified clean step dicts, each with
+        at least 'interface' and 'step' keys.
+    :returns: True if all steps declare requires_ramdisk=False, else False.
+    """
+    driver_steps = {step_id(s): s for s in
+                    _get_cleaning_steps(task, enabled=False, sort=False)}
+    for user_step in user_steps:
+        if user_step.get('execute_on_child_nodes'):
+            continue
+        if user_step.get('step') in ['power_on', 'power_off', 'reboot',
+                                     'hold', 'wait']:
+            continue
+        sid = step_id(user_step)
+        driver_step = driver_steps.get(sid)
+        if driver_step is None:
+            return False
+        if driver_step.get('requires_ramdisk', True):
+            return False
+    return True
 
 
 def _get_deployment_steps(task, enabled=False, sort=True):
@@ -220,6 +270,23 @@ def _get_deployment_steps(task, enabled=False, sort=True):
     sort_key = _deploy_step_key if sort else None
     return _get_steps(task, DEPLOYING_INTERFACE_PRIORITY, 'get_deploy_steps',
                       enabled=enabled, sort_step_key=sort_key)
+
+
+def _get_service_steps(task, enabled=False, sort=True):
+    """Get service steps for task.node.
+
+    :param task: A TaskManager object
+    :param enabled: If True, returns only enabled (priority > 0) steps. If
+        False, returns all clean steps.
+    :param sort: Used for consistency, ignored.
+    :raises: NodeServicingFailure if there was a problem getting the
+        clean steps.
+    :returns: A list of clean step dictionaries
+    """
+    service_steps = _get_steps(task, SERVICING_INTERFACE_PRIORITY,
+                               'get_service_steps', enabled=enabled,
+                               sort_step_key=None)
+    return service_steps
 
 
 def _get_verify_steps(task, enabled=False, sort=True):
@@ -253,15 +320,22 @@ def _get_verify_steps(task, enabled=False, sort=True):
     return verify_steps
 
 
-def set_node_cleaning_steps(task, disable_ramdisk=False):
+def set_node_cleaning_steps(task, disable_ramdisk=False,
+                            use_existing_steps=False):
     """Set up the node with clean step information for cleaning.
 
     For automated cleaning, get the clean steps from the driver.
     For manual cleaning, the user's clean steps are known but need to be
     validated against the driver's clean steps.
 
+    :param task: A TaskManager object
     :param disable_ramdisk: If `True`, only steps with requires_ramdisk=False
         are accepted.
+    :param use_existing_steps: If `True`, validate existing steps from
+        driver_internal_info['clean_steps'] which comes from manual cleaning
+        API call or a runbook-based declarative automated cleaning. If
+        `False`, retrieve cleaning steps from the driver (implicit
+        automated cleaning).
     :raises: InvalidParameterValue if there is a problem with the user's
              clean steps.
     :raises: NodeCleaningFailure if there was a problem getting the
@@ -269,14 +343,9 @@ def set_node_cleaning_steps(task, disable_ramdisk=False):
     """
     node = task.node
 
-    # For manual cleaning, the target provision state is MANAGEABLE, whereas
-    # for automated cleaning, it is AVAILABLE.
-    manual_clean = node.target_provision_state == states.MANAGEABLE
-
-    if not manual_clean:
-        # Get the prioritized steps for automated cleaning
-        steps = _get_cleaning_steps(task, enabled=True)
-    else:
+    # NOTE(JayF): This is true when doing manual cleaning or when doing
+    #             cleaning via runbook.
+    if use_existing_steps is True:
         # For manual cleaning, the list of cleaning steps was specified by the
         # user and already saved in node.driver_internal_info['clean_steps'].
         # Now that we know what the driver's available clean steps are, we can
@@ -284,11 +353,24 @@ def set_node_cleaning_steps(task, disable_ramdisk=False):
         steps = _validate_user_clean_steps(
             task, node.driver_internal_info['clean_steps'],
             disable_ramdisk=disable_ramdisk)
+    else:
+        # Get the prioritized steps for automated cleaning
+        steps = _get_cleaning_steps(task, enabled=True)
 
-    LOG.debug('List of the steps for %(type)s cleaning of node %(node)s: '
-              '%(steps)s', {'type': 'manual' if manual_clean else 'automated',
-                            'node': node.uuid,
-                            'steps': steps})
+    # Filter out operator-disallowed clean steps
+    disallowed = CONF.api.disallow_clean_steps
+    if disallowed:
+        steps = [s for s in steps
+                 if step_id(s) not in disallowed]
+
+    # For manual cleaning, the target provision state is MANAGEABLE, whereas
+    # for automated cleaning, it is AVAILABLE.
+    manual_clean = node.target_provision_state == states.MANAGEABLE
+    if not CONF.conductor.log_step_flows_to_syslog:
+        LOG.debug(
+            'List of the steps for %(type)s cleaning of node %(node)s: '
+            '%(steps)s', {'type': 'manual' if manual_clean else 'automated',
+                          'node': node.uuid, 'steps': steps})
 
     node.clean_step = {}
     node.set_driver_internal_info('clean_steps', steps)
@@ -424,16 +506,61 @@ def set_node_deployment_steps(task, reset_current=True, skip_missing=False):
              deployment steps.
     """
     node = task.node
-    node.set_driver_internal_info('deploy_steps', _get_all_deployment_steps(
-        task, skip_missing=skip_missing))
+    steps = _get_all_deployment_steps(task, skip_missing=skip_missing)
 
-    LOG.debug('List of the deploy steps for node %(node)s: %(steps)s', {
-        'node': node.uuid,
-        'steps': node.driver_internal_info['deploy_steps']
-    })
+    # Filter out operator-disallowed deploy steps
+    disallowed = CONF.api.disallow_deploy_steps
+    if disallowed:
+        steps = [s for s in steps
+                 if step_id(s) not in disallowed]
+
+    node.set_driver_internal_info('deploy_steps', steps)
+
+    if not CONF.conductor.log_step_flows_to_syslog:
+        LOG.debug('List of the deploy steps for node %(node)s: %(steps)s', {
+            'node': node.uuid,
+            'steps': node.driver_internal_info['deploy_steps']
+        })
     if reset_current:
         node.deploy_step = {}
         node.set_driver_internal_info('deploy_step_index', None)
+    node.save()
+
+
+def set_node_service_steps(task, disable_ramdisk=False):
+    """Set up the node with clean step information for cleaning.
+
+    For automated cleaning, get the clean steps from the driver.
+    For manual cleaning, the user's clean steps are known but need to be
+    validated against the driver's clean steps.
+
+    :param disable_ramdisk: If `True`, only steps with requires_ramdisk=False
+        are accepted.
+    :raises: InvalidParameterValue if there is a problem with the user's
+             clean steps.
+    :raises: NodeServicingFailure if there was a problem getting the
+             service steps.
+    """
+    # FIXME(janders) it seems NodeServicingFailure is never actually raised,
+    # perhaps we should remove it?
+    node = task.node
+    steps = _validate_user_service_steps(
+        task, node.driver_internal_info.get('service_steps', []),
+        disable_ramdisk=disable_ramdisk)
+
+    # Filter out operator-disallowed service steps
+    disallowed = CONF.api.disallow_service_steps
+    if disallowed:
+        steps = [s for s in steps
+                 if step_id(s) not in disallowed]
+
+    if not CONF.conductor.log_step_flows_to_syslog:
+        LOG.debug('List of the steps for service of node %(node)s: '
+                  '%(steps)s', {'node': node.uuid, 'steps': steps})
+
+    node.service_step = {}
+    node.set_driver_internal_info('service_steps', steps)
+    node.set_driver_internal_info('service_step_index', None)
     node.save()
 
 
@@ -446,6 +573,40 @@ def step_id(step):
     :return: the step's ID string.
     """
     return '.'.join([step['interface'], step['step']])
+
+
+def check_disallowed_steps(steps, step_type, raise_on_disallowed=True):
+    """Check and optionally filter steps against the operator disallow list.
+
+    When raise_on_disallowed is True (user-provided steps), raises
+    StepNotAllowed for the first disallowed step found.  When False
+    (automated / runbook steps), silently filters them out.
+
+    :param steps: list of step dicts, or None.
+    :param step_type: one of 'clean', 'deploy', 'service'.
+    :param raise_on_disallowed: if True, raise on first disallowed step;
+        if False, silently remove disallowed steps.
+    :returns: the (possibly filtered) list of steps, or None.
+    :raises: StepNotAllowed if raise_on_disallowed and a step is disallowed.
+    """
+    if steps is None:
+        return None
+    config_map = {
+        'clean': CONF.api.disallow_clean_steps,
+        'deploy': CONF.api.disallow_deploy_steps,
+        'service': CONF.api.disallow_service_steps,
+    }
+    disallowed = config_map[step_type]
+    if not disallowed:
+        return steps
+    if raise_on_disallowed:
+        for step in steps:
+            sid = step_id(step)
+            if sid in disallowed:
+                raise exception.StepNotAllowed(step=sid, step_type=step_type)
+        return steps
+    else:
+        return [s for s in steps if step_id(s) not in disallowed]
 
 
 def _validate_deploy_steps_unique(user_steps):
@@ -541,7 +702,7 @@ def _validate_user_step(task, user_step, driver_step, step_type,
                   'unexpected': ', '.join(unexpected)})
         errors.append(error)
 
-    if step_type == 'clean' or user_step['priority'] > 0:
+    if step_type != 'deploy' or user_step['priority'] > 0:
         # Check that all required arguments were specified by the user
         missing = []
         for (arg_name, arg_info) in argsinfo.items():
@@ -557,10 +718,13 @@ def _validate_user_step(task, user_step, driver_step, step_type,
                       'miss': ', '.join(missing)})
             errors.append(error)
         if disable_ramdisk and driver_step.get('requires_ramdisk', True):
-            error = _('clean step %s requires booting a ramdisk') % user_step
+            error = _('%(type)s step %(step)s requires booting a ramdisk') % {
+                'type': step_type,
+                'step': user_step
+            }
             errors.append(error)
 
-    if step_type == 'clean':
+    if step_type != 'deploy':
         # Copy fields that should not be provided by a user
         user_step['abortable'] = driver_step.get('abortable', False)
         user_step['priority'] = driver_step.get('priority', 0)
@@ -580,6 +744,67 @@ def _validate_user_step(task, user_step, driver_step, step_type,
             errors.append(error)
 
     return errors
+
+
+def _check_step_policy(context, user_step, node=None):
+    """Check if a step-level policy rule exists and enforce it.
+
+    Policy rules use the naming convention
+    ``baremetal:step:execute:<interface>.<step>``.
+    If no matching rule is loaded, the step is unrestricted.
+
+    :param context: A request context.
+    :param user_step: A user step dictionary with 'interface' and
+        'step' keys.
+    :param node: Optional node object. When provided,
+        ``node.owner`` and ``node.lessee`` are included in the
+        policy target so that ownership-based rules can be
+        evaluated. When None (e.g. during runbook creation),
+        only the requester's credentials are checked.
+    :returns: An error message string if the policy check fails,
+        or None if the step is allowed or no rule exists.
+    """
+    rule = 'baremetal:step:execute:%s.%s' % (
+        user_step['interface'], user_step['step'])
+    enforcer = policy.get_enforcer()
+    if rule not in enforcer.rules:
+        return None
+    cdict = context.to_policy_values()
+    target_dict = dict(cdict)
+    if node is not None:
+        target_dict['node.owner'] = node.owner
+        target_dict['node.lessee'] = node.lessee
+    try:
+        policy.authorize(rule, target_dict, context)
+    except exception.HTTPForbidden:
+        return (_('insufficient privileges to execute step '
+                  '%(step)s on interface %(interface)s')
+                % {'step': user_step['step'],
+                   'interface': user_step['interface']})
+    return None
+
+
+def validate_user_steps_policy(context, user_steps, node=None):
+    """Validate step-level RBAC policies for user-requested steps.
+
+    Checks each step against per-step policy rules. Called from
+    the API layer during runbook creation (no node context) and
+    during provision state changes (with node context).
+
+    :param context: A request context.
+    :param user_steps: A list of user step dictionaries.
+    :param node: Optional node object for ownership-based rules.
+    :raises: NotAuthorized if any step fails its policy check.
+    """
+    if not user_steps:
+        return
+    errors = []
+    for step in user_steps:
+        error = _check_step_policy(context, step, node=node)
+        if error:
+            errors.append(error)
+    if errors:
+        raise exception.NotAuthorized('; '.join(errors))
 
 
 def _validate_user_steps(task, user_steps, driver_steps, step_type,
@@ -646,6 +871,16 @@ def _validate_user_steps(task, user_steps, driver_steps, step_type,
     result = []
 
     for user_step in user_steps:
+        if user_step.get('execute_on_child_nodes'):
+            # NOTE(TheJulia): This input is validated on the API side
+            # as we have the original API request context to leverage
+            # for RBAC validation.
+            continue
+        if user_step.get('step') in ['power_on', 'power_off', 'reboot',
+                                     'hold', 'wait']:
+            # NOTE(TheJulia): These are flow related steps the conductor
+            # resolves internally.
+            continue
         # Check if this user-specified step isn't supported by the driver
         try:
             driver_step = driver_steps[step_id(user_step)]
@@ -678,7 +913,6 @@ def _validate_user_steps(task, user_steps, driver_steps, step_type,
         err = error_prefix or ''
         err += '; '.join(errors)
         raise exception.InvalidParameterValue(err=err)
-
     return result
 
 
@@ -742,6 +976,36 @@ def _validate_user_deploy_steps(task, user_steps, error_prefix=None,
                                 skip_missing=skip_missing)
 
 
+def _validate_user_service_steps(task, user_steps, disable_ramdisk=False):
+    """Validate the user-specified service steps.
+
+    :param task: A TaskManager object
+    :param user_steps: a list of clean steps. A clean step is a dictionary
+        with required keys 'interface' and 'step', and optional key 'args'::
+
+              { 'interface': <driver_interface>,
+                'step': <name_of_clean_step>,
+                'args': {<arg1>: <value1>, ..., <argn>: <valuen>} }
+
+            For example::
+
+              { 'interface': 'deploy',
+                'step': 'upgrade_firmware',
+                'args': {'force': True} }
+    :param disable_ramdisk: If `True`, only steps with requires_ramdisk=False
+        are accepted.
+    :raises: InvalidParameterValue if validation of clean steps fails.
+    :raises: NodeCleaningFailure if there was a problem getting the
+        clean steps from the driver.
+    :return: validated service steps update with information from the driver
+    """
+    # We call with enabled = False below so we pickup auto-disabled
+    # steps, since service steps are not automagic like cleaning can be.
+    driver_steps = _get_service_steps(task, enabled=False, sort=False)
+    return _validate_user_steps(task, user_steps, driver_steps, 'service',
+                                disable_ramdisk=disable_ramdisk)
+
+
 def _get_validated_user_deploy_steps(task, deploy_steps=None,
                                      skip_missing=False):
     """Validate the deploy steps for a node.
@@ -788,3 +1052,56 @@ def validate_user_deploy_steps_and_templates(task, deploy_steps=None,
     _get_validated_steps_from_templates(task, skip_missing=skip_missing)
     # Validate steps from passed argument or stored on the node.
     _get_validated_user_deploy_steps(task, deploy_steps, skip_missing)
+
+
+def use_reserved_step_handler(task, step):
+    """Returns guidance for reserved step execution or process is used.
+
+    This method is utilized to handle some specific cases with the execution
+    of steps. For example, reserved step names, or reserved names which
+    have specific meaning in the state machine.
+
+    :param task: a TaskManager object.
+    :param step: The requested step.
+    """
+    step_name = step.get('step')
+    step_args = step.get('args', {})
+    if step_name and step_name in RESERVED_STEP_HANDLER_MAPPING.keys():
+        call_to_use = RESERVED_STEP_HANDLER_MAPPING[step_name]
+        method = call_to_use[0]
+        parameter = call_to_use[1]
+        method(task, parameter)
+        return USED_HANDLER
+    if step_name == 'hold':
+        task.process_event('hold')
+        return EXIT_STEPS
+    # If we've reached this point, we're going to return None as
+    # there is no work for us to do. This allows the caller to
+    # take its normal path.
+    if step_name == 'wait':
+        # By default, we enter a wait state.
+        task.process_event('wait')
+        if 'seconds' in step_args:
+            # If we have a seconds argument, just pause.
+            rec_seconds = int(step_args['seconds'])
+            if rec_seconds > CONF.conductor.max_conductor_wait_step_seconds:
+                warning = (
+                    _('A wait time exceeding the configured maximum '
+                      'has been requested. Holding for %s, got %s.') %
+                    (rec_seconds,
+                     CONF.conductor.max_conductor_wait_step_seconds)
+                )
+                utils.node_history_record(task.node, event=warning,
+                                          event_type=task.node.provision_state)
+                LOG.warning(warning)
+                rec_seconds = CONF.conductor.max_conductor_wait_step_seconds
+            _sleep_wrapper(rec_seconds)
+            # Explicitly resume.
+            task.process_event('resume')
+        # Return True, which closed out execution until the next heartbeat.
+        return EXIT_STEPS
+
+
+def _sleep_wrapper(seconds):
+    """Wrapper for sleep to allow for unit testing."""
+    time.sleep(seconds)

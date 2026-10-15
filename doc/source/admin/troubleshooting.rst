@@ -1,3 +1,10 @@
+.. meta::
+   :description: Troubleshoot common Ironic bare metal service issues. Deployment failures, driver problems, network issues, and performance optimization solutions.
+   :keywords: ironic troubleshooting, bare metal issues, deployment failures, driver debugging, network problems, performance issues, error resolution
+   :author: OpenStack Ironic Team
+   :robots: index, follow
+   :audience: system administrators, support engineers
+
 .. _troubleshooting:
 
 ======================
@@ -104,23 +111,6 @@ A few things should be checked in this case:
      ``True``; make sure the target nodes are in ``available`` and
      ``maintenance`` is ``False``;
 
-#. If you do not use scheduling based on resource classes, then the node's
-   properties must have been set either manually or via inspection.
-   For each node with ``available`` state check that the ``properties``
-   JSON field has valid values for the keys ``cpus``, ``cpu_arch``,
-   ``memory_mb`` and ``local_gb``. Example of valid properties::
-
-        $ baremetal node show <IRONIC NODE> --fields properties
-        +------------+------------------------------------------------------------------------------------+
-        | Property   | Value                                                                              |
-        +------------+------------------------------------------------------------------------------------+
-        | properties | {u'memory_mb': u'8192', u'cpu_arch': u'x86_64', u'local_gb': u'41', u'cpus': u'4'} |
-        +------------+------------------------------------------------------------------------------------+
-
-   .. warning::
-       If you're using exact match filters in the Nova Scheduler, make sure
-       the flavor and the node properties match exactly.
-
 #. The Nova flavor that you are using does not match any properties of the
    available Ironic nodes. Use
    ::
@@ -208,7 +198,7 @@ location of the files will depend on the way you've built the ramdisk.
 
     This will allow you to run commands within the filesystem, e.g. use package
     manager. If the ramdisk is also systemd-based, and you have login
-    credentials set up, you can even boot a real ramdisk enviroment with
+    credentials set up, you can even boot a real ramdisk environment with
 
     ::
 
@@ -225,7 +215,7 @@ directory back::
 API Errors
 ==========
 
-The `debug_tracebacks_in_api` config option may be set to return tracebacks
+The ``debug_tracebacks_in_api`` config option may be set to return tracebacks
 in the API response for all 4xx and 5xx errors.
 
 .. _retrieve_deploy_ramdisk_logs:
@@ -445,7 +435,7 @@ the IPMI port to be unreachable through ipmitool, as shown:
     $ ipmitool -I lan -H ipmi_host -U ipmi_user -P ipmi_pass chassis power status
     Error: Unable to establish LAN session
 
-To fix this, enable `IPMI over lan` setting using your BMC tool or web app.
+To fix this, enable ``IPMI over lan`` setting using your BMC tool or web app.
 
 Troubleshooting lanplus interface
 ---------------------------------
@@ -458,7 +448,7 @@ When working with lanplus interfaces, you may encounter the following error:
     Error in open session response message : insufficient resources for session
     Error: Unable to establish IPMI v2 / RMCP+ session
 
-To fix that issue, please enable `RMCP+ Cipher Suite3 Configuration` setting
+To fix that issue, please enable ``RMCP+ Cipher Suite3 Configuration`` setting
 using your BMC tool or web app.
 
 Why are my nodes stuck in a "-ing" state?
@@ -538,9 +528,9 @@ Again, these sorts of cases will depend upon the exact configuration of the
 deployment, but hopefully these are areas where these actions can occur.
 
 * Conversion to raw image files upon download to the conductor, from the
-  ``[DEFAULT]force_raw_images`` option. Users using Glance may also experience
+  :oslo.config:option:`DEFAULT.force_raw_images` option. Users using Glance may also experience
   issues here as the conductor will cache the image to be written which takes
-  place when the ``[agent]image_download_source`` is set to ``http`` instead of
+  place when the :oslo.config:option:`agent.image_download_source` is set to ``http`` instead of
   ``swift``.
 
 .. note::
@@ -565,7 +555,7 @@ of such wait states includes:
 
 * ``clean wait`` for cleaning,
 * ``inspect wait`` for introspection,
-* ``rescue wait`` for rescueing, and
+* ``rescue wait`` for rescuing, and
 * ``wait call-back`` for deploying.
 
 Communication issues between the conductor and the node
@@ -597,10 +587,13 @@ to do this.
 Stopping the operation
 ----------------------
 
-Cleaning, inspection and rescuing can be stopped while in ``clean wait``,
-``inspect wait`` and ``rescue wait`` states using the ``abort`` command.
-It will move the node to the corresponding failure state (``clean failed``,
-``inspect failed`` or ``rescue failed``)::
+Cleaning, inspection, servicing and rescuing can be stopped while in
+``clean wait``, ``inspect wait``, ``service wait`` and ``rescue wait`` states
+using the ``abort`` command. If the step running at the time has ``abortable``
+parameter set to ``True``, the abort will happen instantly, otherwise the
+process will be aborted once the currently running step is finished.
+The node will be moved to the corresponding failure state (``clean failed``,
+``inspect failed``, ``service failed`` or ``rescue failed``)::
 
     baremetal node abort <node>
 
@@ -643,22 +636,26 @@ Originally this was a fairly easy issue to encounter. The retry logic path
 which resulted between the Orchestration (heat) and Compute (nova) services,
 could sometimes result in additional un-necessary ports being created.
 
-Bugs of this class have been largely resolved since the Rocky development
-cycle. Since then, the way this can become encountered is due to Networking
-(neutron) VIF attachments not being removed or deleted prior to deleting a
-port in the Bare Metal service.
+Most users of modern Ironic are unlikely to experience this except in
+situations where a Networking (neutron) VIF attachment was not removed
+or deleted prior to deleting and re-creating a port in the Bare Metal
+service. Users utilizing custom tooling may also experience a similar
+issue due to incorrect usage patterns, i.e. a port being pre-assigned
+a physical machine's MAC address.
 
-Ultimately, the key of this is that the port is being deleted. Under most
-operating circumstances, there really is no need to delete the port, and
-VIF attachments are stored on the port object, so deleting the port
-*CAN* result in the VIF not being cleaned up from Neutron.
+Ultimately, the key of this is that the port is being deleted,
+or a separate port was added outside of Ironic's workflow. Under most
+operating circumstances, there really is no need to delete the port
+on a node, and VIF attachments are stored on the port object,
+so deleting the port *CAN* result in the VIF not being cleaned
+up from Neutron which ends up creating this sort of situation.
 
 Under normal circumstances, when deleting ports, a node should be in a
 stable state, and the node should not be provisioned. If the
 ``baremetal port delete`` command fails, this may indicate that
 a known VIF is still attached. Generally if they are transitory from cleaning,
 provisioning, rescuing, or even inspection, getting the node to the
-``available`` state wil unblock your delete operation, that is unless there is
+``available`` state will unblock your delete operation, that is unless there is
 a tenant VIF attahment. In that case, the vif will need to be removed from
 with-in the Bare Metal service using the
 ``baremetal node vif detach`` command.
@@ -669,7 +666,7 @@ the port's ``internal_info`` field.
 .. warning::
    The ``maintenance`` flag can be used to force the node's port to be
    deleted, however this will disable any check that would normally block
-   the user from issuing a delete and accidently orphaning the VIF attachment
+   the user from issuing a delete and accidentally orphaning the VIF attachment
    record.
 
 How do I resolve this?
@@ -694,13 +691,122 @@ Using that, you can delete the port. Example:
    use or no longer seems applicable/operable. If multiple deployments of
    the Bare Metal service with a single Neutron, the possibility that a
    inventory typo, or possibly even a duplicate MAC address exists, which
-   could also produce the same basic error message.
+   could also produce the same basic error message. A final root cause
+   is where users might pre-create a port in Neutron with a Bare Metal
+   port's MAC address, which is an incorrect practice as Ironic attempts
+   to assert the MAC address based upon the Node.
+
+Reattaching networking on active instances
+==========================================
+
+In advanced networking scenarios, operators may need to reconfigure the
+network binding for an active bare metal instance without rebooting it or
+interrupting the running workload. This is particularly useful for:
+
+- **VXLAN network topology changes**: When the underlying VXLAN network
+  configuration needs to be updated while instances remain online
+- **Network infrastructure changes**: When physical network segments are
+  reconfigured or migrated
+- **Network binding recovery**: When Neutron port bindings become stale or
+  inconsistent with the actual network state
+- **Switch reconfiguration**: When network switches need to update their
+  port configurations without instance downtime
+
+The ``reattach_networking`` service step
+-----------------------------------------
+
+The Neutron network interface provides a ``reattach_networking`` service step
+that can be invoked on nodes in the ``active`` state. This step:
+
+1. Unbinds the tenant network ports in Neutron (clearing binding:host_id
+   and binding:profile)
+2. Rebinds the tenant network ports with updated binding information
+3. Does **not** require booting the ironic-python-agent (IPA) ramdisk
+4. Does **not** remove VIF attachments from the node's ports
+5. Does **not** require rebooting the instance
+
+This allows network switches to reconfigure their ports based on the
+updated Neutron port binding information without any instance downtime.
+
+How to use it
+-------------
+
+To reattach networking on an active node, use the following command:
+
+.. code-block:: console
+
+  $ openstack baremetal node service <node-uuid> \
+      --service-steps '[{"interface": "network", "step": "reattach_networking"}]'
+
+The node will transition to ``servicing`` state, execute the reattach
+operation, and return to ``active`` state. The entire operation typically
+completes in seconds.
+
+Example:
+
+.. code-block:: console
+
+  $ openstack baremetal node service 5e9258c4-cfda-40b6-86e2-e192f523d668 \
+      --service-steps '[{"interface": "network", "step": "reattach_networking"}]'
+
+You can monitor the progress with:
+
+.. code-block:: console
+
+  $ openstack baremetal node show <node-uuid> -f value -c provision_state
+
+When it returns to ``active``, the network reattaching is complete.
+
+.. NOTE::
+   An operator may wish to utilize this feature via a runbook definition.
+
+Important considerations
+-------------------------
+
+- **Only works with the Neutron network interface**: This service step is
+  only available when using ``network_interface=neutron``. It will not
+  appear for ``flat`` or ``noop`` network interfaces.
+
+- **Requires existing VIF attachments**: The node's ports must already have
+  tenant VIF attachments (``tenant_vif_port_id`` in port.internal_info).
+  This service step reattaches existing attachments; it does not create new
+  ones.
+
+- **Smart NIC support**: The step properly handles Smart NIC ports,
+  including waiting for the Smart NIC host agent to be available before
+  reattaching.
+
+- **No network downtime expected**: In most cases, the network reattaching
+  happens quickly enough that active network connections may continue
+  working. However, brief disruption is possible depending on the network
+  switch implementation and configuration.
+
+- **Instance remains running**: The instance operating system and all
+  running processes continue without interruption. No reboot occurs.
+
+When NOT to use this
+---------------------
+
+Do not use ``reattach_networking`` for:
+
+- **Initial VIF attachment**: Use ``openstack baremetal node vif attach``
+  to attach VIFs to a node for the first time.
+
+- **Removing VIFs**: Use ``openstack baremetal node vif detach`` to remove
+  VIF attachments.
+
+- **Nodes not in ACTIVE state**: This service step is designed for active
+  instances. For nodes in other states, use the normal provisioning
+  workflow.
+
+- **Changing VIF assignments**: This step reattaches existing VIFs; it does
+  not change which Neutron ports are attached to which node ports.
 
 My test VM image does not deploy -- mount point does not exist
 ==============================================================
 
-What is likely occuring
------------------------
+What is likely occurring
+------------------------
 
 The image attempting to be deployed likely is a partition image where
 the file system that the user wishes to boot from lacks the required
@@ -783,6 +889,39 @@ be set in UTC.
    Microsoft Windows uses local time by default, so a machine that has
    previously run Windows will likely have wrong time.
 
+I've checked the clock skew, tried syncing with NTP, and certificate reports not valid yet
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If you have encountered a case where you have tried to sync the clock of
+a system and deployment/cleaning operations are failing stating the
+certificate is not valid yet or has expired, there could be a few different
+things going on.
+
+But first, we need to delineate an aspect. There is more than one clock in
+most systems.
+
+Specifically, a Baseboard Management Controller has its own clock, which may
+or may not be syncing with the "Host" clock of the system. It is important to
+ensure that the Host clock in bios firmware settings is what is checked.
+The best way to do this is to, on the console, boot into firmware settings,
+and check the "Date / Time Settings".
+
+In most cases, simple clock skew can be addressed through use of the
+``ipa-ntp-server`` setting, however the Ironic community has become aware
+of reports where even that does not remedy this issue. Investigation has found
+some hardware also allowing a timezone setting to be introduced with a UTC
+offset or localized time zone. It appears that when the ramdisk boots, the
+ramdisk clock does not properly calculate UTC as a result, and believes the
+time to be skewed based upon the timezone setting applied in firmware
+settings. The Ironic community recommends that the only timezone used
+set in a system clock is UTC, as Linux generally expects the system clock
+to be in UTC.
+
+Another option is the ``auto_tls_allowed_clock_skew`` setting in the
+ironic-python-agent configuration file. It defaults to 1 hour. If you
+find you need to modify this setting in your deployment, please notify
+Ironic community.
+
 I changed ironic.conf, and now I can't edit my nodes.
 =====================================================
 
@@ -862,7 +1001,7 @@ How did I get here?
 One of the major consumers of memory in a host running an ironic-conductor is
 transformation of disk images using the ``qemu-img`` tool. This tool, because
 the disk images it works with are both compressed and out of linear block
-order, requires a considerable amount of memory to efficently re-assemble
+order, requires a considerable amount of memory to efficiently re-assemble
 and write-out a disk to a device, or to simply convert the format such as
 to a ``raw`` image.
 
@@ -884,11 +1023,11 @@ This can be addressed a few different ways:
 * Add swap space.
 * Reduce concurrency, possibly via another conductor or changing the
   nova-compute.conf ``max_concurrent_builds`` parameter.
-* Or finally, adjust the ``[DEFAULT]minimum_required_memory`` parameter
+* Or finally, adjust the :oslo.config:option:`DEFAULT.minimum_required_memory` parameter
   in your ironic.conf file. The default should be considered a "default
   of last resort" and you may need to reserve additional memory. You may
-  also wish to adjust the ``[DEFAULT]minimum_memory_wait_retries`` and
-  ``[DEFAULT]minimum_memory_wait_time`` parameters.
+  also wish to adjust the :oslo.config:option:`DEFAULT.minimum_memory_wait_retries` and
+  :oslo.config:option:`DEFAULT.minimum_memory_wait_time` parameters.
 
 Why does API return "Node is locked by host"?
 =============================================
@@ -1001,9 +1140,9 @@ for cleaning operations is *50* and should be suitable for the majority of
 baremetal operators.
 
 These settings can be modified by using the
-``[conductor]max_concurrent_deploy`` and ``[conductor]max_concurrent_clean``
+:oslo.config:option:`conductor.max_concurrent_deploy` and :oslo.config:option:`conductor.max_concurrent_clean`
 settings from the ironic.conf file supporting the ``ironic-conductor``
-service. Neither setting can be explicity disabled, however there is also no
+service. Neither setting can be explicitly disabled, however there is also no
 upper limit to the setting.
 
 .. note::
@@ -1129,7 +1268,7 @@ basic troubleshooting steps:
 * If the version of ironic supports the feature, consult the node history
   log, ``baremetal node history list`` and
   ``baremetal node history get <uuid>``.
-* Consult the acutal console screen of the physical machine. *If* the ramdisk
+* Consult the actual console screen of the physical machine. *If* the ramdisk
   booted, you will generally want to investigate the controller logs and see
   if an uploaded agent log is being stored on the conductor responsible for
   the baremetal node. Consult `Retrieving logs from the deploy ramdisk`_.
@@ -1144,3 +1283,348 @@ or manual cleaning with ``clean`` command. or the next appropriate action
 in the workflow process you are attempting to follow, which may be
 ultimately be decommissioning the node because it could have failed and is
 being removed or replaced.
+
+I can't seem to introspect newly added nodes in a large cluster
+===============================================================
+
+With larger clusters, the act of synchronizing DHCP for introspection and
+hardware discovery can take quite a bit of time because of the operational
+overhead. What happens is we spend so much time trying to perform
+the update that the processes stay continuously busy, which can have a side
+effect such as impacting the ability to successfully introspect nodes
+which were very recently added to the cluster.
+
+To remedy this, try setting ``[pxe_filter]sync_period`` to be less frequent,
+i.e. a larger value to enable conductors to have time between running syncs.
+
+.. note::
+   Ironic now has this functionality also merged into Ironic directly as part
+   of the merge of the ``ironic-inspector`` service into ``ironic`` itself.
+   This merger will result in a slightly more performant implementation, which
+   may necessitate re-evaluation and tuning of the ``[pxe_filter]sync_period``
+   parameter.
+
+Some or all of my baremetal nodes disappeared! Help?!
+=====================================================
+
+If you just upgraded, and this has occurred:
+
+#) Don't Panic
+#) Don't try to re-enroll the nodes. They should still be there,
+   you just can't see them at the moment.
+
+Over the past few years, Ironic and OpenStack project as a whole has been
+working to improve the model of Role Based Access Control. For users of
+Ironic, this means an extended role based access control model allowing
+delineation of nodes and the ability for projects to both self-manage.
+
+The result is that users inside of a project are only permitted to see
+baremetal nodes, through the ``owner`` and ``lessee`` field, which has
+been granted access to the project.
+
+However, as with any complex effort, there can be hiccups, and you have
+encountered one. Specifically that based upon large scale operator feedback,
+Ironic kept logic behind System scoped user usage, which OpenStack largely
+avoided due to concerns over effort.
+
+As such, you have a couple different paths you can take, and your ideal
+path is also going to vary upon your model of usage and comfort level.
+We recommend reading the rest of this answer section before taking any
+further action.
+
+A good starting point is obtaining a ``system`` scoped account with an
+``admin`` or ``member`` role. Either of those roles will permit a node's
+``owner`` or ``lessee`` fields to be changed. Executing
+``baremetal node list`` commands with this account should show you all
+baremetal nodes across all projects. Alternatively, if you just want to
+enable the legacy RBAC policies temporarily to change the fields, that is also
+an option, although not encouraged, and can be done utilizing the
+``[oslo_policy] enforce_scope`` and ``[oslo_policy] enforce_new_defaults``
+settings.
+
+System Scoped Accounts
+----------------------
+
+A ``system`` scoped account is one which has access and authority over the
+whole of the of an OpenStack deployment. A simplified way to think of
+this is when deployed, a username and password is utilized to "bootstrap"
+keystone. The rights granted to that user are inherently a system scoped
+``admin`` role level of access. You can use this level of access to
+check the status, or run additional commands.
+
+In this example below, which if successful, should return a list of all
+baremetal nodes known to Ironic, once the executing user supplies the
+valid password. In this case the "admin" account keystone was
+bootstrapped with. As a minor note, you will not be able to have
+any "OS_*" environment variables loaded into your current
+command shell, including "OS_CLOUD" for this command to be successful.
+
+.. code-block:: console
+
+    $ openstack --os-username=admin --os-user-domain-name=default --os-system-scope all baremetal node list
+
+You can alternatively issue a `system-scoped token <https://docs.openstack.org/keystone/latest/admin/tokens-overview.html#operation_create_system_token>`_
+and reuse further commands with that token, or even generate a new system
+scoped account with a role of ``member``.
+
+Changing/Assigning an Owner
+---------------------------
+
+Ironic performs matching based upon Project ID. The owner field can be set
+to a project's ID value, which allows baremetal nodes to be visible.
+
+.. code-block:: console
+
+    $ PROJECT_ID=$(openstack project show -c id -f value $PROJECT_NAME)
+    $ baremetal node set --owner $PROJECT_ID $NODE_UUID_OR_NAME
+
+Why am I only seeing *some* of the nodes?
+-----------------------------------------
+
+During the Zed development cycle of Ironic, Ironic added an option which
+defaulted to True, which enabled project scoped ``admin`` users to be able
+to create their own baremetal nodes without needing higher level access.
+This default enabled option, ``[api] project_admin_can_manage_own_nodes``,
+automatically stamps the requestor's project ID on to a baremetal node if an
+``owner`` is not otherwise specified upon creation. Obviously, this can
+create a mixed perception if an operator never paid attention to the ``owner``
+field before now.
+
+If your bare metal management processes require that full machine management
+is made using a project scoped account, please configure an appropriate
+node ``owner`` for the nodes which need to be managed. Ironic recognizes
+this is going to vary based upon processes and preferences.
+
+Config Drives in Swift, but rebuilds fails?
+===========================================
+
+When deploying instances, Ironic can be configured such that configuration
+drives are stored in Swift. The pointer to the configuration drive is saved
+in Ironic as a Temporary URL which has a time expiration.
+
+When you issue the rebuild request for a node, Ironic expects that you will
+supply new configuration drive contents with your request, however this is
+also optional.
+
+Because Swift has been set as the optional configuration drive storage
+location, a rebuild can fail if the prior configuration drive file is no
+longer accessible and no new configuration drive has been supplied to Ironic.
+
+To resolve this case, you can either supply new configuration drive contents
+with your request, or disable configuration from being stored in Swift for
+new baremetal node deployments by changing setting
+:oslo.config:option:`deploy.configdrive_use_object_store` to ``false``.
+
+Ironic says my Image is Invalid
+===============================
+
+As a result of security fixes which were added to Ironic, resulting from the
+security posture of the ``qemu-img`` utility, Ironic enforces certain aspects
+related to image files.
+
+* Enforces that the file format of a disk image matches what Ironic is
+  told by an API user. Any mismatch will result in the image being declared
+  as invalid. A mismatch with the file contents and what is stored in the
+  Image service will necessitate uploading a new image as that property
+  cannot be changed in the image service *after* creation of an image.
+* Enforces that the input file format to be written is ``qcow2`` or ``raw``.
+  This can be extended by modifying ``[conductor]permitted_image_formats`` in
+  ``ironic.conf``.
+* Performs safety and sanity check assessment against the file, which can be
+  disabled by modifying ``[conductor]disable_deep_image_inspection`` and
+  setting it to ``True``. Doing so is not considered safe and should only
+  be done by operators accepting the inherent risk that the image they
+  are attempting to use may have a bad or malicious structure.
+  Image safety checks are generally performed as the deployment process begins
+  and stages artifacts, however a late stage check is performed when
+  needed by the ironic-python-agent.
+
+Using /dev/sda does not write to the first disk
+===============================================
+
+Alternative name: I chose /dev/sda but I found it as /dev/sdb after rebooting.
+
+Historically, Linux users have grown accustom to a context where /dev/sda is
+the first device in a physical machine. Meaning, if you look at the device
+by_path information or the HCTL, or device LUN, the device ends with a zero.
+
+For example, assuming 3 disks, two controllers, with a single disk on the
+second controller would look something like this:
+
+* /dev/sda maps to a device with lun 0, HCTL 0:0:0:0
+* /dev/sdb maps to a device with lun 1, HCTL 0:0:1:0
+* /dev/sdc maps to a device with lun 2, HCTL 0:1:0:0
+
+However, this was a pattern we grew accustom to because the order of device
+discovery was sequential *and* synchronous. In other words the kernel stepped
+through all possible devices one at a time. Where this breaks is when the
+kernel is operating in a mode where device initialization is asynchronous as
+some distributions have decided to adopt.
+
+The result of a move to an asynchronous initialization is /dev/sda has always
+been the *first* device to initialize, *not* the first device in the system.
+As a result, we can end up with something looking like:
+
+* /dev/sda maps to a device with lun 1, HCTL 0:0:1:0
+* /dev/sdb maps to a device with lun 2, HCTL 0:1:0:0
+* /dev/sdc maps to a device with lun 0, HCTL 0:0:0:0
+
+Generally, most operators might then consider referencing the
+/dev/disk/by-path structure to match disk devices because that seems to imply
+a static order, *however* a kernel operating with asynchronous device
+initialization will order *everything*, including PCI devices the same way,
+meaning by-path can also be unreliable. Furthermore, if your server hardware
+is using multipath IO, you should be operating with multipath enabled such
+that the device is used.
+
+The net result is the best criteria to match on is:
+
+* Serial Number
+* World Wide Name
+* Device HCTL, which *does* appear to be static in these cases, but is not
+  applicable for hosts using multipathing. It may, ultimately, not be static
+  enough, just depending on the hardware in use.
+
+.. NOTE: Some RAID controllers will generate fake WWN and Serial numbers for
+   "disks" being supplied by the RAID controller. Some may also use the same
+   WWN for *all* devices, which is a valid approach as the device Logical Unit
+   Numbers or Device identifier number would be different. Ultimately this
+   means labels on disks may not be able to be matched to volumes through a
+   RAID controller, and operators will need to simply "know their hardware"
+   to navigate the best path depending on the configuration and behavior of
+   their hardware.
+
+.. NOTE: Centos Stream-9 appears to have a probe_type="sync" option which
+   reverts this behavior. For more information please see
+   this `centos stream-9 changeset <https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/merge_requests/2819/diffs?commit_id=a93f405246083f0c2e81d0e6c37ba31c6c1b29c3>`_.
+
+I changed the BMC password, and now a node is in maintenance state.
+===================================================================
+
+Ironic automatically checks access to a remote BMC utilizing the configured
+credentials for the driver. Depending on the driver in use, this can vary
+in field name, but these fields are set in each node's ``driver_info``
+parameter and must be reset.
+
+Once the credential issue has been resolved, Ironic automatically moves
+the node out of maintenance state upon the next attempt to check the power
+state. Please review :doc:`/admin/power-sync` for more information, however
+an operator can also explicitly unset the maintenance state as well, and
+the examples below are detailed as such.
+
+For example, with Redfish...
+
+.. code-block:: console
+
+    $ openstack baremetal node set --driver-info redfish_username=<new_user> --driver-info redfish_password=<new_pass> <node_uuid>
+    $ openstack baremetal node maintenance unset <node_uuid>
+
+For example, with IPMI...
+
+.. code-block:: console
+
+    $ openstack baremetal node set --driver-info ipmi_username=<new_user> --driver-info ipmi_password=<new_pass> <node_uuid>
+    $ openstack baremetal node maintenance unset <node_uuid>
+
+For example, with iDRAC drivers...
+
+.. code-block:: console
+
+    $ openstack baremetal node set --driver-info drac_username=<new_user> --driver-info drac_password=<new_pass> <node_uuid>
+    $ openstack baremetal node set --driver-info redfish_username=<new_user> --driver-info redfish_password=<new_pass> <node_uuid>
+    $ openstack baremetal node maintenance unset <node_uuid>
+
+.. note::
+   The ``drac_username`` and ``drac_password`` parameters were used by WSMAN
+   Dell iDRAC drivers. Newer versions of the drivers utilize Redfish natively.
+
+.. note::
+   Ironic generally does not manage or rotate the remote BMC credentials due
+   to the risk of user lockout if the account is not for the specific use of
+   Ironic. Some vendor drivers have added this functionality, however such
+   actions should be made with caution.
+
+I'm attempting to use Redfish, and something weird is happening!
+================================================================
+
+Redfish is a standard which is a union of an HTTPS based RESTful API
+interaction, coupled with individual resource data models.
+Occasionally vendors take a very different reading of the standard,
+which is to be expected, but at the same time the vendors sometimes also
+go directly against the standard, such as moving resources.
+
+Ultimately Ironic tries to address as many of these issues that we
+are made aware of; however often we will need additional structural
+information to remedy these sorts of issues.
+
+Often these sorts of issues might manifest as Virtual Media not working,
+or boot mode settings behaving oddly, or Ironic believe the UEFI state is
+"None". While these are all past examples the Ironic has since addressed,
+most of them appeared on major vendor BMC firmware updates or major feature
+level updates in the BMC firmware.
+
+The best way to address this is to open a bug in Launchpad and supply as much
+information for the Ironic community to be able to work this issue.
+
+Commands which may provide helpful information for the Ironic community to
+navigate the issue you have encountered.
+
+.. code-block:: console
+
+   $ curl -u <bmc_user>:<bmc_password> -k https://<bmc_address>/redfish/v1/Systems/
+   $ curl -u <bmc_user>:<bmc_password> -k https://<bmc_address>/redfish/v1/Systems/<system>/
+   $ curl -u <bmc_user>:<bmc_password> -k https://<bmc_address>/redfish/v1/Managers/
+   $ curl -u <bmc_user>:<bmc_password> -k https://<bmc_address>/redfish/v1/Managers/<bmc>
+
+.. NOTE::
+   Because of the structurally nested model, the Ironic project may request
+   additional commands to be executed against the BMC, but this will be on
+   a case-by-case basis as we understand the exact issue and what changes
+   may be required in order to navigate this issue.
+
+.. WARNING::
+   Please be careful to redact any usernames, passwords, and addresses which
+   may be sensitive in any data provided to the Ironic community.
+
+Unfortunately, there is no magical quick fix for these sorts of issues, but
+the Ironic community has a track record of attempting to navigate and address
+these issues as they arise.
+
+I'm using Boot-From-Volume, and the SAN passwords were changed.
+===============================================================
+
+In this event, the credential uses for an iSCSI attachment have been changed
+on a storage area network (SAN), and Ironic nodes have lost connectivity with
+iSCSI boot volumes.
+
+The proper procedure here varies based upon if you're using the ``cinder``
+``storage_interface`` option, or if you're using the ``external`` option.
+
+In the case of the ``cinder`` driver being used, if you power off the
+baremetal node via Ironic's API, and then power the node back on. This
+will trigger Ironic to attempt to re-attach the volume to the baremetal
+node via Cinder's API which will cause the most up-to-date configuration
+to be presented to the bare metal node being booted.
+
+If you're using the ``external`` interface option, you will need to manually
+reset you're volume connector information values. Please refer to
+:doc:`/admin/boot-from-volume` for more information.
+
+My configdrive download from tempurl fails with a 401 error!
+============================================================
+
+This can happen because initial first sequence of deployment is close to the
+:oslo.config:option:`conductor.deploy_callback_timeout` is set to a value,
+and :oslo.config:option:`conductor.configdrive_swift_temp_url_duration` is
+not set to a value.
+
+What is happening is the deployment process is running, but running to close
+to when the ``deploy_callback_timeout`` would have normally aborted the
+deployment, but it just got started deploying and thus would not be aborted.
+
+Yet that timeout is the setting leverage when no other setting is set, and
+the result is that the configdrive temporary url download is rejected just
+after the temporary url timed out. Newer versions of ironic automatically
+add a slightly larger buffer to that window to try and prevent this issue
+from arising under normal conditions, however ideally you should set an
+explicit temporary url duration in your configuration.

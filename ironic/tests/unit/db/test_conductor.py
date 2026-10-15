@@ -21,6 +21,7 @@ from unittest import mock
 from oslo_utils import timeutils
 
 from ironic.common import exception
+from ironic.common import utils as common_utils
 from ironic.tests.unit.db import base
 from ironic.tests.unit.db import utils
 
@@ -155,6 +156,21 @@ class DbConductorTestCase(base.DbTestCase):
         c = self.dbapi.get_conductor(c.hostname)
         self.assertEqual(test_time, timeutils.normalize_time(c.updated_at))
 
+    @mock.patch.object(timeutils, 'utcnow', autospec=True)
+    def test_touch_conductor_offline(self, mock_utcnow):
+        test_time = datetime.datetime(2000, 1, 1, 0, 0)
+        mock_utcnow.return_value = test_time
+        c = self._create_test_cdr()
+        self.assertEqual(test_time, timeutils.normalize_time(c.updated_at))
+
+        test_time = datetime.datetime(2000, 1, 1, 0, 1)
+        mock_utcnow.return_value = test_time
+        self.dbapi.touch_conductor(c.hostname, online=False)
+        self.assertRaises(
+            exception.ConductorNotFound,
+            self.dbapi.get_conductor,
+            c.hostname)
+
     def test_touch_conductor_not_found(self):
         # A conductor's heartbeat will not create a new record,
         # it will only update existing ones
@@ -219,7 +235,8 @@ class DbConductorTestCase(base.DbTestCase):
         h = 'fake-host'
         expected = {}
 
-        mock_utcnow.return_value = datetime.datetime.utcnow()
+        mock_utcnow.return_value = datetime.datetime.now(
+            datetime.timezone.utc).replace(tzinfo=None)
         self._create_test_cdr(hostname=h, drivers=[], hardware_types=[])
         result = self.dbapi.get_active_hardware_type_dict()
         self.assertEqual(expected, result)
@@ -230,7 +247,8 @@ class DbConductorTestCase(base.DbTestCase):
         ht = 'hardware-type'
         expected = {ht: {h}}
 
-        mock_utcnow.return_value = datetime.datetime.utcnow()
+        mock_utcnow.return_value = datetime.datetime.now(
+            datetime.timezone.utc).replace(tzinfo=None)
         self._create_test_cdr(hostname=h, drivers=[], hardware_types=[ht])
         result = self.dbapi.get_active_hardware_type_dict()
         self.assertEqual(expected, result)
@@ -244,7 +262,8 @@ class DbConductorTestCase(base.DbTestCase):
         key = '%s:%s' % (group, ht)
         expected = {key: {h}}
 
-        mock_utcnow.return_value = datetime.datetime.utcnow()
+        mock_utcnow.return_value = datetime.datetime.now(
+            datetime.timezone.utc).replace(tzinfo=None)
         self._create_test_cdr(hostname=h, drivers=[], hardware_types=[ht],
                               conductor_group=group)
         result = self.dbapi.get_active_hardware_type_dict(use_groups=True)
@@ -257,7 +276,8 @@ class DbConductorTestCase(base.DbTestCase):
         ht2 = 'another-hardware-type'
         expected = {ht1: {h}, ht2: {h}}
 
-        mock_utcnow.return_value = datetime.datetime.utcnow()
+        mock_utcnow.return_value = datetime.datetime.now(
+            datetime.timezone.utc).replace(tzinfo=None)
         self._create_test_cdr(hostname=h, drivers=[],
                               hardware_types=[ht1, ht2])
         result = self.dbapi.get_active_hardware_type_dict()
@@ -270,7 +290,8 @@ class DbConductorTestCase(base.DbTestCase):
         ht = 'hardware-type'
         expected = {ht: {h1, h2}}
 
-        mock_utcnow.return_value = datetime.datetime.utcnow()
+        mock_utcnow.return_value = datetime.datetime.now(
+            datetime.timezone.utc).replace(tzinfo=None)
         self._create_test_cdr(id=1, hostname=h1, drivers=[],
                               hardware_types=[ht])
         self._create_test_cdr(id=2, hostname=h2, drivers=[],
@@ -287,7 +308,8 @@ class DbConductorTestCase(base.DbTestCase):
         ht2 = 'another-hardware-type'
         expected = {ht1: {h1, h2}, ht2: {h1, h2}}
 
-        mock_utcnow.return_value = datetime.datetime.utcnow()
+        mock_utcnow.return_value = datetime.datetime.now(
+            datetime.timezone.utc).replace(tzinfo=None)
         self._create_test_cdr(id=1, hostname=h1, drivers=[],
                               hardware_types=[ht1, ht2])
         self._create_test_cdr(id=2, hostname=h2, drivers=[],
@@ -295,9 +317,11 @@ class DbConductorTestCase(base.DbTestCase):
         result = self.dbapi.get_active_hardware_type_dict()
         self.assertEqual(expected, result)
 
+    @mock.patch.object(common_utils, 'is_ironic_using_sqlite', autospec=True)
     @mock.patch.object(timeutils, 'utcnow', autospec=True)
-    def test_get_active_hardware_type_dict_with_old_conductor(self,
-                                                              mock_utcnow):
+    def test_get_active_hardware_type_dict_with_old_conductor(
+            self, mock_utcnow, mock_is_sqlite):
+        mock_is_sqlite.return_value = False
         past = datetime.datetime(2000, 1, 1, 0, 0)
         present = past + datetime.timedelta(minutes=2)
 
@@ -326,9 +350,12 @@ class DbConductorTestCase(base.DbTestCase):
         expected = {ht: {h1, h2}, ht1: {h1}, ht2: {h2}}
         result = self.dbapi.get_active_hardware_type_dict()
         self.assertEqual(expected, result)
+        self.assertEqual(2, mock_is_sqlite.call_count)
 
+    @mock.patch.object(common_utils, 'is_ironic_using_sqlite', autospec=True)
     @mock.patch.object(timeutils, 'utcnow', autospec=True)
-    def test_get_offline_conductors(self, mock_utcnow):
+    def test_get_offline_conductors(self, mock_utcnow, mock_is_sqlite):
+        mock_is_sqlite.return_value = False
         self.config(heartbeat_timeout=60, group='conductor')
         time_ = datetime.datetime(2000, 1, 1, 0, 0)
 
@@ -344,9 +371,34 @@ class DbConductorTestCase(base.DbTestCase):
         mock_utcnow.return_value = time_ + datetime.timedelta(seconds=61)
         self.assertEqual([c.hostname], self.dbapi.get_offline_conductors())
         self.assertEqual([c.id], self.dbapi.get_offline_conductors(field='id'))
+        self.assertEqual(3, mock_is_sqlite.call_count)
 
+    @mock.patch.object(common_utils, 'is_ironic_using_sqlite', autospec=True)
     @mock.patch.object(timeutils, 'utcnow', autospec=True)
-    def test_get_online_conductors(self, mock_utcnow):
+    def test_get_offline_conductors_with_sqlite(self, mock_utcnow,
+                                                mock_is_sqlite):
+        mock_is_sqlite.return_value = True
+        self.config(heartbeat_timeout=60, group='conductor')
+        time_ = datetime.datetime(2000, 1, 1, 0, 0)
+
+        mock_utcnow.return_value = time_
+        self._create_test_cdr()
+
+        # Only 30 seconds passed since last heartbeat, it's still
+        # considered alive
+        mock_utcnow.return_value = time_ + datetime.timedelta(seconds=30)
+        self.assertEqual([], self.dbapi.get_offline_conductors())
+
+        # 61 seconds passed since last heartbeat, it's dead
+        mock_utcnow.return_value = time_ + datetime.timedelta(seconds=61)
+        self.assertEqual([], self.dbapi.get_offline_conductors())
+        self.assertEqual([], self.dbapi.get_offline_conductors(field='id'))
+        self.assertEqual(3, mock_is_sqlite.call_count)
+
+    @mock.patch.object(common_utils, 'is_ironic_using_sqlite', autospec=True)
+    @mock.patch.object(timeutils, 'utcnow', autospec=True)
+    def test_get_online_conductors(self, mock_utcnow, mock_is_sqlite):
+        mock_is_sqlite.return_value = False
         self.config(heartbeat_timeout=60, group='conductor')
         time_ = datetime.datetime(2000, 1, 1, 0, 0)
 
@@ -361,6 +413,26 @@ class DbConductorTestCase(base.DbTestCase):
         # 61 seconds passed since last heartbeat, it's dead
         mock_utcnow.return_value = time_ + datetime.timedelta(seconds=61)
         self.assertEqual([], self.dbapi.get_online_conductors())
+        self.assertEqual(2, mock_is_sqlite.call_count)
+
+    @mock.patch.object(timeutils, 'utcnow', autospec=True)
+    def test_get_online_conductors_with_sqlite(self, mock_utcnow):
+        # NOTE(TheJulia): Explicitly skipping the mock so the underlying
+        # code on the test is 'tested'.
+        self.config(heartbeat_timeout=60, group='conductor')
+        time_ = datetime.datetime(2000, 1, 1, 0, 0)
+
+        mock_utcnow.return_value = time_
+        c = self._create_test_cdr()
+
+        # Only 30 seconds passed since last heartbeat, it's still
+        # considered alive
+        mock_utcnow.return_value = time_ + datetime.timedelta(seconds=30)
+        self.assertEqual([c.hostname], self.dbapi.get_online_conductors())
+
+        # 61 seconds passed since last heartbeat, it's dead
+        mock_utcnow.return_value = time_ + datetime.timedelta(seconds=61)
+        self.assertEqual([c.hostname], self.dbapi.get_online_conductors())
 
     @mock.patch.object(timeutils, 'utcnow', autospec=True)
     def test_list_hardware_type_interfaces(self, mock_utcnow):
@@ -415,5 +487,89 @@ class DbConductorTestCase(base.DbTestCase):
 
         # 61 seconds passed since last heartbeat, it's dead
         mock_utcnow.return_value = time_ + datetime.timedelta(seconds=61)
-        result = self.dbapi.list_hardware_type_interfaces([ht1, ht2])
+        with mock.patch.object(common_utils, 'is_ironic_using_sqlite',
+                               autospec=True) as mock_is_sqlite:
+            mock_is_sqlite.return_value = False
+            result = self.dbapi.list_hardware_type_interfaces([ht1, ht2])
+            self.assertEqual(1, mock_is_sqlite.call_count)
         self.assertEqual([], result)
+
+        # Validate we still have four entries with SQLite, which is the
+        # default for all unit tests running.
+        result = self.dbapi.list_hardware_type_interfaces([ht1, ht2])
+        self.assertEqual(4, len(result))
+
+    def test_delete_conductor(self):
+        self.dbapi.register_conductor(
+            {'hostname': 'test-conductor',
+             'drivers': ['fake'],
+             'conductor_group': 'test-group'})
+
+        self.dbapi.get_conductor('test-conductor')
+        self.dbapi.delete_conductor('test-conductor')
+
+        self.assertRaises(exception.ConductorNotFound,
+                          self.dbapi.get_conductor, 'test-conductor')
+
+    def test_delete_conductor_not_found(self):
+        self.assertRaises(exception.ConductorNotFound,
+                          self.dbapi.delete_conductor,
+                          'fake-hostname')
+
+    def test_delete_conductor_clears_reservations(self):
+        self.dbapi.register_conductor(
+            {'hostname': 'test-conductor',
+             'drivers': ['fake'],
+             'conductor_group': 'test-group'})
+
+        node = self.dbapi.create_node({
+            'uuid': 'test-node-uuid',
+            'driver': 'fake',
+            'reservation': 'test-conductor'
+        })
+
+        self.assertEqual('test-conductor', node.reservation)
+        self.dbapi.delete_conductor('test-conductor')
+
+        node = self.dbapi.get_node_by_uuid('test-node-uuid')
+        self.assertIsNone(node.reservation)
+
+    def test_delete_conductor_clears_hardware_interfaces(self):
+        conductor = self.dbapi.register_conductor(
+            {'hostname': 'test-conductor',
+             'drivers': ['fake'],
+             'conductor_group': 'test-group'})
+
+        self.dbapi.register_conductor_hardware_interfaces(
+            conductor['id'],
+            [{'hardware_type': 'fake',
+              'interface_type': 'deploy',
+              'interface_name': 'direct',
+              'default': True}])
+
+        interfaces = self.dbapi.list_conductor_hardware_interfaces(
+            conductor['id'])
+        self.assertEqual(1, len(interfaces))
+
+        self.dbapi.delete_conductor('test-conductor')
+        interfaces = self.dbapi.list_conductor_hardware_interfaces(
+            conductor['id'])
+        self.assertEqual([], interfaces)
+
+    def test_delete_conductor_clears_conductor_affinity(self):
+        conductor = self.dbapi.register_conductor(
+            {'hostname': 'test-conductor',
+             'drivers': ['fake'],
+             'conductor_group': 'test-group'})
+
+        node = self.dbapi.create_node({
+            'uuid': 'test-node-uuid',
+            'driver': 'fake',
+            'conductor_affinity': conductor['id']
+        })
+
+        self.assertEqual(conductor['id'], node.conductor_affinity)
+        self.dbapi.delete_conductor('test-conductor')
+
+        node = self.dbapi.get_node_by_uuid('test-node-uuid')
+        self.assertIsNone(node.conductor_affinity)

@@ -20,17 +20,17 @@ import os
 from urllib import parse as urlparse
 
 from oslo_log import log
-from oslo_utils import excutils
-from oslo_utils import importutils
+from oslo_utils import netutils
 from oslo_utils import strutils
 import rfc3986
+import sushy
 import tenacity
 
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import utils as common_utils
 from ironic.conf import CONF
-
-sushy = importutils.try_import('sushy')
+from ironic.drivers import utils as driver_utils
 
 LOG = log.getLogger(__name__)
 
@@ -72,11 +72,97 @@ OPTIONAL_PROPERTIES = {
     'redfish_auth_type': _('Redfish HTTP client authentication method. Can be '
                            '"basic", "session" or "auto". If not set, the '
                            'default value is taken from Ironic '
-                           'configuration as ``[redfish]auth_type`` option.')
+                           'configuration as ``[redfish]auth_type`` option.'),
+    'firmware_update_unresponsive_bmc_wait': _(
+        'Number of seconds to wait to avoid the BMC becoming unresponsive '
+        'during firmware updates. If not set, the default value is taken from '
+        'the Ironic configuration ``firmware_update_wait_unresponsive_bmc`` '
+        'in the ``[redfish]`` section.'),
+    'redfish_tls_minimum_version': _(
+        'Minimum TLS protocol version for connections to the '
+        'Redfish BMC. Can be "1.1", "1.2", or "1.3". If not '
+        'set, the default value is taken from Ironic '
+        'configuration as ``[redfish]tls_minimum_version`` '
+        'option.'),
+    'redfish_tls_ciphers': _(
+        'OpenSSL cipher list to use for connections to the '
+        'Redfish BMC. If not set, the default value is taken '
+        'from Ironic configuration as '
+        '``[redfish]tls_ciphers`` option.'),
 }
 
 COMMON_PROPERTIES = REQUIRED_PROPERTIES.copy()
 COMMON_PROPERTIES.update(OPTIONAL_PROPERTIES)
+
+
+# All available FIRMWARE COMPONENTS
+BIOS = 'bios'
+"BIOS Firmware Component"
+
+BMC = 'bmc'
+"BMC Firmware Component"
+
+NIC_COMPONENT_PREFIX = "nic:"
+"Prefix for NIC Firmware Components"
+
+NIC = "nic"
+"NIC Firmware Component type"
+
+FIRMWARE_COMPONENTS = [BIOS, BMC]
+"""Firmware Components available to update"""
+
+
+def get_component_type(component):
+    """Determine the type of firmware component.
+
+    Note: This helper exists primarily to handle NIC components which use
+    a prefix pattern (e.g., 'nic:BCM57414', 'nic:adapter1') rather than
+    exact string matches. This centralizes the component type detection
+    logic that is used in multiple places (update initiation, task
+    monitoring, completion handling) and provides a single source of truth
+    for component type classification.
+
+    :param component: The component name from settings
+    :returns: One of 'bios', 'bmc', 'nic', or None
+    """
+    if component == BIOS:
+        return BIOS
+    elif component == BMC:
+        return BMC
+    elif component.startswith(NIC_COMPONENT_PREFIX):
+        return NIC
+    return None
+
+
+def _parse_tls_settings(node, driver_info):
+    """Parse TLS hardening settings from driver_info with config fallback.
+
+    :param node: an Ironic node object
+    :param driver_info: the node's driver_info dict
+    :returns: dictionary of TLS-related sushy parameters
+    :raises: InvalidParameterValue on invalid tls_minimum_version
+    """
+    tls_min = driver_info.get(
+        'redfish_tls_minimum_version',
+        CONF.redfish.tls_minimum_version)
+    if tls_min and tls_min not in ('1.1', '1.2', '1.3'):
+        raise exception.InvalidParameterValue(
+            _('Invalid value "%(value)s" set in '
+              'driver_info/redfish_tls_minimum_version on node '
+              '%(node)s. The value should be one of '
+              '"1.1", "1.2", or "1.3".') %
+            {'value': tls_min, 'node': node.uuid})
+
+    tls_ciphers = driver_info.get(
+        'redfish_tls_ciphers',
+        CONF.redfish.tls_ciphers)
+
+    params = {}
+    if tls_min:
+        params['tls_min_version'] = tls_min
+    if tls_ciphers:
+        params['tls_ciphers'] = tls_ciphers
+    return params
 
 
 def parse_driver_info(node):
@@ -98,6 +184,10 @@ def parse_driver_info(node):
 
     # Validate the Redfish address
     address = driver_info['redfish_address']
+
+    if isinstance(address, str):
+        address = netutils.escape_ipv6(address)
+
     try:
         parsed = rfc3986.uri_reference(address)
     except TypeError:
@@ -141,7 +231,8 @@ def parse_driver_info(node):
                 {'value': driver_info['redfish_system_id'], 'node': node.uuid})
 
     # Check if verify_ca is a Boolean or a file/directory in the file-system
-    verify_ca = driver_info.get('redfish_verify_ca', True)
+    verify_ca = driver_utils.get_verify_ca(
+        node, driver_info.get('redfish_verify_ca', True))
     if isinstance(verify_ca, str):
         if os.path.isdir(verify_ca) or os.path.isfile(verify_ca):
             pass
@@ -182,19 +273,23 @@ def parse_driver_info(node):
                     'node_uuid': node.uuid}
     if root_prefix:
         sushy_params['root_prefix'] = root_prefix
+    sushy_params.update(_parse_tls_settings(node, driver_info))
+
+    unres_bmc_wait = driver_info.get('firmware_update_unresponsive_bmc_wait')
+    if unres_bmc_wait:
+        sushy_params['firmware_update_unresponsive_bmc_wait'] = unres_bmc_wait
 
     return sushy_params
 
 
 class SessionCache(object):
     """Cache of HTTP sessions credentials"""
-    AUTH_CLASSES = {}
-    if sushy:
-        AUTH_CLASSES.update(
-            basic=sushy.auth.BasicAuth,
-            session=sushy.auth.SessionAuth,
-            auto=sushy.auth.SessionOrBasicAuth
-        )
+
+    AUTH_CLASSES = dict(
+        basic=sushy.auth.BasicAuth,
+        session=sushy.auth.SessionAuth,
+        auto=sushy.auth.SessionOrBasicAuth
+    )
 
     _sessions = collections.OrderedDict()
 
@@ -203,10 +298,14 @@ class SessionCache(object):
         # include it in the session key.
         # NOTE(TheJulia): Multiplying the address by 4, to ensure
         # we meet a minimum of 16 bytes for salt.
+        # NOTE(frickler): password may be None, make sure we have a str
+        password = driver_info.get('password')
+        if not password:
+            password = ''
         pw_hash = hashlib.pbkdf2_hmac(
             'sha512',
-            driver_info.get('password').encode('utf-8'),
-            str(driver_info.get('address') * 4).encode('utf-8'), 40)
+            password.encode('utf-8'),
+            str(driver_info.get('address') * 4).encode('utf-8'), 600000)
         self._driver_info = driver_info
         # Assemble the session key and append the hashed password to it,
         # which forces new sessions to be established when the saved password
@@ -237,6 +336,14 @@ class SessionCache(object):
                         'auth': authenticator}
         if 'root_prefix' in self._driver_info:
             sushy_params['root_prefix'] = self._driver_info['root_prefix']
+        if 'tls_min_version' in self._driver_info:
+            sushy_params['tls_min_version'] = (
+                self._driver_info['tls_min_version'])
+        if 'tls_ciphers' in self._driver_info:
+            sushy_params['tls_ciphers'] = (
+                self._driver_info['tls_ciphers'])
+        sushy_params['connect_timeout'] = CONF.redfish.connect_timeout
+        sushy_params['read_timeout'] = CONF.redfish.read_timeout
         conn = sushy.Sushy(
             self._driver_info['address'],
             **sushy_params
@@ -313,6 +420,23 @@ def get_event_service(node):
         raise exception.RedfishError(error=e)
 
 
+def get_first_controller(storage):
+    """Get the first storage controller from a storage object.
+
+    :param storage: a storage object
+    :returns: the first storage controller or None
+    """
+    try:
+        controllers = storage.controllers
+        if not controllers:
+            raise sushy.exceptions.MissingAttributeError
+        members = controllers.get_members()
+        return members[0] if members else None
+    except sushy.exceptions.MissingAttributeError:
+        controllers = getattr(storage, 'storage_controllers', None)
+        return controllers[0] if controllers else None
+
+
 def get_system(node):
     """Get a Redfish System that represents a node.
 
@@ -331,6 +455,44 @@ def get_system(node):
     except sushy.exceptions.ResourceNotFoundError as e:
         LOG.error('The Redfish System "%(system)s" was not found for '
                   'node %(node)s. Error %(error)s',
+                  {'system': system_id or '<default>',
+                   'node': node.uuid, 'error': e})
+        raise exception.RedfishError(error=e)
+
+
+def get_root_vendor(node):
+    """Get the BMC vendor from the Redfish Service Root.
+
+    :param node: an Ironic node object
+    :returns: The Vendor string from the ServiceRoot, or None
+    """
+    try:
+        return _get_connection(node, lambda conn: conn.json.get('Vendor'))
+    except Exception as e:
+        LOG.debug('Failed to get vendor from the Redfish Service Root '
+                  'for node %(node)s. Error %(error)s',
+                  {'node': node.uuid, 'error': e})
+        return None
+
+
+def get_system_collection(node):
+    """Get a Redfish System Collection that includes the node
+
+    :param node: an Ironic node object
+    :raises: RedfishConnectionError when it fails to connect to Redfish
+    :raises: RedfishError if the System is not registered in Redfish
+    """
+    driver_info = parse_driver_info(node)
+    system_id = driver_info['system_id']
+
+    try:
+        return _get_connection(
+            node,
+            lambda conn, system_id: conn.get_system_collection(),
+            system_id)
+    except sushy.exceptions.ResourceNotFoundError as e:
+        LOG.error('The Redfish Systems Collection "%(system)s" was not found'
+                  ' for node %(node)s. Error %(error)s',
                   {'system': system_id or '<default>',
                    'node': node.uuid, 'error': e})
         raise exception.RedfishError(error=e)
@@ -394,7 +556,7 @@ def _get_connection(node, lambda_fun, *args):
         except sushy.exceptions.AccessError as e:
             LOG.warning('For node %(node)s, we received an authentication '
                         'access error from address %(address)s with auth_type '
-                        '%(auth_type)s. The client will not be re-used upon '
+                        '%(auth_type)s. The client will not be reused upon '
                         'the next re-attempt. Please ensure your using the '
                         'correct credentials. Error: %(error)s',
                         {'address': driver_info['address'],
@@ -411,12 +573,12 @@ def _get_connection(node, lambda_fun, *args):
 
     try:
         return _get_cached_connection(lambda_fun, *args)
-    except exception.RedfishConnectionError as e:
-        with excutils.save_and_reraise_exception():
-            LOG.error('Failed to connect to Redfish at %(address)s for '
-                      'node %(node)s. Error: %(error)s',
+    except exception.RedfishConnectionError:
+        LOG.exception('Failed to connect to Redfish at %(address)s for '
+                      'node %(node)s.',
                       {'address': driver_info['address'],
-                       'node': node.uuid, 'error': e})
+                       'node': node.uuid})
+        raise
 
 
 def get_enabled_macs(task, system):
@@ -441,6 +603,7 @@ def get_enabled_macs(task, system):
                 LOG.warning("Ignoring device for %(node)s as no MAC "
                             "reported", {'node': task.node.uuid})
                 continue
+            nic_mac = common_utils.normalize_mac(nic_mac)
             enabled_macs[nic_mac] = nic_state
 
     if not enabled_macs:
@@ -474,3 +637,62 @@ def wait_until_get_system_ready(node):
     driver_info = parse_driver_info(node)
     system_id = driver_info['system_id']
     return _get_system(driver_info, system_id)
+
+
+def get_manager(node, system, manager_id=None):
+    """Get a node's manager.
+
+    :param system: a Sushy system object
+    :param manager_id: the id of the manager
+    :return: a sushy Manager
+    :raises: RedfishError when the System doesn't have Managers associated
+    """
+
+    try:
+        sushy_manager = None
+        available_managers = system.managers
+        if available_managers:
+            if manager_id is None:
+                sushy_manager = available_managers[0]
+            else:
+                for manager in available_managers:
+                    if manager.identity == manager_id:
+                        sushy_manager = manager
+        if sushy_manager is None:
+            raise Exception("Couldn't find any Sushy Manager")
+        return sushy_manager
+    except sushy.exceptions.MissingAttributeError as e:
+        LOG.error('Redfish Managers for node %(node)s are not associated '
+                  'with system %(system)s. Error %(error)s',
+                  {'system': system.identity,
+                   'node': node.uuid, 'error': e})
+        raise exception.RedfishError(error=e)
+    except Exception as exc:
+        LOG.error('Redfish Manager was not found for '
+                  'node %(node)s under system %(system)s. Error %(error)s',
+                  {'system': system.identity,
+                   'node': node.uuid, 'error': exc})
+        raise exception.RedfishError(error=exc)
+
+
+def get_chassis(node, system):
+    """Get a Redfish Chassis associated with a System of a node
+
+    :param node: an Ironic node object
+    :param system: the Sushy System object
+    :raises: RedfishConnectionError when it fails to connect to Redfish
+    :raises: RedfishError if there is no Chassis registered
+    """
+    try:
+        available_chassis = system.chassis
+        if available_chassis:
+            return available_chassis[0]
+        else:
+            raise exception.RedfishError(
+                _('The Redfish Chassis was not found for node %(node)s.')
+                % {'node': node.uuid})
+    except sushy.exceptions.MissingAttributeError as e:
+        LOG.error('No chassis associated with system %(system)s. '
+                  'Error %(error)s',
+                  {'system': system.identity, 'error': e})
+        raise exception.RedfishError(error=e)

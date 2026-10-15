@@ -33,21 +33,9 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
                      base.NetworkInterface):
     """Neutron v2 network interface"""
 
-    def __init__(self):
-        failures = []
-        cleaning_net = CONF.neutron.cleaning_network
-        if not cleaning_net:
-            failures.append('cleaning_network')
-
-        provisioning_net = CONF.neutron.provisioning_network
-        if not provisioning_net:
-            failures.append('provisioning_network')
-
-        if failures:
-            raise exception.DriverLoadError(
-                driver=self.__class__.__name__,
-                reason=(_('The following [neutron] group configuration '
-                          'options are missing: %s') % ', '.join(failures)))
+    # Indicator signaling metadata generation/handling can be achieved on this
+    # interface.
+    capabilities = ['metadata']
 
     def validate(self, task):
         """Validates the network interface.
@@ -57,33 +45,42 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
             is invalid.
         :raises: MissingParameterValue, if some parameters are missing.
         """
-        self.get_cleaning_network_uuid(task)
-        self.get_provisioning_network_uuid(task)
+        # NOTE(TheJulia): These are the minimal networks needed for
+        # the neutron network interface to function.
+        if 'admin' in task.context.roles:
+            # NOTE(TheJulia): In a fully integrated environment, the user
+            # must be an admin to fully resolve networking details.
+            self.get_cleaning_network_uuid(task)
+            self.get_provisioning_network_uuid(task)
+        if (task.node.disable_power_off
+                and not CONF.neutron.allow_disabling_power_off):
+            raise exception.InvalidParameterValue(
+                _("Nodes with disable_power_off cannot be used with the "
+                  "neutron network interface (disallowed in the "
+                  "configuration)"))
 
-    def _add_network(self, task, network, security_groups, process):
+    def _add_network(self, task, network, security_groups, net_type):
         # If we have left over ports from a previous process, remove them
         neutron.rollback_ports(task, network)
-        LOG.info('Adding %s network to node %s', process, task.node.uuid)
+        LOG.info('Adding %s network to node %s', net_type, task.node.uuid)
         vifs = neutron.add_ports_to_network(task, network,
                                             security_groups=security_groups)
-        field = '%s_vif_port_id' % process
         for port in task.ports:
             if port.uuid in vifs:
                 internal_info = port.internal_info
-                internal_info[field] = vifs[port.uuid]
+                internal_info[net_type.vif_key] = vifs[port.uuid]
                 port.internal_info = internal_info
                 port.save()
         return vifs
 
-    def _remove_network(self, task, network, process):
+    def _remove_network(self, task, network, net_type):
         LOG.info('Removing ports from %s network for node %s',
-                 process, task.node.uuid)
+                 net_type, task.node.uuid)
         neutron.remove_ports_from_network(task, network)
-        field = '%s_vif_port_id' % process
         for port in task.ports:
-            if field in port.internal_info:
+            if net_type.vif_key in port.internal_info:
                 internal_info = port.internal_info
-                del internal_info[field]
+                del internal_info[net_type.vif_key]
                 port.internal_info = internal_info
                 port.save()
 
@@ -96,7 +93,7 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         self._add_network(
             task, self.get_provisioning_network_uuid(task),
             CONF.neutron.provisioning_network_security_groups,
-            'provisioning')
+            common.NetType.PROVISIONING)
 
     def remove_provisioning_network(self, task):
         """Remove the provisioning network from a node.
@@ -105,7 +102,8 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         :raises: NetworkError
         """
         return self._remove_network(
-            task, self.get_provisioning_network_uuid(task), 'provisioning')
+            task, self.get_provisioning_network_uuid(task),
+            common.NetType.PROVISIONING)
 
     def add_cleaning_network(self, task):
         """Create neutron ports for each port on task.node to boot the ramdisk.
@@ -117,7 +115,7 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         return self._add_network(
             task, self.get_cleaning_network_uuid(task),
             CONF.neutron.cleaning_network_security_groups,
-            'cleaning')
+            common.NetType.CLEANING)
 
     def remove_cleaning_network(self, task):
         """Deletes the neutron port created for booting the ramdisk.
@@ -126,7 +124,8 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         :raises: NetworkError
         """
         return self._remove_network(
-            task, self.get_cleaning_network_uuid(task), 'cleaning')
+            task, self.get_cleaning_network_uuid(task),
+            common.NetType.CLEANING)
 
     def validate_rescue(self, task):
         """Validates the network interface for rescue operation.
@@ -147,7 +146,7 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         return self._add_network(
             task, self.get_rescuing_network_uuid(task),
             CONF.neutron.rescuing_network_security_groups,
-            'rescuing')
+            common.NetType.RESCUING)
 
     def remove_rescuing_network(self, task):
         """Deletes neutron port created for booting the rescue ramdisk.
@@ -156,7 +155,8 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         :raises: NetworkError
         """
         return self._remove_network(
-            task, self.get_rescuing_network_uuid(task), 'rescuing')
+            task, self.get_rescuing_network_uuid(task),
+            common.NetType.RESCUING)
 
     def configure_tenant_networks(self, task):
         """Configure tenant networks for a node.
@@ -168,33 +168,35 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         ports = task.ports
         LOG.info('Mapping instance ports to %s', node.uuid)
 
-        # TODO(russell_h): this is based on the broken assumption that the
-        # number of Neutron ports will match the number of physical ports.
-        # Instead, we should probably list ports for this instance in
-        # Neutron and update all of those with the appropriate portmap.
         if not ports:
             msg = _("No ports are associated with node %s") % node.uuid
             LOG.error(msg)
             raise exception.NetworkError(msg)
-        ports = [p for p in ports if not p.portgroup_id]
         portgroups = task.portgroups
 
-        client = neutron.get_client(context=task.context)
-        pobj_without_vif = 0
-        for port_like_obj in ports + portgroups:
+        # Only objects with a tenant VIF recorded in internal_info (set by
+        # vif_attach) are plugged. Every one of them must succeed. Ports
+        # that are members of a portgroup are included so they can be
+        # plugged individually.
+        to_plug = [
+            p for p in ports + portgroups
+            if self._get_vif_id_by_port_like_obj(p)]
 
-            try:
-                common.plug_port_to_tenant_network(task, port_like_obj,
-                                                   client=client)
-            except exception.VifNotAttached:
-                pobj_without_vif += 1
-                continue
-
-        if pobj_without_vif == len(ports + portgroups):
+        if not to_plug:
             msg = _("No neutron ports or portgroups are associated with "
                     "node %s") % node.uuid
             LOG.error(msg)
             raise exception.NetworkError(msg)
+
+        client = neutron.get_client(context=task.context)
+        try:
+            for port_like_obj in to_plug:
+                # NOTE: any failure here (NetworkError) propagates so we
+                # never leave the node with only some tenant VIFs plugged.
+                common.plug_port_to_tenant_network(task, port_like_obj,
+                                                   client=client)
+        finally:
+            client.close()
 
     def unconfigure_tenant_networks(self, task):
         """Unconfigure tenant networks for a node.
@@ -209,20 +211,20 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         node = task.node
         LOG.info('Unbinding instance ports from node %s', node.uuid)
 
-        ports = [p for p in task.ports if not p.portgroup_id]
-        portgroups = task.portgroups
-        for port_like_obj in ports + portgroups:
-            vif_port_id = (
-                port_like_obj.internal_info.get(common.TENANT_VIF_KEY)
-            )
+        for port_like_obj in task.ports + task.portgroups:
+            vif_port_id = NeutronNetwork._get_vif_id_by_port_like_obj(
+                port_like_obj)
             if not vif_port_id:
                 continue
 
             is_smart_nic = neutron.is_smartnic_port(port_like_obj)
             if is_smart_nic:
                 client = neutron.get_client(context=task.context)
-                link_info = port_like_obj.local_link_connection
-                neutron.wait_for_host_agent(client, link_info['hostname'])
+                try:
+                    link_info = port_like_obj.local_link_connection
+                    neutron.wait_for_host_agent(client, link_info['hostname'])
+                finally:
+                    client.close()
 
             # NOTE(kaifeng) address is optional for port group, avoid to
             # regenerate mac when the address is absent.
@@ -253,7 +255,7 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         return self._add_network(
             task, self.get_inspection_network_uuid(task),
             CONF.neutron.inspection_network_security_groups,
-            'inspection')
+            common.NetType.INSPECTION)
 
     def remove_inspection_network(self, task):
         """Removes the inspection network from a node.
@@ -264,4 +266,68 @@ class NeutronNetwork(common.NeutronVIFPortIDMixin,
         :raises: MissingParameterValue, if some parameters are missing.
         """
         return self._remove_network(
-            task, self.get_inspection_network_uuid(task), 'inspection')
+            task, self.get_inspection_network_uuid(task),
+            common.NetType.INSPECTION)
+
+    def validate_servicing(self, task):
+        """Validates the network interface for servicing operation.
+
+        :param task: a TaskManager instance.
+        :raises: InvalidParameterValue, if the network interface configuration
+            is invalid.
+        :raises: MissingParameterValue, if some parameters are missing.
+        """
+        self.get_servicing_network_uuid(task)
+
+    def add_servicing_network(self, task):
+        """Create neutron ports for each port to boot the servicing ramdisk.
+
+        :param task: a TaskManager instance.
+        :returns: a dictionary in the form {port.uuid: neutron_port['id']}
+        """
+        return self._add_network(
+            task, self.get_servicing_network_uuid(task),
+            CONF.neutron.servicing_network_security_groups,
+            common.NetType.SERVICING)
+
+    def remove_servicing_network(self, task):
+        """Deletes neutron port created for booting the servicing ramdisk.
+
+        :param task: a TaskManager instance.
+        :raises: NetworkError
+        """
+        return self._remove_network(
+            task, self.get_servicing_network_uuid(task),
+            common.NetType.SERVICING)
+
+    @base.service_step(priority=0, requires_ramdisk=False)
+    def reattach_networking(self, task):
+        """Reattach tenant networking without rebooting the node.
+
+        This service step unbinds and rebinds the tenant network ports
+        attached to the node without requiring a reboot or IPA deployment.
+        This is useful for advanced networking scenarios such as:
+
+        - Reconfiguring VXLAN network topology
+        - Updating network binding after infrastructure changes
+        - Recovering from network binding failures
+        - Migrating network segments or physical networks
+
+        The VIF attachments are preserved (not removed), only the Neutron
+        port bindings are cleared and re-established. This allows network
+        switches to reconfigure the ports without instance downtime.
+
+        :param task: A TaskManager instance.
+        :raises: NetworkError if reattaching fails
+        """
+        LOG.info('Reattaching tenant networking for node %s', task.node.uuid)
+
+        # Unbind current tenant networks (VIF IDs remain in
+        # port.internal_info)
+        self.unconfigure_tenant_networks(task)
+
+        # Reattach tenant networks using existing VIF IDs
+        self.configure_tenant_networks(task)
+
+        LOG.info('Successfully reattached tenant networking for node %s',
+                 task.node.uuid)

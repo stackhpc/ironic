@@ -7,7 +7,7 @@ Boot From Volume
 Overview
 ========
 The Bare Metal service supports booting from a Cinder iSCSI volume as of the
-Pike release. This guide will primarily deal with this use case, but will be
+Pike release. This guide will primarily deal with this use case but will be
 updated as more paths for booting from a volume, such as FCoE, are introduced.
 
 The boot from volume is supported on both legacy BIOS and
@@ -21,33 +21,16 @@ In essence, ironic sets the stage for the process, by providing the required
 information to the boot interface to facilitate the configuration of the
 the node OR the iPXE boot templates such that the node CAN be booted.
 
-.. seqdiag::
-   :scale: 80
+.. figure:: ./../images/boot-from-volume.svg
+   :width: 100%
 
-   diagram {
-      User; API; Conductor; Storage; Boot; Network; Deploy;
-      activation = none;
-      span_height = 1;
-      edge_length = 250;
-      default_note_color = white;
-      default_fontsize = 14;
+In this example, the boot interface does the heavy lifting. Some
+hardware types with vendor-specific boot interfaces are able to
+signal via an out-of-band mechanism to the baremetal node's BMC
+that the integrated iSCSI initiators are to connect to the supplied
+volume target information.
 
-      User -> API [label = "User or intermediate service such as nova supplies volume target configuration."];
-      User -> API [label = "Sends deployment request."];
-      API -> Conductor [label = "API transmits the action to the conductor service"];
-      Conductor -> Storage [label = "Conductor calls the storage_interface to perform attachment of volume to node"];
-      Conductor -> Boot [label = "Conductor calls the boot interface signaling preparation of an instance"];
-      Conductor -> Network [label = "Conductor attaches the machine to network requested by the user VIF"];
-      Conductor -> Deploy [label = "Conductor starts deployment steps which just turn the power on."];
-   }
-
-In this example, the boot interface does the heavy lifting. For drivers the
-``irmc`` and ``ilo`` hardware types with hardware type specific boot
-interfaces, they are able to signal via an out of band mechanism to the
-baremetal node's BMC that the integrated iSCSI initiators are to connect
-to the supplied volume target information.
-
-In most hardware this would be the network cards of the machine.
+In most hardware, this would be the network cards of the machine.
 
 In the case of the ``ipxe`` boot interface, templates are created on disk
 which point to the iscsi target information that was either submitted
@@ -56,7 +39,7 @@ requested as the baremetal's boot from volume disk upon requesting the
 instance.
 
 In terms of network access, both interface methods require connectivity
-to the iscsi target. In the vendor driver specific path, additional network
+to the iscsi target. In the vendor driver-specific path, additional network
 configuration options may be available to allow separation of standard
 network traffic and instance network traffic. In the iPXE case, this is
 not possible as the OS userspace re-configures the iSCSI connection
@@ -64,7 +47,7 @@ after detection inside the OS ramdisk boot.
 
 An iPXE user *may* be able to leverage multiple VIFs, one specifically
 set to be set with ``pxe_enabled`` to handle the initial instance boot
-and back-end storage traffic where as external facing network traffic
+and back-end storage traffic whereas external-facing network traffic
 occurs on a different interface. This is a common pattern in iSCSI
 based deployments in the physical realm.
 
@@ -86,7 +69,7 @@ Currently booting from a volume requires:
 Conductor Configuration
 =======================
 In ironic.conf, you can specify a list of enabled storage interfaces. Check
-``[DEFAULT]enabled_storage_interfaces`` in your ironic.conf to ensure that
+:oslo.config:option:`DEFAULT.enabled_storage_interfaces` in your ironic.conf to ensure that
 your desired interface is enabled. For example, to enable the ``cinder`` and
 ``noop`` storage interfaces::
 
@@ -94,7 +77,7 @@ your desired interface is enabled. For example, to enable the ``cinder`` and
   enabled_storage_interfaces = cinder,noop
 
 If you want to specify a default storage interface rather than setting the
-storage interface on a per node basis, set ``[DEFAULT]default_storage_interface``
+storage interface on a per node basis, set :oslo.config:option:`DEFAULT.default_storage_interface`
 in ironic.conf. The ``default_storage_interface`` will be used for any node that
 doesn't have a storage interface defined.
 
@@ -111,6 +94,14 @@ on an existing node::
 
 A default storage interface can be specified in ironic.conf. See the
 `Conductor Configuration`_ section for details.
+
+The storage interface is responsible for managing the mapping state of the
+volume to the host. If some changes need to be communicated from Cinder and
+then updated for Ironic to become aware of them, such as a change in iSCSI
+credentials, then the act of powering baremetal node off via Ironic's API
+will trigger these values to be updated automatically as the ``cinder``
+storage interface resets the volume attachments with power actions to
+ensure the latest information is used for each boot sequence.
 
 iSCSI Configuration
 -------------------
@@ -157,13 +148,13 @@ Use without the Compute Service
 -------------------------------
 
 As discussed in other sections, the Bare Metal service has a concept of a
-`connector` that is used to represent an interface that is intended to
+``connector`` that is used to represent an interface that is intended to
 be utilized to attach the remote volume.
 
-In addition to the connectors, we have a concept of a `target` that can be
+In addition to the connectors, we have a concept of a ``target`` that can be
 defined via the API. While a user of this feature through the Compute
 service would automatically have a new target record created for them,
-it is not explicitly required, and can be performed manually.
+it is not explicitly required and can be performed manually.
 
 A target record can be created using a command similar to the example below::
 
@@ -193,7 +184,7 @@ the node should or could boot from a remote volume.
 
 It must be noted that minimal configuration or value validation occurs
 with the ``external`` storage interface. The ``cinder`` storage interface
-contains more extensive validation, that is likely un-necessary in a
+contains more extensive validation, that is likely unnecessary in a
 ``external`` scenario.
 
 Setting the external storage interface::
@@ -245,7 +236,7 @@ contain support for multi-attach volumes.
 When support for storage interfaces was added to the Bare Metal service,
 specifically for the ``cinder`` storage interface, the concept of volume
 multi-attach was accounted for, however has not been fully tested,
-and is unlikely to be fully tested until there is Compute service integration
+and is unlikely to be fully tested until there is a Compute service integration
 as well as volume driver support.
 
 The data model for storage of volume targets in the Bare Metal service

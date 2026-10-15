@@ -13,37 +13,37 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import time
+
 from oslo_log import log
-from oslo_utils import importutils
+import sushy
 
 from ironic.common import exception
 from ironic.common.i18n import _
 from ironic.common import states
 from ironic.conductor import task_manager
 from ironic.conductor import utils as cond_utils
+from ironic.conf import CONF
 from ironic.drivers import base
 from ironic.drivers.modules.redfish import management as redfish_mgmt
 from ironic.drivers.modules.redfish import utils as redfish_utils
 
 LOG = log.getLogger(__name__)
 
-sushy = importutils.try_import('sushy')
+GET_POWER_STATE_MAP = {
+    sushy.SYSTEM_POWER_STATE_ON: states.POWER_ON,
+    sushy.SYSTEM_POWER_STATE_POWERING_ON: states.POWER_ON,
+    sushy.SYSTEM_POWER_STATE_OFF: states.POWER_OFF,
+    sushy.SYSTEM_POWER_STATE_POWERING_OFF: states.POWER_OFF
+}
 
-if sushy:
-    GET_POWER_STATE_MAP = {
-        sushy.SYSTEM_POWER_STATE_ON: states.POWER_ON,
-        sushy.SYSTEM_POWER_STATE_POWERING_ON: states.POWER_ON,
-        sushy.SYSTEM_POWER_STATE_OFF: states.POWER_OFF,
-        sushy.SYSTEM_POWER_STATE_POWERING_OFF: states.POWER_OFF
-    }
-
-    SET_POWER_STATE_MAP = {
-        states.POWER_ON: sushy.RESET_ON,
-        states.POWER_OFF: sushy.RESET_FORCE_OFF,
-        states.REBOOT: sushy.RESET_FORCE_RESTART,
-        states.SOFT_REBOOT: sushy.RESET_GRACEFUL_RESTART,
-        states.SOFT_POWER_OFF: sushy.RESET_GRACEFUL_SHUTDOWN
-    }
+SET_POWER_STATE_MAP = {
+    states.POWER_ON: sushy.RESET_ON,
+    states.POWER_OFF: sushy.RESET_FORCE_OFF,
+    states.REBOOT: sushy.RESET_FORCE_RESTART,
+    states.SOFT_REBOOT: sushy.RESET_GRACEFUL_RESTART,
+    states.SOFT_POWER_OFF: sushy.RESET_GRACEFUL_SHUTDOWN
+}
 
 TARGET_STATE_MAP = {
     states.REBOOT: states.POWER_ON,
@@ -63,25 +63,41 @@ def _set_power_state(task, system, power_state, timeout=None):
     :raises: RedfishConnectionError when it fails to connect to Redfish
     :raises: RedfishError on an error from the Sushy library
     """
-    system.reset_system(SET_POWER_STATE_MAP.get(power_state))
+    reset_type = SET_POWER_STATE_MAP.get(power_state)
+    # NOTE(jayjahns): Some BMCs (e.g. Dell iDRAC10) transiently reject the
+    # "On" reset type with an HTTP 409 ActionParameterValueConflict for a
+    # short window after a power-off, until the BMC settles. The value is
+    # correct (the same "On" is accepted once settled) and such BMCs may not
+    # implement "ForceOn", so retry the power-on until the BMC accepts it or
+    # the configured attempts are exhausted.
+    max_retries = CONF.redfish.power_on_conflict_retry_attempts
+    for attempt in range(max_retries + 1):
+        try:
+            system.reset_system(reset_type)
+            break
+        except sushy.exceptions.HTTPError as e:
+            if (power_state == states.POWER_ON
+                    and e.status_code == 409
+                    and 'ActionParameterValueConflict' in str(e)
+                    and attempt < max_retries):
+                LOG.warning('Node %(node)s: BMC rejected power-on with 409 '
+                            '(ActionParameterValueConflict); retry %(n)d of '
+                            '%(max)d after the BMC settles.',
+                            {'node': task.node.uuid, 'n': attempt + 1,
+                             'max': max_retries})
+                time.sleep(CONF.redfish.power_on_conflict_retry_interval)
+                continue
+            raise
     target_state = TARGET_STATE_MAP.get(power_state, power_state)
+    if power_state == states.REBOOT:
+        LOG.debug('Waiting 15 seconds to give the node %s a chance to power '
+                  'off before checking its power state', task.node.uuid)
+        time.sleep(15)
     cond_utils.node_wait_for_power_state(task, target_state,
                                          timeout=timeout)
 
 
 class RedfishPower(base.PowerInterface):
-
-    def __init__(self):
-        """Initialize the Redfish power interface.
-
-        :raises: DriverLoadError if the driver can't be loaded due to
-            missing dependencies
-        """
-        super(RedfishPower, self).__init__()
-        if not sushy:
-            raise exception.DriverLoadError(
-                driver='redfish',
-                reason=_('Unable to import the sushy library'))
 
     def get_properties(self):
         """Return the properties of the interface.
@@ -132,6 +148,47 @@ class RedfishPower(base.PowerInterface):
 
         try:
             _set_power_state(task, system, power_state, timeout=timeout)
+        except sushy.exceptions.HTTPError as e:
+            # Handle HTTP 400 (BadRequest) and 409 (Conflict) errors where
+            # the BMC indicates the node is already in the desired state
+            if e.status_code in (400, 409):
+                target_state = TARGET_STATE_MAP.get(power_state, power_state)
+
+                # Refresh system state to get current power state from BMC
+                # instead of using potentially stale cached data
+                try:
+                    system.refresh()
+                except Exception as refresh_error:
+                    LOG.warning('Failed to refresh system state for node '
+                                '%(node)s: %(error)s',
+                                {'node': task.node.uuid,
+                                 'error': refresh_error})
+
+                current_state = GET_POWER_STATE_MAP.get(system.power_state)
+
+                # If current state is undetermined, check for hints in the
+                # error message.
+                if current_state is None:
+                    error_msg = str(e).lower()
+                    if (target_state == states.POWER_OFF
+                        and ('host is powered off' in error_msg
+                             or 'already powered off' in error_msg)):
+                        current_state = states.POWER_OFF
+                    elif (target_state == states.POWER_ON
+                          and ('host is powered on' in error_msg
+                               or 'already powered on' in error_msg)):
+                        current_state = states.POWER_ON
+
+                if current_state == target_state:
+                    LOG.info('Node %(node)s power operation (%(requested)s) '
+                             'failed with HTTP %(code)s, but node is already '
+                             'in the expected final state (%(final)s). '
+                             'Treating as successful. Error was: %(error)s',
+                             {'node': task.node.uuid, 'requested': power_state,
+                              'code': e.status_code, 'final': target_state,
+                              'error': e})
+                    return  # Success - already in desired final state
+            raise
         except sushy.exceptions.SushyError as e:
             error_msg = (_('Setting power state to %(state)s failed for node '
                            '%(node)s. Error: %(error)s') %
@@ -155,14 +212,20 @@ class RedfishPower(base.PowerInterface):
 
         try:
             if current_power_state == states.POWER_ON:
-                next_state = states.POWER_OFF
-                _set_power_state(task, system, next_state, timeout=timeout)
+                if task.node.disable_power_off:
+                    # Skip powering off, reboot after restoring the boot device
+                    next_state = states.REBOOT
+                else:
+                    next_state = states.POWER_OFF
+                    _set_power_state(task, system, next_state, timeout=timeout)
+                    next_state = states.POWER_ON
+            else:
+                next_state = states.POWER_ON
 
             if isinstance(task.driver.management,
                           redfish_mgmt.RedfishManagement):
                 task.driver.management.restore_boot_device(task, system)
 
-            next_state = states.POWER_ON
             _set_power_state(task, system, next_state, timeout=timeout)
         except sushy.exceptions.SushyError as e:
             error_msg = (_('Reboot failed for node %(node)s when setting '

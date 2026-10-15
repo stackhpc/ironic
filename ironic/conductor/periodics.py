@@ -15,12 +15,13 @@
 import collections
 import functools
 import inspect
+import time
 
-import eventlet
 from futurist import periodics
 from oslo_log import log
 
 from ironic.common import exception
+from ironic.common import metrics_utils
 from ironic.conductor import base_manager
 from ironic.conductor import task_manager
 from ironic.drivers import base as driver_base
@@ -29,15 +30,75 @@ from ironic.drivers import base as driver_base
 LOG = log.getLogger(__name__)
 
 
+METRICS = metrics_utils.get_metrics_logger(__name__)
+
+
+def refresh_periodic_attributes(func):
+    """Update futurist periodic attributes from deferred CONF resolvers.
+
+    Used for periodics whose ``enabled`` or ``spacing`` were supplied as
+    callables so that values are read after configuration is loaded (for
+    example in oslo.service spawn workers, which bypass the LP #1562258
+    import-order guard in ``ironic.command.conductor``).
+    """
+    target = getattr(func, '__func__', func)
+    target_dict = getattr(target, '__dict__', {})
+    enabled_resolver = target_dict.get('_periodic_enabled_resolver')
+    spacing_resolver = target_dict.get('_periodic_spacing_resolver')
+    if not enabled_resolver and not spacing_resolver:
+        return False
+
+    spacing = target_dict.get('_periodic_spacing',
+                              getattr(target, '_periodic_spacing', None))
+    if spacing_resolver is not None:
+        spacing = spacing_resolver()
+        target._periodic_spacing = spacing
+
+    if enabled_resolver is not None:
+        target._is_periodic = bool(enabled_resolver()) and spacing > 0
+    elif spacing_resolver is not None:
+        target._is_periodic = spacing > 0
+
+    return True
+
+
+def refresh_class_periodic_attributes(cls):
+    """Refresh lazy periodic attributes on all periodic methods of ``cls``."""
+    for _name, member in inspect.getmembers(cls):
+        if periodics.is_periodic(member):
+            refresh_periodic_attributes(member)
+
+
 def periodic(spacing, enabled=True, **kwargs):
     """A decorator to define a periodic task.
 
-    :param spacing: how often (in seconds) to run the periodic task.
+    :param spacing: how often (in seconds) to run the periodic task, or a
+        callable returning the spacing in seconds.
     :param enabled: whether the task is enabled; defaults to ``spacing > 0``.
+        May be a callable returning a boolean, in which case it is evaluated
+        when periodic tasks are collected (and after spawn unpickling when
+        configuration has been restored).
     """
-    return periodics.periodic(spacing=spacing,
-                              enabled=enabled and spacing > 0,
-                              **kwargs)
+    lazy_enabled = callable(enabled)
+    lazy_spacing = callable(spacing)
+
+    if not lazy_enabled and not lazy_spacing:
+        return periodics.periodic(spacing=spacing,
+                                  enabled=enabled and spacing > 0,
+                                  **kwargs)
+
+    def decorator(func):
+        # Placeholder registration; refresh_periodic_attributes() sets real
+        # spacing and _is_periodic before the PeriodicWorker is created.
+        decorated = periodics.periodic(spacing=1, enabled=False,
+                                       **kwargs)(func)
+        if lazy_enabled:
+            decorated._periodic_enabled_resolver = enabled
+        if lazy_spacing:
+            decorated._periodic_spacing_resolver = spacing
+        return decorated
+
+    return decorator
 
 
 class Stop(Exception):
@@ -46,7 +107,7 @@ class Stop(Exception):
 
 def node_periodic(purpose, spacing, enabled=True, filters=None,
                   predicate=None, predicate_extra_fields=(), limit=None,
-                  shared_task=True):
+                  shared_task=True, node_count_metric_name=None):
     """A decorator to define a periodic task to act on nodes.
 
     Defines a periodic task that fetches the list of nodes mapped to the
@@ -84,6 +145,9 @@ def node_periodic(purpose, spacing, enabled=True, filters=None,
         iteration to determine the limit.
     :param shared_task: if ``True``, the task will have a shared lock. It is
         recommended to start with a shared lock and upgrade it only if needed.
+    :param node_count_metric_name: A string value to identify a metric
+        representing the count of matching nodes to be recorded upon the
+        completion of the periodic.
     """
     node_type = collections.namedtuple(
         'Node',
@@ -116,10 +180,11 @@ def node_periodic(purpose, spacing, enabled=True, filters=None,
             else:
                 local_limit = limit
             assert local_limit is None or local_limit > 0
-
+            node_count = 0
             nodes = manager.iter_nodes(filters=filters,
                                        fields=predicate_extra_fields)
             for (node_uuid, *other) in nodes:
+                node_count += 1
                 if predicate is not None:
                     node = node_type(node_uuid, *other)
                     if accepts_manager:
@@ -135,7 +200,19 @@ def node_periodic(purpose, spacing, enabled=True, filters=None,
                                               shared=shared_task) as task:
                         if interface_type is not None:
                             impl = getattr(task.driver, interface_type)
-                            if not isinstance(impl, self.__class__):
+                            # Match the node's interface by exact type
+                            # rather than isinstance().  When a subclass
+                            # (e.g. DracRedfishBIOS) inherits a periodic
+                            # from its base (RedfishBIOS) and both are
+                            # enabled, each interface is collected as its
+                            # own task.  An isinstance() check would let
+                            # the base task also match subclass nodes, so
+                            # the same node would be processed by two
+                            # tasks (duplicate resume RPCs).  Exact-type
+                            # matching keeps the node sets disjoint and
+                            # ensures each node is handled by its own
+                            # implementation.
+                            if type(impl) is not type(self):
                                 continue
 
                         result = func(self, task, *args, **kwargs)
@@ -151,13 +228,19 @@ def node_periodic(purpose, spacing, enabled=True, filters=None,
                     break
                 finally:
                     # Yield on every iteration
-                    eventlet.sleep(0)
+                    time.sleep(0)
 
                 if (local_limit is not None
                         and (result is None or result)):
                     local_limit -= 1
                     if not local_limit:
                         return
+            if node_count_metric_name:
+                # Send post-run metrics.
+                METRICS.send_gauge(
+                    node_count_metric_name,
+                    node_count)
+            LOG.debug('Completed periodic task for purpose %s.', purpose)
 
         return wrapper
 

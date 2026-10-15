@@ -30,23 +30,21 @@ DRIVER.
 """
 
 import contextlib
+import ipaddress
 import os
 import re
 import subprocess
 import tempfile
 import time
 
-from eventlet.green import subprocess as green_subprocess
-from ironic_lib import metrics_utils
-from ironic_lib import utils as ironic_utils
 from oslo_concurrency import processutils
 from oslo_log import log as logging
-from oslo_utils import excutils
 from oslo_utils import strutils
 
 from ironic.common import boot_devices
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import metrics_utils
 from ironic.common import states
 from ironic.common import utils
 from ironic.conductor import task_manager
@@ -71,9 +69,9 @@ REQUIRED_PROPERTIES = {
 }
 OPTIONAL_PROPERTIES = {
     'ipmi_password': _("password. Optional."),
-    'ipmi_hex_kg_key': _('Kg key for IPMIv2 authentication. '
-                         'The key is expected in hexadecimal format. '
-                         'Optional.'),
+    'ipmi_hex_kg_key': _("Kg key for IPMIv2 authentication. "
+                         "The key is expected in hexadecimal format. "
+                         "Optional."),
     'ipmi_port': _("remote IPMI RMCP port. Optional."),
     'ipmi_priv_level': _("privilege level; default is ADMINISTRATOR. One of "
                          "%s. Optional.") % ', '.join(VALID_PRIV_LEVELS),
@@ -206,7 +204,7 @@ def _vendor_aware_boot_device_map(task):
         # NOTE(TheJulia): Similar differences may exist with Cisco UCS
         # hardware when using IPMI, however at present we don't know
         # what the setting would be.
-        # NOTE(TheJulia) I've observed "mc info" manufacter name of a cisco
+        # NOTE(TheJulia) I've observed "mc info" manufacturer name of a cisco
         # c-series machine to return "Unknown (0x168B)"
     return boot_dev_map
 
@@ -280,37 +278,73 @@ def _console_pwfile_path(uuid):
 
 
 @contextlib.contextmanager
-def _make_password_file(password):
-    """Makes a temporary file that contains the password.
+def _prepare_ipmi_password(driver_info):
+    """Prepares the IPMI password by either setting it in the environment
 
-    :param password: the password
-    :returns: the absolute pathname of the temporary file
+    or creating a temporary file.
+
+    :param driver_info: the ipmitool parameters for accessing a node.
+    :returns: the absolute pathname of the password
     :raises: PasswordFileFailedToCreate from creating or writing to the
              temporary file
     """
-    f = None
-    try:
-        f = tempfile.NamedTemporaryFile(mode='w', dir=CONF.tempdir)
-        f.write(str(password))
-        f.flush()
-    except (IOError, OSError) as exc:
-        if f is not None:
-            f.close()
-        raise exception.PasswordFileFailedToCreate(error=exc)
-    except Exception:
-        with excutils.save_and_reraise_exception():
+    if CONF.ipmi.store_cred_in_env:
+        yield _persist_ipmi_password(driver_info)
+    else:
+        f = None
+        try:
+            f = tempfile.NamedTemporaryFile(mode='w', dir=CONF.tempdir)
+            f.write(str(driver_info['password'] or '\0'))
+            f.flush()
+        except (IOError, OSError) as exc:
+            if f is not None:
+                f.close()
+            raise exception.PasswordFileFailedToCreate(error=exc) from exc
+        except Exception:
+            if f is not None:
+                f.close()
+            raise
+
+        try:
+            # NOTE(jlvillal): This yield can not be in the try/except block
+            # above because an exception by the caller of this function would
+            # then get changed to a PasswordFileFailedToCreate exception which
+            # would mislead about the problem and its cause.
+            yield ('-f', f.name)
+        finally:
             if f is not None:
                 f.close()
 
+
+def is_bridging_enabled(node):
+    """Check if IPMI bridging is enabled.
+
+    This call is used in the inspector lookup.
+    """
+    return node.driver_info.get("ipmi_bridging", "no") != "no"
+
+
+def _validate_ipmi_address(address, node_uuid):
+    """Validate that the IPMI address is a valid IP or hostname.
+
+    :param address: The IPMI address to validate
+    :param node_uuid: Node UUID for error messages
+    :raises: InvalidParameterValue if the address is invalid
+    """
+    if not address:
+        return
+
     try:
-        # NOTE(jlvillal): This yield can not be in the try/except block above
-        # because an exception by the caller of this function would then get
-        # changed to a PasswordFileFailedToCreate exception which would mislead
-        # about the problem and its cause.
-        yield f.name
-    finally:
-        if f is not None:
-            f.close()
+        ipaddress.ip_address(address)
+        return  # Valid IP address
+    except ValueError:
+        pass  # Not an IP, check if it's a valid hostname
+
+    if not utils.is_hostname_safe(address):
+        raise exception.InvalidParameterValue(
+            _('Invalid IPMI address "%(address)s" for node %(node)s. '
+              'Must be a valid IP address or hostname.') %
+            {'address': address, 'node': node_uuid})
 
 
 def _parse_driver_info(node):
@@ -450,7 +484,7 @@ def _parse_driver_info(node):
     }
 
 
-def _get_ipmitool_args(driver_info, pw_file=None):
+def _get_ipmitool_args(driver_info, pw_file=None, use_pwd_env=False):
     ipmi_version = ('lanplus'
                     if driver_info['protocol_version'] == '2.0'
                     else 'lan')
@@ -477,6 +511,8 @@ def _get_ipmitool_args(driver_info, pw_file=None):
     if pw_file:
         args.append('-f')
         args.append(pw_file)
+    elif use_pwd_env:
+        args.append('-E')
 
     if CONF.ipmi.debug:
         args.append('-v')
@@ -485,6 +521,25 @@ def _get_ipmitool_args(driver_info, pw_file=None):
     args = [str(arg) for arg in args]
 
     return args
+
+
+def _persist_ipmi_password(driver_info):
+    """Persists IPMI password for passing to the ipmitool
+
+    :param driver_info: driver info with the ipmitool parameters
+    """
+    env = {}
+    if CONF.ipmi.store_cred_in_env:
+        password = driver_info.get('password')
+        if password:
+            env = {'IPMI_PASSWORD': password}
+        return '-E', env
+
+    path = _console_pwfile_path(driver_info['uuid'])
+    pw_file = console_utils.make_persistent_password_file(
+        path, driver_info['password'] or '\0')
+
+    return '-f', pw_file
 
 
 def _ipmitool_timing_args():
@@ -516,7 +571,7 @@ def _ipmitool_timing_args():
 
 
 def choose_cipher_suite(actual_cipher_suite):
-    """Gives the possible next avaible cipher suite version.
+    """Gives the possible next available cipher suite version.
 
     Based on CONF.ipmi.cipher_suite_versions and the last cipher suite version
     used that failed. This function is only called if the node doesn't have
@@ -552,9 +607,11 @@ def check_cipher_suite_errors(cmd_stderr):
     :returns: True if the cmd_stderr contains a cipher suite error,
         False otherwise.
     """
-    cs_errors = ["Unsupported cipher suite ID",
-                 "Error in open session response message :"
-                 " no matching cipher suite"]
+    cs_errors = [
+        "Unsupported cipher suite ID",
+        "Error in open session response message : no matching cipher suite",
+        "Error in open session response message : invalid role",
+    ]
     for cs_err in cs_errors:
         if cmd_stderr is not None and cs_err in cmd_stderr:
             return True
@@ -636,10 +693,15 @@ def _exec_ipmitool(driver_info, command, check_exit_code=None,
         # 'ipmitool' command will prompt password if there is no '-f'
         # option, we set it to '\0' to write a password file to support
         # empty password
-        with _make_password_file(driver_info['password'] or '\0') as pw_file:
-            cmd_args.append('-f')
-            cmd_args.append(pw_file)
+
+        with _prepare_ipmi_password(driver_info) as (flag, env_path):
+            cmd_args.append(flag)
+            if CONF.ipmi.store_cred_in_env:
+                extra_args['env_variables'] = env_path
+            else:
+                cmd_args.append(env_path)
             cmd_args.extend(command.split(" "))
+
             try:
                 out, err = utils.execute(*cmd_args, **extra_args)
                 return out, err
@@ -648,29 +710,30 @@ def _exec_ipmitool(driver_info, command, check_exit_code=None,
                     actual_cs = update_cipher_suite_cmd(actual_cs, args)
                 else:
                     change_cs = False
-                with excutils.save_and_reraise_exception() as ctxt:
-                    err_list = [
-                        x for x in (
-                            IPMITOOL_RETRYABLE_FAILURES
-                            + CONF.ipmi.additional_retryable_ipmi_errors)
-                        if x in str(e)]
-                    # If Ironic is doing retries then retry all errors
-                    retry_failures = (err_list
-                                      or not CONF.ipmi.use_ipmitool_retries)
-                    if ((time.time() > end_time)
-                        or (num_tries == 0)
-                        or not retry_failures):
-                        LOG.error('IPMI Error while attempting "%(cmd)s" '
-                                  'for node %(node)s. Error: %(error)s',
-                                  {'node': driver_info['uuid'],
-                                   'cmd': e.cmd, 'error': e})
-                    else:
-                        ctxt.reraise = False
-                        LOG.warning('IPMI Error encountered, retrying '
-                                    '"%(cmd)s" for node %(node)s. '
-                                    'Error: %(error)s',
-                                    {'node': driver_info['uuid'],
-                                     'cmd': e.cmd, 'error': e})
+
+                err_list = [
+                    x for x in (
+                        IPMITOOL_RETRYABLE_FAILURES
+                        + CONF.ipmi.additional_retryable_ipmi_errors)
+                    if x in str(e)]
+                # If Ironic is doing retries then retry all errors
+                retry_failures = (err_list
+                                  or not CONF.ipmi.use_ipmitool_retries)
+                if ((time.time() > end_time)
+                    or (num_tries == 0)
+                    or not retry_failures):
+                    LOG.error('IPMI Error while attempting "%(cmd)s" '
+                              'for node %(node)s. Error: %(error)s',
+                              {'node': driver_info['uuid'],
+                               'cmd': e.cmd, 'error': e})
+                    raise
+                else:
+                    LOG.warning('IPMI Error encountered, retrying '
+                                '"%(cmd)s" for node %(node)s. '
+                                'Error: %(error)s',
+                                {'node': driver_info['uuid'],
+                                 'cmd': e.cmd, 'error': e})
+
             finally:
                 LAST_CMD_TIME[driver_info['address']] = time.time()
 
@@ -701,6 +764,9 @@ def _set_and_wait(task, power_action, driver_info, timeout=None):
         cmd_name = "soft"
         target_state = states.POWER_OFF
         timeout = timeout or CONF.conductor.soft_power_off_timeout
+    elif power_action == states.REBOOT:
+        cmd_name = "reset"
+        target_state = states.POWER_ON
 
     # NOTE(sambetts): Retries for ipmi power action failure will be handled by
     # the _exec_ipmitool function, so no need to wrap this call in its own
@@ -710,13 +776,15 @@ def _set_and_wait(task, power_action, driver_info, timeout=None):
         _exec_ipmitool(driver_info, cmd)
     except (exception.PasswordFileFailedToCreate,
             processutils.ProcessExecutionError,
-            subprocess.TimeoutExpired,
-            # https://github.com/eventlet/eventlet/issues/624
-            green_subprocess.TimeoutExpired) as e:
+            subprocess.TimeoutExpired) as e:
         LOG.warning("IPMI power action %(cmd)s failed for node %(node_id)s "
                     "with error: %(error)s.",
                     {'node_id': driver_info['uuid'], 'cmd': cmd, 'error': e})
         raise exception.IPMIFailure(cmd=cmd)
+    if power_action == states.REBOOT:
+        LOG.debug('Sleeping 15 seconds to give the node %s a chance to power '
+                  'off before checking its state', task.node.uuid)
+        time.sleep(15)
     return cond_utils.node_wait_for_power_state(task, target_state,
                                                 timeout=timeout)
 
@@ -937,13 +1005,13 @@ def _check_temp_dir():
         except (exception.PathNotFound,
                 exception.DirectoryNotWritable,
                 exception.InsufficientDiskSpace) as e:
-            with excutils.save_and_reraise_exception():
-                TMP_DIR_CHECKED = False
-                err_msg = (_("Ipmitool drivers need to be able to create "
-                             "temporary files to pass password to ipmitool. "
-                             "Encountered error: %s") % e)
-                e.message = err_msg
-                LOG.error(err_msg)
+            TMP_DIR_CHECKED = False
+            err_msg = (_("Ipmitool drivers need to be able to create "
+                         "temporary files to pass password to ipmitool. "
+                         "Encountered error: %s") % e)
+            e.message = err_msg
+            LOG.exception(err_msg)
+            raise
         else:
             TMP_DIR_CHECKED = True
 
@@ -997,7 +1065,12 @@ class IPMIPower(base.PowerInterface):
         :raises: MissingParameterValue if a required parameter is missing.
 
         """
-        _parse_driver_info(task.node)
+        driver_info = _parse_driver_info(task.node)
+
+        ipmi_address = driver_info.get('address')
+        if ipmi_address:
+            _validate_ipmi_address(ipmi_address, task.node.uuid)
+
         # NOTE(tenbrae): don't actually touch the BMC in validate because it is
         #             called too often, and BMCs are too fragile.
         #             This is a temporary measure to mitigate problems while
@@ -1046,6 +1119,11 @@ class IPMIPower(base.PowerInterface):
         elif power_state == states.SOFT_POWER_OFF:
             _soft_power_off(task, driver_info, timeout=timeout)
         elif power_state == states.SOFT_REBOOT:
+            if task.node.disable_power_off:
+                # There is no way to implement this in ipmitool, apparently
+                raise exception.UnsupportedHardwareFeature(
+                    node=task.node.uuid,
+                    feature=states.SOFT_POWER_OFF)
             _soft_power_off(task, driver_info, timeout=timeout)
             driver_utils.ensure_next_boot_device(task, driver_info)
             _power_on(task, driver_info, timeout=timeout)
@@ -1071,6 +1149,10 @@ class IPMIPower(base.PowerInterface):
 
         """
         driver_info = _parse_driver_info(task.node)
+        if task.node.disable_power_off:
+            driver_utils.ensure_next_boot_device(task, driver_info)
+            _set_and_wait(task, states.REBOOT, driver_info, timeout=timeout)
+            return
         # NOTE(jlvillal): Some BMCs will error if setting power state to off if
         # the node is already turned off.
         current_status = _power_status(driver_info)
@@ -1201,8 +1283,8 @@ class IPMIManagement(base.ManagementInterface):
         boot_mode = boot_mode_utils.get_boot_mode(task.node)
         if boot_mode == 'uefi':
             # Long story short: UEFI was added to IPMI after the final spec
-            # release occured. This means BMCs may actually NEED to be
-            # explicitly told if the boot is persistant because the
+            # release occurred. This means BMCs may actually NEED to be
+            # explicitly told if the boot is persistent because the
             # BMC may return a value which is explicitly parsed as
             # no change, BUT the BMC may treat that as operational default.
             efi_persistence = '0xe0' if persistent else '0xa0'
@@ -1332,7 +1414,7 @@ class IPMIManagement(base.ManagementInterface):
         """
         driver_info = _parse_driver_info(task.node)
         # with '-v' option, we can get the entire sensor data including the
-        # extended sensor informations
+        # extended sensor information
         cmd = "sdr -v"
         try:
             out, err = _exec_ipmitool(
@@ -1371,23 +1453,44 @@ class VendorPassthru(base.VendorInterface):
     def __init__(self):
         _constructor_checks(driver=self.__class__.__name__)
 
+    _send_raw_step_args = {
+        'raw_bytes': {
+            'description': (
+                'A string of raw bytes to convey the request to transmit '
+                'to the remote BMC.'
+            ),
+            'required': True
+        }
+    }
+
     @METRICS.timer('VendorPassthru.send_raw')
+    @base.service_step(priority=0,
+                       argsinfo=_send_raw_step_args)
+    @base.deploy_step(priority=0,
+                      argsinfo=_send_raw_step_args)
+    @base.clean_step(priority=0, abortable=False,
+                     argsinfo=_send_raw_step_args,
+                     requires_ramdisk=False)
     @base.passthru(['POST'],
                    description=_("Send raw bytes to the BMC. Required "
                                  "argument: 'raw_bytes' - a string of raw "
                                  "bytes (e.g. '0x00 0x01')."))
     @task_manager.require_exclusive_lock
-    def send_raw(self, task, http_method, raw_bytes):
+    def send_raw(self, task, **kwargs):
         """Send raw bytes to the BMC. Bytes should be a string of bytes.
 
         :param task: a TaskManager instance.
-        :param http_method: the HTTP method used on the request.
         :param raw_bytes: a string of raw bytes to send, e.g. '0x00 0x01'
+                          supplied as a kwargument.
         :raises: IPMIFailure on an error from ipmitool.
         :raises: MissingParameterValue if a required parameter is missing.
         :raises:  InvalidParameterValue when an invalid value is specified.
 
         """
+        raw_bytes = kwargs.get('raw_bytes')
+        if not raw_bytes:
+            raise exception.MissingParameterValue(
+                'Argument raw_bytes is missing.')
         send_raw(task, raw_bytes)
 
     @METRICS.timer('VendorPassthru.bmc_reset')
@@ -1493,14 +1596,17 @@ class IPMIConsole(base.ConsoleInterface):
                 "Check the 'ipmi_protocol_version' parameter in "
                 "node's driver_info"))
 
-    def _get_ipmi_cmd(self, driver_info, pw_file):
+    def _get_ipmi_cmd(self, driver_info, pw_file=None, use_pwd_env=False):
         """Get ipmi command for ipmitool usage.
 
         :param driver_info: driver info with the ipmitool parameters
         :param pw_file: password file to be used in ipmitool command
+        :param use_pwd_env: when True, add -E so ipmitool reads password
+            from IPMI_PASSWORD environment variable
         :returns: returns a command string for ipmitool
         """
-        return ' '.join(_get_ipmitool_args(driver_info, pw_file=pw_file))
+        return ' '.join(_get_ipmitool_args(driver_info, pw_file=pw_file,
+                                           use_pwd_env=use_pwd_env))
 
     def _start_console(self, driver_info, start_method):
         """Start a remote console for the node.
@@ -1514,86 +1620,36 @@ class IPMIConsole(base.ConsoleInterface):
                  created
         :raises: ConsoleSubprocessFailed when invoking the subprocess failed
         """
-        path = _console_pwfile_path(driver_info['uuid'])
-        pw_file = console_utils.make_persistent_password_file(
-            path, driver_info['password'] or '\0')
-        ipmi_cmd = self._get_ipmi_cmd(driver_info, pw_file)
-        ipmi_cmd += ' sol activate'
-
-        try:
-            start_method(driver_info['uuid'], driver_info['port'], ipmi_cmd)
-        except (exception.ConsoleError, exception.ConsoleSubprocessFailed):
-            with excutils.save_and_reraise_exception():
-                ironic_utils.unlink_without_raise(path)
-
-
-class IPMIShellinaboxConsole(IPMIConsole):
-    """A ConsoleInterface that uses ipmitool and shellinabox."""
-
-    def _get_ipmi_cmd(self, driver_info, pw_file):
-        """Get ipmi command for ipmitool usage.
-
-        :param driver_info: driver info with the ipmitool parameters
-        :param pw_file: password file to be used in ipmitool command
-        :returns: returns a command string for ipmitool
-        """
-        command = super(IPMIShellinaboxConsole, self)._get_ipmi_cmd(
-            driver_info, pw_file)
-        return ("/:%(uid)s:%(gid)s:HOME:%(basic_command)s"
-                % {'uid': os.getuid(),
-                   'gid': os.getgid(),
-                   'basic_command': command})
-
-    @METRICS.timer('IPMIShellinaboxConsole.start_console')
-    def start_console(self, task):
-        """Start a remote console for the node.
-
-        :param task: a task from TaskManager
-        :raises: InvalidParameterValue if required ipmi parameters are missing
-        :raises: PasswordFileFailedToCreate if unable to create a file
-                 containing the password
-        :raises: ConsoleError if the directory for the PID file cannot be
-                 created
-        :raises: ConsoleSubprocessFailed when invoking the subprocess failed
-        """
-        driver_info = _parse_driver_info(task.node)
-        if not driver_info['port']:
-            driver_info['port'] = _allocate_port(task)
-
-        try:
-            self._exec_stop_console(driver_info)
-        except OSError:
-            # We need to drop any existing sol sessions with sol deactivate.
-            # OSError is raised when sol session is already deactivated,
-            # so we can ignore it.
-            pass
-        self._start_console(driver_info,
-                            console_utils.start_shellinabox_console)
-
-    @METRICS.timer('IPMIShellinaboxConsole.stop_console')
-    def stop_console(self, task):
-        """Stop the remote console session for the node.
-
-        :param task: a task from TaskManager
-        :raises: ConsoleError if unable to stop the console
-        """
-        try:
-            console_utils.stop_shellinabox_console(task.node.uuid)
-        finally:
-            ironic_utils.unlink_without_raise(
-                _console_pwfile_path(task.node.uuid))
-        _release_allocated_port(task)
-
-    def _exec_stop_console(self, driver_info):
-        cmd = "sol deactivate"
-        _exec_ipmitool(driver_info, cmd, check_exit_code=[0, 1])
-
-    @METRICS.timer('IPMIShellinaboxConsole.get_console')
-    def get_console(self, task):
-        """Get the type and connection information about the console."""
-        driver_info = _parse_driver_info(task.node)
-        url = console_utils.get_shellinabox_console_url(driver_info['port'])
-        return {'type': 'shellinabox', 'url': url}
+        flag, path_or_env = _persist_ipmi_password(driver_info)
+        if flag == '-f':
+            pw_file = path_or_env
+            cmd = self._get_ipmi_cmd(driver_info, pw_file=pw_file)
+            cmd += ' sol activate'
+            try:
+                start_method(driver_info['uuid'], driver_info['port'], cmd)
+            except (exception.ConsoleError,
+                    exception.ConsoleSubprocessFailed) as e:
+                utils.unlink_without_raise(pw_file)
+                LOG.exception('IPMI Error while attempting "%(cmd)s" '
+                              'for node %(node)s. Error: %(error)s',
+                              {'node': driver_info['uuid'],
+                               'cmd': cmd, 'error': e})
+                raise
+        else:
+            # flag == '-E', use password from environment
+            cmd = self._get_ipmi_cmd(driver_info, pw_file=None,
+                                     use_pwd_env=True)
+            cmd += ' sol activate'
+            try:
+                start_method(driver_info['uuid'], driver_info['port'], cmd,
+                             env_variables=path_or_env)
+            except (exception.ConsoleError,
+                    exception.ConsoleSubprocessFailed) as e:
+                LOG.exception('IPMI Error while attempting "%(cmd)s" '
+                              'for node %(node)s. Error: %(error)s',
+                              {'node': driver_info['uuid'],
+                               'cmd': cmd, 'error': e})
+                raise
 
 
 class IPMISocatConsole(IPMIConsole):
@@ -1611,6 +1667,9 @@ class IPMISocatConsole(IPMIConsole):
                  created
         :raises: ConsoleSubprocessFailed when invoking the subprocess failed
         """
+        # Dealloc allocated port if any, so the same host can never has
+        # duplicated port.
+        _release_allocated_port(task)
         driver_info = _parse_driver_info(task.node)
         if not driver_info['port']:
             driver_info['port'] = _allocate_port(
@@ -1636,8 +1695,7 @@ class IPMISocatConsole(IPMIConsole):
         try:
             console_utils.stop_socat_console(task.node.uuid)
         finally:
-            ironic_utils.unlink_without_raise(
-                _console_pwfile_path(task.node.uuid))
+            utils.unlink_without_raise(_console_pwfile_path(task.node.uuid))
         self._exec_stop_console(driver_info)
         _release_allocated_port(task)
 
@@ -1652,5 +1710,13 @@ class IPMISocatConsole(IPMIConsole):
         :param task: a task from TaskManager
         """
         driver_info = _parse_driver_info(task.node)
+
+        try:
+            self._exec_stop_console(driver_info)
+        except OSError:
+            # We need to drop any existing sol sessions with sol deactivate.
+            # OSError is raised when sol session is already deactivated,
+            # so we can ignore it.
+            pass
         url = console_utils.get_socat_console_url(driver_info['port'])
         return {'type': 'socat', 'url': url}

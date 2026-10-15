@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Copyright © 2012 New Dream Network, LLC (DreamHost)
 #
@@ -29,10 +28,12 @@ from ironic.db import api as dbapi
 LOG = log.getLogger(__name__)
 
 CHECKED_DEPRECATED_POLICY_ARGS = False
-INBOUND_HEADER = 'X-Openstack-Request-Id'
-GLOBAL_REQ_ID = 'openstack.global_request_id'
-ID_FORMAT = (r'^req-[a-f0-9]{8}-[a-f0-9]{4}-'
-             r'[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
+
+# Call once, don't call on each request because it is
+# a ton of extra overhead.
+DBAPI = dbapi.get_instance()
+
+CONF = cfg.CONF
 
 
 def policy_deprecation_check():
@@ -76,8 +77,21 @@ class ConfigHook(hooks.PecanHook):
 class DBHook(hooks.PecanHook):
     """Attach the dbapi object to the request so controllers can get to it."""
 
+    # NOTE(TheJulia): This hook is deprecated, and should be expected to be
+    # removed after the 2026.2 Ironic release.
     def before(self, state):
-        state.request.dbapi = dbapi.get_instance()
+        if CONF.rpc_transport == 'none' or CONF.use_rpc_for_database:
+            # If the transport is disabled, the request is not to use
+            # the database, and as such it doesn't need to be attached
+            # to the request.
+            state.request.dbapi = None
+        else:
+            state.request.dbapi = DBAPI
+
+    def after(self, state):
+        # Explicitly set to None since we don't need the DB connection
+        # after we're done processing the request.
+        state.request.dbapi = None
 
 
 class ContextHook(hooks.PecanHook):
@@ -87,17 +101,8 @@ class ContextHook(hooks.PecanHook):
         super(ContextHook, self).__init__()
 
     def before(self, state):
-        is_public_api = state.request.environ.get('is_public_api', False)
-        auth_token_info = state.request.environ.get('keystone.token_info')
-        # set the global_request_id if we have an inbound request id
-        gr_id = state.request.headers.get(INBOUND_HEADER, "")
-        if re.match(ID_FORMAT, gr_id):
-            state.request.environ[GLOBAL_REQ_ID] = gr_id
-
         ctx = context.RequestContext.from_environ(
-            state.request.environ,
-            is_public_api=is_public_api,
-            auth_token_info=auth_token_info)
+            state.request.environ)
         # Do not pass any token with context for noauth mode
         if cfg.CONF.auth_strategy != 'keystone':
             ctx.auth_token = None
@@ -110,10 +115,6 @@ class ContextHook(hooks.PecanHook):
         if state.request.context == {}:
             # An incorrect url path will not create RequestContext
             return
-        # NOTE(lintan): RequestContext will generate a request_id if no one
-        # passing outside, so it always contain a request_id.
-        request_id = state.request.context.request_id
-        state.response.headers['Openstack-Request-Id'] = request_id
 
 
 class RPCHook(hooks.PecanHook):

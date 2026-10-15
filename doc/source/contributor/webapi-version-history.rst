@@ -2,8 +2,286 @@
 REST API Version History
 ========================
 
-1.81 (Antelope)
+1.115 (Hibiscus)
+----------------
+
+Add ``state``, ``target_provision_state``, and ``duration_seconds`` fields
+to the node history detail response. Clients requesting microversion 1.115
+or higher will receive these fields, providing additional information about
+the node's provisioning state and the duration of each history event.
+
+1.114 (Hibiscus)
+----------------
+
+Add hardware identity fields to the firmware component response:
+
+* ``GET /v1/nodes/{node_ident}/firmware`` now returns ``vendor``, ``model``,
+  and ``serial_number`` for each firmware component when the client declares
+  API microversion 1.114 or higher.  All three fields are nullable strings.
+* For NIC components the values come from the Redfish ``NetworkAdapter``
+  resource (``Manufacturer``, ``Model``, ``SerialNumber`` respectively).
+* For BMC components only ``model`` is populated from ``Manager.Model``
+  (e.g. ``"iDRAC 9"``); ``vendor`` and ``serial_number`` are ``null``.
+* For BIOS components all three fields are ``null``.
+
+1.113 (Hibiscus)
+----------------
+
+Add ``project`` field to node history detail response. Clients
+requesting microversion 1.113 or higher will receive the project
+field when requesting detailed node history, enabling identification
+of which project triggered each history event.
+
+1.112 (Hibiscus)
 ----------------------
+
+Add runbook traits support:
+
+* Runbooks now carry a ``traits`` set (list of custom trait strings).
+  When executing a runbook on a node, the system checks that the node
+  has at least one trait that intersects with the runbook's traits set.
+  This replaces the previous requirement that the runbook ``name``
+  must exactly match a node trait.
+* The runbook ``name`` may now be any valid logical name string (letters,
+  digits, hyphens, dots, underscores; 1–255 characters). The old
+  constraint that names must follow the trait format (``CUSTOM_*`` or
+  an ``os-traits`` standard trait) is lifted.
+* New sub-resource ``/v1/runbooks/{ident}/traits`` with endpoints:
+
+  * ``GET`` – list the runbook's traits
+  * ``PUT`` – replace all traits (body: ``{"traits": [...]}``), or add a
+    single trait (``PUT /v1/runbooks/{ident}/traits/{trait}`` with no body)
+  * ``DELETE /v1/runbooks/{ident}/traits/{trait}`` – remove a single trait
+
+Add runbook description field:
+
+* A ``description`` field (nullable string, max 255 characters) is added
+  to runbooks, consistent with other Ironic objects.
+
+1.111 (Gazpacho)
+----------------------
+
+Add ``available_for_dynamic_portgroup`` boolean field to the port object
+(defaults to ``True``) and ``dynamic_portgroup`` boolean field to the
+portgroup object. The port field is user-editable via POST and PATCH
+requests. The portgroup field is read-only to API consumers.
+
+1.110 (Gazpacho)
+----------------------
+
+Add support for aborting deployment in the ``wait call-back`` (DEPLOYWAIT) state.
+This provides consistency with other wait states that already support the abort
+verb, allowing operators to issue ``abort`` on a node in DEPLOYWAIT state to
+transition it to DEPLOYFAIL. The node remains in DEPLOYFAIL state without
+triggering automated cleaning, allowing operators to investigate the issue or
+retry deployment.
+
+1.109 (Gazpacho)
+----------------------
+
+Add ``health`` field to the node object.
+
+1.108 (Gazpacho)
+------------------------
+Add support for ``disable_ramdisk`` parameter to provisioning endpoint
+``/v1/nodes/{node_ident}/states/provision`` for the 'service' verb.
+
+1.107 (Gazpacho)
+------------------------
+
+Add the ``x-openstack-request-id`` header to all responses. This header mirrors
+the ``openstack-request-id`` header.
+
+1.106 (Gazpacho)
+----------------------
+
+Add ability to filter on a node shard when listing portgroups.
+
+1.105 (Gazpacho)
+----------------------
+
+Removes support to set an OVN VTEP endpoint for ``local_link_information``.
+Investigation by multiple contributors and maintainers realized that
+this experiemntal feature was not scalable and relies upon a manual
+ovn vtep endpoint service, and as such has been removed.
+
+1.104 (Gazpacho)
+------------------------
+
+Add a new ``instance_name`` field to the node resource. This field provides
+a human-readable name for the instance deployed on a node and is automatically
+synchronized with ``instance_info.display_name`` for backward compatibility
+with Nova.
+
+1.103 (Gazpacho)
+-----------------------
+
+Add a 'category' field to the Portgroup object.
+
+1.102 (Gazpacho)
+-----------------------
+
+Add a 'physical_network' field to the Portgroup object.
+
+1.101 (Flamingo)
+-----------------------
+
+Add a 'category' field to the Port object.
+
+1.100 (Flamingo)
+-----------------------
+
+Add a 'vendor' field to the Port object.
+
+1.99 (Flamingo)
+-----------------------
+
+Add ability to filter on node conductor group when listing ports and
+portgroups.
+
+1.98 (Flamingo)
+-----------------------
+
+Add support for patching object attributes with keys containing ~ or /.
+
+1.97 (Flamingo)
+-----------------------
+
+Add a 'description' field to the Port object.
+
+1.95 (Epoxy)
+-----------------------
+
+Add support to set/unset disable_power_off on nodes.
+
+1.94 (Epoxy)
+-----------------------
+
+Add support to create ports passing in either the node name or UUID.
+
+1.92 (Dalmatian)
+-----------------------
+
+Adds runbooks, a predefined list of steps that can be run on
+nodes associated via traits and used in place of an explicit
+list of steps for manual cleaning or servicing, to enable
+self-service of maintenance items by project members.
+
+* Adds a new REST API endpoint ``/v1/runbooks/`` with basic CRUD support.
+* Extends the ``/v1/nodes/<node>/states/provision`` API to accept a runbook
+  identifier (name or UUID) instead of ``clean_steps`` or ``service_steps`` for
+  servicing or manual cleaning.
+* Implements RBAC-aware lifecycle management for runbooks, allowing projects
+  to limit who can CRUD and use a runbook.
+
+1.91 (Dalmatian)
+-----------------------
+
+Removes special treatment of .json for API objects
+
+* ``/v1/nodes/test.json`` will now only mean node with the name
+  "test.json"
+* ``/v1/nodes/test.json``.json will mean a node with the name
+  "test.json.json" and,
+* ``/v1/nodes/test`` will mean a node with the name "test".
+
+So ``/v1/nodes/test.json`` will no longer default to "test" and
+will HTTP 404 unless a node with the name "test" actually exists.
+
+This also removes the backward compatibility with the
+``guess_content_type_from_ext`` feature
+
+1.90 (Caracal)
+-----------------------
+
+API supports ovn vtep switches as a valid schema for
+``port.local_link_connection``. Ovn vtep switches are represented
+as the following:
+
+.. code-block:: json
+
+   {
+     "port_id": "exampleportid",
+     "vtep-logical-switch": "examplelogicalswitch",
+     "vtep-physical-switch": "examplephysicalswitch"
+   }
+
+1.89 (Caracal)
+---------------------------------
+
+Adds support to attaching or detaching images from a node's virtual
+media using the ``/v1/nodes/{node_ident}/vmedia`` endpoint. A ``POST``
+request containing ``device_type``, ``image_url``,
+and ``image_download_source`` will attach the requested image to the
+node's virtual media. A later ``DELETE`` request to the same endpoint
+will detach it.
+
+1.88 (Bobcat)
+-----------------------
+
+Added the ``name`` field to the port API. It should be unique when set,
+and can be used to identify a port resource.
+
+1.87 (Bobcat)
+-------------
+
+Adds the ``service`` provision state verb to allow modifications
+via the "steps" interface to occur with a baremetal node. With this
+functionality comes a ``service_step`` field on the ``/v1/nodes``
+based resources, which indicates the current step.
+
+1.86 (Bobcat)
+-------------
+
+Adds a ``firmware_interface`` field to the ``/v1/nodes`` resources.
+
+1.85 (Bobcat, 22.1)
+-------------------
+
+This version adds a new provision state change verb called ``unhold``
+to be utilized with the new ``provision_state`` values ``clean hold``
+and ``deploy hold``. The verb instructs Ironic to remove the node
+from it's present hold and to resume it's prior cleaning or
+deployment process.
+
+1.84 (Bobcat, 22.1)
+-------------------
+
+Add callback endpoint for in-band inspection ``/v1/continue_inspection``.
+This endpoint is not designed to be used by regular users.
+
+1.83 (Bobcat, 22.0)
+-------------------
+
+This version adds a concept of child nodes through the use of a
+``parent_node`` field which can be set on a node.
+
+Under normal conditions, child nodes are not visible in the normal node
+list, as they are more for nested resources and not machines which can be
+freely used outside of an integrated context of the parent node.
+Think of a "child node" as a node with it's own BMC embedded inside of
+an existing node.
+
+Additionally:
+
+- Adds ``GET /v1/nodes/{node_ident}/children`` to return a list of node
+  UUIDs which represent children, which can acted upon individually.
+- Adds ``GET /v1/nodes/?include_children=True`` to return a list of all
+  parent nodes and children.
+- Adds ``GET /v1/nodes?parent_node={node_ident}`` to explicitly request
+  a detailed list of nodes by parent relationship.
+
+1.82 (Antelope, 21.4)
+---------------------
+
+This version signifies the addition of node sharding endpoints.
+
+- Adds support for get, set, and delete of shard key on Node object.
+- Adds support for ``GET /v1/shards`` which returns a list of all shards and
+  the count of nodes assigned to each.
+
+1.81 (Antelope, 21.3)
+---------------------
 
 Add endpoint to retrieve introspection data for nodes via the REST API.
 
@@ -12,7 +290,7 @@ Add endpoint to retrieve introspection data for nodes via the REST API.
 1.80 (Zed, 21.1)
 ----------------------
 
-This verison is a signifier of additional RBAC functionality allowing
+This version is a signifier of additional RBAC functionality allowing
 a project scoped ``admin`` to create or delete nodes in Ironic.
 
 1.79 (Zed, 21.0)
@@ -631,9 +909,9 @@ Add node ``clean_step`` field.
 1.6 (Kilo)
 ----------
 
-Add :ref:`inspection` process: introduce ``inspecting`` and ``inspectfail``
-provision states, and ``inspect`` action that can be used when a node is in
-``manageable`` provision state.
+Add :doc:`inspection </admin/inspection>` process: introduce ``inspecting`` and
+``inspectfail`` provision states, and ``inspect`` action that can be used when
+a node is in ``manageable`` provision state.
 
 1.5 (Kilo)
 ----------

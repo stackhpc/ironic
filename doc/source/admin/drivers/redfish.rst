@@ -1,3 +1,10 @@
+.. meta::
+   :description: Configure Ironic Redfish driver for modern server management. Support for Dell, HPE, Supermicro, and standards-based BMC control via Redfish API.
+   :keywords: redfish driver, BMC management, server automation, dell idrac, hpe ilo, supermicro, standards-based management, REST API
+   :author: OpenStack Ironic Team
+   :robots: index, follow
+   :audience: system administrators, hardware engineers
+
 ==============
 Redfish driver
 ==============
@@ -6,7 +13,33 @@ Overview
 ========
 
 The ``redfish`` driver enables managing servers compliant with the
-Redfish_ protocol.
+Redfish_ standard. While Redfish strives to provide a standard model of
+interaction for baseboard management controllers, vendors often do things
+slightly different or interpret the standard differently. Ironic attempts
+to support a number of features while also navigating these issues, however
+if you do encounter any issues, please do not hesitate to open a bug for the
+Ironic maintainers.
+
+Supported features include:
+
+* Network, :ref:`virtual media <redfish-virtual-media>` and :ref:`HTTP(s)
+  <redfish-https-boot>` boot.
+* Additional virtual media features:
+
+  * :ref:`Ramdisk deploy interface <redfish-virtual-media-ramdisk>`.
+  * :doc:`/admin/dhcp-less`.
+  * `Virtual media API
+    <https://docs.openstack.org/api-ref/baremetal/#attach-detach-virtual-media-nodes>`_.
+
+* :ref:`Changing boot mode and secure boot status <redfish-boot-mode>`.
+* :doc:`In-band </admin/inspection/index>` and `out-of-band inspection`_.
+* Retrieving and changing :ref:`BIOS settings <redfish-bios-settings>`.
+* Applying :doc:`firmware updates </admin/firmware-updates>`.
+* Configuring :doc:`hardware RAID </admin/raid>`.
+* :doc:`Hardware metrics <redfish/metrics>` and integration with
+  `ironic-prometheus-exporter
+  <https://docs.openstack.org/ironic-prometheus-exporter/latest/>`_.
+* Event notifications configured via :doc:`redfish/passthru`.
 
 Prerequisites
 =============
@@ -23,16 +56,17 @@ Enabling the Redfish driver
 #. Add ``redfish`` to the list of ``enabled_hardware_types``,
    ``enabled_power_interfaces``, ``enabled_management_interfaces`` and
    ``enabled_inspect_interfaces`` as well as ``redfish-virtual-media``
-   to ``enabled_boot_interfaces`` in ``/etc/ironic/ironic.conf``.
+   and ``redfish-https`` to ``enabled_boot_interfaces`` in
+   ``/etc/ironic/ironic.conf``.
    For example::
 
     [DEFAULT]
     ...
     enabled_hardware_types = ipmi,redfish
-    enabled_boot_interfaces = ipxe,redfish-virtual-media
+    enabled_boot_interfaces = ipxe,redfish-virtual-media,redfish-https
     enabled_power_interfaces = ipmitool,redfish
     enabled_management_interfaces = ipmitool,redfish
-    enabled_inspect_interfaces = inspector,redfish
+    enabled_inspect_interfaces = agent,redfish
 
 #. Restart the ironic conductor service::
 
@@ -50,53 +84,61 @@ set to ``redfish``.
 The following properties are specified in the node's ``driver_info``
 field:
 
-- ``redfish_address``: The URL address to the Redfish controller. It must
-                       include the authority portion of the URL, and can
-                       optionally include the scheme. If the scheme is
-                       missing, https is assumed.
-                       For example: https://mgmt.vendor.com. This is required.
+``redfish_address``
+    The URL address to the Redfish controller. It must include the authority
+    portion of the URL, and can optionally include the scheme. If the scheme is
+    missing, https is assumed. For example: ``https://mgmt.vendor.com``. This
+    is required.
 
-- ``redfish_system_id``: The canonical path to the ComputerSystem resource
-                         that the driver will interact with. It should include
-                         the root service, version and the unique resource
-                         path to the ComputerSystem. This property is only
-                         required if target BMC manages more than one
-                         ComputerSystem. Otherwise ironic will pick the only
-                         available ComputerSystem automatically. For
-                         example: /redfish/v1/Systems/1.
+``redfish_system_id``
+    The canonical path to the ComputerSystem resource that the driver will
+    interact with. It should include the root service, version and the unique
+    resource path to the ComputerSystem. This property is only required if
+    target BMC manages more than one ComputerSystem. Otherwise ironic will pick
+    the only available ComputerSystem automatically. For example:
+    ``/redfish/v1/Systems/1``.
 
-- ``redfish_username``: User account with admin/server-profile access
-                        privilege. Although not required, it is highly
-                        recommended.
+``redfish_username``
+    User account with admin/server-profile access privilege. Although not
+    required, it is highly recommended.
 
-- ``redfish_password``: User account password. Although not required, it is
-                        highly recommended.
+``redfish_password``
+    User account password. Although not required, it is highly recommended.
 
-- ``redfish_verify_ca``: If redfish_address has the **https** scheme, the
-                         driver will use a secure (TLS_) connection when
-                         talking to the Redfish controller. By default
-                         (if this is not set or set to True), the driver
-                         will try to verify the host certificates. This
-                         can be set to the path of a certificate file or
-                         directory with trusted certificates that the
-                         driver will use for verification. To disable
-                         verifying TLS_, set this to False. This is optional.
+``redfish_verify_ca``
+    If ``redfish_address`` has the ``https://`` scheme, the driver will use a
+    secure (TLS_) connection when talking to the Redfish controller. By default
+    (if this is not set or set to ``True``), the driver will try to verify the
+    host certificates. This can be set to the path of a certificate file or
+    directory with trusted certificates that the driver will use for
+    verification. To disable verifying TLS_, set this to ``False``. This is
+    optional.
 
-- ``redfish_auth_type``: Redfish HTTP client authentication method. Can be
-                         "basic", "session" or "auto".
-                         The "auto" mode first tries "session" and falls back
-                         to "basic" if session authentication is not supported
-                         by the Redfish BMC. Default is set in ironic config
-                         as ``[redfish]auth_type``. Most operators should not
-                         need to leverage this setting. Session based
-                         authentication should generally be used in most
-                         cases as it prevents re-authentication every time
-                         a background task checks in with the BMC.
+``redfish_auth_type``
+    Redfish HTTP client authentication method. Can be ``basic``, ``session`` or
+    ``auto``.  The ``auto`` mode first tries ``session`` and falls back to
+    ``basic`` if session authentication is not supported by the Redfish BMC.
+    Default is set in ironic config as :oslo.config:option:`redfish.auth_type`.
+    Most operators should not need to leverage this setting. Session based
+    authentication should generally be used in most cases as it prevents
+    re-authentication every time a background task checks in with the BMC.
+
+``vmedia_transport_protocol``
+    Override transport protocol selection for virtual media. Valid values are
+    ``HTTP``, ``NFS`` (NFSv3), or ``CIFS``. If not set, HTTP is used by
+    default. This setting must be supported by the BMC.
+
+    .. note::
+       NFS uses NFSv3 and does not send credentials to the BMC. CIFS/SMB
+       supports optional username/password authentication configured via
+       ``[cifs]username`` and ``[cifs]password``. Both NFS and CIFS require
+       operators to mount the respective share at ``[nfs]share_path`` or
+       ``[cifs]share_path`` on all conductor hosts.
 
 .. note::
    The ``redfish_address``, ``redfish_username``, ``redfish_password``,
    and ``redfish_verify_ca`` fields, if changed, will trigger a new session
-   to be establsihed and cached with the BMC. The ``redfish_auth_type`` field
+   to be established and cached with the BMC. The ``redfish_auth_type`` field
    will only be used for the creation of a new cached session, or should
    one be rejected by the BMC.
 
@@ -113,6 +155,8 @@ a node with the ``redfish`` driver. For example:
 
 For more information about enrolling nodes see :ref:`enrollment`
 in the install guide.
+
+.. _redfish-boot-mode:
 
 Boot mode support
 =================
@@ -140,25 +184,21 @@ Two clean and deploy steps are provided for key management:
 ``management.clear_secure_boot_keys``
     removes all secure boot keys from the node.
 
-Out-Of-Band inspection
-======================
+Rebooting on boot mode changes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The ``redfish`` hardware type can inspect the bare metal node by querying
-Redfish compatible BMC. This process is quick and reliable compared to the
-way the ``inspector`` hardware type works i.e. booting bare metal node
-into the introspection ramdisk.
+While some hardware is able to change the boot mode or the `UEFI secure boot`_
+state immediately, other models may require a reboot for such a change to be
+applied. Furthermore, some hardware models cannot change the boot mode and the
+secure boot state simultaneously, requiring several reboots.
 
-.. note::
+The Bare Metal service refreshes the System resource after issuing a PATCH
+request against it. If the expected change is not observed, the node is
+rebooted, and the Bare Metal service waits until the change is applied. In the
+end, the previous power state is restored.
 
-   The ``redfish`` inspect interface relies on the optional parts of the
-   Redfish specification. Not all Redfish-compliant BMCs might serve the
-   required information, in which case bare metal node inspection will fail.
-
-.. note::
-
-   The ``local_gb`` property cannot always be discovered, for example, when a
-   node does not have local storage or the Redfish implementation does not
-   support the required schema. In this case the property will be set to 0.
+This logic makes changing boot configuration more robust at the expense of
+several reboots in the worst case.
 
 .. _redfish-virtual-media:
 
@@ -198,7 +238,7 @@ BIOS boot mode, it suffice to set ironic boot interface to
    :doc:`/admin/drivers/idrac` for more details on this hardware type.
 
 If UEFI boot mode is desired, the user should additionally supply EFI
-System Partition image (ESP_), see `Configuring an ESP image`_ for details.
+System Partition image (ESP_), see :doc:`/install/configure-esp` for details.
 
 If ``[driver_info]/config_via_floppy`` boolean property of the node is set to
 ``true``, ironic will create a file with runtime configuration parameters,
@@ -214,7 +254,7 @@ user-specified kernel command line parameters.
 .. code-block:: bash
 
   baremetal node set node-0 \
-    --driver-info kernel_append_params="nofb nomodeset vga=normal"
+    --driver-info kernel_append_params="nofb vga=normal"
 
 .. note::
    The ``driver_info`` field is supported starting with the Xena release.
@@ -249,77 +289,21 @@ with the Wallaby release it's possible to provide a pre-built ISO image:
    accepted.
 
 .. note::
+   NFS (NFSv3) and CIFS/SMB transport protocols are supported for virtual media
+   attachment in addition to HTTP(S). HTTP is used by default. To use NFS or
+   CIFS, configure the shares using ``[nfs]base_url``/``[nfs]share_path`` or
+   ``[cifs]base_url``/``[cifs]share_path``, and set
+   ``driver_info[vmedia_transport_protocol]`` on each node. Operators are
+   responsible for mounting the share on all conductor hosts.
+
+.. note::
    Before the Xena release the parameters were called ``redfish_deploy_iso``
    and ``redfish_rescue_iso`` accordingly. The old names are still supported
    for backward compatibility.
 
 No customization is currently done to the image, so e.g.
-:doc:`/admin/dhcp-less` won't work. `Configuring an ESP image`_ is also
+:doc:`/admin/dhcp-less` won't work. :doc:`/install/configure-esp` is also
 unnecessary.
-
-Configuring an ESP image
-~~~~~~~~~~~~~~~~~~~~~~~~~
-
-An ESP image is an image that contains the necessary bootloader to boot the ISO
-in UEFI mode. You will need a GRUB2 image file, as well as Shim for secure
-boot. See :ref:`uefi-pxe-grub` for an explanation how to get them.
-
-Then the following script can be used to build an ESP image:
-
-.. code-block:: bash
-
-   DEST=/path/to/esp.img
-   GRUB2=/path/to/grub.efi
-   SHIM=/path/to/shim.efi
-   TEMP_MOUNT=$(mktemp -d)
-
-   dd if=/dev/zero of=$DEST bs=4096 count=1024
-   mkfs.fat -s 4 -r 512 -S 4096 $DEST
-
-   sudo mount $DEST $TEMP_MOUNT
-   sudo mkdir -p $DEST/EFI/BOOT
-   sudo cp "$SHIM" $DEST/EFI/BOOT/BOOTX64.efi
-   sudo cp "$GRUB2" $DEST/EFI/BOOT/GRUBX64.efi
-   sudo umount $TEMP_MOUNT
-
-.. note::
-   If you use an architecture other than x86-64, you'll need to adjust the
-   destination paths.
-
-The resulting image should be provided via the ``driver_info/bootloader``
-ironic node property in form of an image UUID or a URL:
-
-.. code-block:: bash
-
-   baremetal node set --driver-info bootloader=<glance-uuid-or-url> node-0
-
-Alternatively, set the bootloader UUID or URL in the configuration file:
-
-.. code-block:: ini
-
-   [conductor]
-   bootloader = <glance-uuid-or-url>
-
-Finally, you need to provide the correct GRUB2 configuration path for your
-image. In most cases this path will depend on your distribution, more
-precisely, the distribution you took the GRUB2 image from. For example:
-
-CentOS:
-
-.. code-block:: ini
-
-   [DEFAULT]
-   grub_config_path = EFI/centos/grub.cfg
-
-Ubuntu:
-
-.. code-block:: ini
-
-   [DEFAULT]
-   grub_config_path = EFI/ubuntu/grub.cfg
-
-.. note::
-   Unlike in the script above, these paths are case-sensitive!
 
 .. _redfish-virtual-media-ramdisk:
 
@@ -364,160 +348,82 @@ or via a link to a raw image:
   baremetal node deploy <node name or UUID> \
       --config-drive http://example.com/config.img
 
-Layer 3 or DHCP-less ramdisk booting
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. _redfish-https-boot:
 
-DHCP-less deploy is supported by the Redfish virtual media boot. See
-:doc:`/admin/dhcp-less` for more information.
+Redfish HTTP(s) Boot
+====================
 
-Firmware update using manual cleaning
-=====================================
+The ``redfish-https`` boot interface is very similar to the
+``redfish-virtual-media`` boot interface. In this driver, we compose an ISO
+image, and request the BMC to inform the UEFI firmware to boot the Ironic
+ramdisk, or a other ramdisk image. This approach is intended to allow a
+pattern of engagement where we have minimal reliance on addressing and
+discovery of the Ironic deployment through autoconfiguration like DHCP,
+and somewhat mirrors vendor examples of booting from an HTTP URL.
 
-The ``redfish`` hardware type supports updating the firmware on nodes using a
-manual cleaning step.
+This interface has some basic constraints.
 
-The firmware update cleaning step allows one or more firmware updates to be
-applied to a node. If multiple updates are specified, then they are applied
-sequentially in the order given. The server is rebooted once per update.
-If a failure occurs, the cleaning step immediately fails which may result
-in some updates not being applied. If the node is placed into maintenance
-mode while a firmware update cleaning step is running that is performing
-multiple firmware updates, the update in progress will complete, and processing
-of the remaining updates will pause.  When the node is taken out of maintenance
-mode, processing of the remaining updates will continue.
+* There is no configuration drive functionality, while Virtual Media did
+  help provide such functionality.
+* This interface *is* dependent upon BMC, EFI Firmware, and Bootloader,
+  which means we may not see additional embedded files an contents in
+  an ISO image. This is the same basic constraint over the ``ramdisk``
+  deploy interface when using Network Booting.
+* This is a UEFI-Only boot interface. No legacy boot is possible with
+  this interface.
 
-When updating the BMC firmware, the BMC may become unavailable for a period of
-time as it resets. In this case, it may be desireable to have the cleaning step
-wait after the update has been applied before indicating that the
-update was successful. This allows the BMC time to fully reset before further
-operations are carried out against it. To cause the cleaning step to wait after
-applying an update, an optional ``wait`` argument may be specified in the
-firmware image dictionary. The value of this argument indicates the number of
-seconds to wait following the update. If the ``wait`` argument is not
-specified, then this is equivalent to ``wait 0``, meaning that it will not
-wait and immediately proceed with the next firmware update if there is one,
-or complete the cleaning step if not.
+A good starting point for this interface, is to think of it as
+higher security network boot, as we are explicitly telling the BMC
+where the node should boot from.
 
-The ``update_firmware`` cleaning step accepts JSON in the following format::
+Like the ``redfish-virtual-media`` boot interface, you will need
+to create an EFI System Partition image (ESP_), see
+:doc:`/install/configure-esp` for details on how to do this.
 
-    [{
-        "interface": "management",
-        "step": "update_firmware",
-        "args": {
-            "firmware_images":[
-                {
-                    "url": "<url_to_firmware_image1>",
-                    "checksum": "<checksum for image, uses SHA1>",
-                    "source": "<optional override source setting for image>",
-                    "wait": <number_of_seconds_to_wait>
-                },
-                {
-                    "url": "<url_to_firmware_image2>"
-                },
-                ...
-            ]
-        }
-    }]
+Additionally, if you would like to use the ``ramdisk`` deployment
+interface, the same basic instructions covered in `Virtual Media Ramdisk`_
+apply, just use ``redfish-https`` as the boot_interface, and keep in mind,
+no configuration drives exist with the ``redfish-https`` boot interface.
 
-The different attributes of the ``update_firmware`` cleaning step are as follows:
+Limitations & Issues
+~~~~~~~~~~~~~~~~~~~~
 
-.. csv-table::
-    :header: "Attribute", "Description"
-    :widths: 30, 120
+Ironic contains two different ways of providing an HTTP(S) URL
+to a remote BMC. The first is Swift, enabled when :oslo.config:option:`redfish.use_swift`
+is set to ``true``. Ironic uploads files to Swift, which are then shared as
+Temporary Swift URLs. While highly scalable, this method does suffer from
+issues where some vendors BMCs reject URLs with **&** or **?** characters.
+There is no available workaround to leverage Swift in this state.
 
-    "``interface``", "Interface of the cleaning step.  Must be ``management`` for firmware update"
-    "``step``", "Name of cleaning step.  Must be ``update_firmware`` for firmware update"
-    "``args``", "Keyword-argument entry (<name>: <value>) being passed to cleaning step"
-    "``args.firmware_images``", "Ordered list of dictionaries of firmware images to be applied"
+When the :oslo.config:option:`redfish.use_swift` setting is set to ``false``, Ironic will house
+the files locally in the :oslo.config:option:`deploy.http_root` folder structure, and then
+generate a URL pointing the BMC to connect to the HTTP service configured
+via :oslo.config:option:`deploy.http_url`.
 
-Each firmware image dictionary, is of the form::
+Out-Of-Band inspection
+======================
 
-    {
-      "url": "<URL of firmware image file>",
-      "checksum": "<checksum for image, uses SHA1>",
-      "source": "<Optional override source setting for image>",
-      "wait": <Optional time in seconds to wait after applying update>
-    }
-
-The ``url`` and ``checksum`` arguments in the firmware image dictionary are
-mandatory, while the ``source`` and ``wait`` arguments are optional.
-
-For ``url`` currently ``http``, ``https``, ``swift`` and ``file`` schemes are
-supported.
-
-``source`` corresponds to ``[redfish]firmware_source`` and by setting it here,
-it is possible to override global setting per firmware image in clean step
-arguments.
-
+The ``redfish`` hardware type can inspect the bare metal node by querying
+Redfish compatible BMC. This process is quick and reliable compared to the
+way the ``agent`` hardware type works i.e. booting bare metal node into
+the introspection ramdisk. The inspection collects various hardware
+information including LLDP (Link Layer Discovery Protocol) data when
+available from the BMC, such as chassis ID, port ID, system name, system
+description, system capabilities, and management addresses.
 
 .. note::
-   At the present time, targets for the firmware update cannot be specified.
-   In testing, the BMC applied the update to all applicable targets on the
-   node. It is assumed that the BMC knows what components a given firmware
-   image is applicable to.
 
-To perform a firmware update, first download the firmware to a web server,
-Swift or filesystem that the Ironic conductor or BMC has network access to.
-This could be the ironic conductor web server or another web server on the BMC
-network. Using a web browser, curl, or similar tool on a server that has
-network access to the BMC or Ironic conductor, try downloading the firmware to
-verify that the URLs are correct and that the web server is configured
-properly.
-
-Next, construct the JSON for the firmware update cleaning step to be executed.
-When launching the firmware update, the JSON may be specified on the command
-line directly or in a file. The following example shows one cleaning step that
-installs four firmware updates. All except 3rd entry that has explicit
-``source`` added, uses setting from ``[redfish]firmware_source`` to determine
-if and where to stage the files::
-
-    [{
-        "interface": "management",
-        "step": "update_firmware",
-        "args": {
-            "firmware_images":[
-                {
-                    "url": "http://192.0.2.10/BMC_4_22_00_00.EXE",
-                    "checksum": "<sha1-checksum-of-the-file>",
-                    "wait": 300
-                },
-                {
-                    "url": "https://192.0.2.10/NIC_19.0.12_A00.EXE",
-                    "checksum": "<sha1-checksum-of-the-file>"
-                },
-                {
-                    "url": "file:///firmware_images/idrac/9/PERC_WN64_6.65.65.65_A00.EXE",
-                    "checksum": "<sha1-checksum-of-the-file>",
-                    "source": "http"
-                },
-                {
-                    "url": "swift://firmware_container/BIOS_W8Y0W_WN64_2.1.7.EXE",
-                    "checksum": "<sha1-checksum-of-the-file>"
-                }
-            ]
-        }
-    }]
-
-Finally, launch the firmware update cleaning step against the node. The
-following example assumes the above JSON is in a file named
-``firmware_update.json``::
-
-    baremetal node clean <ironic_node_uuid> --clean-steps firmware_update.json
-
-In the following example, the JSON is specified directly on the command line::
-
-    baremetal node clean <ironic_node_uuid> --clean-steps '[{"interface": "management", "step": "update_firmware", "args": {"firmware_images":[{"url": "http://192.0.2.10/BMC_4_22_00_00.EXE", "wait": 300}, {"url": "https://192.0.2.10/NIC_19.0.12_A00.EXE"}]}}]'
+   The ``redfish`` inspect interface relies on the optional parts of the
+   Redfish specification. Not all Redfish-compliant BMCs might serve the
+   required information, in which case bare metal node inspection will fail.
 
 .. note::
-   Firmware updates may take some time to complete. If a firmware update
-   cleaning step consistently times out, then consider performing fewer
-   firmware updates in the cleaning step or increasing
-   ``clean_callback_timeout`` in ironic.conf to increase the timeout value.
 
-.. warning::
-   Warning: Removing power from a server while it is in the process of updating
-   firmware may result in devices in the server, or the server itself becoming
-   inoperable.
+   The ``local_gb`` property cannot always be discovered, for example, when a
+   node does not have local storage or the Redfish implementation does not
+   support the required schema. In this case the property will be set to 0.
+
+.. _redfish-bios-settings:
 
 Retrieving BIOS Settings
 ========================
@@ -543,163 +449,15 @@ settings. The following fields will be returned in the BIOS API
     "``unique``", "The setting is specific to this node"
     "``reset_required``", "After changing this setting a node reboot is required"
 
-.. _node-vendor-passthru-methods:
+Further topics
+==============
 
-Node Vendor Passthru Methods
-============================
+.. toctree::
 
-.. csv-table::
-    :header: "Method", "Description"
-    :widths: 25, 120
-
-    "``create_subscription``", "Create a new subscription on the Node"
-    "``delete_subscription``", "Delete a subscription of a Node"
-    "``get_all_subscriptions``", "List all subscriptions of a Node"
-    "``get_subscription``", "Show a single subscription of a Node"
-    "``eject_vmedia``", "Eject attached virtual media from a Node"
-
-
-Create Subscription
-~~~~~~~~~~~~~~~~~~~
-
-.. csv-table:: Request
-    :header: "Name", "In", "Type", "Description"
-    :widths: 25, 15, 15, 90
-
-    "Destination", "body", "string", "The URI of the destination Event Service"
-    "EventTypes (optional)", "body", "array",  "List of ypes of events that shall be sent to the destination"
-    "Context (optional)", "body", "string", "A client-supplied string that is stored with the event destination
-    subscription"
-    "Protocol (optional)", "body", "string", "The protocol type that the event will use for sending
-    the event to the destination"
-
-Example JSON to use in ``create_subscription``::
-
-    {
-        "Destination": "https://someurl",
-        "EventTypes": ["Alert"],
-        "Context": "MyProtocol",
-        "args": "Redfish"
-    }
-
-
-Delete Subscription
-~~~~~~~~~~~~~~~~~~~
-
-.. csv-table:: Request
-    :header: "Name", "In", "Type", "Description"
-    :widths: 21, 21, 21, 37
-
-    "id", "body", "string", "The Id of the subscription generated by the BMC "
-
-
-Example JSON to use in ``delete_subscription``::
-
-    {
-        "id": "<id of the subscription generated by the BMC>"
-    }
-
-
-Get Subscription
-~~~~~~~~~~~~~~~~
-
-.. csv-table:: Request
-    :header: "Name", "In", "Type", "Description"
-    :widths: 21, 21, 21, 37
-
-    "id", "body", "string", "The Id of the subscription generated by the BMC "
-
-
-Example JSON to use in ``get_subscription``::
-
-    {
-        "id": "<id of the subscription generated by the BMC>"
-    }
-
-
-Get All Subscriptions
-~~~~~~~~~~~~~~~~~~~~~
-
-The ``get_all_subscriptions`` doesn't require any parameters.
-
-
-Eject Virtual Media
-~~~~~~~~~~~~~~~~~~~
-
-.. csv-table:: Request
-    :header: "Name", "In", "Type", "Description"
-    :widths: 25, 15, 15, 90
-
-    "boot_device (optional)", "body", "string", "Type of the device to eject (all devices by default)"
-
-Internal Session Cache
-======================
-
-The ``redfish`` hardware type, and derived interfaces, utilizes a built-in
-session cache which prevents Ironic from re-authenticating every time
-Ironic attempts to connect to the BMC for any reason.
-
-This consists of cached connectors objects which are used and tracked by
-a unique consideration of ``redfish_username``, ``redfish_password``,
-``redfish_verify_ca``, and finally ``redfish_address``. Changing any one
-of those values will trigger a new session to be created.
-The ``redfish_system_id`` value is explicitly not considered as Redfish
-has a model of use of one BMC to many systems, which is also a model
-Ironic supports.
-
-The session cache default size is ``1000`` sessions per conductor.
-If you are operating a deployment with a larger number of Redfish
-BMCs, it is advised that you do appropriately tune that number.
-This can be tuned via the API service configuration file,
-``[redfish]connection_cache_size``.
-
-Session Cache Expiration
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-By default, sessions remain cached for as long as possible in
-memory, as long as they have not experienced an authentication,
-connection, or other unexplained error.
-
-Under normal circumstances, the sessions will only be rolled out
-of the cache in order of oldest first when the cache becomes full.
-There is no time based expiration to entries in the session cache.
-
-Of course, the cache is only in memory, and restarting the
-``ironic-conductor`` will also cause the cache to be rebuilt
-from scratch. If this is due to any persistent connectivity issue,
-this may be sign of an unexpected condition, and please consider
-contacting the Ironic developer community for assistance.
-
-Redfish Interoperability Profile
-================================
-
-Ironic projects provides Redfish Interoperability Profile located in
-``redfish-interop-profiles`` folder at source code root. The Redfish
-Interoperability Profile is a JSON document written in a particular format
-that serves two purposes.
-
-*  It enables the creation of a human-readable document that merges the
-   profile requirements with the Redfish schema into a single document
-   for developers or users.
-*  It allows a conformance test utility to test a Redfish Service
-   implementation for conformance with the profile.
-
-The JSON document structure is intended to align easily with JSON payloads
-retrieved from Redfish Service implementations, to allow for easy comparisons
-and conformance testing. Many of the properties defined within this structure
-have assumed default values that correspond with the most common use case, so
-that those properties can be omitted from the document for brevity.
-
-Validation of Profiles using DMTF tool
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-An open source utility has been created by the Redfish Forum to verify that
-a Redfish Service implementation conforms to the requirements included in a
-Redfish Interoperability Profile. The Redfish Interop Validator is available
-for download from the DMTF's organization on Github at
-https://github.com/DMTF/Redfish-Interop-Validator. Refer to instructions in
-README on how to configure and run validation.
-
+   redfish/metrics
+   redfish/passthru
+   redfish/session-cache
+   redfish/interop
 
 .. _Redfish: http://redfish.dmtf.org/
 .. _Sushy: https://opendev.org/openstack/sushy

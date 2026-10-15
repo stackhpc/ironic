@@ -10,13 +10,14 @@ Overview
 Workflows to onboard new hardware often include a stress-testing step to
 provoke early failures and to avoid that these load-triggered issues only
 occur when the nodes have already moved to production. These ``burn-in``
-tests typically include CPU, memory, disk, and network. With the Xena
+tests typically include CPU, GPU, memory, disk, and network. With the Xena
 release, Ironic supports such tests as part of the cleaning framework.
 
 The burn-in steps rely on standard tools such as
 `stress-ng <https://wiki.ubuntu.com/Kernel/Reference/stress-ng>`_ for CPU
-and memory, or `fio <https://fio.readthedocs.io/en/latest/>`_ for disk and
-network. The burn-in cleaning steps are part of the generic hardware manager
+and memory, `fio <https://fio.readthedocs.io/en/latest/>`_ for disk and
+network, or `gpu-burn <https://github.com/wilicc/gpu-burn>`_ for GPU tests.
+The burn-in cleaning steps are part of the generic hardware manager
 in the Ironic Python Agent (IPA) and therefore the agent ramdisk does not
 need to be bundled with a specific
 :ironic-python-agent-doc:`IPA hardware manager
@@ -31,7 +32,7 @@ for the individual tests will be outlined below.
 CPU burn-in
 ===========
 
-The options, following a `agent_burnin_` + stress-ng stressor (`cpu`) +
+The options, following a ``agent_burnin_`` + stress-ng stressor (``cpu``) +
 stress-ng option schema, are:
 
 * ``agent_burnin_cpu_timeout`` (default: 24 hours)
@@ -39,7 +40,7 @@ stress-ng option schema, are:
 
 to limit the overall runtime and to pick the number of CPUs to stress.
 
-For instance, in order to limit the time of the CPU burn-in to 10 minutes
+For instance, to limit the time of the CPU burn-in to 10 minutes
 do:
 
 .. code-block:: console
@@ -57,7 +58,7 @@ Then launch the test with:
 Memory burn-in
 ==============
 
-The options, following a `agent_burnin_` + stress-ng stressor (`vm`) +
+The options, following a ``agent_burnin_`` + stress-ng stressor (``vm``) +
 stress-ng option schema, are:
 
 * ``agent_burnin_vm_timeout`` (default: 24 hours)
@@ -65,7 +66,7 @@ stress-ng option schema, are:
 
 to limit the overall runtime and to set the fraction of RAM to stress.
 
-For instance, in order to limit the time of the memory burn-in to 1 hour
+For instance, to limit the time of the memory burn-in to 1 hour
 and the amount of RAM to be used to 75% run:
 
 .. code-block:: console
@@ -85,7 +86,7 @@ Then launch the test with:
 Disk burn-in
 ============
 
-The options, following a `agent_burnin_` + fio stressor (`fio_disk`) +
+The options, following a ``agent_burnin_`` + fio stressor (``fio_disk``) +
 fio option schema, are:
 
 * agent_burnin_fio_disk_runtime (default: 0, meaning no time limit)
@@ -94,7 +95,7 @@ fio option schema, are:
 to set the time limit and the number of iterations when going
 over the disks.
 
-For instance, in order to limit the number of loops to 2 set:
+For instance, to limit the number of loops to 2 set:
 
 .. code-block:: console
 
@@ -108,7 +109,7 @@ Then launch the test with:
     baremetal node clean --clean-steps '[{"step": "burnin_disk", \
         "interface": "deploy"}]' $NODE_NAME_OR_UUID
 
-In order to launch a parallel SMART self test on all devices after the
+To launch a parallel SMART self-test on all devices after the
 disk burn-in (which will fail the step if any of the tests fail), set:
 
 .. code-block:: console
@@ -119,7 +120,7 @@ disk burn-in (which will fail the step if any of the tests fail), set:
 Network burn-in
 ===============
 
-Burning in the network needs a little more config, since we need a pair
+Burning in the network needs a little more config since we need a pair
 of nodes to perform the test. This pairing can be done either in a static
 way, i.e. pairs are defined upfront, or dynamically via a distributed
 coordination backend which orchestrates the pair matching. While the
@@ -145,7 +146,7 @@ hostname of the other node to test), like:
 Dynamic network burn-in configuration
 -------------------------------------
 
-In order to use dynamic pair matching, a coordination backend is used
+To use dynamic pair matching, a coordination backend is used
 via `tooz <https://docs.openstack.org/tooz/latest/>`_. The corresponding
 backend URL then needs to be added to the node, e.g. for a Zookeeper
 backend it would look similar to:
@@ -201,6 +202,41 @@ The actual network burn-in can then be launched with:
 Both nodes will wait for the other node to show up and block while waiting.
 If the partner does not show up, the cleaning timeout will step in.
 
+GPU burn-in
+============
+
+The GPU burn-in tests come in two parts:
+
+* Check that the correct number of GPUs are visible by the operating system
+* GPU burn-in test using `gpu-burn <https://github.com/wilicc/gpu-burn>`_
+
+The first check will only be performed if the option
+``agent_burnin_gpu_count`` has been set to a value above 0.
+
+The options, following a ``agent_burnin_`` + gpu stressor (``gpu``) option
+schema, are:
+
+* ``agent_burnin_gpu_install_dir`` (default: /opt/gpu-burn)
+* ``agent_burnin_gpu_timeout`` (default: 24 hours)
+* ``agent_burnin_gpu_memory`` (default: 95%)
+* ``agent_burnin_gpu_count`` (default: 0, The GPU count check is disabled by
+  default)
+
+For instance, in order to limit the time of the GPU burn-in to 10 minutes
+do:
+
+.. code-block:: console
+
+    baremetal node set --driver-info agent_burnin_gpu_timeout=600 \
+        $NODE_NAME_OR_UUID
+
+Then launch the test with:
+
+.. code-block:: console
+
+   baremetal node clean --clean-steps '[{"step": "burnin_gpu", \
+       "interface": "deploy"}]' $NODE_NAME_OR_UUID
+
 Logging
 =======
 
@@ -209,11 +245,11 @@ performance of the stressed components, keeping this information for
 verification or acceptance purposes may be desirable. By default, the
 output of the burn-in tools goes to the journal of the Ironic Python
 Agent and is therefore sent back as an archive to the conductor. In order
-to consume the output of the burn-in steps more easily, or even in real-time,
+to consume the output of the burn-in steps more easily, or even in real time,
 the nodes can be configured to store the output of the individual steps to
 files in the ramdisk (from where they can be picked up by a logging pipeline).
 
-The configuration of the outpout file is done via one of
+The configuration of the output file is done via one of
 ``agent_burnin_cpu_outputfile``, ``agent_burnin_vm_outputfile``,
 ``agent_burnin_fio_disk_outputfile``, and
 ``agent_burnin_fio_network_outputfile`` parameters which need to be added

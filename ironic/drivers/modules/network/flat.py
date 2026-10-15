@@ -34,6 +34,10 @@ class FlatNetwork(common.NeutronVIFPortIDMixin,
                   neutron.NeutronNetworkInterfaceMixin, base.NetworkInterface):
     """Flat network interface."""
 
+    # Indicator signaling  metadata generation/handling can be achieved on this
+    # interface.
+    capabilities = ['metadata']
+
     def __init__(self):
         cleaning_net = CONF.neutron.cleaning_network
         if not cleaning_net:
@@ -57,9 +61,8 @@ class FlatNetwork(common.NeutronVIFPortIDMixin,
         LOG.debug("Binding flat network ports")
         bound_ports = []
         for port_like_obj in task.ports + task.portgroups:
-            vif_port_id = (
-                port_like_obj.internal_info.get(common.TENANT_VIF_KEY)
-            )
+            vif_port_id = FlatNetwork._get_vif_id_by_port_like_obj(
+                port_like_obj)
             if not vif_port_id:
                 continue
             port_attrs = {'binding:host_id': task.node.uuid,
@@ -75,6 +78,11 @@ class FlatNetwork(common.NeutronVIFPortIDMixin,
                          '%(err)s') % {'port_id': vif_port_id, 'err': e})
                 LOG.exception(msg)
                 raise exception.NetworkError(msg)
+        if not bound_ports:
+            msg = (_('Failed to bind any flat network ports for node %s') %
+                   task.node.uuid)
+            LOG.error(msg)
+            raise exception.NetworkError(msg)
         LOG.debug("Finished binding flat network ports, attached: %s",
                   ' '.join(bound_ports))
 
@@ -85,9 +93,8 @@ class FlatNetwork(common.NeutronVIFPortIDMixin,
         ports = [p for p in task.ports if not p.portgroup_id]
         portgroups = task.portgroups
         for port_like_obj in ports + portgroups:
-            vif_port_id = (
-                port_like_obj.internal_info.get(common.TENANT_VIF_KEY)
-            )
+            vif_port_id = FlatNetwork._get_vif_id_by_port_like_obj(
+                port_like_obj)
             if not vif_port_id:
                 continue
             neutron.unbind_neutron_port(vif_port_id, context=task.context)
@@ -125,29 +132,27 @@ class FlatNetwork(common.NeutronVIFPortIDMixin,
         """
         self._unbind_flat_ports(task)
 
-    def _add_service_network(self, task, network, process):
+    def _add_service_network(self, task, network, net_type):
         # If we have left over ports from a previous process, remove them
         neutron.rollback_ports(task, network)
-        LOG.info('Adding %s network to node %s', process, task.node.uuid)
+        LOG.info('Adding %s network to node %s', net_type, task.node.uuid)
         vifs = neutron.add_ports_to_network(task, network)
-        field = '%s_vif_port_id' % process
         for port in task.ports:
             if port.uuid in vifs:
                 internal_info = port.internal_info
-                internal_info[field] = vifs[port.uuid]
+                internal_info[net_type.vif_key] = vifs[port.uuid]
                 port.internal_info = internal_info
                 port.save()
         return vifs
 
-    def _remove_service_network(self, task, network, process):
+    def _remove_service_network(self, task, network, net_type):
         LOG.info('Removing ports from %s network for node %s',
-                 process, task.node.uuid)
+                 net_type, task.node.uuid)
         neutron.remove_ports_from_network(task, network)
-        field = '%s_vif_port_id' % process
         for port in task.ports:
-            if field in port.internal_info:
+            if net_type.vif_key in port.internal_info:
                 internal_info = port.internal_info
-                del internal_info[field]
+                del internal_info[net_type.vif_key]
                 port.internal_info = internal_info
                 port.save()
 
@@ -159,7 +164,8 @@ class FlatNetwork(common.NeutronVIFPortIDMixin,
         :raises: NetworkError, InvalidParameterValue
         """
         return self._add_service_network(
-            task, self.get_cleaning_network_uuid(task), 'cleaning')
+            task, self.get_cleaning_network_uuid(task),
+            common.NetType.CLEANING)
 
     def remove_cleaning_network(self, task):
         """Remove the cleaning network from a node.
@@ -168,7 +174,8 @@ class FlatNetwork(common.NeutronVIFPortIDMixin,
         :raises: NetworkError
         """
         return self._remove_service_network(
-            task, self.get_cleaning_network_uuid(task), 'cleaning')
+            task, self.get_cleaning_network_uuid(task),
+            common.NetType.CLEANING)
 
     def add_rescuing_network(self, task):
         """Add the rescuing network to a node.
@@ -205,7 +212,8 @@ class FlatNetwork(common.NeutronVIFPortIDMixin,
             is invalid.
         """
         return self._add_service_network(
-            task, self.get_inspection_network_uuid(task), 'inspection')
+            task, self.get_inspection_network_uuid(task),
+            common.NetType.INSPECTION)
 
     def remove_inspection_network(self, task):
         """Removes the inspection network from a node.
@@ -216,4 +224,30 @@ class FlatNetwork(common.NeutronVIFPortIDMixin,
         :raises: MissingParameterValue, if some parameters are missing.
         """
         return self._remove_service_network(
-            task, self.get_inspection_network_uuid(task), 'inspection')
+            task, self.get_inspection_network_uuid(task),
+            common.NetType.INSPECTION)
+
+    def add_servicing_network(self, task):
+        """Add the rescuing network to a node.
+
+        Flat network does not use the servicing network.
+        Bind the port again since unconfigure_tenant_network() unbound it.
+
+        :param task: A TaskManager instance.
+        :returns: a dictionary in the form {port.uuid: neutron_port['id']}
+        :raises: NetworkError, InvalidParameterValue
+        """
+        LOG.info('Bind ports for servicing node %s', task.node.uuid)
+        self._bind_flat_ports(task)
+
+    def remove_servicing_network(self, task):
+        """Remove the servicing network from a node.
+
+        Flat network does not use the servicing network.
+        Unbind the port again since add_rescuing_network() bound it.
+
+        :param task: A TaskManager instance.
+        :raises: NetworkError
+        """
+        LOG.info('Unbind ports for servicing node %s', task.node.uuid)
+        self._unbind_flat_ports(task)

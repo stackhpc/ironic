@@ -16,13 +16,11 @@ Both offline and rolling upgrades are supported.
 Plan your upgrade
 =================
 
-* Rolling upgrades are available starting with the Pike release; that is, when
-  upgrading from Ocata. This means that it is possible to do an upgrade with
-  minimal to no downtime of the Bare Metal API.
+* Rolling upgrades are supported for the Bare Metal service, allowing upgrades
+  with minimal to no downtime of the Bare Metal API.
 
-* Upgrades are only supported between two consecutive named releases.
-  This means that you cannot upgrade Ocata directly into Queens; you need to
-  upgrade into Pike first.
+* Upgrades are supported between named releases in the framing of
+  `SLURP <https://docs.openstack.org/project-team-guide/release-cadence-adjustment.html>`_.
 
 * The `release notes <https://docs.openstack.org/releasenotes/ironic/>`_
   should always be read carefully when upgrading the Bare Metal service.
@@ -85,10 +83,10 @@ Once the above is done, do the following:
   .. warning::
      You will not be able to start an upgrade to the release
      after this one, until this has been completed for the current
-     release. For example, as part of upgrading from Ocata to Pike,
-     you need to complete Pike's data migrations. If this not done,
-     you will not be able to upgrade to Queens -- it will not be
-     possible to execute Queens' database schema updates.
+     release. You need to complete the current release's data migrations
+     before upgrading to the next release. If this is not done,
+     you will not be able to upgrade to the next release -- it will not be
+     possible to execute the next release's database schema updates.
 
 
 Rolling upgrades
@@ -97,8 +95,8 @@ Rolling upgrades
 To Reduce downtime, the services can be upgraded in a rolling fashion, meaning
 to upgrade one or a few services at a time to minimize impact.
 
-Rolling upgrades are available starting with the Pike release. This feature
-makes it possible to upgrade between releases, such as Ocata to Pike, with
+Rolling upgrades are supported for the Bare Metal service. This feature
+makes it possible to upgrade between consecutive releases with
 minimal to no downtime of the Bare Metal API.
 
 Requirements
@@ -163,16 +161,17 @@ is to make use of new features immediately.
 you are doing a cold upgrade).
 
 This data migration must be completed. If not, you will not be able to
-upgrade to future releases. For example, if you had upgraded from Ocata to
-Pike but did not do the data migrations, you will not be able to upgrade from
-Pike to Queens. (More precisely, you will not be able to apply Queens' schema
+upgrade to future releases. For example, if you upgraded between releases
+but did not do the data migrations, you will not be able to upgrade to
+the next release. (More precisely, you will not be able to apply the next
+release's schema
 migrations.)
 
 Graceful conductor service shutdown
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The ironic-conductor service is a Python process listening for messages on a
-message queue. When the operator sends the SIGTERM signal to the process, the
+message queue. When the operator sends the ``SIGTERM`` signal to the process, the
 service stops consuming messages from the queue, so that no additional work is
 picked up. It completes any outstanding work and then terminates. During this
 process, messages can be left on the queue and will be processed after the
@@ -183,11 +182,25 @@ older code, and start up a service using newer code with minimal impact.
    This was tested with RabbitMQ messaging backend and may vary with other
    backends.
 
-Nodes that are being acted upon by an ironic-conductor process, which are
-not in a stable state, may encounter failures. Node failures that occur
-during an upgrade are likely due to timeouts, resulting from delays
-involving messages being processed and acted upon by a conductor
-during long running, multi-step processes such as deployment or cleaning.
+Nodes that are being acted upon by an ironic-conductor process, which are not in
+a stable state, will be put into a failed state when
+:oslo.config:option:`conductor.graceful_shutdown_timeout` is reached. Node failures that occur
+during an upgrade are likely due to timeouts, resulting from delays involving
+messages being processed and acted upon by a conductor during long running,
+multi-step processes such as deployment or cleaning.
+
+Drain conductor service shutdown
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A drain shutdown is similar to graceful shutdown, differing in the following ways:
+
+* Triggered by sending signal ``SIGUSR2`` to the process instead of ``SIGTERM``
+* The timeout for process termination is determined by
+  :oslo.config:option:`DEFAULT.drain_shutdown_timeout` instead of :oslo.config:option:`conductor.graceful_shutdown_timeout`
+
+:oslo.config:option:`DEFAULT.drain_shutdown_timeout` is set long enough so that any node in a not
+stable state will have time to reach a stable state (complete or failed) before
+the ironic-conductor process terminates.
 
 API load balancer draining
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -240,7 +253,7 @@ During maintenance window
      the version you are upgrading from (that is, the old version). Based on
      this setting, the new ironic-conductor services will downgrade any
      RPC communication and data objects to conform to the old service.
-     For example, if you are upgrading from Ocata to Pike, set this value to
+     For example, when upgrading between consecutive releases, set this value to
      ``ocata``.
    * start the service
 
@@ -263,7 +276,7 @@ During maintenance window
      newer API versions that the old services did not support. This prevents
      new features (available in new API versions) from being used until after
      the upgrade has been completed.
-     For example, if you are upgrading from Ocata to Pike, set this value to
+     For example, when upgrading between consecutive releases, set this value to
      ``ocata``.
    * restart the service
    * add it back into the load balancer
@@ -317,11 +330,10 @@ release.
   .. warning::
      Note that you will not be able to start an upgrade to the next release after
      this one, until this has been completed for the current release. For example,
-     as part of upgrading from Ocata to Pike, you need to complete Pike's data
-     migrations. If this not done, you will not be able to upgrade to Queens --
-     it will not be possible to execute Queens' database schema updates.
+     as part of upgrading between releases, you need to complete the current
+     release's data migrations. If this not done, you will not be able to
+     upgrade to the next release -- it will not be possible to execute the
+     next release's database schema updates.
 
 .. toctree::
   :hidden:
-
-  upgrade-to-hardware-types.rst

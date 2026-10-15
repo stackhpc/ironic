@@ -15,15 +15,114 @@
 #    under the License.
 
 """Ironic specific exceptions list."""
-
+import collections
 from http import client as http_client
+import json
 
-from ironic_lib.exception import IronicException
+from oslo_config import cfg
 from oslo_log import log as logging
 
 from ironic.common.i18n import _
 
 LOG = logging.getLogger(__name__)
+
+
+CONF = cfg.CONF
+
+
+def _ensure_exception_kwargs_serializable(exc_class_name, kwargs):
+    """Ensure that kwargs are serializable
+
+    Ensure that all kwargs passed to exception constructor can be passed over
+    RPC, by trying to convert them to JSON, or, as a last resort, to string.
+    If it is not possible, unserializable kwargs will be removed, letting the
+    receiver handle the exception string as it is configured to.
+
+    :param exc_class_name: a IronicException class name.
+    :param kwargs: a dictionary of keyword arguments passed to the exception
+        constructor.
+    :returns: a dictionary of serializable keyword arguments.
+    """
+    serializers = [(json.dumps, _('when converting to JSON')),
+                   (str, _('when converting to string'))]
+    exceptions = collections.defaultdict(list)
+    serializable_kwargs = {}
+    for k, v in kwargs.items():
+        for serializer, msg in serializers:
+            try:
+                serializable_kwargs[k] = serializer(v)
+                exceptions.pop(k, None)
+                break
+            except Exception as e:
+                exceptions[k].append(
+                    '(%(serializer_type)s) %(e_type)s: %(e_contents)s' %
+                    {'serializer_type': msg, 'e_contents': e,
+                     'e_type': e.__class__.__name__})
+    if exceptions:
+        LOG.error("One or more arguments passed to the %(exc_class)s "
+                  "constructor as kwargs can not be serialized. The "
+                  "serialized arguments: %(serialized)s. These "
+                  "unserialized kwargs were dropped because of the "
+                  "exceptions encountered during their "
+                  "serialization:\n%(errors)s",
+                  dict(errors=';\n'.join("%s: %s" % (k, '; '.join(v))
+                                         for k, v in exceptions.items()),
+                       exc_class=exc_class_name,
+                       serialized=serializable_kwargs))
+        # We might be able to actually put the following keys' values into
+        # format string, but there is no guarantee, drop it just in case.
+        for k in exceptions:
+            del kwargs[k]
+    return serializable_kwargs
+
+
+class IronicException(Exception):
+    """Base Ironic Exception
+
+    To correctly use this class, inherit from it and define
+    a '_msg_fmt' property. That _msg_fmt will get printf'd
+    with the keyword arguments provided to the constructor.
+
+    If you need to access the message from an exception you should use
+    str(exc)
+
+    """
+
+    _msg_fmt = _("An unknown exception occurred.")
+    code = 500
+    headers = {}
+    safe = False
+
+    def __init__(self, message=None, **kwargs):
+        self.kwargs = _ensure_exception_kwargs_serializable(
+            self.__class__.__name__, kwargs)
+
+        if 'code' not in self.kwargs:
+            try:
+                self.kwargs['code'] = self.code
+            except AttributeError:
+                pass
+        else:
+            self.code = int(kwargs['code'])
+
+        if not message:
+            try:
+                message = self._msg_fmt % kwargs
+
+            except Exception:
+                # kwargs doesn't match a variable in the message
+                # log the issue and the kwargs
+                prs = ', '.join('%s=%s' % pair for pair in kwargs.items())
+                LOG.exception('Exception in string format operation '
+                              '(arguments %s)', prs)
+                if not CONF.errors.fatal_exception_format_errors:
+                    # at least get the core message out if something
+                    # happened
+                    message = self._msg_fmt
+                else:
+                    raise
+
+        super(IronicException, self).__init__(message)
 
 
 class NotAuthorized(IronicException):
@@ -38,6 +137,10 @@ class OperationNotPermitted(NotAuthorized):
 class Invalid(IronicException):
     _msg_fmt = _("Unacceptable parameters.")
     code = http_client.BAD_REQUEST
+
+
+class MalformedRequestURI(Invalid):
+    _msg_fmt = _("Malformed request URI.")
 
 
 class Conflict(IronicException):
@@ -118,6 +221,10 @@ class VolumeTargetAlreadyExists(Conflict):
 class VolumeTargetBootIndexAlreadyExists(Conflict):
     _msg_fmt = _("A volume target with boot index '%(boot_index)s' "
                  "for the same node already exists.")
+
+
+class NodeInventoryAlreadyExists(Conflict):
+    _msg_fmt = _("A node inventory with ID %(id)s already exists.")
 
 
 class VifAlreadyAttached(Conflict):
@@ -269,6 +376,15 @@ class NodeNotFound(NotFound):
     _msg_fmt = _("Node %(node)s could not be found.")
 
 
+class SwitchNotFound(NotFound):
+    _msg_fmt = _("Switch %(switch_id)s could not be found or is not "
+                 "supported by any configured switch driver.")
+
+
+class DuplicateNodeOnLookup(NodeNotFound):
+    pass  # Same error message, the difference only matters internally
+
+
 class PortgroupNotFound(NotFound):
     _msg_fmt = _("Portgroup %(portgroup)s could not be found.")
 
@@ -417,12 +533,8 @@ class ServiceUnavailable(IronicException):
     _msg_fmt = _("Connection failed")
 
 
-class Forbidden(IronicException):
-    _msg_fmt = _("Requested OpenStack Images API is forbidden")
-
-
-class BadRequest(IronicException):
-    pass
+# TODO(dtantsur): leave only one variant
+BadRequest = Invalid
 
 
 class InvalidEndpoint(IronicException):
@@ -437,12 +549,8 @@ class HTTPForbidden(NotAuthorized):
     _msg_fmt = _("Access was denied to the following resource: %(resource)s")
 
 
-class Unauthorized(IronicException):
-    pass
-
-
-class HTTPNotFound(NotFound):
-    pass
+# TODO(dtantsur): leave only one variant
+HTTPNotFound = NotFound
 
 
 class ConfigNotFound(IronicException):
@@ -497,14 +605,6 @@ class PasswordFileFailedToCreate(IronicException):
     _msg_fmt = _("Failed to create the password file. %(error)s")
 
 
-class IloOperationError(DriverOperationError):
-    _msg_fmt = _("%(operation)s failed, error: %(error)s")
-
-
-class IloOperationNotSupported(DriverOperationError):
-    _msg_fmt = _("%(operation)s not supported. error: %(error)s")
-
-
 class DracOperationError(DriverOperationError):
     _msg_fmt = _('DRAC operation failed. Reason: %(error)s')
 
@@ -547,20 +647,16 @@ class FileSystemNotSupported(IronicException):
                  "File system %(fs)s is not supported.")
 
 
-class IRMCOperationError(DriverOperationError):
-    _msg_fmt = _('iRMC %(operation)s failed. Reason: %(error)s')
-
-
-class IRMCSharedFileSystemNotMounted(DriverOperationError):
-    _msg_fmt = _("iRMC shared file system '%(share)s' is not mounted.")
-
-
 class HardwareInspectionFailure(IronicException):
     _msg_fmt = _("Failed to inspect hardware. Reason: %(error)s")
 
 
 class NodeCleaningFailure(IronicException):
     _msg_fmt = _("Failed to clean node %(node)s: %(reason)s")
+
+
+class NodeServicingFailure(IronicException):
+    _msg_fmt = _("Failed to service node %(node)s: %(reason)s")
 
 
 class PathNotFound(IronicException):
@@ -647,10 +743,6 @@ class InstanceUnrescueFailure(IronicException):
                  '%(node)s: %(reason)s')
 
 
-class XClarityError(IronicException):
-    _msg_fmt = _("XClarity exception occurred. Error: %(error)s")
-
-
 class BIOSSettingAlreadyExists(Conflict):
     _msg_fmt = _('A BIOS setting %(name)s for node %(node)s already exists.')
 
@@ -712,20 +804,32 @@ class InvalidDeployTemplate(Invalid):
     _msg_fmt = _("Deploy template invalid: %(err)s.")
 
 
+class RunbookDuplicateName(Conflict):
+    _msg_fmt = _("A runbook with name %(name)s already exists.")
+
+
+class RunbookAlreadyExists(Conflict):
+    _msg_fmt = _("A runbook with UUID %(uuid)s already exists.")
+
+
+class RunbookNotFound(NotFound):
+    _msg_fmt = _("Runbook %(runbook)s could not be found.")
+
+
+class RunbookTraitNotFound(NotFound):
+    _msg_fmt = _("Runbook %(runbook_id)s doesn't have a trait '%(trait)s'")
+
+
+class InvalidRunbook(Invalid):
+    _msg_fmt = _("Runbook invalid: %(err)s.")
+
+
 class InvalidKickstartTemplate(Invalid):
     _msg_fmt = _("The kickstart template is missing required variables")
 
 
 class InvalidKickstartFile(Invalid):
     _msg_fmt = _("The kickstart file is not valid.")
-
-
-class IBMCError(DriverOperationError):
-    _msg_fmt = _("IBMC exception occurred on node %(node)s. Error: %(error)s")
-
-
-class IBMCConnectionError(IBMCError):
-    _msg_fmt = _("IBMC connection failed for node %(node)s: %(error)s")
 
 
 class ClientSideError(RuntimeError):
@@ -829,7 +933,7 @@ class NodeHistoryNotFound(NotFound):
 
 
 class NodeInventoryNotFound(NotFound):
-    _msg_fmt = _("Node inventory record %(inventory)s could not be found.")
+    _msg_fmt = _("Node inventory record for node %(node)s could not be found.")
 
 
 class IncorrectConfiguration(IronicException):
@@ -841,23 +945,7 @@ class NodeVerifyFailure(IronicException):
     _msg_fmt = _("Failed to verify node %(node)s: %(reason)s")
 
 
-class ImageRefIsARedirect(IronicException):
-    _msg_fmt = _("Received a URL redirect when attempting to evaluate "
-                 "image reference %(image_ref)s pointing to "
-                 "%(redirect_url)s. This may, or may not be recoverable.")
-    redirect_url = None
-
-    def __init__(self, image_ref=None, redirect_url=None, msg=None):
-        self.redirect_url = redirect_url
-        # Kwargs are expected by ironic_lib's IronicException to convert
-        # the message.
-        super(ImageRefIsARedirect, self).__init__(
-            message=msg,
-            image_ref=image_ref,
-            redirect_url=redirect_url)
-
-
-class ConcurrentActionLimit(IronicException):
+class ConcurrentActionLimit(TemporaryFailure):
     # NOTE(TheJulia): We explicitly don't report the concurrent
     # action limit configuration value as a security guard since
     # if informed of the limit, an attacker can tailor their attack.
@@ -865,3 +953,215 @@ class ConcurrentActionLimit(IronicException):
                  "The concurrent action limit for %(task_type)s "
                  "has been reached. Please contact your administrator "
                  "and try again later.")
+
+
+class SwiftObjectStillExists(IronicException):
+    _msg_fmt = _("Clean up failed for swift object %(obj)s during deletion"
+                 " of node %(node)s.")
+
+
+class FirmwareComponentAlreadyExists(Conflict):
+    _msg_fmt = _('A Firmware component %(name)s for node %(node)s'
+                 ' already exists.')
+
+
+class FirmwareComponentNotFound(NotFound):
+    _msg_fmt = _("Node %(node)s doesn't have Firmware component %(name)s")
+
+
+class InvalidNodeInventory(Invalid):
+    _msg_fmt = _("Inventory for node %(node)s is invalid: %(reason)s")
+
+
+class UnsupportedHardwareFeature(Invalid):
+    _msg_fmt = _("Node %(node)s hardware does not support feature "
+                 "%(feature)s, which is required based upon the "
+                 "requested configuration.")
+
+
+class BootModeNotAllowed(Invalid):
+    _msg_fmt = _("'%(mode)s' boot mode is not allowed for %(op)s operation.")
+
+class StepNotAllowed(Invalid):
+    _msg_fmt = _("%(step_type)s step '%(step)s' is not allowed. Disallowed "
+                 "by operator configuration "
+                 "[api]disallow_%(step_type)s_steps.")
+    code = http_client.BAD_REQUEST
+
+class InvalidImage(ImageUnacceptable):
+    _msg_fmt = _("The requested image is not valid for use.")
+
+
+class ImageChecksumError(InvalidImage):
+    """Exception indicating checksum failed to match."""
+    _msg_fmt = _("The supplied image checksum is invalid or does not match.")
+
+
+class ImageChecksumAlgorithmFailure(InvalidImage):
+    """Cannot load the requested or required checksum algorithm."""
+    _msg_fmt = _("The requested image checksum algorithm cannot be loaded.")
+
+
+class ImageChecksumURLNotSupported(InvalidImage):
+    """Exception indicating we cannot support the remote checksum file."""
+    _msg_fmt = _("Use of remote checksum files is not supported.")
+
+
+class ImageChecksumFileReadFailure(InvalidImage):
+    """An OSError was raised when trying to read the file."""
+    _msg_fmt = _("Failed to read the file from local storage "
+                 "to perform a checksum operation.")
+    code = http_client.SERVICE_UNAVAILABLE
+
+
+class ParentNodeLocked(Conflict):
+    _msg_fmt = _("Node %(node)s parent_node %(parent)s is presently locked "
+                 "and we are unable to perform any action on it at this "
+                 "time. Please retry after the current operation is "
+                 "completed.")
+
+
+class ChildNodeLocked(Conflict):
+    _msg_fmt = _("Node %(node)s child_node %(child)s is presently locked "
+                 "and we are unable to perform any action on it at this "
+                 "time. Please retry after the current operation is "
+                 "completed.")
+
+
+class InvalidMetricConfig(Invalid):
+    """Error raised when a metric config is invalid."""
+
+    message = "Invalid value for metrics config option."
+
+
+class MetricsNotSupported(IronicException):
+    _msg_fmt = _("Metrics action is not supported. You may need to "
+                 "adjust the [metrics] section in ironic.conf.")
+
+
+class ServiceLookupFailure(IronicException):
+    _msg_fmt = _("Cannot find %(service)s service through multicast.")
+
+
+class ServiceRegistrationFailure(IronicException):
+    _msg_fmt = _("Cannot register %(service)s service: %(error)s")
+
+
+class Unauthorized(IronicException):
+    code = http_client.UNAUTHORIZED
+    headers = {'WWW-Authenticate': 'Basic realm="Baremetal API"'}
+
+
+class SecurityProxyNegotiationFailed(IronicException):
+    _msg_fmt = _("Failed to negotiate security type with server: %(reason)s")
+
+
+class RFBAuthHandshakeFailed(IronicException):
+    _msg_fmt = _("Failed to complete auth handshake: %(reason)s")
+
+
+class RFBAuthNoAvailableScheme(IronicException):
+    _msg_fmt = _("No matching auth scheme: allowed types: "
+                 "'%(allowed_types)s', "
+                 "desired types: '%(desired_types)s'")
+
+
+class ConsoleContainerError(IronicException):
+    _msg_fmt = _("Console container error with provider '%(provider)s', "
+                 "reason: %(reason)s")
+
+
+class ImageHostRateLimitFailure(TemporaryFailure):
+    _msg_fmt = _("The image registry has indicates the rate limit has been "
+                 "exceeded for url %(image_ref)s. Please try again later or "
+                 "consider using authentication and/or trying again.")
+
+
+class ImageMatchFailure(InvalidImage):
+    _msg_fmt = _("The requested image lacks the required attributes to "
+                 "identify the file to select.")
+
+
+class OciImageNotSpecific(InvalidImage):
+    _msg_fmt = _("The requested image (%(image_ref)s) was not specific. "
+                 "Please supply a full URL mapping to the manifest to be "
+                 "utilized for the file download.")
+
+
+class OciImageTagNotFound(ImageNotFound):
+    _msg_fmt = _("Image tag %(image_url)s could not be found, "
+                 "available tags are %(tags)s")
+
+
+class ImageServiceAuthenticationRequired(ImageUnacceptable):
+    _msg_fmt = _("The requested image %(image_ref)s requires "
+                 "authentication which has not been provided. "
+                 "Unable to proceed.")
+
+
+class InspectionRuleAlreadyExists(Conflict):
+    """Rule requested already exists in the database."""
+    _msg_fmt = _("A rule with UUID %(uuid)s already exists.")
+
+
+class InspectionRuleNotFound(NotFound):
+    """The requested rule was not found."""
+    _msg_fmt = _("Rule %(rule)s could not be found.")
+
+
+class InspectionRuleValidationFailure(IronicException):
+    """Inspection rule validation fails during creation or execution."""
+    _msg_fmt = _("Inspection rule validation failed. Reason: %(reason)s")
+
+
+class InspectionRuleExecutionFailure(HardwareInspectionFailure):
+    """Raised when an inspection rule fails during execution."""
+    _msg_fmt = _("Inspection rule execution failed. Reason: %(reason)s")
+
+
+class RuleActionExecutionFailure(InspectionRuleExecutionFailure):
+    """Raised when an inspection rule action fails during execution."""
+    _msg_fmt = _("Inspection rule action execution failed. "
+                 "Reason: %(reason)s")
+
+
+class RuleConditionCheckFailure(InspectionRuleExecutionFailure):
+    """Raised when an inspection rule condition fails during execution."""
+    _msg_fmt = _("Inspection rule condition check failed. Reason: %(reason)s")
+
+
+class ConfigDriveRegenerationFailure(IronicException):
+    """Raised when we fail to handle configuration drive corrections."""
+    # NOTE(TheJulia): This is not intended to get raised to a user, but more
+    # so we handle known possible failure cases and don't fail horribly.
+
+
+class TraitBasedNetworkingException(IronicException):
+    """Raised when there's an issue with trait based networking feature."""
+    pass
+
+
+class TBNComparatorPrefixMatchTypeMismatch(TraitBasedNetworkingException):
+    """Comparator prefix match can only be used against a string."""
+    pass
+
+
+class TBNComparatorCollectionTypeMismatch(TraitBasedNetworkingException):
+    """Only equality, inequality, and prefix match support collections."""
+    pass
+
+
+class TBNNoTraitsApplicableToNode(TraitBasedNetworkingException):
+    """If no traits apply to a node, then nothing can be done."""
+    _msg_fmt = _("No Trait Based Networking traits were found which could "
+                 "apply to the node %(node)s.")
+
+class TBNNoPortMatchesFound(TraitBasedNetworkingException):
+    """No matching ports were found when planning the network for this node"""
+    _msg_fnt = _("No matching ports where found when planning the networking "
+                 "for node %(node)s and network %(vif_id)s")
+
+class InvalidContent(Invalid):
+    """Invalid or malicious content has been provided to the conductor."""
+    _msg_fmt = _("Invalid or potentially malicious content has been provided "
+                 "to the conductor and the conductor will not proceed.")

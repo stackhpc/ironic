@@ -27,7 +27,9 @@ from ironic.objects import notification
 class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Add owner field
-    VERSION = '1.1'
+    # Version 1.2: Add remotable method check_node_list
+    # Version 1.3: Relevant methods changed to be remotable methods.
+    VERSION = '1.3'
 
     dbapi = dbapi.get_instance()
 
@@ -79,11 +81,8 @@ class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
                 # DB: set unavailable fields to their default.
                 self.owner = None
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get(cls, context, allocation_ident):
         """Find an allocation by its ID, UUID or name.
 
@@ -102,11 +101,8 @@ class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
         else:
             raise exception.InvalidIdentity(identity=allocation_ident)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_id(cls, context, allocation_id):
         """Find an allocation by its integer ID.
 
@@ -121,11 +117,8 @@ class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
         allocation = cls._from_db_object(context, cls(), db_allocation)
         return allocation
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_uuid(cls, context, uuid):
         """Find an allocation by its UUID.
 
@@ -140,11 +133,8 @@ class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
         allocation = cls._from_db_object(context, cls(), db_allocation)
         return allocation
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_name(cls, context, name):
         """Find an allocation based by its name.
 
@@ -159,11 +149,8 @@ class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
         allocation = cls._from_db_object(context, cls(), db_allocation)
         return allocation
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def list(cls, context, filters=None, limit=None, marker=None,
              sort_key=None, sort_dir=None):
         """Return a list of Allocation objects.
@@ -186,10 +173,7 @@ class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
                                                        sort_dir=sort_dir)
         return cls._from_db_object_list(context, db_allocations)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def create(self, context=None):
         """Create a Allocation record in the DB.
 
@@ -206,10 +190,7 @@ class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
         db_allocation = self.dbapi.create_allocation(values)
         self._from_db_object(self._context, self, db_allocation)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def destroy(self, context=None):
         """Delete the Allocation from the DB.
 
@@ -225,10 +206,7 @@ class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
         self.dbapi.destroy_allocation(self.uuid)
         self.obj_reset_changes()
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def save(self, context=None):
         """Save updates to this Allocation.
 
@@ -248,10 +226,7 @@ class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
         updated_allocation = self.dbapi.update_allocation(self.uuid, updates)
         self._from_db_object(self._context, self, updated_allocation)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def refresh(self, context=None):
         """Loads updates for this Allocation.
 
@@ -271,6 +246,18 @@ class Allocation(base.IronicObject, object_base.VersionedObjectDictCompat):
         current = self.get_by_uuid(self._context, uuid=self.uuid)
         self.obj_refresh(current)
         self.obj_reset_changes()
+
+    @classmethod
+    @base.remotable
+    def check_node_list(cls, context, candidate_nodes, project):
+        """Provides a pass-through to the database for allocation node lists.
+
+        Calls the database directly as opposed to allowing the API to directly
+        call the database when an indirection API is set.
+        """
+        return cls.dbapi.check_node_list(
+            candidate_nodes,
+            project=project)
 
 
 @base.IronicObjectRegistry.register

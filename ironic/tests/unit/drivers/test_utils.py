@@ -13,10 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from dataclasses import dataclass
 import datetime
 import os
 from unittest import mock
 
+from ddt import data
+from ddt import ddt
+from ddt import unpack
 from oslo_config import cfg
 from oslo_utils import timeutils
 
@@ -30,6 +34,15 @@ from ironic.drivers import utils as driver_utils
 from ironic.tests import base as tests_base
 from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.objects import utils as obj_utils
+
+
+def annotate(name, *args):
+    class AnnotatedList(list):
+        pass
+
+    al = AnnotatedList([*args])
+    al.__name__ = name
+    return al
 
 
 class UtilsTestCase(db_base.DbTestCase):
@@ -211,15 +224,111 @@ class UtilsTestCase(db_base.DbTestCase):
         self.assertEqual("Value of 'capabilities' must be string. Got "
                          + str(int), str(exc))
 
-    def test_normalize_mac_string(self):
-        mac_raw = "0A:1B-2C-3D:4F"
-        mac_clean = driver_utils.normalize_mac(mac_raw)
-        self.assertEqual("0a1b2c3d4f", mac_clean)
+    def test_get_field_bootloader(self):
+        driver_info = self.node.driver_info
+        driver_info['bootloader'] = 'custom.efi'
+        self.node.driver_info = driver_info
+        result = driver_utils.get_field(self.node, 'bootloader', use_conf=True)
+        self.assertEqual('custom.efi', result)
 
-    def test_normalize_mac_unicode(self):
-        mac_raw = u"0A:1B-2C-3D:4F"
-        mac_clean = driver_utils.normalize_mac(mac_raw)
-        self.assertEqual("0a1b2c3d4f", mac_clean)
+        self.config(bootloader='global.efi', group='conductor')
+        del self.node.driver_info['bootloader']
+        result = driver_utils.get_field(self.node, 'bootloader', use_conf=True)
+        self.assertEqual('global.efi', result)
+
+    def test_get_field_bootloader_by_arch(self):
+        self.config(bootloader_by_arch={'aarch64': 'grubaa64.efi'},
+                    group='conductor')
+        properties = self.node.properties
+        properties['cpu_arch'] = 'aarch64'
+        self.node.properties = properties
+
+        result = driver_utils.get_field(self.node, 'bootloader', use_conf=True)
+        self.assertEqual('grubaa64.efi', result)
+
+
+@ddt
+class GetKernelAppendParamsTestCase(tests_base.TestCase):
+    @dataclass(frozen=True)
+    class FauxTestNode:
+        instance_info: dict
+        driver_info: dict
+
+    @data(
+        annotate(
+            "valid params in instance_info",
+            FauxTestNode({'kernel_append_params': 'quiet ro'},
+                         {}),
+            '',
+            'quiet ro',
+            False,
+            False
+        ),
+        annotate(
+            "valid params in driver_info",
+            FauxTestNode({},
+                         {'kernel_append_params': 'quiet ro'}),
+            '',
+            'quiet ro',
+            False,
+            False
+        ),
+        annotate(
+            "params in default",
+            FauxTestNode({}, {}),
+            'quiet ro',
+            'quiet ro',
+            False,
+            False
+        ),
+        annotate(
+            "invalid params in instance_info raises",
+            FauxTestNode({'kernel_append_params': 'bad\nparams'}, {}),
+            '',
+            '',
+            True,
+            False
+
+        ),
+        annotate(
+            "invalid params in driver_info raises",
+            FauxTestNode({}, {'kernel_append_params': 'bad\nparams'}),
+            '',
+            '',
+            True,
+            False
+        ),
+        annotate(
+            "parsing disabled - but newline is filtered",
+            FauxTestNode({}, {'kernel_append_params': 'quiet\n ro'}),
+            '',
+            'quiet ro',
+            False,
+            True,
+        ),
+    )
+    @unpack
+    def test_get_kernel_append_params(
+            self,
+            test_node: FauxTestNode,
+            default: str,
+            expected_result: str,
+            should_raise: bool,
+            disable_kernel_parameter_parsing: bool):
+        cfg.CONF.set_override('disable_kernel_parameter_parsing',
+                              disable_kernel_parameter_parsing,
+                              'conductor')
+        if should_raise:
+            self.assertRaises(
+                exception.InvalidParameterValue,
+                driver_utils.get_kernel_append_params,
+                test_node,
+                default)
+        else:
+            self.assertEqual(
+                expected_result,
+                driver_utils.get_kernel_append_params(test_node,
+                                                      default))
 
 
 class UtilsRamdiskLogsTestCase(tests_base.TestCase):
@@ -342,13 +451,17 @@ class UtilsRamdiskLogsTestCase(tests_base.TestCase):
             'deploy_logs_swift_container', container_name, 'agent')
         cfg.CONF.set_override('deploy_logs_swift_days_to_expire', 1, 'agent')
 
+        mock_swift_api = mock_swift.return_value
+        mock_swift_api.__enter__.return_value = mock_swift_api
+
         mock_logs_name.return_value = file_name
         driver_utils.store_ramdisk_logs(self.node, b64str)
 
-        mock_swift.return_value.create_object.assert_called_once_with(
+        mock_swift_api.create_object.assert_called_once_with(
             container_name, file_name, mock.ANY,
             object_headers={'X-Delete-After': '86400'})
         mock_logs_name.assert_called_once_with(self.node, label=None)
+        mock_swift_api.__exit__.assert_called_once()
 
     @mock.patch.object(os, 'makedirs', autospec=True)
     @mock.patch.object(driver_utils,
@@ -370,6 +483,127 @@ class UtilsRamdiskLogsTestCase(tests_base.TestCase):
 
         mock_makedirs.assert_called_once_with(log_path)
         mock_logs_name.assert_called_once_with(self.node, label=None)
+
+
+class GetAgentKernelRamdiskTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super(GetAgentKernelRamdiskTestCase, self).setUp()
+        self.node = obj_utils.create_test_node(self.context)
+
+    def test_get_agent_kernel_ramdisk_from_node_driver_info(self):
+        """Test getting kernel/ramdisk from node driver_info."""
+        self.node.driver_info = {
+            'deploy_kernel': 'http://example.com/kernel',
+            'deploy_ramdisk': 'http://example.com/ramdisk'
+        }
+        result = driver_utils.get_agent_kernel_ramdisk(self.node)
+        expected = {
+            'deploy_kernel': 'http://example.com/kernel',
+            'deploy_ramdisk': 'http://example.com/ramdisk'
+        }
+        self.assertEqual(expected, result)
+
+    def test_get_agent_kernel_ramdisk_from_by_arch(self):
+        """Test kernel/ramdisk from by_arch config when no driver_info."""
+        self.config(deploy_kernel_by_arch={'x86_64': 'kernel_by_arch'},
+                    group='conductor')
+        self.config(deploy_ramdisk_by_arch={'x86_64': 'ramdisk_by_arch'},
+                    group='conductor')
+        self.node.properties = {'cpu_arch': 'x86_64'}
+        result = driver_utils.get_agent_kernel_ramdisk(self.node)
+        expected = {
+            'deploy_kernel': 'kernel_by_arch',
+            'deploy_ramdisk': 'ramdisk_by_arch'
+        }
+        self.assertEqual(expected, result)
+
+    def test_get_agent_kernel_ramdisk_from_global_config(self):
+        """Test getting kernel/ramdisk from global config."""
+        self.config(deploy_kernel='global_kernel', group='conductor')
+        self.config(deploy_ramdisk='global_ramdisk', group='conductor')
+        result = driver_utils.get_agent_kernel_ramdisk(self.node)
+        expected = {
+            'deploy_kernel': 'global_kernel',
+            'deploy_ramdisk': 'global_ramdisk'
+        }
+        self.assertEqual(expected, result)
+
+    def test_get_agent_kernel_ramdisk_inconsistent_node_raises_exception(self):
+        """Test that inconsistent node config raises exception enabled."""
+        self.config(error_on_ramdisk_config_inconsistency=True,
+                    group='conductor')
+        self.node.driver_info = {'deploy_kernel': 'kernel_only'}
+
+        self.assertRaises(exception.MissingParameterValue,
+                          driver_utils.get_agent_kernel_ramdisk, self.node)
+
+    def test_get_agent_kernel_ramdisk_inconsistent_node_logs_warning(self):
+        """Test that inconsistent node config logs warning when disabled."""
+        self.config(error_on_ramdisk_config_inconsistency=False,
+                    group='conductor')
+        self.config(deploy_kernel='global_kernel', group='conductor')
+        self.config(deploy_ramdisk='global_ramdisk', group='conductor')
+        self.node.driver_info = {'deploy_kernel': 'kernel_only'}
+
+        with mock.patch.object(driver_utils.LOG, 'warning',
+                               autospec=True) as mock_log:
+            result = driver_utils.get_agent_kernel_ramdisk(self.node)
+            # fall back to global config since node config is inconsistent
+            expected = {
+                'deploy_kernel': 'global_kernel',
+                'deploy_ramdisk': 'global_ramdisk'
+            }
+            self.assertEqual(expected, result)
+            mock_log.assert_called_once()
+
+    def test_get_agent_kernel_ramdisk_inconsistent_by_arch_raises(self):
+        """Test that inconsistent by_arch config raises when enabled."""
+        self.config(error_on_ramdisk_config_inconsistency=True,
+                    group='conductor')
+        self.config(deploy_kernel_by_arch={'x86_64': 'kernel_by_arch'},
+                    group='conductor')
+        # Missing ramdisk_by_arch for x86_64
+        self.node.properties = {'cpu_arch': 'x86_64'}
+
+        self.assertRaises(exception.MissingParameterValue,
+                          driver_utils.get_agent_kernel_ramdisk, self.node)
+
+    def test_get_agent_kernel_ramdisk_inconsistent_by_arch_logs_warning(self):
+        """Test that inconsistent by_arch config logs warning when disabled."""
+        self.config(error_on_ramdisk_config_inconsistency=False,
+                    group='conductor')
+        self.config(deploy_kernel='fallback_kernel', group='conductor')
+        self.config(deploy_ramdisk='fallback_ramdisk', group='conductor')
+        self.config(deploy_kernel_by_arch={'x86_64': 'kernel_by_arch'},
+                    group='conductor')
+        # Missing ramdisk_by_arch for x86_64
+        self.node.properties = {'cpu_arch': 'x86_64'}
+
+        with mock.patch.object(driver_utils.LOG, 'warning',
+                               autospec=True) as mock_log:
+            result = driver_utils.get_agent_kernel_ramdisk(self.node)
+            # Should fall back to global config
+            expected = {
+                'deploy_kernel': 'fallback_kernel',
+                'deploy_ramdisk': 'fallback_ramdisk'
+            }
+            self.assertEqual(expected, result)
+            mock_log.assert_called_once()
+
+    def test_get_agent_kernel_ramdisk_rescue_mode(self):
+        """Test getting rescue kernel/ramdisk works correctly."""
+        self.node.driver_info = {
+            'rescue_kernel': 'http://example.com/rescue_kernel',
+            'rescue_ramdisk': 'http://example.com/rescue_ramdisk'
+        }
+        result = driver_utils.get_agent_kernel_ramdisk(self.node,
+                                                       mode='rescue')
+        expected = {
+            'rescue_kernel': 'http://example.com/rescue_kernel',
+            'rescue_ramdisk': 'http://example.com/rescue_ramdisk'
+        }
+        self.assertEqual(expected, result)
 
 
 class MixinVendorInterfaceTestCase(db_base.DbTestCase):
@@ -408,3 +642,65 @@ class MixinVendorInterfaceTestCase(db_base.DbTestCase):
             self.assertRaises(exception.InvalidParameterValue,
                               self.vendor.validate,
                               task, method='fake_method')
+
+
+class GetVerifyCATestCase(tests_base.TestCase):
+
+    def setUp(self):
+        super(GetVerifyCATestCase, self).setUp()
+
+    def test_default_verify_is_unspecified(self):
+        node = obj_utils.get_test_node(self.context)
+        for case in [
+            {
+                'driver': 'idrac',
+                'config_group': 'drac',
+                'driver_info_key': 'redfish_verify_ca',
+            },
+            {
+                'driver': 'redfish',
+                'config_group': 'redfish',
+                'driver_info_key': 'redfish_verify_ca',
+            },
+        ]:
+            node.driver = case['driver']
+
+            verify_ca = driver_utils.get_verify_ca(node, True)
+            self.assertEqual(verify_ca, True)
+
+            verify_ca = driver_utils.get_verify_ca(node, False)
+            self.assertEqual(verify_ca, False)
+
+            verify_ca = driver_utils.get_verify_ca(node, None)
+            self.assertIsNone(verify_ca)
+
+            verify_ca = driver_utils.get_verify_ca(node, 'rootca.crt')
+            self.assertEqual(verify_ca, 'rootca.crt')
+
+    def test_default_verify_is_specified(self):
+        node = obj_utils.get_test_node(self.context)
+        for case in [
+            {
+                'driver': 'idrac',
+                'config_group': 'redfish',
+            },
+            {
+                'driver': 'redfish',
+                'config_group': 'redfish',
+            },
+        ]:
+            node.driver = case['driver']
+            cfg.CONF.set_override(
+                'verify_ca', 'default.crt', case['config_group'])
+
+            verify_ca = driver_utils.get_verify_ca(node, True)
+            self.assertEqual(verify_ca, 'default.crt')
+
+            verify_ca = driver_utils.get_verify_ca(node, False)
+            self.assertEqual(verify_ca, False)
+
+            verify_ca = driver_utils.get_verify_ca(node, None)
+            self.assertEqual(verify_ca, 'default.crt')
+
+            verify_ca = driver_utils.get_verify_ca(node, 'rootca.crt')
+            self.assertEqual(verify_ca, 'rootca.crt')

@@ -13,19 +13,53 @@ the end user. There are two types of user images:
     a kernel and with an initramfs.
 
     .. warning::
-        To use partition images with local boot, Grub2 must be installed on
-        them.
+        To use partition images, Grub2 must be installed in the image.
+        This is *not* a recommended path.
 
 *whole disk images*
     contain a complete partition table with one or more partitions.
 
     .. warning::
         The kernel/initramfs pair must not be used with whole disk images,
-        otherwise they'll be mistaken for partition images.
+        otherwise they'll be mistaken for partition images. Whole disk images
+        are the recommended type of images to use.
 
 Many distributions publish their own cloud images. These are usually whole disk
 images that are built for legacy boot mode (not UEFI), with Ubuntu being an
 exception (they publish images that work in both modes).
+
+Supported Disk Image Formats
+----------------------------
+
+The following formats are tested by Ironic and are expected to work as
+long as no unknown or unsafe special features are being used
+
+* raw - A file containing bytes as they would exist on a disk or other
+  block storage device. This is the simplest format.
+* qcow2 - An updated file format based upon the `QEMU <https://www.qemu.org>`_
+  Copy-on-Write format.
+
+A special mention exists for ``iso`` formatted "CD" images. While Ironic uses
+the ISO9660 filesystems in some of it's processes for aspects such as virtual
+media, it does *not* support writing them to the remote block storage device.
+
+Image formats we believe may work due to third party reports, but do not test:
+
+* vmdk - A file format derived from the image format originally created
+  by VMware for their hypervisor product line. Specifically we believe
+  a single file VMDK formatted image should work. As there are
+  are several subformats, some of which will not work and may result
+  in unexpected behavior such as failed deployments.
+* vdi - A file format used by
+  `Oracle VM Virtualbox <https://www.virtualbox.org>`_ hypervisor.
+
+As Ironic does not support these formats, their usage is normally blocked
+due security considerations by default. Please consult with your Ironic Operator.
+
+It is important to highlight that Ironic enforces and matches the file type
+based upon signature, and not file extension. If there is a mismatch,
+the input and or remote service records such as in the Image service
+must be corrected.
 
 disk-image-builder
 ------------------
@@ -71,6 +105,24 @@ only the main image is used.
 
 If you want to use Fedora image, replace ``ubuntu`` with ``fedora`` in the
 chosen command.
+
+To build images for distributions other than ubuntu, follow the build method
+for Whole disk images.
+
+- Example for Rocky Linux
+
+  If you use the rocky-container element, specify the ``openssh-server`` and
+  ``cloud-init`` elements to enable ssh login with a key pair, and specify the
+  ``growroot`` element to adjust the disk size.
+
+  .. code-block:: console
+
+     $ export DIB_CONTAINERFILE_PODMAN_ROOT=1
+     $ disk-image-create rocky-container vm dhcp-all-interfaces \
+     > block-device-efi openssh-server cloud-init growroot -o my-image
+
+If you want to use Alma Linux image, replace ``rocky-container`` with
+``almalinux-container`` in the chosen command.
 
 .. _disk-image-builder: https://docs.openstack.org/diskimage-builder/latest/
 

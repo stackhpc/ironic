@@ -12,11 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from collections import defaultdict
 import inspect
-import itertools
-import operator
-import os.path
 
 from docutils import nodes
 from docutils.parsers import rst
@@ -58,19 +54,22 @@ def _list_table(add, headers, data, title='', columns=None):
             else:
                 # potentially multi-line string
                 add('     * %s' % lines[0])
-                for l in lines[1:]:
-                    add('       %s' % l)
+                for line in lines[1:]:
+                    add('       %s' % line)
     add('')
 
 
 def _format_doc(doc):
     "Format one method docstring to be shown in the step table."
     paras = doc.split('\n\n')
-    if paras[-1].startswith(':'):
+    formatted_docstring = []
+    for line in paras:
+        if line.startswith(':'):
+            continue
         # Remove the field table that commonly appears at the end of a
         # docstring.
-        paras = paras[:-1]
-    return '\n\n'.join(paras)
+        formatted_docstring.append(line)
+    return '\n\n'.join(formatted_docstring)
 
 
 _clean_steps = {}
@@ -88,8 +87,8 @@ def _init_steps_by_driver():
 
     for interface_name in sorted(driver_factory.driver_base.ALL_INTERFACES):
         if DEBUG:
-            LOG.info('[{}] probing available plugins for interface {}'.format(
-                __name__, interface_name))
+            LOG.info('[%s] probing available plugins for interface %s',
+                     __name__, interface_name)
 
         loader = stevedore.ExtensionManager(
             'ironic.hardware.interfaces.{}'.format(interface_name),
@@ -114,8 +113,8 @@ def _init_steps_by_driver():
                     'doc': _format_doc(inspect.getdoc(method)),
                 }
                 if DEBUG:
-                    LOG.info('[{}] interface {!r} driver {!r} STEP {}'.format(
-                        __name__, interface_name, plugin.name, step))
+                    LOG.info('[%s] interface %r driver %r STEP %r',
+                        __name__, interface_name, plugin.name, step)
                 steps.append(step)
 
             if steps:
@@ -153,7 +152,8 @@ class AutomatedStepsDirective(rst.Directive):
 
         result = ViewList()
 
-        for interface_name in ['power', 'management', 'deploy', 'bios', 'raid']:
+        for interface_name in ['power', 'management', 'firmware',
+                               'deploy', 'bios', 'raid']:
             interface_info = _clean_steps.get(interface_name, {})
             if not interface_info:
                 continue
@@ -167,7 +167,8 @@ class AutomatedStepsDirective(rst.Directive):
                 _list_table(
                     title='{} cleaning steps'.format(driver_name),
                     add=lambda x: result.append(x, source_name),
-                    headers=['Name', 'Details', 'Priority', 'Stoppable', 'Arguments'],
+                    headers=['Name', 'Details', 'Priority',
+                             'Stoppable', 'Arguments'],
                     columns=[20, 30, 10, 10, 30],
                     data=(
                         ('``{}``'.format(s['step']),
@@ -192,3 +193,6 @@ class AutomatedStepsDirective(rst.Directive):
 def setup(app):
     app.add_directive('show-steps', AutomatedStepsDirective)
     _init_steps_by_driver()
+    return {
+        'parallel_read_safe': True,
+    }

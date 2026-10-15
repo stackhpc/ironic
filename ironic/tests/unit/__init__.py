@@ -22,15 +22,15 @@
    :platform: Unix
 """
 
-# TODO(tenbrae): move eventlet imports to ironic.__init__ once we move to PBR
+# NOTE(TheJulia): This is to force oslo_service from trying to use eventlet.
+from oslo_service import backend
+backend.init_backend(backend.BackendType.THREADING)
 
-import eventlet
-from oslo_config import cfg
-from oslo_log import log
+from oslo_config import cfg # noqa E402
+from oslo_log import log # noqa E402
 
-from ironic import objects
+from ironic import objects # noqa E402
 
-eventlet.monkey_patch(os=False)
 
 log.register_options(cfg.CONF)
 log.setup(cfg.CONF, 'ironic')

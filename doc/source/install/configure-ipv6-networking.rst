@@ -6,6 +6,13 @@ configuration. This page covers the IPv6 specifics only. Please refer to
 :doc:`/install/configure-tenant-networks` and
 :doc:`/install/configure-networking` for general networking configuration.
 
+.. WARNING::
+   IPv6 Networking is not actively tested in upstream Continuous
+   Integration pipelines, in large part because test virtual machines
+   have limited support and known issues. Hardware vendors often have
+   better firmware which enables this functionality, but may require
+   specific operating modes, such as ``stateless`` or ``stateful``
+   depending on the requirements placed upon them by their customers.
 
 Configure ironic PXE driver for provisioning using IPv6 addressing
 ==================================================================
@@ -13,8 +20,8 @@ Configure ironic PXE driver for provisioning using IPv6 addressing
 The PXE drivers operate in such a way that they are able to utilize
 both IPv4 and IPv6 addresses based upon the deployment's operating state and
 configuration. Internally, the drivers attempt to prepare configuration options for both formats, which allows ports which are IPv6 only to automatically
-receieve boot parameters. As a result of this, it is critical that the
-``[DEFAULT]my_ipv6`` configuration parameter is set to the conductor's
+receive boot parameters. As a result of this, it is critical that the
+:oslo.config:option:`DEFAULT.my_ipv6` configuration parameter is set to the conductor's
 IPv6 address. This option is unique per conductor, and due to the nature
 of automatic address assignment, it cannot be "guessed" by the software.
 
@@ -46,17 +53,17 @@ Provisioning with IPv6 stateful addressing
 ------------------------------------------
 
 When using stateful addressing DHCPv6 is providing both addresses and other
-configuration via DHCPv6 options such as the bootfile-url and bootfile-
-parameters.
+configuration via DHCPv6 options such as the bootfile-url and
+bootfile-parameters.
 
 The "identity-association" (IA) construct used by DHCPv6 is challenging when
 booting over the network. Firmware, and ramdisks typically end up using
-different DUID/IAID combinations and it is not always possible for one chain-
-booting stage to release its address before giving control to the next step. In
-case the DHCPv6 server is configured with static reservations only the result is
-that booting will fail because the DHCPv6 server has no addresses available. To
-get past this issue either configure the DHCPv6 server with multiple address
-reservations for each host, or use a dynamic range.
+different DUID/IAID combinations and it is not always possible for one
+chain-booting stage to release its address before giving control to the next
+step. In case the DHCPv6 server is configured with static reservations only
+the result is that booting will fail because the DHCPv6 server has no
+addresses available. To get past this issue either configure the DHCPv6 server
+with multiple address reservations for each host, or use a dynamic range.
 
 .. Note:: Support for multiple address reservations requires dnsmasq version
           2.81 or later. Some distributions may backport this feature to

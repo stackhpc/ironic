@@ -15,7 +15,6 @@ import contextlib
 from oslo_config import cfg
 from oslo_log import log
 from oslo_messaging import exceptions as oslo_msg_exc
-from oslo_utils import excutils
 from oslo_versionedobjects import exception as oslo_vo_exc
 
 from ironic.common import exception
@@ -24,10 +23,12 @@ from ironic.objects import allocation as allocation_objects
 from ironic.objects import chassis as chassis_objects
 from ironic.objects import deploy_template as deploy_template_objects
 from ironic.objects import fields
+from ironic.objects import inspection_rule as inspection_rule_objects
 from ironic.objects import node as node_objects
 from ironic.objects import notification
 from ironic.objects import port as port_objects
 from ironic.objects import portgroup as portgroup_objects
+from ironic.objects import runbook as runbook_objects
 from ironic.objects import volume_connector as volume_connector_objects
 from ironic.objects import volume_target as volume_target_objects
 
@@ -48,12 +49,17 @@ CRUD_NOTIFY_OBJ = {
              port_objects.PortCRUDPayload),
     'portgroup': (portgroup_objects.PortgroupCRUDNotification,
                   portgroup_objects.PortgroupCRUDPayload),
+    'runbook': (runbook_objects.RunbookCRUDNotification,
+                runbook_objects.RunbookCRUDPayload),
     'volumeconnector':
         (volume_connector_objects.VolumeConnectorCRUDNotification,
          volume_connector_objects.VolumeConnectorCRUDPayload),
     'volumetarget':
         (volume_target_objects.VolumeTargetCRUDNotification,
          volume_target_objects.VolumeTargetCRUDPayload),
+    'inspectionrule':
+        (inspection_rule_objects.InspectionRuleCRUDNotification,
+         inspection_rule_objects.InspectionRuleCRUDPayload),
 }
 
 
@@ -101,8 +107,7 @@ def _emit_api_notification(context, obj, action, level, status, **kwargs):
                                    "%(payload_method)s, error %(error)s"))
 
         payload = payload_method(obj, **extra_args)
-        if resource == 'node':
-            notification.mask_secrets(payload)
+        notification.mask_secrets(payload)
         notification_method(
             publisher=notification.NotificationPublisher(
                 service='ironic-api', host=CONF.host),
@@ -148,11 +153,11 @@ def handle_error_notification(context, obj, action, **kwargs):
     try:
         yield
     except Exception:
-        with excutils.save_and_reraise_exception():
-            _emit_api_notification(context, obj, action,
-                                   fields.NotificationLevel.ERROR,
-                                   fields.NotificationStatus.ERROR,
-                                   **kwargs)
+        _emit_api_notification(context, obj, action,
+                               fields.NotificationLevel.ERROR,
+                               fields.NotificationStatus.ERROR,
+                               **kwargs)
+        raise
 
 
 def emit_end_notification(context, obj, action, **kwargs):

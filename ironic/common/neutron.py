@@ -30,10 +30,6 @@ from ironic import objects
 
 LOG = log.getLogger(__name__)
 
-# TODO(pas-ha) remove in Rocky, until then it is a default
-# for CONF.neutron.url in noauth case when endpoint_override is not set
-DEFAULT_NEUTRON_URL = 'http://%s:9696' % CONF.my_ip
-
 _NEUTRON_SESSION = None
 
 VNIC_BAREMETAL = 'baremetal'
@@ -41,6 +37,41 @@ VNIC_SMARTNIC = 'smart-nic'
 
 PHYSNET_PARAM_NAME = 'provider:physical_network'
 """Name of the neutron network API physical network parameter."""
+
+
+class NeutronNetworkClient:
+    """Wrapper for neutron network proxy that ensures connection cleanup.
+
+    This class wraps the openstacksdk network proxy and holds a reference
+    to the underlying Connection object to ensure it can be properly closed
+    to prevent file descriptor leaks.
+    """
+
+    def __init__(self, connection, network_proxy):
+        self._connection = connection
+        self._network_proxy = network_proxy
+
+    def __getattr__(self, name):
+        return getattr(self._network_proxy, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def close(self):
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            except Exception as e:
+                LOG.warning('Error closing neutron connection: %s', e)
+            finally:
+                self._connection = None
+
+    def __del__(self):
+        self.close()
 
 
 def _get_neutron_session():
@@ -70,14 +101,19 @@ def get_client(token=None, context=None, auth_from_config=False):
 
     user_auth = None
     if (not auth_from_config and CONF.neutron.auth_type != 'none'
-            and context.auth_token):
+            and context.auth_token and not context.system_scope):
+        # If we have a token, we *should* use the user's auth, however we
+        # can only do so *if* it is a project scoped request. If it is
+        # system scoped, we cannot leverage user auth data to make the next
+        # request.
         user_auth = keystone.get_service_auth(context, endpoint, service_auth)
 
     sess = keystone.get_session('neutron', timeout=CONF.neutron.timeout,
                                 auth=user_auth or service_auth)
     conn = openstack.connection.Connection(session=sess, oslo_conf=CONF)
+    network_proxy = conn.global_request(context.global_id).network
 
-    return conn.global_request(context.global_id).network
+    return NeutronNetworkClient(conn, network_proxy)
 
 
 def update_neutron_port(context, port_id, attrs, client=None):
@@ -92,17 +128,26 @@ def update_neutron_port(context, port_id, attrs, client=None):
     :param attrs:  The attributes to update on the port
     :param client: Optional Neutron client
     """
+    client_to_close = None
     if not client:
         # verify that user can see the port before updating it
-        get_client(context=context).get_port(port_id)
+        verify_client = get_client(context=context)
+        try:
+            verify_client.get_port(port_id)
+        finally:
+            verify_client.close()
         # Set user_auth=False to ensure auth values from ironic.conf is used
         #  prevents issues where a non-admin user is not allowed to manage
         #  Neutron ports.
-        client = get_client(context=context, auth_from_config=True)
+        client = client_to_close = get_client(context=context,
+                                              auth_from_config=True)
 
-    attrs = attrs.get('port', attrs)
-
-    return client.update_port(port_id, **attrs)
+    try:
+        attrs = attrs.get('port', attrs)
+        return client.update_port(port_id, **attrs)
+    finally:
+        if client_to_close:
+            client_to_close.close()
 
 
 def unbind_neutron_port(port_id, client=None, context=None, reset_mac=True):
@@ -141,19 +186,71 @@ def unbind_neutron_port(port_id, client=None, context=None, reset_mac=True):
         raise exception.NetworkError(msg)
 
 
-def update_port_address(port_id, address, context=None):
+def unbind_neutron_port_if_bound(port_id, client=None, context=None):
+    """Check and if bound, unbind a neutron port.
+
+    A wrapper around unbind_neutron_port which checks if the port is already
+    bound, and if so then triggers the port to be unbound. This is critical
+    early on if a user has pre-bound the port.
+
+    If the port is missing from Neutron, then a NetworkError exception will
+    also be raised because in this code path, we explicitly expect the port
+    to already exist and be accessible.
+
+    :param port_id: Neutron Port ID
+    :param client: Optional Neutron client.
+    :param context: request context
+    :type context: ironic.common.context.RequestContext
+    :raises: NetworkError
+    """
+    client_to_close = None
+    if not client:
+        client = client_to_close = get_client(context=context)
+    try:
+        is_bound = None
+        try:
+            port = client.get_port(port_id)
+            if not (port.binding_host_id is None
+                    or port.binding_host_id == ''):
+                is_bound = True
+        except openstack_exc.ResourceNotFound:
+            msg = (_('The neutron port %(port_id)s was not found when we '
+                     'expect it to exist. We cannot proceed.')
+                   % {'port_id': port_id})
+            raise exception.NetworkError(msg)
+        except openstack_exc.OpenStackCloudException as e:
+            msg = (_('An unknown error was encountered while attempting '
+                     'to retrieve neutron port %(port_id)s. Error: '
+                     '%(err)s') % {'port_id': port_id, 'err': e})
+            raise exception.NetworkError(msg)
+        if is_bound:
+            # If bound, then trigger an unbind using the already created
+            # context and client.
+            LOG.debug('Attempting to unbind port %s because it is already '
+                      'bound in Neutron.', port_id)
+            # Don't use a client or overall context
+            unbind_neutron_port(port_id)
+    finally:
+        if client_to_close:
+            client_to_close.close()
+
+
+def update_port_address(port_id, address, context=None, client=None):
     """Update a port's mac address.
 
     :param port_id: Neutron port id.
     :param address: new MAC address.
     :param context: request context
     :type context: ironic.common.context.RequestContext
+    :param client: A neutron client object.
     :raises: FailedToUpdateMacOnPort
     """
-    client = get_client(context=context)
-    port_attrs = {'mac_address': address}
+    client_to_close = None
+    if not client:
+        client = client_to_close = get_client(context=context)
 
     try:
+        port_attrs = {'mac_address': address}
         msg = (_("Failed to get the current binding on Neutron "
                  "port %s.") % port_id)
         port = client.get_port(port_id)
@@ -182,6 +279,9 @@ def update_port_address(port_id, address, context=None):
     except (openstack_exc.OpenStackCloudException, exception.NetworkError):
         LOG.exception(msg)
         raise exception.FailedToUpdateMacOnPort(port_id=port_id)
+    finally:
+        if client_to_close:
+            client_to_close.close()
 
 
 def _verify_security_groups(security_groups, client):
@@ -257,9 +357,10 @@ def add_ports_to_network(task, network_uuid, security_groups=None):
     :raises: NetworkError
     :returns: a dictionary in the form {port.uuid: neutron_port['id']}
     """
-    client = get_client(context=task.context)
+    client = get_client(context=task.context, auth_from_config=True)
     node = task.node
-    add_all_ports = CONF.neutron.add_all_ports
+    pxe_capability = 'pxe_boot' in task.driver.boot.capabilities
+    add_all_ports = CONF.neutron.add_all_ports or not pxe_capability
 
     # If Security Groups are specified, verify that they exist
     _verify_security_groups(security_groups, client)
@@ -296,8 +397,9 @@ def add_ports_to_network(task, network_uuid, security_groups=None):
         ports_to_create = task.ports
     if not ports_to_create:
         pxe_enabled = 'PXE-enabled ' if not add_all_ports else ''
+        client.close()
         raise exception.NetworkError(_(
-            "No available %(enabled)sports on node %(node)s.") %
+            "No available %(enabled)s ports on node %(node)s.") %
             {'enabled': pxe_enabled, 'node': node.uuid})
 
     for ironic_port in ports_to_create:
@@ -311,8 +413,14 @@ def add_ports_to_network(task, network_uuid, security_groups=None):
             continue
 
         update_port_attrs['mac_address'] = ironic_port.address
+
+        # Stores local link information for the port
         binding_profile = {'local_link_information':
                            [portmap[ironic_port.uuid]]}
+
+        if ironic_port.physical_network:
+            binding_profile['physical_network'] = ironic_port.physical_network
+
         update_port_attrs['binding:profile'] = binding_profile
 
         if not ironic_port.pxe_enabled:
@@ -349,21 +457,40 @@ def add_ports_to_network(task, network_uuid, security_groups=None):
                                        update_port_attrs)
             if CONF.neutron.dhcpv6_stateful_address_count > 1:
                 _add_ip_addresses_for_ipv6_stateful(task.context, port, client)
-            if is_smart_nic:
-                wait_for_port_status(client, port.id, 'ACTIVE')
+
+            binding_fail_fatal = False
+            is_neutron_iface = node.network_interface == 'neutron'
+
+            if is_neutron_iface:
+                binding_fail_fatal = CONF.neutron.fail_on_port_binding_failure
+
+            default_failure_behavior = is_smart_nic or binding_fail_fatal
+
+            fail_on_binding_failure = node.driver_info.get(
+                'fail_on_binding_failure', default_failure_behavior)
+
+            # NOTE(cid): Only check port status if it's a smart NIC or if we're
+            # configured to fail on binding failures. This avoids unnecessary
+            # failures when using network interfaces where binding may fail but
+            # we want to continue anyway (like in the case of flat networks).
+            if fail_on_binding_failure:
+                wait_for_port_status(
+                    client, port.id, 'ACTIVE',
+                    fail_on_binding_failure=fail_on_binding_failure)
         except openstack_exc.OpenStackCloudException as e:
             failures.append(ironic_port.uuid)
             LOG.warning("Could not create neutron port for node's "
-                        "%(node)s port %(ir-port)s on the neutron "
+                        "%(node)s port %(ir_port)s on the neutron "
                         "network %(net)s. %(exc)s",
                         {'net': network_uuid, 'node': node.uuid,
-                         'ir-port': ironic_port.uuid, 'exc': e})
+                         'ir_port': ironic_port.uuid, 'exc': e})
         else:
             ports[ironic_port.uuid] = port.id
 
     if failures:
         if len(failures) == len(ports_to_create):
             rollback_ports(task, network_uuid)
+            client.close()
             raise exception.NetworkError(_(
                 "Failed to create neutron ports for node's %(node)s ports "
                 "%(ports)s.") % {'node': node.uuid, 'ports': ports_to_create})
@@ -377,6 +504,7 @@ def add_ports_to_network(task, network_uuid, security_groups=None):
                  'created ports (ironic ID: neutron ID): %(ports)s.',
                  {'node_uuid': node.uuid, 'net': network_uuid, 'ports': ports})
 
+    client.close()
     return ports
 
 
@@ -387,7 +515,8 @@ def remove_ports_from_network(task, network_uuid):
     :param network_uuid: UUID of a neutron network ports will be deleted from.
     :raises: NetworkError
     """
-    add_all_ports = CONF.neutron.add_all_ports
+    pxe_capability = 'pxe_boot' in task.driver.boot.capabilities
+    add_all_ports = CONF.neutron.add_all_ports or not pxe_capability
     if not add_all_ports:
         macs = [p.address for p in task.ports if p.pxe_enabled]
     else:
@@ -410,7 +539,7 @@ def remove_neutron_ports(task, params):
     :param params: Dict of params to filter ports.
     :raises: NetworkError
     """
-    client = get_client(context=task.context)
+    client = get_client(context=task.context, auth_from_config=True)
     node_uuid = task.node.uuid
 
     try:
@@ -420,10 +549,12 @@ def remove_neutron_ports(task, params):
                  'from neutron, possible network issue. %(exc)s') %
                {'node': node_uuid, 'exc': e})
         LOG.exception(msg)
+        client.close()
         raise exception.NetworkError(msg)
 
     if not ports:
         LOG.debug('No ports to remove for node %s', node_uuid)
+        client.close()
         return
 
     for port in ports:
@@ -443,17 +574,18 @@ def remove_neutron_ports(task, params):
                      'a network issue: %(exc)s') %
                    {'vif': port.id, 'node': node_uuid, 'exc': e})
             LOG.exception(msg)
+            client.close()
             raise exception.NetworkError(msg)
 
     LOG.info('Successfully removed node %(node_uuid)s neutron ports.',
              {'node_uuid': node_uuid})
+    client.close()
 
 
-def _uncidr(cidr, ipv6=False):
+def _uncidr(cidr):
     """Convert CIDR network representation into network/netmask form
 
     :param cidr: network in CIDR form
-    :param ipv6: if `True`, consider `cidr` being IPv6
     :returns: a tuple of network/host number in dotted
         decimal notation, netmask in dotted decimal notation
 
@@ -462,24 +594,37 @@ def _uncidr(cidr, ipv6=False):
     return str(net.network_address), str(net.netmask)
 
 
-def get_neutron_port_data(port_id, vif_id, client=None, context=None):
+def get_neutron_port_data(port_id, vif_id, client=None, context=None,
+                          mac_address=None, iface_type='vif',
+                          bond_links=None):
     """Gather Neutron port and network configuration
 
     Query Neutron for port and network configuration, return whatever
-    is available.
+    is available. Apply a mac_address override, which may be useful for
+    the caller if this is being executed prior to port attachments.
 
     :param port_id: ironic port/portgroup ID.
     :param vif_id: Neutron port ID.
     :param client: Optional a Neutron client object.
     :param context: request context
     :type context: ironic.common.context.RequestContext
+    :param mac_address: An override ethernet mac address.
+    :param iface_type: Default interface type to denote a link
+                       to be. Likely ignored by cloud-init, but
+                       still best to be populated. Other applicable
+                       option is 'phy', or 'bond'.
+    :param bond_links: A list of dictionaries of additional links
+                       which indicate the port is a bind. This
+                       value being set overrides the iface_type
+                       value to 'bond'
     :raises: NetworkError
     :returns: a dict holding network configuration information
          associated with this ironic or Neutron port.
     """
 
+    client_to_close = None
     if not client:
-        client = get_client(context=context)
+        client = client_to_close = get_client(context=context)
 
     try:
         port_config = client.get_port(vif_id)
@@ -488,11 +633,18 @@ def get_neutron_port_data(port_id, vif_id, client=None, context=None):
         msg = (_('Unable to get port info for %(port_id)s. Error: '
                  '%(err)s') % {'port_id': vif_id, 'err': e})
         LOG.exception(msg)
+        if client_to_close:
+            client_to_close.close()
         raise exception.NetworkError(msg)
 
     LOG.debug('Received port %(port)s data: %(info)s',
               {'port': vif_id, 'info': port_config})
 
+    # NOTE(TheJulia): We might want to change this to be just an ID
+    # at some point. The name is not a unique field, so someone evaluating
+    # the metadata may become confused. That being said, this also really
+    # is not hurting anyone and could be friendlier to a user as well.
+    # https://github.com/openstack/neutron/blob/ec34283b9d11924aaa8141cde23281753f5ecbcb/neutron/db/models_v2.py#L125
     port_id = port_config['name'] or port_id
 
     network_id = port_config.network_id
@@ -504,6 +656,8 @@ def get_neutron_port_data(port_id, vif_id, client=None, context=None):
         msg = (_('Unable to get network info for %(network_id)s. Error: '
                  '%(err)s') % {'network_id': network_id, 'err': e})
         LOG.exception(msg)
+        if client_to_close:
+            client_to_close.close()
         raise exception.NetworkError(msg)
 
     LOG.debug('Received network %(network)s data: %(info)s',
@@ -511,20 +665,45 @@ def get_neutron_port_data(port_id, vif_id, client=None, context=None):
 
     subnets_config = {}
 
+    if mac_address:
+        use_mac_address = mac_address
+    else:
+        use_mac_address = port_config['mac_address']
+
+    if bond_links:
+        # If we have bond links, we have to override the
+        # default value for the mapping.
+        iface_type = 'bond'
+
     network_data = {
         'links': [
             {
                 'id': port_id,
-                'type': 'vif',
-                'ethernet_mac_address': port_config['mac_address'],
+                'type': iface_type,
+                'ethernet_mac_address': use_mac_address,
                 'vif_id': port_config['id'],
                 'mtu': network_config['mtu']
             }
         ],
         'networks': [
 
+        ],
+
+        'services': [
+
         ]
     }
+
+    # Finish setup of bond links configuration injection
+    if bond_links:
+        links = [link['id'] for link in bond_links]
+        # Add the list of links to the bond port
+        network_data['links'][0]['bond_links'] = links
+        # Add the rest of the links to the metadata.
+        network_data['links'].extend(bond_links)
+
+    # Proceed with attempting to hydrate the rest of the
+    # network metadata around networks and services.
 
     for fixed_ip in port_config.get('fixed_ips', []):
         subnet_id = fixed_ip['subnet_id']
@@ -541,12 +720,13 @@ def get_neutron_port_data(port_id, vif_id, client=None, context=None):
             msg = (_('Unable to get subnet info for %(subnet_id)s. Error: '
                      '%(err)s') % {'subnet_id': subnet_id, 'err': e})
             LOG.exception(msg)
+            if client_to_close:
+                client_to_close.close()
             raise exception.NetworkError(msg)
 
         subnet_config = subnets_config[subnet_id]
 
-        subnet_network, netmask = _uncidr(
-            subnet_config.cidr, subnet_config.ip_version == 6)
+        subnet_network, netmask = _uncidr(subnet_config.cidr)
 
         network = {
             'id': fixed_ip['subnet_id'],
@@ -577,8 +757,7 @@ def get_neutron_port_data(port_id, vif_id, client=None, context=None):
 
         for host_config in subnet_config['host_routes']:
             subnet_network, netmask = _uncidr(
-                host_config['destination'],
-                subnet_config['ip_version'] == 6)
+                host_config['destination'])
 
             route = {
                 'network': subnet_network,
@@ -590,6 +769,20 @@ def get_neutron_port_data(port_id, vif_id, client=None, context=None):
 
         network_data['networks'].append(network)
 
+        for dns_nameserver in subnet_config['dns_nameservers']:
+            service = {
+                'type': 'dns',
+                'address': dns_nameserver
+            }
+            # NOTE(TheJulia): 'services' is expected to be defined on a
+            # network level and in the top level for the overall network
+            # data structure. Unknown if anyone actually uses it beyond
+            # just the top level. See this link:
+            # https://docs.openstack.org/nova/latest/_downloads/9119ca7ac90aa2990e762c08baea3a36/network_data.json  # noqa
+            network_data['services'].append(service)
+
+    if client_to_close:
+        client_to_close.close()
     return network_data
 
 
@@ -688,13 +881,16 @@ def validate_network(uuid_or_name, net_type=_('network'), context=None):
     """
     if not uuid_or_name:
         raise exception.MissingParameterValue(
-            _('UUID or name of %s is not set in configuration') % net_type)
+            _('UUID or name of %s is not set in configuration or '
+              'in node driver_info.') % net_type)
 
     client = get_client(context=context)
-    network = _get_network_by_uuid_or_name(client, uuid_or_name,
-                                           net_type=net_type)
-
-    return network.id
+    try:
+        network = _get_network_by_uuid_or_name(client, uuid_or_name,
+                                               net_type=net_type)
+        return network.id
+    finally:
+        client.close()
 
 
 def validate_port_info(node, port):
@@ -776,6 +972,9 @@ def is_smartnic_port(port_data):
     if isinstance(port_data, dict):
         return port_data.get('is_smartnic', False)
 
+    if isinstance(port_data, objects.Portgroup):
+        return False
+
     LOG.warning('Unknown port data type: %(type)s', {'type': type(port_data)})
     return False
 
@@ -834,11 +1033,51 @@ def _get_port_by_uuid(client, port_uuid):
     return port
 
 
+def _get_segment_by_subnet_uuid(client, subnet_uuid):
+    """Return a neutron segment from a subnet UUID.
+
+    :param client: A Neutron client object.
+    :param subnet_uuid: UUID of a Neutron subnet to query.
+    :returns: A dict describing the neutron segment, or None.
+    :raises: InvalidParameterValue if the subnet or segment does not exist.
+    :raises: NetworkError on failure to contact Neutron.
+    """
+    try:
+        subnet = client.get_subnet(subnet_uuid)
+    except openstack_exc.ResourceNotFound:
+        raise exception.InvalidParameterValue(
+            _('Neutron subnet %(subnet_uuid)s was not found') %
+            {'subnet_uuid': subnet_uuid})
+    except openstack_exc.OpenStackCloudException as exc:
+        raise exception.NetworkError(
+            _('Could not retrieve neutron subnet: %s') %
+            exc)
+
+    segment_id = subnet.get('segment_id')
+    if segment_id is None:
+        return None
+
+    try:
+        segment = client.get_segment(segment_id)
+    except openstack_exc.ResourceNotFound:
+        raise exception.InvalidParameterValue(
+            _('Neutron segment %(segment_id)s was not found') %
+            {'segment_id': segment_id})
+    except openstack_exc.OpenStackCloudException as exc:
+        raise exception.NetworkError(
+            _('Could not retrieve neutron segment: %s') %
+            exc)
+
+    return segment
+
+
 def get_physnets_by_port_uuid(client, port_uuid):
     """Return the set of physical networks associated with a neutron port.
 
     Query the network to which the port is attached and return the set of
-    physical networks associated with the segments in that network.
+    physical networks associated with the segments in that network. If a port
+    is assigned to a subnet with a direct segment mapping, return the physnet
+    associated with its segment instead.
 
     :param client: A Neutron client object.
     :param port_uuid: UUID of a Neutron port to query.
@@ -852,6 +1091,20 @@ def get_physnets_by_port_uuid(client, port_uuid):
     network = _get_network_by_uuid_or_name(client, network_uuid)
 
     if network.segments is not None:
+        # If a port already has IP addresses assigned, this may indicate
+        # which segment it is connected to.
+        for fixed_ip in port.get('fixed_ips', []):
+            segment = _get_segment_by_subnet_uuid(client,
+                                                  fixed_ip.get('subnet_id'))
+            # When a network uses l2_adjancency, subnets don't map directly to
+            # segments
+            if segment is not None:
+                physnet = segment.get('physical_network')
+                # Return the segment's physnet if there is one for this network
+                # type
+                if physnet is not None:
+                    return set([physnet])
+
         # A network with multiple segments will have a 'segments' parameter
         # which will contain a list of segments. Each segment should have a
         # 'provider:physical_network' parameter which contains the physical
@@ -911,12 +1164,15 @@ def wait_for_host_agent(client, host_id, target_state='up'):
     stop=tenacity.stop_after_attempt(CONF.agent.neutron_agent_max_attempts),
     wait=tenacity.wait_fixed(CONF.agent.neutron_agent_status_retry_interval),
     reraise=True)
-def wait_for_port_status(client, port_id, status):
+def wait_for_port_status(client, port_id, status,
+                         fail_on_binding_failure=None):
     """Wait for port status to be the desired status
 
     :param client: A Neutron client object.
     :param port_id: Neutron port_id
     :param status: Port's target status, can be ACTIVE, DOWN ... etc.
+    :param fail_on_binding_failure: Whether to raise exception if port
+        binding fails.
     :returns: boolean indicates that the port status matches the
         required value passed by param status.
     :raises: InvalidParameterValue if the port does not exist.
@@ -930,6 +1186,14 @@ def wait_for_port_status(client, port_id, status):
               {'port_id': port_id, 'status': port.status})
     if port.status == status:
         return True
+
+    # fail early on port binding failure
+    if port.get('binding:vif_type') == 'binding_failed':
+        msg = "Binding failed for neutron port %s" % port_id
+        if fail_on_binding_failure:
+            LOG.error(msg)
+            raise openstack_exc.OpenStackCloudException(msg)
+        LOG.warning(msg)
     raise exception.NetworkError(
         'Port %(port_id)s failed to reach status %(status)s' % {
             'port_id': port_id, 'status': status})
@@ -943,7 +1207,7 @@ class NeutronNetworkInterfaceMixin(object):
             or CONF.neutron.cleaning_network
         )
         return validate_network(
-            cleaning_network, _('cleaning network'),
+            cleaning_network, 'cleaning_network',
             context=task.context)
 
     def get_provisioning_network_uuid(self, task):
@@ -952,7 +1216,7 @@ class NeutronNetworkInterfaceMixin(object):
             or CONF.neutron.provisioning_network
         )
         return validate_network(
-            provisioning_network, _('provisioning network'),
+            provisioning_network, 'provisioning_network',
             context=task.context)
 
     # TODO(stendulker): FlatNetwork should not use this method.
@@ -963,7 +1227,7 @@ class NeutronNetworkInterfaceMixin(object):
             or CONF.neutron.rescuing_network
         )
         return validate_network(
-            rescuing_network, _('rescuing network'),
+            rescuing_network, 'rescuing_network',
             context=task.context)
 
     def get_inspection_network_uuid(self, task):
@@ -972,7 +1236,7 @@ class NeutronNetworkInterfaceMixin(object):
             or CONF.neutron.inspection_network
         )
         return validate_network(
-            inspection_network, _('inspection network'),
+            inspection_network, 'inspection_network',
             context=task.context)
 
     def validate_inspection(self, task):
@@ -985,7 +1249,17 @@ class NeutronNetworkInterfaceMixin(object):
         """
         try:
             self.get_inspection_network_uuid(task)
-        except exception.MissingParameterValue:
+        except exception.MissingParameterValue as exc:
             # Fall back to non-managed in-band inspection
             raise exception.UnsupportedDriverExtension(
-                driver=task.node.driver, extension='inspection')
+                _("Insufficient information provided for managed "
+                  "inspection: %s") % exc)
+
+    def get_servicing_network_uuid(self, task):
+        servicing_network = (
+            task.node.driver_info.get('servicing_network')
+            or CONF.neutron.servicing_network
+        )
+        return validate_network(
+            servicing_network, _('servicing network'),
+            context=task.context)

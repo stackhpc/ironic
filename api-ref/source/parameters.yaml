@@ -36,6 +36,12 @@ x-openstack-ironic-api-version:
   in: header
   required: true
   type: string
+x-openstack-request-id:
+  description: >
+    This mirrors the ``openstack-request-id`` header.
+  in: header
+  required: false
+  type: string
 
 # variables in path
 allocation_ident:
@@ -106,13 +112,19 @@ node_ident:
   type: string
 port_ident:
   description: |
-    The UUID of the port.
+    The UUID or Name of the port.
   in: path
   required: true
   type: string
 portgroup_ident:
   description: |
     The UUID or Name of the portgroup.
+  in: path
+  required: true
+  type: string
+runbook_ident:
+  description: |
+    The UUID or name of the runbook.
   in: path
   required: true
   type: string
@@ -207,6 +219,12 @@ fields_for_conductor:
   in: query
   required: false
   type: array
+include_children:
+  description: |
+    Whether to show child nodes in the node list, which are normally hidden.
+  in: query
+  required: false
+  type: boolean
 limit:
   description: |
     Requests a page size of items. Returns a number of items up to a limit
@@ -281,12 +299,29 @@ r_conductor_group:
   in: query
   required: false
   type: string
+r_conductor_group_port:
+  description: |
+    Filter the list of returned ports or portgroups, and only return those with
+    the specified ``conductor_group`` or an empty set if none found. List of
+    case-insensitive strings up to 255 characters, containing ``a-z``, ``0-9``,
+    ``_``, ``-``, and ``.``. This cannot be used if ``node``, ``node_uuid``,
+    ``portgroup`` or ``address`` is specified.
+
+    For example, the following request returns only the ports for nodes
+    in conductor groups ``bear`` and ``metal``:
+
+    ::
+
+       GET /v1/ports?conductor_groups=bear,metal
+  in: query
+  required: false
+  type: array
 r_description_contains:
   description: |
     Filter the list of returned nodes, and only return those containing
     substring specified by ``description_contains``.
   in: query
-  requred: false
+  required: false
   type: string
 r_driver:
   description: |
@@ -300,6 +335,13 @@ r_fault:
     Filter the list of returned nodes, and only return those with the specified
     ``fault``. Possible values are determined by faults supported by ironic,
     e.g., ``power failure``, ``clean failure`` or ``rescue abort failure``.
+  in: query
+  required: false
+  type: string
+r_instance_name:
+  description: |
+    Filter the list of returned nodes, and only return the node with this
+    specific instance name, or an empty set if not found.
   in: query
   required: false
   type: string
@@ -343,13 +385,17 @@ r_port_node_ident:
   description: |
     Filter the list of returned Ports, and only return the ones associated
     with this specific node (name or UUID), or an empty set if not found.
+    This filter takes precedence over all other filters, and cannot be set at
+    the same time as node_uuid or portgroup.
   in: query
   required: false
   type: string
 r_port_node_uuid:
   description: |
     Filter the list of returned Ports, and only return the ones associated
-    with this specific node UUID, or an empty set if not found.
+    with this specific node UUID, or an empty set if not found. This filter
+    takes precedence over all other filters, and cannot be set at the same
+    time as node or portgroup.
   in: query
   required: false
   type: string
@@ -357,9 +403,18 @@ r_port_portgroup_ident:
   description: |
     Filter the list of returned Ports, and only return the ones associated
     with this specific Portgroup (name or UUID), or an empty set if not found.
+    This filter takes precedence over all other filters, and cannot be set at
+    the same time as node_uuid or node.
   in: query
   required: false
   type: string
+r_port_shard:
+  description: |
+    Filter the list of returned Ports, and only return the ones associated
+    with nodes in this specific shard(s), or an empty set if not found.
+  in: query
+  required: false
+  type: array
 r_portgroup_address:
   description: |
     Filter the list of returned Portgroups, and only return the ones with the
@@ -526,7 +581,7 @@ bios_interface:
   type: string
 bios_setting_allowable_values:
   description: |
-    A list of allowable values, otherwise ``null``.
+    A list of allowable values. May be ``null``.
   in: body
   required: true
   type: array
@@ -556,21 +611,19 @@ bios_setting_min_length:
   type: integer
 bios_setting_name:
   description: |
-    The name of a Bios setting for a Node, eg. "virtualization".
+    The name of a Bios setting for a Node, eg. ``virtualization``.
   in: body
   required: true
   type: string
 bios_setting_read_only:
   description: |
-    This Bios seting is read only and can't be changed.
-    May be None.
+    This Bios setting is read only and can't be changed. May be ``null``.
   in: body
   required: true
   type: boolean
 bios_setting_reset_required:
   description: |
-    After setting this Bios setting a node reboot is required.
-    May be None.
+    After setting this Bios setting a node reboot is required. May be ``null``.
   in: body
   required: true
   type: boolean
@@ -588,7 +641,7 @@ bios_setting_upper_bound:
   type: integer
 bios_setting_value:
   description: |
-    The value of a Bios setting for a Node, eg. "on".
+    The value of a Bios setting for a Node, eg. "on". May be ``null``.
   in: body
   required: true
   type: string
@@ -741,6 +794,13 @@ default_deploy_interface:
   in: body
   required: true
   type: string
+default_firmware_interface:
+  description: |
+    The default firmware interface used for a node with a dynamic driver, if no
+    firmware interface is specified for the node.
+  in: body
+  required: true
+  type: string
 default_inspect_interface:
   description: |
     The default inspection interface used for a node with a dynamic driver, if
@@ -862,11 +922,22 @@ description:
   in: body
   required: true
   type: string
+disable_power_off:
+  description: |
+    If set to true, power off for the node is explicitly disabled, instead, a
+    reboot will be used in place of power on/off. Additionally, when possible,
+    the node will be disabled (i.e., its API agent will be rendered unusable
+    and network configuration will be removed) instead of being powered off.
+  in: body
+  required: false
+  type: boolean
 disable_ramdisk:
   description: |
-    If set to ``true``, the ironic-python-agent ramdisk will not be booted for
-    cleaning. Only clean steps explicitly marked as not requiring ramdisk can
-    be executed in this mode. Only allowed for manual cleaning.
+    If set to ``true``, the ironic-python-agent ramdisk will not be booted.
+    Only steps explicitly marked as not requiring ramdisk can be executed in
+    this mode.
+    Allowed for manual cleaning (starting with API microversion 1.70) and for
+    manual servicing (starting with API microversion 1.108).
   in: body
   required: false
   type: boolean
@@ -901,6 +972,12 @@ drivers:
   in: body
   required: true
   type: array
+duration_seconds:
+  description: |
+    The total execution time or duration of the recorded event in seconds.
+  in: body
+  required: true
+  type: integer
 enabled_bios_interfaces:
   description: |
     The enabled bios interfaces for this driver.
@@ -922,6 +999,12 @@ enabled_console_interfaces:
 enabled_deploy_interfaces:
   description: |
     The enabled deploy interfaces for this driver.
+  in: body
+  required: true
+  type: list
+enabled_firmware_interfaces:
+  description: |
+    The enabled firmware interfaces for this driver.
   in: body
   required: true
   type: list
@@ -989,6 +1072,72 @@ fault:
     possible types, e.g., "clean failure" and "rescue abort failure".
   in: body
   required: false
+  type: string
+firmware_component:
+  description: |
+    The Firmware Component of a Node, eg. "bios".
+  in: body
+  required: true
+  type: string
+firmware_component_current_version:
+  description: |
+    The current version of a Firmware Component.
+  in: body
+  required: true
+  type: string
+firmware_component_initial_version:
+  description: |
+    The initial version of a Firmware Component.
+  in: body
+  required: true
+  type: string
+firmware_component_last_version_flashed:
+  description: |
+    The last version flashed of a Firmware Component.
+  in: body
+  required: true
+  type: string
+firmware_component_model:
+  description: |
+    The hardware model of a Firmware Component, sourced from the Redfish
+    ``NetworkAdapter.Model`` (NICs) or ``Manager.Model`` (BMC) resource.
+    ``null`` when not available (BIOS).
+    Available starting with API microversion 1.114.
+  in: body
+  required: false
+  type: string
+firmware_component_serial_number:
+  description: |
+    The serial number of a Firmware Component, sourced from the Redfish
+    ``NetworkAdapter.SerialNumber`` resource. ``null`` for BMC and BIOS
+    components, and for NICs that do not expose a serial number.
+    Available starting with API microversion 1.114.
+  in: body
+  required: false
+  type: string
+firmware_component_vendor:
+  description: |
+    The hardware vendor of a Firmware Component, sourced from the Redfish
+    ``NetworkAdapter.Manufacturer`` (NICs) or ``Manager`` (BMC) resource.
+    ``null`` when not available (BIOS, BMC without manufacturer data).
+    Available starting with API microversion 1.114.
+  in: body
+  required: false
+  type: string
+firmware_components:
+  description: |
+    List of Firmware Components of the node. It includes following fields
+    "created_at", "updated_at", "component", "initial_version",
+    "current_version", "last_version_flashed". Starting with API microversion
+    1.114, also includes "vendor", "model", "serial_number".
+  in: body
+  required: true
+  type: array
+firmware_interface:
+  description: |
+    Firmware interface for a node, e.g. “redfish”.
+  in: body
+  required: true
   type: string
 history_event:
   description: |
@@ -1071,6 +1220,106 @@ inspection_finished_at:
   in: body
   required: true
   type: string
+inspection_rule_action_args:
+  description: |
+    A list (in the sense of Python ``*args``)
+    or a dict (in the sense of Python ``**kwargs``) with arguments for
+    the action operator.
+  in: body
+  required: true
+  type: array
+inspection_rule_action_loop:
+  description: |
+    This is an Ansible-style loop field. It contains a list or dictionary
+    of items to iterate over for the same action.
+  in: body
+  required: false
+  type: array
+inspection_rule_action_op:
+  description: |
+    The operator to execute with specified arguments when conditions are met.
+  in: body
+  required: true
+  type: string
+inspection_rule_actions:
+  description: |
+    A list of actions to run during inspection. An action is a dictionary
+    or list, with required keys 'op' and 'args', and optional key 'loop'.
+  in: body
+  required: true
+  type: array
+inspection_rule_condition_args:
+  description: |
+    A list (in the sense of Python ``*args``)
+    or a dict (in the sense of Python ``**kwargs``) with arguments for
+    the condition operator.
+  in: body
+  required: true
+  type: array
+inspection_rule_condition_loop:
+  description: |
+    This is an Ansible-style loop field. It contains a list or dictionary
+    of items to iterate over for the same condition.
+  in: body
+  required: false
+  type: array
+inspection_rule_condition_multiple:
+  description: |
+    Determines how the results of all loop iterations are combined, whether
+    a condition is returned as true if 'any' check passes,
+    or only when 'all'; the 'first', or the 'last' check is true.
+  in: body
+  required: false
+  type: string
+inspection_rule_condition_op:
+  description: |
+    The operator to run conditions by, with specified arguments.
+  in: body
+  required: true
+  type: string
+inspection_rule_conditions:
+  description: |
+    A list of conditions to check before applying the rule. A
+    condition is a dictionary or list, with required keys 'op' and 'args', and
+    optional keys 'loop' and 'multiple'.
+  in: body
+  required: false
+  type: array
+inspection_rule_description:
+  description: |
+    Informational text about this rule.
+  in: body
+  required: false
+  type: string
+inspection_rule_ident:
+  description: |
+     The UUID of the inspection rule.
+  in: body
+  required: false
+  type: string
+inspection_rule_phase:
+  description: |
+    Specifies the phase when the rule should run, defaults to 'main'.
+  in: body
+  required: false
+  type: string
+inspection_rule_priority:
+  description: |
+    A non-negative integer priority for the rule. Specifies the rule's
+    precedence level during execution. Priorities between 0 and 9999 can be
+    used by all rules, negative value and values above 10000 are reserved for
+    built-in rules. The default priority is 0.
+  in: body
+  required: false
+  type: int
+inspection_rule_sensitive:
+  description: |
+    Indicates whether the rule contains sensitive information. A sensitive
+    rule will also have the ability to see sensitive fields on inspection
+    data.
+  in: body
+  required: false
+  type: string
 inspection_started_at:
   description: |
     The UTC date and time when the hardware inspection was started,
@@ -1088,9 +1337,24 @@ instance_info:
   in: body
   required: true
   type: JSON
+instance_name:
+  description: |
+    A human-readable name for the instance deployed on this node. This is
+    automatically synchronized with the ``display_name`` from the node's
+    ``instance_info`` for backward compatibility with Nova.
+  in: body
+  required: false
+  type: string
 instance_uuid:
   description: |
     UUID of the Nova instance associated with this Node.
+
+    .. note::
+        This field does not follow standard JSON PATCH RFC 6902 behavior.
+        The "add" operator cannot replace an existing instance_uuid value.
+        Attempting to do so will result in a 409 Conflict error (NodeAssociated
+        exception). This protection prevents race conditions when multiple
+        Nova compute agents try to associate the same node.
   in: body
   required: true
   type: string
@@ -1217,8 +1481,8 @@ n_ports:
   type: array
 n_properties:
   description: |
-    Physical characteristics of this Node. Populated by ironic-inspector during
-    inspection. May be edited via the REST API at any time.
+    Physical characteristics of this Node. Populated during inspection. May be
+    edited via the REST API at any time.
   in: body
   required: true
   type: JSON
@@ -1308,6 +1572,13 @@ owner:
   in: body
   required: false
   type: string
+parent_node:
+  description: |
+    An optional UUID which can be used to denote the "parent" baremetal
+    node.
+  in: body
+  required: false
+  type: string
 passthru_async:
   description: |
     If True the passthru function is invoked asynchronously; if False,
@@ -1349,8 +1620,8 @@ pg_ports:
   type: array
 physical_network:
   description: |
-    The name of the physical network to which a port is connected. May be
-    empty.
+    The name of the physical network to which a port or portgroup is
+    connected. May be empty.
   in: body
   required: true
   type: string
@@ -1361,10 +1632,41 @@ port_address:
   in: body
   required: true
   type: string
+port_category:
+  description: |
+    Category of the network Port. Helps to further differentiate the Port.
+  in: body
+  required: false
+  type: string
+port_description:
+  description: |
+    Descriptive text about the network Port.
+  in: body
+  required: false
+  type: string
+port_name:
+  description: |
+    The name assigned to the network Port.
+  in: body
+  required: false
+  type: string
+port_vendor:
+  description: |
+    Name of the hardware vendor of the network Port.
+  in: body
+  required: false
+  type: string
 portgroup_address:
   description: |
     Physical hardware address of this Portgroup, typically the hardware
     MAC address.
+  in: body
+  required: false
+  type: string
+portgroup_category:
+  description: |
+    Category of the network Portgroup. Helps to further differentiate the
+    Portgroup.
   in: body
   required: false
   type: string
@@ -1433,6 +1735,12 @@ power_timeout:
   in: body
   required: false
   type: integer
+project:
+  description: |
+    The UUID or name of the project that triggered this history event.
+  in: body
+  required: true
+  type: string
 properties:
   description: |
     A list of links to driver properties.
@@ -1594,6 +1902,22 @@ req_description:
   in: body
   required: false
   type: string
+req_disable_power_off:
+  description: |
+    If set to ``true``, power off for the node is explicitly disabled, instead, a
+    reboot will be used in place of power on/off. Additionally, when possible,
+    the node will be disabled (i.e., its API agent will be rendered unusable
+    and network configuration will be removed) instead of being powered off.
+  in: body
+  required: false
+  type: boolean
+req_disable_ramdisk:
+  description: |
+    Whether to boot ramdisk while using a runbook for cleaning or servicing
+    operation.
+  in: body
+  required: false
+  type: boolean
 req_driver_info:
   description: |
     All the metadata required by the driver to manage this Node. List of fields
@@ -1621,6 +1945,12 @@ req_inspect_interface:
   in: body
   required: false
   type: string
+req_inspection_rule_phase:
+  description: |
+    Specifies the phase when the rule should run, defaults to 'main'.
+  in: body
+  required: false
+  type: string
 req_instance_info:
   description: |
     Information used to customize the deployed image. May include root partition
@@ -1630,9 +1960,24 @@ req_instance_info:
   in: body
   required: false
   type: JSON
+req_instance_name:
+  description: |
+    A human-readable name for the instance deployed on this node. This is
+    automatically synchronized with the ``display_name`` from the node's
+    ``instance_info`` for backward compatibility with Nova.
+  in: body
+  required: false
+  type: string
 req_instance_uuid:
   description: |
     UUID of the Nova instance associated with this Node.
+
+    .. note::
+        This field does not follow standard JSON PATCH RFC 6902 behavior.
+        The "add" operator cannot replace an existing instance_uuid value.
+        Attempting to do so will result in a 409 Conflict error (NodeAssociated
+        exception). This protection prevents race conditions when multiple
+        Nova compute agents try to associate the same node.
   in: body
   required: false
   type: string
@@ -1716,8 +2061,8 @@ req_persistent:
   type: boolean
 req_physical_network:
   description: |
-    The name of the physical network to which a port is connected. May be
-    empty.
+    The name of the physical network to which a port or portgroup is connected.
+    May be empty.
   in: body
   required: false
   type: string
@@ -1728,10 +2073,41 @@ req_port_address:
   in: body
   required: true
   type: string
+req_port_category:
+  description: |
+    Category of the network Port. Helps to further differentiate the Port.
+  in: body
+  required: false
+  type: string
+req_port_description:
+  description: |
+    Descriptive text about the network Port.
+  in: body
+  required: false
+  type: string
+req_port_name:
+  description: |
+    The name assigned to the network Port.
+  in: body
+  required: false
+  type: string
+req_port_vendor:
+  description: |
+    Name of the hardware vendor of the network Port.
+  in: body
+  required: false
+  type: string
 req_portgroup_address:
   description: |
     Physical hardware address of this Portgroup, typically the hardware
     MAC address.
+  in: body
+  required: false
+  type: string
+req_portgroup_category:
+  description: |
+    Category of the network Portgroup. Helps to further differentiate the
+    Portgroup.
   in: body
   required: false
   type: string
@@ -1807,6 +2183,20 @@ req_resource_class_create:
   in: body
   required: false
   type: string
+req_shard:
+  description: |
+    Filter the list of returned Nodes, and only return the ones associated
+    with nodes in this specific shard(s), or an empty set if not found.
+  in: body
+  required: false
+  type: array
+req_sharded:
+  description: |
+    When true, filter the list of returned Nodes, and only return the ones with
+    a non-null ``shard`` value. When false, the inverse filter is performed.
+  in: body
+  required: false
+  type: boolean
 req_standalone_ports_supported:
   description: |
     Indicates whether ports that are members of this portgroup can be
@@ -1927,11 +2317,99 @@ retired_reason:
   in: body
   required: false
   type: string
+runbook_name:
+  description: |
+    The unique name of the runbook. It must be prefixed with ``CUSTOM_``,
+    which makes it conform to the TRAITS_SCHEMA format. The runbook name must
+    match a node trait indicating it can run on a node.
+  in: body
+  required: true
+  type: string
+runbook_owner:
+  description: |
+    The unique identifier of the runbook owner.
+    This must be ``null`` if ``runbook_public`` is ``true``.
+  in: body
+  required: false
+  type: string
+runbook_public:
+  description: |
+    Indicates whether a runbook is available for public use or not.
+    This must be ``false`` if ``runbook_owner`` is not ``null``.
+  in: body
+  required: false
+  type: boolean
+runbook_step_args:
+  description: |
+    A dictionary of arguments that are passed to the runbook step method.
+  in: body
+  required: true
+  type: object
+runbook_step_interface:
+  description: |
+    The name of the driver interface.
+  in: body
+  required: true
+  type: string
+runbook_step_order:
+  description: |
+    A non-negative integer order for the step.
+  in: body
+  required: true
+  type: integer
+runbook_step_step:
+  description: |
+    The name of the runbook step method on the driver interface.
+  in: body
+  required: true
+  type: string
+runbook_steps:
+  description: |
+    The runbook steps of the runbook template. Must be a list of dictionaries
+    containing at least one runbook step. See `Request Runbook Step`_ for step
+    parameters.
+  in: body
+  required: true
+  type: array
 secure_boot:
   description: |
     Indicates whether node is currently booted with secure_boot turned on.
   in: body
   type: boolean
+service_step:
+  description: |
+    A dictionary containing the interface and step to be executed on the node.
+    The dictionary must contain the keys 'interface' and 'step'. If specified,
+    the value for 'args' is a keyword variable argument dictionary that is
+    passed to the cleaning step method.
+  in: body
+  required: true
+  type: JSON
+service_steps:
+  description: |
+    An ordered list of service steps that will be performed on the node. A
+    cleaning step is a dictionary with required keys 'interface' and 'step', and
+    optional key 'args'. If specified, the value for 'args' is a keyword variable
+    argument dictionary that is passed to the cleaning step method.
+  in: body
+  required: false
+  type: array
+shard:
+  description: |
+    A string indicating the shard this node belongs to.
+  in: body
+  type: string
+shard_count:
+  description: |
+    The number of nodes with this current string as their assigned shard value.
+  in: body
+  type: integer
+shard_name:
+  description: |
+    The name of the shard. A value of "None" indicates the count of nodes with
+    an empty shard value.
+  in: body
+  type: string
 standalone_ports_supported:
   description: |
     Indicates whether ports that are members of this portgroup can be
@@ -1939,6 +2417,12 @@ standalone_ports_supported:
   in: body
   required: true
   type: boolean
+state:
+  description: |
+    The provisioning state of the baremetal node when the history event was logged.
+  in: body
+  required: true
+  type: string
 storage_interface:
   description: |
     Interface used for attaching and detaching volumes on this node, e.g.
@@ -2077,7 +2561,25 @@ versions:
   in: body
   required: true
   type: array
-
+vmedia_device_type:
+  description: |
+    The type of the virtual media device used, e.g. CDROM
+  in: body
+  required: true
+  type: string
+vmedia_image_download_source:
+  description: |
+    How the image is served to the BMC, "http" for a remote location or
+    "local" to use the local web server.
+  in: body
+  required: false
+  type: string
+vmedia_image_url:
+  description: |
+    The url of the image to attach to a virtual media device.
+  in: body
+  required: true
+  type: string
 # variables returned from volume-connector
 volume_connector_connector_id:
   description: |

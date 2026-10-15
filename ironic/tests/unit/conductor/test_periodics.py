@@ -15,8 +15,12 @@ from unittest import mock
 from oslo_utils import uuidutils
 
 from ironic.common import context as ironic_context
+from oslo_config import cfg
+
 from ironic.conductor import base_manager
 from ironic.conductor import periodics
+
+CONF = cfg.CONF
 from ironic.conductor import task_manager
 from ironic.drivers.modules import fake
 from ironic.tests.unit.db import base as db_base
@@ -24,6 +28,27 @@ from ironic.tests.unit.objects import utils as obj_utils
 
 
 _FILTERS = {'maintenance': False}
+
+
+class TestLazyPeriodicAttributes(db_base.DbTestCase):
+
+    def test_refresh_periodic_attributes_resolves_callables(self):
+        @periodics.periodic(spacing=lambda: 120,
+                            enabled=lambda: CONF.sensor_data.send_sensor_data)
+        def sample_task():
+            return None
+
+        self.assertFalse(sample_task._is_periodic)
+
+        CONF.set_override('send_sensor_data', True, group='sensor_data')
+        periodics.refresh_periodic_attributes(sample_task)
+
+        self.assertTrue(sample_task._is_periodic)
+        self.assertEqual(120, sample_task._periodic_spacing)
+
+        CONF.set_override('send_sensor_data', False, group='sensor_data')
+        periodics.refresh_periodic_attributes(sample_task)
+        self.assertFalse(sample_task._is_periodic)
 
 
 class PeriodicTestService(base_manager.BaseConductorManager):
@@ -73,6 +98,10 @@ class PeriodicTestInterface(fake.FakePower):
         self.test.assertIsInstance(manager, PeriodicTestService)
         self.test.assertIsInstance(context, ironic_context.RequestContext)
         self.nodes.append(task.node.uuid)
+
+
+class PeriodicTestSubInterface(PeriodicTestInterface):
+    """A subclass that inherits its parent's periodic unchanged."""
 
 
 @mock.patch.object(PeriodicTestService, 'iter_nodes', autospec=True)
@@ -182,3 +211,34 @@ class NodePeriodicTestCase(db_base.DbTestCase):
         mock_iter_nodes.assert_called_once_with(self.service,
                                                 filters=None, fields=())
         self.assertEqual([self.uuid], iface.nodes)
+
+    @mock.patch.object(task_manager, 'acquire', autospec=True)
+    def test_interface_check_exact_type(self, mock_acquire, mock_iter_nodes):
+        """Exact-type matching keeps base and subclass node sets disjoint.
+
+        When both a base interface and a subclass that inherits its
+        periodic are enabled (e.g. RedfishBIOS and DracRedfishBIOS),
+        each is collected as its own task.  The base-bound task must
+        not also process the subclass's nodes, otherwise the same node
+        is handled twice (duplicate resume RPCs).  The subclass-bound
+        task must process them so subclass overrides apply.
+        """
+        mock_iter_nodes.side_effect = [
+            iter([(self.uuid, 'driver2', 'group')]),
+            iter([(self.uuid, 'driver2', 'group')]),
+        ]
+        base_iface = PeriodicTestInterface(self)
+        sub_iface = PeriodicTestSubInterface(self)
+        # The node's power interface is the subclass instance.
+        task = mock.Mock(spec=task_manager.TaskManager,
+                         node=self.node,
+                         driver=mock.Mock(power=sub_iface))
+        mock_acquire.return_value.__enter__.return_value = task
+
+        # The base-bound periodic must skip the subclass node...
+        base_iface.simple(self.service, self.context)
+        self.assertEqual([], base_iface.nodes)
+
+        # ...while the subclass-bound periodic processes it.
+        sub_iface.simple(self.service, self.context)
+        self.assertEqual([self.uuid], sub_iface.nodes)

@@ -15,18 +15,20 @@
 
 from http import client as http_client
 
-from ironic_lib import metrics_utils
 from pecan import rest
 
 from ironic import api
 from ironic.api.controllers import link
 from ironic.api.controllers.v1 import utils as api_utils
 from ironic.api import method
+from ironic.api.schemas.v1 import driver as schema
+from ironic.api import validation
 from ironic.common import args
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import metrics_utils
 from ironic.drivers import base as driver_base
-
+from ironic import objects
 
 METRICS = metrics_utils.get_metrics_logger(__name__)
 
@@ -80,6 +82,10 @@ def hide_fields_in_newer_versions(driver):
         driver.pop('default_bios_interface', None)
         driver.pop('enabled_bios_interfaces', None)
 
+    if not api_utils.allow_firmware_interface():
+        driver.pop('default_firmware_interface', None)
+        driver.pop('enabled_firmware_interfaces', None)
+
 
 def convert_with_links(name, hosts, detail=False, interface_info=None,
                        fields=None, sanitize=True):
@@ -126,8 +132,10 @@ def convert_with_links(name, hosts, detail=False, interface_info=None,
         if detail:
             if interface_info is None:
                 # TODO(jroll) objectify this
-                interface_info = (api.request.dbapi
-                                  .list_hardware_type_interfaces([name]))
+                interface_info = (objects.Conductor
+                                  .list_hardware_type_interfaces_dict(
+                                      api.request.context,
+                                      [name]))
             for iface_type in driver_base.ALL_INTERFACES:
                 default = None
                 enabled = set()
@@ -187,7 +195,8 @@ def list_convert_with_links(hardware_types, detail=False, fields=None):
     # This is checked in Driver.convert_with_links(), however also
     # checking here can save us a DB query.
     if api_utils.allow_dynamic_drivers() and detail:
-        iface_info = api.request.dbapi.list_hardware_type_interfaces(
+        iface_info = objects.Conductor.list_hardware_type_interfaces_dict(
+            api.request.context,
             list(hardware_types))
     else:
         iface_info = []
@@ -219,6 +228,8 @@ class DriverPassthruController(rest.RestController):
     @METRICS.timer('DriverPassthruController.methods')
     @method.expose()
     @args.validate(driver_name=args.string)
+    @validation.request_parameter_schema(schema.methods_request_parameter)
+    @validation.response_body_schema(schema.methods_response_body)
     def methods(self, driver_name):
         """Retrieve information about vendor methods of the given driver.
 
@@ -242,6 +253,9 @@ class DriverPassthruController(rest.RestController):
     @method.expose()
     @method.body('data')
     @args.validate(driver_name=args.string, method=args.string)
+    @validation.request_parameter_schema(schema.passthru_request_parameter)
+    @validation.request_body_schema(schema.passthru_request_body)
+    @validation.response_body_schema(schema.passthru_response_body)
     def _default(self, driver_name, method, data=None):
         """Call a driver API extension.
 
@@ -269,6 +283,8 @@ class DriverRaidController(rest.RestController):
     @METRICS.timer('DriverRaidController.logical_disk_properties')
     @method.expose()
     @args.validate(driver_name=args.string)
+    @validation.request_parameter_schema(schema.raid_request_parameter)
+    @validation.response_body_schema(schema.raid_response_body)
     def logical_disk_properties(self, driver_name):
         """Returns the logical disk properties for the driver.
 
@@ -324,6 +340,17 @@ class DriversController(rest.RestController):
     @method.expose()
     @args.validate(type=args.string, detail=args.boolean,
                    fields=args.string_list)
+    @validation.request_query_schema(schema.index_request_query, None, 76)
+    @validation.request_query_schema(schema.index_request_query_v77, 77, 85)
+    @validation.request_query_schema(schema.index_request_query_v86, 86)
+    @validation.response_body_schema(
+        schema.index_response_body_v1_13, None, 13)
+    @validation.response_body_schema(schema.index_response_body_v14_29, 14, 29)
+    @validation.response_body_schema(schema.index_response_body_v30_32, 30, 32)
+    @validation.response_body_schema(schema.index_response_body_v33_37, 33, 37)
+    @validation.response_body_schema(schema.index_response_body_v38_39, 38, 39)
+    @validation.response_body_schema(schema.index_response_body_v40_85, 40, 85)
+    @validation.response_body_schema(schema.index_response_body_v86, 86)
     def get_all(self, type=None, detail=None, fields=None):
         """Retrieve a list of drivers."""
         # FIXME(tenbrae): formatting of the auto-generated REST API docs
@@ -344,7 +371,8 @@ class DriversController(rest.RestController):
                 'if specified.'))
 
         if type is None or type == 'dynamic':
-            hw_type_dict = api.request.dbapi.get_active_hardware_type_dict()
+            hw_type_dict = objects.Conductor.get_active_hardware_type_dict(
+                api.request.context)
         else:
             # NOTE(dtantsur): we don't support classic drivers starting with
             # the Rocky release.
@@ -355,6 +383,17 @@ class DriversController(rest.RestController):
     @METRICS.timer('DriversController.get_one')
     @method.expose()
     @args.validate(driver_name=args.string, fields=args.string_list)
+    @validation.request_parameter_schema(schema.show_request_parameter)
+    @validation.request_query_schema(schema.show_request_query, None, 76)
+    @validation.request_query_schema(schema.show_request_query_v77, 77, 85)
+    @validation.request_query_schema(schema.show_request_query_v86, 86)
+    @validation.response_body_schema(schema.show_response_body_v1_13, None, 13)
+    @validation.response_body_schema(schema.show_response_body_v14_29, 14, 29)
+    @validation.response_body_schema(schema.show_response_body_v30_32, 30, 32)
+    @validation.response_body_schema(schema.show_response_body_v33_37, 33, 37)
+    @validation.response_body_schema(schema.show_response_body_v38_39, 38, 39)
+    @validation.response_body_schema(schema.show_response_body_v40_85, 40, 85)
+    @validation.response_body_schema(schema.show_response_body_v86, 86)
     def get_one(self, driver_name, fields=None):
         """Retrieve a single driver."""
         # NOTE(russell_h): There is no way to make this more efficient than
@@ -365,7 +404,8 @@ class DriversController(rest.RestController):
 
         _check_allow_driver_fields(fields)
 
-        hw_type_dict = api.request.dbapi.get_active_hardware_type_dict()
+        hw_type_dict = objects.Conductor.get_active_hardware_type_dict(
+            api.request.context)
         for name, hosts in hw_type_dict.items():
             if name == driver_name:
                 return convert_with_links(name, list(hosts),
@@ -376,6 +416,8 @@ class DriversController(rest.RestController):
     @METRICS.timer('DriversController.properties')
     @method.expose()
     @args.validate(driver_name=args.string)
+    @validation.request_parameter_schema(schema.properties_request_parameter)
+    @validation.response_body_schema(schema.properties_response_body)
     def properties(self, driver_name):
         """Retrieve property information of the given driver.
 

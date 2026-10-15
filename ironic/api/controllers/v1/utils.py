@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import copy
 from http import client as http_client
 import inspect
@@ -25,6 +26,7 @@ import jsonschema
 from jsonschema import exceptions as json_schema_exc
 import os_traits
 from oslo_config import cfg
+from oslo_log import log
 from oslo_policy import policy as oslo_policy
 from oslo_utils import uuidutils
 from pecan import rest
@@ -37,6 +39,7 @@ from ironic.common import exception
 from ironic.common import faults
 from ironic.common.i18n import _
 from ironic.common import policy
+from ironic.common import state_machine
 from ironic.common import states
 from ironic.common import utils
 from ironic.conductor import steps as conductor_steps
@@ -45,6 +48,8 @@ from ironic.objects import fields as ofields
 
 
 CONF = cfg.CONF
+
+LOG = log.getLogger(__name__)
 
 
 _JSONPATCH_EXCEPTIONS = (jsonpatch.JsonPatchConflict,
@@ -94,6 +99,10 @@ TRAITS_SCHEMA = {
     ]
 }
 
+# NOTE(TheJulia): Support for vtep-physical-switch and
+# vtep-logical-switch has been removed as of API version 1.105,
+# but is still permitted on the API surface in the version range
+# so we don't break overall API interaction compatibility.
 LOCAL_LINK_BASE_SCHEMA = {
     'type': 'object',
     'properties': {
@@ -103,8 +112,14 @@ LOCAL_LINK_BASE_SCHEMA = {
         'switch_info': {'type': 'string'},
         'network_type': {'type': 'string',
                          'enum': ['managed', 'unmanaged']},
+        'vtep-logical-switch': {'type': 'string'},
+        'vtep-physical-switch': {'type': 'string'},
     },
-    'additionalProperties': False
+    'additionalProperties': False,
+    'dependentRequired': {
+        'vtep-logical-switch': ['vtep-physical-switch'],
+        'vtep-physical-switch': ['vtep-logical-switch']
+    }
 }
 
 LOCAL_LINK_SCHEMA = copy.deepcopy(LOCAL_LINK_BASE_SCHEMA)
@@ -114,6 +129,11 @@ LOCAL_LINK_SCHEMA['required'] = ['port_id', 'switch_id']
 LOCAL_LINK_SMART_NIC_SCHEMA = copy.deepcopy(LOCAL_LINK_BASE_SCHEMA)
 # set mandatory fields for a smart nic
 LOCAL_LINK_SMART_NIC_SCHEMA['required'] = ['port_id', 'hostname']
+
+LOCAL_LINK_OVN_SCHEMA = copy.deepcopy(LOCAL_LINK_BASE_SCHEMA)
+LOCAL_LINK_OVN_SCHEMA['required'] = ['port_id', 'vtep-logical-switch',
+                                     'vtep-physical-switch']
+LOCAL_LINK_OVN_90_FIELDS = ['vtep-logical-switch', 'vtep-physical-switch']
 
 # no other mandatory fields for a network_type=unmanaged link
 LOCAL_LINK_UNMANAGED_SCHEMA = copy.deepcopy(LOCAL_LINK_BASE_SCHEMA)
@@ -125,6 +145,7 @@ LOCAL_LINK_CONN_SCHEMA = {'anyOf': [
     LOCAL_LINK_SCHEMA,
     LOCAL_LINK_SMART_NIC_SCHEMA,
     LOCAL_LINK_UNMANAGED_SCHEMA,
+    LOCAL_LINK_OVN_SCHEMA,
     {'type': 'object', 'additionalProperties': False},
 ]}
 
@@ -146,6 +167,24 @@ DEPLOY_STEP_SCHEMA = {
     'additionalProperties': False,
 }
 
+RUNBOOK_STEP_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'args': {'type': 'object'},
+        'interface': {
+            'type': 'string',
+            'enum': list(conductor_steps.CLEANING_INTERFACE_PRIORITY)
+        },
+        'step': {'type': 'string', 'minLength': 1},
+        'order': {'anyOf': [
+            {'type': 'integer', 'minimum': 0},
+            {'type': 'string', 'minLength': 1, 'pattern': '^[0-9]+$'}
+        ]}
+    },
+    'required': ['interface', 'step', 'order'],
+    'additionalProperties': False,
+}
+
 
 def local_link_normalize(name, value):
     if not value:
@@ -163,7 +202,7 @@ def local_link_normalize(name, value):
         except exception.InvalidDatapathID:
             raise exception.InvalidSwitchID(switch_id=value['switch_id'])
     except KeyError:
-        # In Smart NIC case 'switch_id' is optional.
+        # In Smart NIC or OVN VTEP case 'switch_id' is optional.
         pass
 
     return value
@@ -294,28 +333,6 @@ def replace_node_uuid_with_id(to_dict):
     return node
 
 
-def replace_node_id_with_uuid(to_dict):
-    """Replace ``node_id`` dict value with ``node_uuid``
-
-    ``node_uuid`` is found by fetching the node by id lookup.
-
-    :param to_dict: Dict to set ``node_uuid`` value on
-    :returns: The node object from the lookup
-    :raises: NodeNotFound with status_code set to 400 BAD_REQUEST
-        when node is not found.
-    """
-    try:
-        node = objects.Node.get_by_id(api.request.context,
-                                      to_dict.pop('node_id'))
-        to_dict['node_uuid'] = node.uuid
-    except exception.NodeNotFound as e:
-        # Change error code because 404 (NotFound) is inappropriate
-        # response for requests acting on non-nodes
-        e.code = http_client.BAD_REQUEST  # BadRequest
-        raise
-    return node
-
-
 def patch_update_changed_fields(from_dict, rpc_object, fields,
                                 schema, id_map=None):
     """Update rpc object based on changed fields in a dict.
@@ -354,7 +371,7 @@ def patched_validate_with_schema(patched_dict, schema, validator=None):
         updates applied
     :param schema: Any dict key not in the schema will be deleted from the
         dict. If no validator is specified then the resulting ``patched_dict``
-        will be validated agains the schema
+        will be validated against the schema
     :param validator: Optional validator to use if there is extra validation
         required beyond the schema
     :raises: exception.Invalid if validation fails
@@ -368,6 +385,17 @@ def patched_validate_with_schema(patched_dict, schema, validator=None):
     validator('patch', patched_dict)
 
 
+def allow_special_characters_in_patch_fields():
+    """Check if special characters are allowed in patch field keys."""
+    return (api.request.version.minor
+            >= versions.MINOR_98_SUPPORT_SPECIAL_CHAR_IN_ATTRIBUTES)
+
+
+def decode_json_pointer(path):
+    """Decode JSON pointer as per RFC 6901 to support '~' and '/'."""
+    return path.replace('~1', '/').replace('~0', '~')
+
+
 def patch_validate_allowed_fields(patch, allowed_fields):
     """Validate that a patch list only modifies allowed fields.
 
@@ -379,7 +407,10 @@ def patch_validate_allowed_fields(patch, allowed_fields):
     """
     fields = set()
     for p in patch:
-        path = p['path'].split('/')[1]
+        if allow_special_characters_in_patch_fields():
+            path = decode_json_pointer(p['path'].split('/')[1])
+        else:
+            path = p['path'].split('/')[1]
         if path not in allowed_fields:
             msg = _("Cannot patch %s. Only the following can be updated: %s")
             raise exception.Invalid(
@@ -407,6 +438,8 @@ def sanitize_dict(to_sanitize, fields):
             to_sanitize.pop(key, None)
 
 
+# TODO(stephenfin): We can repurpose this check to only set a default for limit
+# when all APIs use jsonschema validation
 def validate_limit(limit):
     if limit is None:
         return CONF.api.max_limit
@@ -417,6 +450,8 @@ def validate_limit(limit):
     return min(CONF.api.max_limit, limit)
 
 
+# TODO(stephenfin): We can remove this check when all APIs use jsonschema
+# validation
 def validate_sort_dir(sort_dir):
     if sort_dir not in ['asc', 'desc']:
         raise exception.ClientSideError(_("Invalid sort direction: %s. "
@@ -531,7 +566,6 @@ def get_rpc_node(node_ident):
     # as a UUID.
     if uuidutils.is_uuid_like(node_ident):
         return objects.Node.get_by_uuid(api.request.context, node_ident)
-
     # We can refer to nodes by their name, if the client supports it
     if allow_node_logical_names():
         if is_valid_logical_name(node_ident):
@@ -674,6 +708,43 @@ def get_rpc_deploy_template_with_suffix(template_ident):
                             exception.DeployTemplateNotFound)
 
 
+def get_rpc_runbook(runbook_ident):
+    """Get the RPC runbook from the UUID or logical name.
+
+    :param runbook_ident: the UUID or logical name of a runbook.
+
+    :returns: The RPC runbook.
+    :raises: InvalidUuidOrName if the name or uuid provided is not valid.
+    :raises: RunbookNotFound if the runbook is not found.
+    """
+    # If runbook_ident is instead a valid UUID, treat it as a UUID.
+    if uuidutils.is_uuid_like(runbook_ident):
+        return objects.Runbook.get_by_uuid(api.request.context,
+                                           runbook_ident)
+
+    # Else, we can refer to runbooks by their name too
+    if utils.is_valid_logical_name(runbook_ident):
+        return objects.Runbook.get_by_name(api.request.context,
+                                           runbook_ident)
+    raise exception.InvalidUuidOrName(name=runbook_ident)
+
+
+def check_runbook_policy_and_retrieve(policy_name, runbook_ident):
+    """Check if the specified policy authorizes this request on a node.
+
+    :param: policy_name: Name of the policy to check.
+    :param: runbook_ident: the UUID or logical name of a runbook.
+
+    :raises: HTTPForbidden if the policy forbids access.
+    :raises: RunbookNotFound if the runbook is not found.
+    :return: a runbook object
+    """
+    rpc_runbook = get_rpc_runbook(runbook_ident)
+    check_owner_policy(object_type='runbook', policy_name=policy_name,
+                       owner=rpc_runbook['owner'])
+    return rpc_runbook
+
+
 def is_valid_node_name(name):
     """Determine if the provided name is a valid node name.
 
@@ -807,6 +878,13 @@ VERSIONED_FIELDS = {
     'network_data': versions.MINOR_66_NODE_NETWORK_DATA,
     'boot_mode': versions.MINOR_75_NODE_BOOT_MODE,
     'secure_boot': versions.MINOR_75_NODE_BOOT_MODE,
+    'shard': versions.MINOR_82_NODE_SHARD,
+    'parent_node': versions.MINOR_83_PARENT_CHILD_NODES,
+    'firmware_interface': versions.MINOR_86_FIRMWARE_INTERFACE,
+    'service_step': versions.MINOR_87_SERVICE,
+    'disable_power_off': versions.MINOR_95_DISABLE_POWER_OFF,
+    'instance_name': versions.MINOR_104_NODE_INSTANCE_NAME,
+    'health': versions.MINOR_109_NODE_HEALTH,
 }
 
 for field in V31_FIELDS:
@@ -849,6 +927,9 @@ def check_allowed_portgroup_fields(fields):
     if (('mode' in fields or 'properties' in fields)
             and not allow_portgroup_mode_properties()):
         raise exception.NotAcceptable()
+    if ('dynamic_portgroup' in fields
+            and not allow_portgroup_dynamic_portgroup()):
+        raise exception.NotAcceptable()
 
 
 def check_allow_management_verbs(verb):
@@ -866,7 +947,7 @@ def check_for_invalid_state_and_allow_filter(provision_state):
         if (api.request.version.minor
                 < versions.MINOR_9_PROVISION_STATE_FILTER):
             raise exception.NotAcceptable()
-        valid_states = states.machine.states
+        valid_states = state_machine.machine.states
         if provision_state not in valid_states:
             raise exception.InvalidParameterValue(
                 _('Provision state "%s" is not valid') % provision_state)
@@ -1065,6 +1146,47 @@ def check_allow_filter_by_lessee(lessee):
              'opr': versions.MINOR_65_NODE_LESSEE})
 
 
+def check_allow_filter_by_shard(shard):
+    """Check if filtering nodes by shard is allowed.
+
+    Version 1.82 of the API allows filtering nodes by shard.
+    """
+    if (shard is not None and api.request.version.minor
+            < versions.MINOR_82_NODE_SHARD):
+        raise exception.NotAcceptable(_(
+            "Request not acceptable. The minimal required API version "
+            "should be %(base)s.%(opr)s") %
+            {'base': versions.BASE_VERSION,
+             'opr': versions.MINOR_82_NODE_SHARD})
+
+
+def check_allow_portgroup_filter_by_shard(shard):
+    """Check if filtering portgroups by shard is allowed.
+
+    Version 1.106 of the API allows filtering portgroups by shard.
+    """
+    if (shard is not None and api.request.version.minor
+            < versions.MINOR_106_PORTGROUP_SHARD):
+        raise exception.NotAcceptable(_(
+            "Request not acceptable. The minimal required API version "
+            "should be %(base)s.%(opr)s") %
+            {'base': versions.BASE_VERSION,
+             'opr': versions.MINOR_106_PORTGROUP_SHARD})
+
+
+def check_allow_child_node_params(include_children=None,
+                                  parent_node=None):
+    if ((include_children is not None
+         or parent_node is not None)
+            and api.request.version.minor
+            < versions.MINOR_83_PARENT_CHILD_NODES):
+        raise exception.NotAcceptable(_(
+            "Request not acceptable. The minimal required API version "
+            "should be %(base)s.%(opr)s") %
+            {'base': versions.BASE_VERSION,
+             'opr': versions.MINOR_83_PARENT_CHILD_NODES})
+
+
 def initial_node_provision_state():
     """Return node state to use by default when creating new nodes.
 
@@ -1174,6 +1296,26 @@ def allow_portgroup_mode_properties():
     """
     return (api.request.version.minor
             >= versions.MINOR_26_PORTGROUP_MODE_PROPERTIES)
+
+
+def allow_portgroup_physical_network():
+    """Check if physical_network can be added to/queried from a portgroup.
+
+    Version 1.102 of the API added physical_network field to portgroup
+    object.
+    """
+    return (api.request.version.minor
+            >= versions.MINOR_102_PORTGROUP_PHYSICAL_NETWORK)
+
+
+def allow_portgroup_category():
+    """Check if category can be added to/queried from a portgroup.
+
+    Version 1.103 of the API added category field to portgroup
+    object.
+    """
+    return (api.request.version.minor
+            >= versions.MINOR_103_PORTGROUP_CATEGORY)
 
 
 def allow_vifs_subcontroller():
@@ -1316,6 +1458,14 @@ def allow_inspect_abort():
     return api.request.version.minor >= versions.MINOR_41_INSPECTION_ABORT
 
 
+def allow_deploy_abort():
+    """Check if deployment abort is allowed.
+
+    Version 1.110 of the API added support for deployment abort in DEPLOYWAIT
+    """
+    return api.request.version.minor >= versions.MINOR_110_DEPLOYWAIT_ABORT
+
+
 def allow_detail_query():
     """Check if passing a detail=True query string is allowed.
 
@@ -1340,6 +1490,13 @@ def allow_node_history():
     """Check if node history access is permitted by API version."""
     return api.request.version.minor >= versions.MINOR_78_NODE_HISTORY
 
+def allow_node_history_project():
+    """Check if node history project field is available."""
+    return api.request.version.minor >= versions.MINOR_113_NODE_HISTORY_PROJECT
+
+def allow_node_history_fields():
+    """Check if advanced node history fields are available."""
+    return api.request.version.minor >= versions.MINOR_115_NODE_HISTORY_FIELDS
 
 def allow_node_inventory():
     """Check if node inventory is allowed."""
@@ -1475,6 +1632,122 @@ def check_policy_true(policy_name):
     return policy.check_policy(policy_name, cdict, api.request.context)
 
 
+def authorize_node_link(orig_node, new_uuid, field_name):
+    """Authorize creating or changing a link to the node on a resource.
+
+    :param orig_node: Node that currently owns the resource.
+    :param new_uuid: UUID of the new node.
+    :param field_name: Human-readable field name for logging and error message.
+    :raises: Invalid on access error
+    :returns: The new Node object
+    """
+    msg = _("Unable to apply the requested %s '%s'. "
+            "Requested value was invalid.")
+
+    try:
+        new_node = check_node_policy_and_retrieve(
+            'baremetal:node:get', new_uuid)
+    except Exception as exc:
+        LOG.debug("Rejecting %s %s: %s", field_name, new_uuid, exc)
+        # Important: do not disclose if the node exists
+        raise exception.Invalid(msg % (field_name, new_uuid))
+
+    if isinstance(orig_node, objects.Node):
+        orig_node = orig_node.as_dict()  # adjust for different callers
+
+    if orig_node.get('owner') != new_node.owner:
+        LOG.warning("Project mismatch on setting or changing %(field)s: "
+                    "current owner '%(orig)s', new %(field)s owner '%(new)s'",
+                    {'orig': orig_node.get('owner'), 'new': new_node.owner,
+                     'field': field_name})
+        # Important: same error message as when the node does not exist
+        raise exception.Invalid(msg % (field_name, new_uuid))
+
+    return new_node
+
+
+def authorize_node_link_patch(orig_node, patch, field_name):
+    """Authorize changing a link to the node on a resource.
+
+    :param orig_node: Node that currently owns the resource.
+    :param patch: JSON patch being applied.
+    :param field_name: Field names that contains the link.
+    :raises: Invalid on access error
+    :returns: The new Node object or the old one if not changed
+    """
+    new_node_id = get_patch_values(patch, f'/{field_name}')
+    if new_node_id:
+        return authorize_node_link(
+            orig_node, new_node_id[0], field_name)
+
+    return orig_node
+
+
+def duplicate_steps(name, value):
+    """Argument validator to check template for duplicate steps"""
+    # TODO(mgoddard): Determine the consequences of allowing duplicate
+    # steps.
+    # * What if one step has zero priority and another non-zero?
+    # * What if a step that is enabled by default is included in a
+    #   template? Do we override the default or add a second invocation?
+
+    # Check for duplicate steps. Each interface/step combination can be
+    # specified at most once.
+    counter = collections.Counter((step['interface'], step['step'])
+                                  for step in value['steps'])
+    duplicates = {key for key, count in counter.items() if count > 1}
+    if duplicates:
+        duplicates = {"interface: %s, step: %s" % (interface, step)
+                      for interface, step in duplicates}
+        err = _("Duplicate deploy steps. A template cannot have multiple "
+                "deploy steps with the same interface and step. "
+                "Duplicates: %s") % "; ".join(duplicates)
+        raise exception.InvalidDeployTemplate(err=err)
+    return value
+
+
+def convert_steps(rpc_steps):
+    for step in rpc_steps:
+        result = {
+            'interface': step['interface'],
+            'step': step['step'],
+            'args': step['args'],
+        }
+
+        if 'priority' in step:
+            result['priority'] = step['priority']
+        elif 'order' in step:
+            result['order'] = step['order']
+
+        yield result
+
+
+def allow_runbooks():
+    """Check if accessing runbook endpoints is allowed.
+
+    Version 1.92 of the API exposed runbook endpoints.
+    """
+    return api.request.version.minor >= versions.MINOR_92_RUNBOOKS
+
+
+def allow_runbook_traits():
+    """Check if runbook traits endpoints and fields are allowed.
+
+    Version 1.112 of the API added traits support to runbooks: the traits
+    set on a runbook controls which nodes are permitted to execute it, the
+    name constraint is relaxed, and a description field is available.
+    """
+    return api.request.version.minor >= versions.MINOR_112_RUNBOOK_TRAITS
+
+
+def allow_inspection_rules():
+    """Check if accessing inspection rule endpoints is allowed.
+
+    Version 1.96 of the API exposed rule endpoints.
+    """
+    return api.request.version.minor >= versions.MINOR_96_INSPECTION_RULES
+
+
 def check_owner_policy(object_type, policy_name, owner, lessee=None,
                        conceal_node=False):
     """Check if the policy authorizes this request on an object.
@@ -1503,6 +1776,19 @@ def check_owner_policy(object_type, policy_name, owner, lessee=None,
             raise exception.NodeNotFound(node=conceal_node)
         else:
             raise
+
+
+def check_and_retrieve_public_runbook(runbook_ident):
+    """If policy authorization check fails, check if runbook is public.
+
+    :param: runbook_ident: the UUID or logical name of a runbook.
+    :raises: HTTPForbidden if runbook is not public.
+    :return: RPC runbook identified by runbook_ident
+    """
+    rpc_runbook = get_rpc_runbook(runbook_ident)
+    if not rpc_runbook.public:
+        raise exception.HTTPForbidden
+    return rpc_runbook
 
 
 def check_node_policy_and_retrieve(policy_name, node_ident,
@@ -1593,6 +1879,27 @@ def check_multiple_node_policies_and_retrieve(policy_names,
     return rpc_node
 
 
+def check_multiple_runbook_policies_and_retrieve(policy_names,
+                                                 runbook_ident):
+    """Check if the specified policies authorize this request on a runbook.
+
+    :param: policy_names: List of policy names to check.
+    :param: runbook_ident: the UUID or logical name of a runbook.
+
+    :raises: HTTPForbidden if the policy forbids access.
+    :raises: RunbookNotFound if the runbook is not found.
+    :return: RPC runbook identified by runbook_ident
+    """
+    rpc_runbook = None
+    for policy_name in policy_names:
+        if rpc_runbook is None:
+            rpc_runbook = check_runbook_policy_and_retrieve(policy_names[0],
+                                                            runbook_ident)
+        else:
+            check_owner_policy('runbook', policy_name, rpc_runbook['owner'])
+    return rpc_runbook
+
+
 def check_list_policy(object_type, owner=None):
     """Check if the list policy authorizes this request on an object.
 
@@ -1626,7 +1933,8 @@ def check_port_policy_and_retrieve(policy_name, port_ident, portgroup=False):
                         a port or portgroup by.
 
     :raises: HTTPForbidden if the policy forbids access.
-    :raises: NodeNotFound if the node is not found.
+    :raises: PortNotFound if the port is not found.
+    :raises: PortgroupNotFound if the portgroup is not found.
     :return: RPC port identified by port_ident associated node
     """
     context = api.request.context
@@ -1821,6 +2129,7 @@ def check_volume_policy_and_retrieve(policy_name, vol_ident, target=False):
     """
     context = api.request.context
     cdict = context.to_policy_values()
+    rpc_node = None
     owner = None
     lessee = None
     try:
@@ -1856,6 +2165,19 @@ def check_volume_policy_and_retrieve(policy_name, vol_ident, target=False):
     return rpc_vol, rpc_node
 
 
+def allow_ovn_vtep_version():
+    """Check if ovn vtep version is allowed.
+
+    Version 1.90 of the API added support for ovn
+    vtep switches in port.local_link_connection.
+
+    Version 1.105 removed VTEP support logic.
+    """
+    ver = api.request.version.minor
+    return (ver >= versions.MINOR_90_OVN_VTEP
+            and ver < versions.MINOR_105_REMOVE_OVN_VTEP)
+
+
 def allow_build_configdrive():
     """Check if building configdrive is allowed.
 
@@ -1871,14 +2193,6 @@ def allow_configdrive_vendor_data():
     """
     return (api.request.version.minor
             >= versions.MINOR_59_CONFIGDRIVE_VENDOR_DATA)
-
-
-def allow_allocation_update():
-    """Check if updating an existing allocation is allowed or not.
-
-    Version 1.57 of the API added support for updating an allocation.
-    """
-    return api.request.version.minor >= versions.MINOR_57_ALLOCATION_UPDATE
 
 
 def allow_allocation_backfill():
@@ -1923,6 +2237,16 @@ def allow_status_in_heartbeat():
     return api.request.version.minor >= versions.MINOR_72_HEARTBEAT_STATUS
 
 
+def allow_unhold_verb():
+    """Check if the unhold verb may be passed to the API"""
+    return api.request.version.minor >= versions.MINOR_85_UNHOLD_VERB
+
+
+def allow_service_verb():
+    """Check if the service verb may be passed to the API."""
+    return api.request.version.minor >= versions.MINOR_87_SERVICE
+
+
 def check_allow_deploy_steps(target, deploy_steps):
     """Check if deploy steps are allowed"""
 
@@ -1944,12 +2268,156 @@ def check_allow_deploy_steps(target, deploy_steps):
             msg, status_code=http_client.BAD_REQUEST)
 
 
-def check_allow_clean_disable_ramdisk(target, disable_ramdisk):
+def check_allow_boot_mode(node_capabilities, disallowed_boot_modes):
+    """Check if boot mode is allowed"""
+
+    if (not node_capabilities) or (not disallowed_boot_modes):
+        return
+
+    disallowed_set = set(disallowed_boot_modes)
+
+    for capability in node_capabilities:
+        for item in capability.lower().split(','):
+            key, value = item.split(':')
+            if key.strip() == 'boot_mode' and value.strip() in disallowed_set:
+                raise exception.BootModeNotAllowed(mode=value.strip(),
+                                                   op=_('provisioning'))
+
+
+def check_allow_disable_ramdisk(target, disable_ramdisk):
     if disable_ramdisk is None:
         return
-    elif api.request.version.minor < versions.MINOR_70_CLEAN_DISABLE_RAMDISK:
+
+    minor = api.request.version.minor
+    if target == states.VERBS['clean']:
+        if minor < versions.MINOR_70_CLEAN_DISABLE_RAMDISK:
+            raise exception.NotAcceptable(
+                _("disable_ramdisk is not acceptable in this API version"))
+        return
+
+    if target == states.VERBS['service']:
+        if minor < versions.MINOR_108_SERVICE_DISABLE_RAMDISK:
+            raise exception.NotAcceptable(
+                _("disable_ramdisk is not acceptable in this API version"))
+        return
+
+    raise exception.BadRequest(
+        _("disable_ramdisk is supported only with manual cleaning "
+          "or servicing"))
+
+
+def check_allow_clean_disable_ramdisk(target, disable_ramdisk):
+    return check_allow_disable_ramdisk(target, disable_ramdisk)
+
+
+def allow_shards_endpoint():
+    """Check if shards endpoint is available."""
+    return api.request.version.minor >= versions.MINOR_82_NODE_SHARD
+
+
+def new_continue_inspection_endpoint():
+    """Check if /v1/continue_inspection endpoint is explicitly requested."""
+    return api.request.version.minor >= versions.MINOR_84_CONTINUE_INSPECTION
+
+
+def allow_continue_inspection_endpoint():
+    """Check if /v1/continue_inspection endpoint is available.
+
+    As a special exception, we allow it in the base version so that the API
+    can be used as a drop-in replacement for the Inspector's API.
+    """
+    return (new_continue_inspection_endpoint()
+            or api.request.version.minor == versions.MINOR_1_INITIAL_VERSION)
+
+
+def allow_firmware_interface():
+    """Check if we should support firmware interface and endpoints.
+
+    Version 1.86 of the API added support for firmware interface.
+    """
+    return api.request.version.minor >= versions.MINOR_86_FIRMWARE_INTERFACE
+
+
+def allow_firmware_identity():
+    return api.request.version.minor >= versions.MINOR_114_FIRMWARE_IDENTITY
+
+
+def allow_port_name():
+    """Check if name is allowed for ports.
+
+    Version 1.88 of the API added name field to the port object.
+    """
+    return api.request.version.minor >= versions.MINOR_88_PORT_NAME
+
+
+def allow_attach_detach_vmedia():
+    """Check if we should support virtual media actions."""
+    return api.request.version.minor >= versions.MINOR_89_ATTACH_DETACH_VMEDIA
+
+
+def allow_get_vmedia():
+    """Check if we should support get virtual media action."""
+    return api.request.version.minor >= versions.MINOR_93_GET_VMEDIA
+
+
+def allow_node_ident_as_param_for_port_creation():
+    """Check if 'node_ident' parameter is allowed for port creation."""
+    return api.request.version.minor >= versions.MINOR_94_PORT_NODENAME
+
+
+def allow_port_description():
+    """Check if description is allowed for ports.
+
+    Version 1.97 of the API added description field to the port object.
+    """
+    return api.request.version.minor >= versions.MINOR_97_PORT_DESCRIPTION
+
+
+def allow_port_vendor():
+    """Check if vendor is allowed for ports.
+
+    Version 1.100 of the API added vendor field to the port object.
+    """
+    return api.request.version.minor >= versions.MINOR_100_PORT_VENDOR
+
+
+def allow_port_category():
+    """Check if category is allowed for ports.
+
+    Version 1.101 of the API added category field to the port object.
+    """
+    return api.request.version.minor >= versions.MINOR_101_PORT_CATEGORY
+
+
+def allow_node_instance_name():
+    """Check if instance_name is allowed for nodes.
+
+    Version 1.104 of the API added instance_name field to the node object.
+    """
+    return api.request.version.minor >= versions.MINOR_104_NODE_INSTANCE_NAME
+
+
+def check_allow_filter_by_instance_name(instance_name):
+    if instance_name is not None and not allow_node_instance_name():
         raise exception.NotAcceptable(
-            _("disable_ramdisk is not acceptable in this API version"))
-    elif target != "clean":
-        raise exception.BadRequest(
-            _("disable_ramdisk is supported only with manual cleaning"))
+            _("instance_name is not acceptable in this API version"))
+
+
+def allow_port_available_for_dynamic_portgroup():
+    """Check if available_for_dynamic_portgroup is allowed for ports.
+
+    Version 1.111 of the API added available_for_dynamic_portgroup
+    field to the port object.
+    """
+    return (api.request.version.minor
+            >= versions.MINOR_111_DYNAMIC_PORTGROUP)
+
+
+def allow_portgroup_dynamic_portgroup():
+    """Check if dynamic_portgroup is allowed for portgroups.
+
+    Version 1.111 of the API added dynamic_portgroup field to the
+    portgroup object.
+    """
+    return (api.request.version.minor
+            >= versions.MINOR_111_DYNAMIC_PORTGROUP)

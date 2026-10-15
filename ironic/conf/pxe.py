@@ -20,13 +20,15 @@ from oslo_config import cfg
 from oslo_config import types as cfg_types
 
 from ironic.common.i18n import _
+from ironic.conf import types as ir_types
 
 opts = [
-    cfg.StrOpt('kernel_append_params',
-               deprecated_name='pxe_append_params',
-               default='nofb nomodeset vga=normal',
-               mutable=True,
-               help=_('Additional append parameters for baremetal PXE boot.')),
+    cfg.Opt('kernel_append_params',
+            deprecated_name='pxe_append_params',
+            default='nofb vga=normal',
+            type=ir_types.KernelParameterString(),
+            mutable=True,
+            help=_('Additional append parameters for baremetal PXE boot.')),
     cfg.StrOpt('default_ephemeral_format',
                default='ext4',
                mutable=True,
@@ -135,11 +137,23 @@ opts = [
     cfg.DictOpt('pxe_bootfile_name_by_arch',
                 default={},
                 help=_('Bootfile DHCP parameter per node architecture. '
-                       'For example: aarch64:grubaa64.efi')),
+                       'Keys can be a cpu_arch value (e.g. aarch64) or a '
+                       'composite key of arch-boot_mode (e.g. '
+                       'x86_64-uefi, x86_64-bios). The composite key is '
+                       'tried first, then the arch-only key as a '
+                       'fallback. '
+                       'For example: aarch64:grubaa64.efi or '
+                       'x86_64-bios:pxelinux.0,x86_64-uefi:bootx64.efi')),
     cfg.DictOpt('ipxe_bootfile_name_by_arch',
                 default={},
                 help=_('Bootfile DHCP parameter per node architecture. '
-                       'For example: aarch64:ipxe_aa64.efi')),
+                       'Keys can be a cpu_arch value (e.g. aarch64) or a '
+                       'composite key of arch-boot_mode (e.g. '
+                       'x86_64-uefi, x86_64-bios). The composite key is '
+                       'tried first, then the arch-only key as a '
+                       'fallback. '
+                       'For example: aarch64:ipxe_aa64.efi or '
+                       'x86_64-bios:undionly.kpxe,x86_64-uefi:snponly.efi')),
     cfg.StrOpt('ipxe_boot_script',
                default=os.path.join(
                    '$pybasedir', 'drivers/modules/boot.ipxe'),
@@ -152,7 +166,7 @@ opts = [
     cfg.IntOpt('ipxe_timeout',
                default=0,
                help=_('Timeout value (in seconds) for downloading an image '
-                      'via iPXE. Defaults to 0 (no timeout)')),
+                      'via iPXE. Timeout is disabled when this value is 0')),
     cfg.IntOpt('boot_retry_timeout',
                min=60,
                help=_('Timeout (in seconds) after which PXE boot should be '
@@ -209,6 +223,13 @@ opts = [
                    '$pybasedir', 'drivers/modules/initial_grub_cfg.template'),
                help=_('On ironic-conductor node, the path to the initial grub'
                       'configuration template for grub network boot.')),
+    cfg.BoolOpt('enable_insecure_template_override',
+                default=False,
+                help=_('If node level pxe_template override is permitted to '
+                       'be used in this Ironic deployment. This is an '
+                       'insecure pattern filed under CVE-2026-44917 and '
+                       'the feature this guards this is expected to be '
+                       'removed in Ironic release 2027.2.')),
 ]
 
 

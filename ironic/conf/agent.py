@@ -25,7 +25,8 @@ opts = [
                 help=_('Whether Ironic will manage booting of the agent '
                        'ramdisk. If set to False, you will need to configure '
                        'your mechanism to allow booting the agent '
-                       'ramdisk.')),
+                       'ramdisk. Deprecated for removal in 2025.2 release.'),
+                deprecated_for_removal=True),
     cfg.IntOpt('memory_consumed_by_agent',
                default=0,
                mutable=True,
@@ -114,7 +115,15 @@ opts = [
     cfg.IntOpt('command_timeout',
                default=60,
                mutable=True,
-               help=_('Timeout (in seconds) for IPA commands.')),
+               help=_('Timeout (in seconds) for IPA commands. '
+                      'A large timeout value may result in the conductor '
+                      'free worker pool becoming exhausted should a multi-'
+                      'node network connectivity issue arise during '
+                      'inband operations. These commands '
+                      'also cause the individual node lock to be held while '
+                      'in progress, which prevents new requests from being '
+                      'acted upon for the impacted nodes until the issue '
+                      'has been resolved.')),
     cfg.IntOpt('max_command_attempts',
                default=3,
                help=_('This is the maximum number of attempts that will be '
@@ -145,10 +154,12 @@ opts = [
                help=_('Wait time in seconds between attempts for validating '
                       'Neutron agent status.')),
     cfg.BoolOpt('require_tls',
-                default=False,
+                default=True,
                 mutable=True,
-                help=_('If set to True, callback URLs without https:// will '
-                       'be rejected by the conductor.')),
+                help=_('If set to False, callback URLs without https:// will '
+                       'be permitted by the conductor, which may be needed '
+                       'for backwards compatibility outside of the supported '
+                       'version window.')),
     cfg.StrOpt('certificates_path',
                default='/var/lib/ironic/certificates',
                help=_('Path to store auto-generated TLS certificates used to '
@@ -163,6 +174,50 @@ opts = [
                help=_('Path to the TLS CA that is used to start the bare '
                       'metal API. In some boot methods this file can be '
                       'passed to the ramdisk.')),
+    cfg.StrOpt(
+        'tls_minimum_version',
+        default='1.3',
+        choices=[
+            ('1.2',
+             _('Require TLS 1.2 as the minimum version.')),
+            ('1.3',
+             _('Require TLS 1.3 as the minimum version. '
+               'Recommended for Post-Quantum Cryptography '
+               'readiness as PQC key exchange is only '
+               'available in TLS 1.3.')),
+        ],
+        help=_("Set the minimum TLS protocol version for "
+               "outbound HTTPS connections from the "
+               "conductor to the ironic-python-agent. "
+               "Defaults to TLS 1.3 since TLS 1.0 and "
+               "1.1 are deprecated (RFC 8996). "
+               "Note: the agent must support the configured "
+               "minimum version for connections to "
+               "succeed. Generally, modern agents should "
+               "support this without issues as long as "
+               "they utliize a modern version of python "
+               "greater than Python 3.6.")),
+    cfg.StrOpt(
+        'tls_ciphers',
+        help=_("Set the list of available ciphers for "
+               "outbound HTTPS connections from the "
+               "conductor to the ironic-python-agent. The "
+               "value should be a string in the OpenSSL "
+               "cipher list format.")),
+    cfg.BoolOpt('allow_md5_checksum',
+                default=True,
+                help=_('When enabled, the agent will be notified it is '
+                       'permitted to consider MD5 checksums. This option '
+                       'is expected to change to a default of False in a '
+                       '2024 release of Ironic.')),
+    cfg.BoolOpt('enable_bios_bootloader_install',
+                default=False,
+                help=_('When enabled, enables agent support for partition '
+                       'images which require a legacy bootloader -- and a '
+                       'call to ``grub-install``. Generally, this should '
+                       'remain disabled for maximum security, however, this '
+                       'option allows it to be re-enabled for '
+                       'compatibility.')),
 ]
 
 

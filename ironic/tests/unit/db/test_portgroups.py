@@ -111,6 +111,102 @@ class DbportgroupTestCase(base.DbTestCase):
     def test_get_portgroups_by_node_id_that_does_not_exist(self):
         self.assertEqual([], self.dbapi.get_portgroups_by_node_id(99))
 
+    def test_get_portgoups_by_conductor_groups(self):
+        group_a_node = db_utils.create_test_node(
+            uuid=uuidutils.generate_uuid(),
+            conductor_group='group_a')
+        group_b_node = db_utils.create_test_node(
+            uuid=uuidutils.generate_uuid(),
+            conductor_group='group_b')
+
+        group_a_uuids = []
+        group_b_uuids = []
+        for i in range(1, 3):
+            port = db_utils.create_test_portgroup(
+                uuid=uuidutils.generate_uuid(), node_id=group_a_node.id,
+                address='52:54:00:cf:2d:4%s' % i, name='group_a_node_pg%s' % i)
+            group_a_uuids.append(str(port.uuid))
+        for i in range(7, 9):
+            port = db_utils.create_test_portgroup(
+                uuid=uuidutils.generate_uuid(), node_id=group_b_node.id,
+                address='52:54:00:cf:2d:4%s' % i, name='group_b_node_pg%s' % i)
+            group_b_uuids.append(str(port.uuid))
+        for i in range(4, 6):
+            port = db_utils.create_test_portgroup(
+                uuid=uuidutils.generate_uuid(), node_id=self.node.id,
+                address='52:54:00:cf:2d:4%s' % i, name='SetUp_node_pg%s' % i)
+        res = self.dbapi.get_portgroup_list(conductor_groups=['group_a'])
+        res_uuids = [r.uuid for r in res]
+        self.assertJsonEqual(group_a_uuids, res_uuids)
+        res = self.dbapi.get_portgroup_list(conductor_groups=['group_b'])
+        res_uuids = [r.uuid for r in res]
+        self.assertJsonEqual(group_b_uuids, res_uuids)
+        res = self.dbapi.get_portgroup_list(
+            conductor_groups=['group_a', 'group_b'])
+        res_uuids = [r.uuid for r in res]
+        self.assertJsonEqual(group_a_uuids + group_b_uuids, res_uuids)
+
+    def _create_test_portgroup_with_shard(self, shard, address,
+                                          owner='12345', lessee='54321'):
+        node = db_utils.create_test_node(
+            uuid=uuidutils.generate_uuid(),
+            owner=owner, lessee=lessee, shard=shard)
+        return db_utils.create_test_portgroup(
+            name='portgroup-%s' % shard,
+            uuid=uuidutils.generate_uuid(),
+            node_id=node.id,
+            address=address)
+
+    def test_get_portgroups_by_shard_no_match(self):
+        res = self.dbapi.get_portgroups_by_shards(['shard1', 'shard2'])
+        self.assertEqual([], res)
+
+    def test_get_portgroups_by_shard_with_match_single(self):
+        self._create_test_portgroup_with_shard('shard1', 'aa:bb:cc:dd:ee:ff')
+
+        res = self.dbapi.get_portgroups_by_shards(['shard1'])
+        self.assertEqual(1, len(res))
+        self.assertEqual('portgroup-shard1', res[0].name)
+
+    def test_get_portgroups_by_shard_with_match_multi(self):
+        self._create_test_portgroup_with_shard('shard1', 'aa:bb:cc:dd:ee:ff')
+        self._create_test_portgroup_with_shard('shard2', 'ab:bb:cc:dd:ee:ff')
+        self._create_test_portgroup_with_shard('shard3', 'ac:bb:cc:dd:ee:ff')
+
+        res = self.dbapi.get_portgroups_by_shards(['shard1', 'shard2'])
+        self.assertEqual(2, len(res))
+        # note(JayF): We do not query for shard3; ensure we don't get it.
+        self.assertNotEqual('portgroup-shard3', res[0].name)
+        self.assertNotEqual('portgroup-shard3', res[1].name)
+
+    def test_get_portgroups_by_shard_with_invalid_project(self):
+        self._create_test_portgroup_with_shard('shard1', 'aa:bb:cc:dd:ee:ff')
+        self._create_test_portgroup_with_shard('shard2', 'ff:ee:dd:cc:bb:aa',
+                                               owner='67890', lessee='09876')
+
+        res = self.dbapi.get_portgroups_by_shards(['shard2'], project='12345')
+        self.assertEqual(0, len(res))
+
+    def test_get_portgroups_by_shard_with_owner_project(self):
+        self._create_test_portgroup_with_shard('shard1', 'aa:bb:cc:dd:ee:ff')
+        self._create_test_portgroup_with_shard('shard2', 'ff:ee:dd:cc:bb:aa',
+                                               owner='67890', lessee='09876')
+
+        res = self.dbapi.get_portgroups_by_shards(['shard1', 'shard2'],
+                                                  project='12345')
+        self.assertEqual(1, len(res))
+        self.assertEqual('portgroup-shard1', res[0].name)
+
+    def test_get_portgroups_by_shard_with_lessee_project(self):
+        self._create_test_portgroup_with_shard('shard1', 'aa:bb:cc:dd:ee:ff')
+        self._create_test_portgroup_with_shard('shard2', 'ff:ee:dd:cc:bb:aa',
+                                               owner='67890', lessee='09876')
+
+        res = self.dbapi.get_portgroups_by_shards(['shard1', 'shard2'],
+                                                  project='09876')
+        self.assertEqual(1, len(res))
+        self.assertEqual('portgroup-shard2', res[0].name)
+
     def test_destroy_portgroup(self):
         self.dbapi.destroy_portgroup(self.portgroup.id)
         self.assertRaises(exception.PortgroupNotFound,
@@ -211,3 +307,61 @@ class DbportgroupTestCase(base.DbTestCase):
         self.assertEqual('active-backup', res.mode)
         res = self.dbapi.get_portgroup_by_name(name)
         self.assertEqual('802.3ad', res.mode)
+
+    def test_create_portgroup_with_physical_network(self):
+        physical_network = 'physnet_alpha'
+        portgroup1 = db_utils.create_test_portgroup(
+            puuid=uuidutils.generate_uuid(),
+            name=uuidutils.generate_uuid(),
+            node_id=self.node.id,
+            address='aa:bb:cc:dd:ee:ff',
+            physical_network=physical_network)
+        portgroup2 = db_utils.create_test_portgroup(
+            puuid=uuidutils.generate_uuid(),
+            name=uuidutils.generate_uuid(),
+            node_id=self.node.id,
+            address='aa:bb:cc:dd:ee:fa',
+            physical_network=physical_network)
+        self.assertEqual(physical_network, portgroup1.physical_network)
+        self.assertEqual(physical_network, portgroup2.physical_network)
+
+        new_physical_network = 'physnet_beta'
+        updated_portgroup = self.dbapi.update_portgroup(
+            portgroup1.id, {'physical_network': new_physical_network})
+
+        self.assertEqual(new_physical_network,
+                         updated_portgroup.physical_network)
+
+        retrieved_portgroup1 = self.dbapi.get_portgroup_by_uuid(
+            portgroup1.uuid)
+        self.assertEqual(new_physical_network,
+                         retrieved_portgroup1.physical_network)
+
+    def test_create_portgroup_with_category(self):
+        category = 'hypernet'
+        portgroup1 = db_utils.create_test_portgroup(
+            puuid=uuidutils.generate_uuid(),
+            name=uuidutils.generate_uuid(),
+            node_id=self.node.id,
+            address='aa:bb:cc:dd:ee:ff',
+            category=category)
+        portgroup2 = db_utils.create_test_portgroup(
+            puuid=uuidutils.generate_uuid(),
+            name=uuidutils.generate_uuid(),
+            node_id=self.node.id,
+            address='aa:bb:cc:dd:ee:fa',
+            category=category)
+        self.assertEqual(category, portgroup1.category)
+        self.assertEqual(category, portgroup2.category)
+
+        new_category = 'ultranet'
+        updated_portgroup = self.dbapi.update_portgroup(
+            portgroup1.id, {'category': new_category})
+
+        self.assertEqual(new_category,
+                         updated_portgroup.category)
+
+        retrieved_portgroup1 = self.dbapi.get_portgroup_by_uuid(
+            portgroup1.uuid)
+        self.assertEqual(new_category,
+                         retrieved_portgroup1.category)

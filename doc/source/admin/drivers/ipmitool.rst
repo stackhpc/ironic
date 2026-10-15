@@ -1,3 +1,10 @@
+.. meta::
+   :description: Configure Ironic IPMI driver using ipmitool for legacy server management. Power control, console access, and hardware monitoring via IPMI protocol.
+   :keywords: ipmi driver, ipmitool, legacy servers, power management, console access, hardware monitoring, baseboard management controller
+   :author: OpenStack Ironic Team
+   :robots: index, follow
+   :audience: system administrators, hardware engineers
+
 ===========
 IPMI driver
 ===========
@@ -41,7 +48,7 @@ Please see :doc:`/install/configure-ipmi` for the required dependencies.
 
     [DEFAULT]
     enabled_hardware_types = ipmi
-    enabled_console_interfaces = ipmitool-socat,ipmitool-shellinabox,no-console
+    enabled_console_interfaces = ipmitool-socat,no-console
     enabled_management_interfaces = ipmitool,noop
     enabled_power_interfaces = ipmitool
     enabled_vendor_interfaces = ipmitool,no-vendor
@@ -81,6 +88,28 @@ with an IPMItool-based driver. For example::
         --driver-info ipmi_address=<address> \
         --driver-info ipmi_username=<username> \
         --driver-info ipmi_password=<password>
+
+
+Changing The Default IPMI Credential Persistence Method
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- ``store_cred_in_env``: :oslo.config:option:`ipmi.store_cred_in_env`.
+
+The ``store_cred_in_env`` configuration option allow users to switch
+between file-based and environment variable persistence methods for
+IPMI password.
+
+For the temporary file option, long lived IPMI sessions, such as those for
+console support, leave files with credentials on the conductor disk for the
+duration of the session.
+
+To switch to environment variable persistence, set the
+``store_cred_in_env`` parameter to ``True`` in the configuration file:
+
+.. code-block:: ini
+
+  [ipmi]
+  store_cred_in_env = True
 
 Advanced configuration
 ======================
@@ -202,10 +231,10 @@ a value that can be used from the list provided (from last to first):
 .. code-block:: ini
 
   [ipmi]
-  cipher_suite_versions = ['1','2','3','6','7','8','11','12']
+  cipher_suite_versions = 1,2,3,6,7,8,11,12
 
 To find the suitable values for this configuration, you can check the field
-`RMCP+ Cipher Suites` after running an ``ipmitool`` command, e.g:
+``RMCP+ Cipher Suites`` after running an ``ipmitool`` command, e.g:
 
 .. code-block:: console
 
@@ -279,7 +308,7 @@ synchronization process, and record this value if not already set.
 While similar issues may exist when setting the boot mode and target
 boot device in other vendors' BMCs, we are not aware of them at present.
 Should you encounter such an issue, please feel free to report this via
-`Storyboard <https://storyboard.openstack.org>`_, and be sure to include
+`Launchpad <https://bugs.launchpad.net/ironic/+bugs>`_, and be sure to include
 the ``chassis bootparam get 5`` output value along with the ``mc info``
 output from your BMC.
 
@@ -289,6 +318,27 @@ Example::
         mc info
     ipmitool -I lanplus -H <BMC ADDRESS> -U <Username> -P <Password> \
         chassis bootparam get 5
+
+send_raw clean/deploy step
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``send_raw`` vendor passthru method is available to be invoked as a
+clean or deployment step should raw bytes need to be transmitted to the
+remote BMC in order to facilitate some sort of action or specific state.
+In this case, the raw bytes to be set are conveyed with a ``raw_bytes``
+argument on the requested clean or deploy step.
+
+Example::
+
+  {
+    "interface": "vendor",
+    "step": "send_raw",
+    "args": {
+      "raw_bytes": "0x00 0x00 0x00 0x00"
+    }
+  }
+
+
 
 .. _IPMItool: https://sourceforge.net/projects/ipmitool/
 .. _IPMI: https://en.wikipedia.org/wiki/Intelligent_Platform_Management_Interface

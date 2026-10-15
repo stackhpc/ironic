@@ -7,6 +7,12 @@ Below is an example flow of how to set up the Bare Metal service so that node
 provisioning will happen in a multi-tenant environment (which means using the
 ``neutron`` network interface as stated above):
 
+.. note::
+   For standalone deployments without the Networking service (Neutron), the
+   ``ironic-networking`` network interface provides an alternative approach
+   for managing switch port configurations. See
+   :doc:`/install/standalone/networking` for details.
+
 #. Network interfaces can be enabled on ironic-conductor by adding them to the
    ``enabled_network_interfaces`` configuration option under the ``default``
    section of the configuration file::
@@ -35,7 +41,7 @@ provisioning will happen in a multi-tenant environment (which means using the
    interface explicitly specified in the creation request.
 
    If this configuration option is not set, the default network interface is
-   determined by looking at the ``[dhcp]dhcp_provider`` configuration option
+   determined by looking at the :oslo.config:option:`dhcp.dhcp_provider` configuration option
    value. If it is ``neutron``, then ``flat`` network interface becomes the
    default, otherwise ``noop`` is the default.
 
@@ -61,7 +67,7 @@ provisioning will happen in a multi-tenant environment (which means using the
 
    .. note::
       If these ``provisioning_network`` and ``cleaning_network`` values are
-      not specified in node's `driver_info` then ironic falls back to the
+      not specified in node's ``driver_info`` then ironic falls back to the
       configuration in the ``neutron`` section.
 
    Please refer to :doc:`configure-cleaning` for more information about
@@ -139,7 +145,7 @@ provisioning will happen in a multi-tenant environment (which means using the
 #. Restart the ironic-conductor and ironic-api services after the
    modifications:
 
-   - Fedora/RHEL8/CentOS8::
+   - Fedora/RHEL/CentOS::
 
       sudo systemctl restart openstack-ironic-api
       sudo systemctl restart openstack-ironic-conductor
@@ -157,4 +163,4 @@ provisioning will happen in a multi-tenant environment (which means using the
 
    where FILENAME is the file located at the TFTP server.
 
-See :ref:`multitenancy` for required node configuration.
+See :ref:`admin-networking` for required node configuration.

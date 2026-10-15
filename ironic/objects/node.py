@@ -29,7 +29,7 @@ from ironic.objects import base
 from ironic.objects import fields as object_fields
 from ironic.objects import notification
 
-REQUIRED_INT_PROPERTIES = ['local_gb', 'cpus', 'memory_mb']
+REQUIRED_INT_PROPERTIES = ['local_gb', 'memory_mb']
 
 CONF = cfg.CONF
 LOG = log.getLogger(__name__)
@@ -78,7 +78,15 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
     # Version 1.34: Add lessee field
     # Version 1.35: Add network_data field
     # Version 1.36: Add boot_mode and secure_boot fields
-    VERSION = '1.36'
+    # Version 1.37: Add shard field
+    # Version 1.38: Add parent_node field
+    # Version 1.39: Add firmware_interface field
+    # Version 1.40: Add service_step field
+    # Version 1.41: Add disable_power_off field
+    # Version 1.42: Moves multiple methods to be remotable methods.
+    # Version 1.43: Add instance_name field
+    # Version 1.44: Add health field
+    VERSION = '1.44'
 
     dbapi = db_api.get_instance()
 
@@ -103,6 +111,11 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         # being executed, or None, indicating deployment is not in progress
         # or has not yet started.
         'deploy_step': object_fields.FlexibleDictField(nullable=True),
+
+        # A service step dictionary, indicating the current step
+        # being executed, or None, indicating deployment is not in progress
+        # or has not yet started.
+        'service_step': object_fields.FlexibleDictField(nullable=True),
 
         'raid_config': object_fields.FlexibleDictField(nullable=True),
         'target_raid_config': object_fields.FlexibleDictField(nullable=True),
@@ -153,6 +166,7 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         'boot_interface': object_fields.StringField(nullable=True),
         'console_interface': object_fields.StringField(nullable=True),
         'deploy_interface': object_fields.StringField(nullable=True),
+        'firmware_interface': object_fields.StringField(nullable=True),
         'inspect_interface': object_fields.StringField(nullable=True),
         'management_interface': object_fields.StringField(nullable=True),
         'network_interface': object_fields.StringField(nullable=True),
@@ -170,6 +184,11 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         'network_data': object_fields.FlexibleDictField(nullable=True),
         'boot_mode': object_fields.StringField(nullable=True),
         'secure_boot': object_fields.BooleanField(nullable=True),
+        'shard': object_fields.StringField(nullable=True),
+        'parent_node': object_fields.StringField(nullable=True),
+        'disable_power_off': objects.fields.BooleanField(nullable=True),
+        'instance_name': object_fields.StringField(nullable=True),
+        'health': object_fields.StringField(nullable=True),
     }
 
     def as_dict(self, secure=False, mask_configdrive=True):
@@ -189,7 +208,7 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         return d
 
     def _validate_property_values(self, properties):
-        """Check if the input of local_gb, cpus and memory_mb are valid.
+        """Check if the input of local_gb and memory_mb are valid.
 
         :param properties: a dict contains the node's information.
         """
@@ -222,15 +241,11 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         if not fields or 'traits' in fields:
             self.traits = object_base.obj_make_list(
                 context, objects.TraitList(context),
-                objects.Trait, db_object['traits'],
-                fields=['trait', 'version'])
+                db_object['traits'], fields=['trait', 'version'])
             self.traits.obj_reset_changes()
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get(cls, context, node_id):
         """Find a node based on its id or uuid and return a Node object.
 
@@ -245,11 +260,8 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         else:
             raise exception.InvalidIdentity(identity=node_id)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_id(cls, context, node_id):
         """Find a node based on its integer ID and return a Node object.
 
@@ -262,11 +274,8 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         node = cls._from_db_object(context, cls(), db_node)
         return node
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_uuid(cls, context, uuid):
         """Find a node based on UUID and return a Node object.
 
@@ -279,11 +288,8 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         node = cls._from_db_object(context, cls(), db_node)
         return node
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_name(cls, context, name):
         """Find a node based on name and return a Node object.
 
@@ -296,11 +302,8 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         node = cls._from_db_object(context, cls(), db_node)
         return node
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def get_by_instance_uuid(cls, context, instance_uuid):
         """Find a node based on the instance UUID and return a Node object.
 
@@ -313,11 +316,8 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         node = cls._from_db_object(context, cls(), db_node)
         return node
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
     @classmethod
+    @object_base.remotable
     def list(cls, context, limit=None, marker=None, sort_key=None,
              sort_dir=None, filters=None, fields=None):
         """Return a list of Node objects.
@@ -353,10 +353,9 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
                                            fields=target_fields)
         return cls._from_db_object_list(context, db_nodes, target_fields)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
+    # NOTE(TheJulia): The choice to not make this a remotable method is
+    # explicit in that locks are intended only for a conductor. If we choose
+    # to change this, we need reconsider the locking model.
     @classmethod
     def reserve(cls, context, tag, node_id):
         """Get and reserve a node.
@@ -376,10 +375,9 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         node = cls._from_db_object(context, cls(), db_node)
         return node
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable_classmethod
+    # NOTE(TheJulia): The choice to not make this a remotable method is
+    # explicit in that locks are intended only for a conductor. If we choose
+    # to change this, we need reconsider the locking model.
     @classmethod
     def release(cls, context, tag, node_id):
         """Release the reservation on a node.
@@ -392,10 +390,7 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         """
         cls.dbapi.release_node(tag, node_id)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def create(self, context=None):
         """Create a Node record in the DB.
 
@@ -419,10 +414,7 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         db_node = self.dbapi.create_node(values)
         self._from_db_object(self._context, self, db_node)
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def destroy(self, context=None):
         """Delete the Node from the DB.
 
@@ -436,10 +428,7 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         self.dbapi.destroy_node(self.uuid)
         self.obj_reset_changes()
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def save(self, context=None):
         """Save updates to this Node.
 
@@ -505,10 +494,7 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
             utils.validate_conductor_group(fields['conductor_group'])
             fields['conductor_group'] = fields['conductor_group'].lower()
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
+    @object_base.remotable
     def refresh(self, context=None):
         """Refresh the object by re-fetching from the DB.
 
@@ -523,15 +509,12 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         self.obj_refresh(current)
         self.obj_reset_changes()
 
-    # NOTE(xek): We don't want to enable RPC on this call just yet. Remotable
-    # methods can be used in the future to replace current explicit RPC calls.
-    # Implications of calling new remote procedures should be thought through.
-    # @object_base.remotable
     def touch_provisioning(self, context=None):
         """Touch the database record to mark the provisioning as alive."""
         self.dbapi.touch_node_provisioning(self.id)
 
     @classmethod
+    @object_base.remotable
     def get_by_port_addresses(cls, context, addresses):
         """Get a node by associated port addresses.
 
@@ -656,6 +639,14 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
             should be set to empty dict (or removed).
         Version 1.36: boot_mode, secure_boot were was added. Defaults are None.
             For versions prior to this, it should be set to None or removed.
+        Version 1.37: shard was added. Default is None. For versions prior to
+            this, it should be set to None or removed.
+        Version 1.39: firmware_interface field was added. Its default value is
+            None. For versions prior to this, it should be set to None (or
+            removed).
+        Version 1.43: instance_name field was added. Its default value is
+            None. For versions prior to this, it should be set to None (or
+            removed).
 
         :param target_version: the desired version of the object
         :param remove_unavailable_fields: True to remove fields that are
@@ -671,24 +662,26 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
                   ('automated_clean', 28), ('protected_reason', 29),
                   ('owner', 30), ('allocation_id', 31), ('description', 32),
                   ('retired_reason', 33), ('lessee', 34), ('boot_mode', 36),
-                  ('secure_boot', 36)]
+                  ('secure_boot', 36), ('shard', 37),
+                  ('firmware_interface', 39), ('instance_name', 43),
+                  ('health', 44)]
 
         for name, minor in fields:
             self._adjust_field_to_version(name, None, target_version,
                                           1, minor, remove_unavailable_fields)
 
-        # NOTE(dtantsur): the default is False for protected
-        self._adjust_field_to_version('protected', False, target_version,
-                                      1, 29, remove_unavailable_fields)
+        boolean_fields = [('protected', 29, False),
+                          ('retired', 33, False),
+                          ('disable_power_off', 41, False)]
+
+        for name, minor, default in boolean_fields:
+            self._adjust_field_to_version(name, default, target_version,
+                                          1, minor, remove_unavailable_fields)
 
         self._convert_deploy_step_field(target_version,
                                         remove_unavailable_fields)
         self._convert_conductor_group_field(target_version,
                                             remove_unavailable_fields)
-
-        self._adjust_field_to_version('retired', False, target_version,
-                                      1, 33, remove_unavailable_fields)
-
         self._convert_network_data_field(target_version,
                                          remove_unavailable_fields)
 
@@ -741,6 +734,29 @@ class Node(base.IronicObject, object_base.VersionedObjectDictCompat):
         self.instance_info[key] = value
         self._changed_fields.add('instance_info')
 
+    def set_property(self, key, value):
+        """Set a `properties` value.
+
+        Setting a `properties` dict value via this method ensures that this
+        field will be flagged for saving.
+
+        :param key: Key of item to set
+        :param value: Value of item to set
+        """
+        self.properties[key] = value
+        self._changed_fields.add('properties')
+
+    def list_child_node_ids(self, exclude_dedicated_power=False):
+        """Returns a list of node IDs for child nodes, if any.
+
+        :param exclude_dedicated_power: Boolean, Default False, if the list
+            should exclude nodes which are independently powered.
+        :returns: A list of any node_id values discovered in the database.
+        """
+        return self.dbapi.get_child_node_ids_by_parent_uuid(
+            self.uuid,
+            exclude_dedicated_power=exclude_dedicated_power)
+
 
 @base.IronicObjectRegistry.register
 class NodePayload(notification.NotificationPayloadBase):
@@ -760,6 +776,7 @@ class NodePayload(notification.NotificationPayloadBase):
         'created_at': ('node', 'created_at'),
         'deploy_step': ('node', 'deploy_step'),
         'description': ('node', 'description'),
+        'disable_power_off': ('node', 'disable_power_off'),
         'driver': ('node', 'driver'),
         'extra': ('node', 'extra'),
         'boot_mode': ('node', 'boot_mode'),
@@ -819,7 +836,8 @@ class NodePayload(notification.NotificationPayloadBase):
     # Version 1.14: Add retired and retired_reason fields exposed via API.
     # Version 1.15: Add node lessee field.
     # Version 1.16: Add boot_mode and secure_boot fields.
-    VERSION = '1.16'
+    # Version 1.17: Add disable_power_off field.
+    VERSION = '1.17'
     fields = {
         'clean_step': object_fields.FlexibleDictField(nullable=True),
         'conductor_group': object_fields.StringField(nullable=True),
@@ -827,6 +845,7 @@ class NodePayload(notification.NotificationPayloadBase):
         'created_at': object_fields.DateTimeField(nullable=True),
         'deploy_step': object_fields.FlexibleDictField(nullable=True),
         'description': object_fields.StringField(nullable=True),
+        'disable_power_off': objects.fields.BooleanField(nullable=True),
         'driver': object_fields.StringField(nullable=True),
         'extra': object_fields.FlexibleDictField(nullable=True),
         'boot_mode': object_fields.StringField(nullable=True),
@@ -911,7 +930,8 @@ class NodeSetPowerStatePayload(NodePayload):
     # Version 1.14: Parent NodePayload version 1.14
     # Version 1.15: Parent NodePayload version 1.15
     # Version 1.16: Parent NodePayload version 1.16
-    VERSION = '1.16'
+    # Version 1.17: Parent NodePayload version 1.17
+    VERSION = '1.17'
 
     fields = {
         # "to_power" indicates the future target_power_state of the node. A
@@ -968,7 +988,8 @@ class NodeCorrectedPowerStatePayload(NodePayload):
     # Version 1.14: Parent NodePayload version 1.14
     # Version 1.15: Parent NodePayload version 1.15
     # Version 1.16: Parent NodePayload version 1.16
-    VERSION = '1.16'
+    # Version 1.17: Parent NodePayload version 1.17
+    VERSION = '1.17'
 
     fields = {
         'from_power': object_fields.StringField(nullable=True)
@@ -1010,7 +1031,8 @@ class NodeSetProvisionStatePayload(NodePayload):
     # Version 1.15: Parent NodePayload version 1.15
     # Version 1.16: add driver_internal_info
     # Version 1.17: Parent NodePayload version 1.16
-    VERSION = '1.17'
+    # Version 1.18: Parent NodePayload version 1.17
+    VERSION = '1.18'
 
     SCHEMA = dict(NodePayload.SCHEMA,
                   **{'instance_info': ('node', 'instance_info'),
@@ -1060,7 +1082,8 @@ class NodeCRUDPayload(NodePayload):
     # Version 1.12: Parent NodePayload version 1.14
     # Version 1.13: Parent NodePayload version 1.15
     # Version 1.14: Parent NodePayload version 1.16
-    VERSION = '1.14'
+    # Version 1.15: Parent NodePayload version 1.17
+    VERSION = '1.15'
 
     SCHEMA = dict(NodePayload.SCHEMA,
                   **{'instance_info': ('node', 'instance_info'),
@@ -1072,7 +1095,7 @@ class NodeCRUDPayload(NodePayload):
         'driver_info': object_fields.FlexibleDictField(nullable=True)
     }
 
-    def __init__(self, node, chassis_uuid):
+    def __init__(self, node, chassis_uuid=None):
         super(NodeCRUDPayload, self).__init__(node, chassis_uuid=chassis_uuid)
 
 

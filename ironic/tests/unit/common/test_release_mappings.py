@@ -44,7 +44,8 @@ NUMERIC_RELEASES = sorted(
     map(versionutils.convert_version_to_tuple,
         set(release_mappings.RELEASE_MAPPING)
         # Update the exceptions whenever needed
-        - {'master', 'zed', 'yoga'}),
+        - {'master', '2026.2', '2026.1', '2025.1', '2024.2', '2024.1',
+           '2023.2', '2023.1', 'antelope', 'zed', 'yoga'}),
     reverse=True)
 
 
@@ -57,12 +58,18 @@ class ReleaseMappingsTestCase(base.TestCase):
     def test_structure(self):
         for value in release_mappings.RELEASE_MAPPING.values():
             self.assertIsInstance(value, dict)
-            self.assertEqual({'api', 'rpc', 'objects'}, set(value))
+            # networking_rpc is optional
+            expected_keys = {'api', 'rpc', 'objects'}
+            optional_keys = {'networking_rpc'}
+            self.assertTrue(set(value).issubset(expected_keys | optional_keys))
+            self.assertTrue(expected_keys.issubset(set(value)))
             self.assertIsInstance(value['api'], str)
             (major, minor) = value['api'].split('.')
             self.assertEqual(1, int(major))
             self.assertLessEqual(int(minor), api_versions.MINOR_MAX_VERSION)
             self.assertIsInstance(value['rpc'], str)
+            if 'networking_rpc' in value:
+                self.assertIsInstance(value['networking_rpc'], str)
             self.assertIsInstance(value['objects'], dict)
             for obj_value in value['objects'].values():
                 self.assertIsInstance(obj_value, list)
@@ -80,6 +87,12 @@ class ReleaseMappingsTestCase(base.TestCase):
     def test_current_rpc_version(self):
         self.assertEqual(rpcapi.ConductorAPI.RPC_API_VERSION,
                          release_mappings.RELEASE_MAPPING['master']['rpc'])
+
+    def test_current_networking_rpc_version(self):
+        from ironic.networking import rpcapi as networking_rpcapi
+        self.assertEqual(
+            networking_rpcapi.NetworkingAPI.RPC_API_VERSION,
+            release_mappings.RELEASE_MAPPING['master']['networking_rpc'])
 
     def test_current_object_versions(self):
         registered_objects = obj_base.IronicObjectRegistry.obj_classes()
@@ -101,10 +114,12 @@ class ReleaseMappingsTestCase(base.TestCase):
         # NodeBase is also excluded as it is covered by Node.
         exceptions = set(['NodeTag', 'ConductorHardwareInterfaces',
                           'NodeTrait', 'DeployTemplateStep',
-                          'NodeBase'])
+                          'NodeBase', 'RunbookStep', 'RunbookTrait'])
         model_names -= exceptions
         # NodeTrait maps to two objects
         model_names |= set(['Trait', 'TraitList'])
+        # RunbookTrait maps to two objects
+        model_names |= set(['RunbookTrait', 'RunbookTraitList'])
         # Deployment is purely virtual.
         model_names.add('Deployment')
         object_names = set(
@@ -120,13 +135,6 @@ class ReleaseMappingsTestCase(base.TestCase):
                 for ver in obj_vers:
                     self.assertTrue(_check_versions_compatibility(
                         ver, registered_objects[obj_name][0].VERSION))
-
-    def test_no_gaps_in_release_versions(self):
-        for i, ver in enumerate(NUMERIC_RELEASES[:-1]):
-            prev = NUMERIC_RELEASES[i + 1]
-            if ver != (prev[0] + 1, 0) and ver != (prev[0], prev[1] + 1):
-                self.fail("Versions %s and %s are not sequential"
-                          % (prev, ver))
 
     def test_no_gaps_in_object_versions(self):
         oldest_release = '%d.%d' % NUMERIC_RELEASES[-1]

@@ -1,7 +1,7 @@
 .. _enrollment:
 
-Enrollment
-==========
+Enrolling hardware with Ironic
+==============================
 
 After all the services have been properly configured, you should enroll your
 hardware with the Bare Metal service, and confirm that the Compute service sees
@@ -81,15 +81,9 @@ affected, since the initial provision state is still ``available``.
 However, using API version 1.11 or above may break existing automation tooling
 with respect to node creation.
 
-The default API version used by (the most recent) python-ironicclient is 1.9,
-but it may change in the future and should not be relied on.
-
-In the examples below we will use version 1.11 of the Bare metal API.
-This gives us the following advantages:
-
-* Explicit power credentials validation before leaving the ``enroll`` state.
-* Running node cleaning before entering the ``available`` state.
-* Not exposing half-configured nodes to the scheduler.
+The ``openstack baremetal`` command line tool tries to negotiate the most
+recent supported version, which in virtually all cases will be newer than
+1.11.
 
 To set the API version for all commands, you can set the environment variable
 ``IRONIC_API_VERSION``. For the OpenStackClient baremetal plugin, set
@@ -118,7 +112,6 @@ and may be combined if desired.
 
    .. code-block:: console
 
-    $ export OS_BAREMETAL_API_VERSION=1.11
     $ baremetal node create --driver ipmi
     +--------------+--------------------------------------+
     | Property     | Value                                |
@@ -237,6 +230,9 @@ and may be combined if desired.
         --driver-info cleaning_network=$CLEAN_UUID_OR_NAME \
         --driver-info provisioning_network=$PROVISION_UUID_OR_NAME
 
+   If you use :doc:`managed inspection </admin/inspection/managed>`, you may
+   also configure ``inspection_network`` the same way.
+
    See :doc:`configure-tenant-networks` for details.
 
 #. You must also inform the Bare Metal service of the network interface cards
@@ -292,12 +288,13 @@ Adding scheduling information
       This is not required for standalone deployments, only for those using
       the Compute service for provisioning bare metal instances.
 
-#. Update the node's properties to match the actual hardware of the node:
+#. Update the node's properties to match the actual hardware of the node.
+   These are optional. When provided, ``memory_mb`` can be used for checking
+   if the instance image fits into the node's memory:
 
    .. code-block:: console
 
     $ baremetal node set $NODE_UUID \
-        --property cpus=$CPU_COUNT \
         --property memory_mb=$RAM_MB \
         --property local_gb=$DISK_GB
 
@@ -310,14 +307,13 @@ Adding scheduling information
          --driver-info ipmi_username=$USER \
          --driver-info ipmi_password=$PASS \
          --driver-info ipmi_address=$ADDRESS \
-         --property cpus=$CPU_COUNT \
          --property memory_mb=$RAM_MB \
          --property local_gb=$DISK_GB
 
    These values can also be discovered during `Hardware Inspection`_.
 
-   .. warning::
-      The value provided for the ``local_gb`` property must match the size of
+   .. note::
+      The value provided for the ``local_gb`` property should match the size of
       the root device you're going to deploy on. By default
       **ironic-python-agent** picks the smallest disk which is not smaller
       than 4 GiB.
@@ -423,12 +419,13 @@ Validating node information
 Making node available for deployment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-In order for nodes to be available for deploying workloads on them, nodes
-must be in the ``available`` provision state. To do this, nodes
-created with API version 1.11 and above must be moved from the ``enroll`` state
-to the ``manageable`` state and then to the ``available`` state.
-This section can be safely skipped, if API version 1.10 or earlier is used
-(which is the case by default).
+In order for nodes to be available for deploying workloads on them, nodes must
+be in the ``available`` provision state. To do this, nodes must be moved from
+the ``enroll`` state to the ``manageable`` state and then to the ``available``
+state.
+
+.. note::
+   This section can be skipped, if API version 1.10 or earlier is used.
 
 After creating a node and before moving it from its initial provision state of
 ``enroll``, basic power and port information needs to be configured on the node.
@@ -626,7 +623,7 @@ Consider the following configuration (shortened for simplicity):
 
     [DEFAULT]
     enabled_hardware_types = ipmi,redfish
-    enabled_console_interfaces = no-console,ipmitool-shellinabox
+    enabled_console_interfaces = no-console,ipmitool-socat
     enabled_deploy_interfaces = direct
     enabled_management_interfaces = ipmitool,redfish
     enabled_power_interfaces = ipmitool,redfish
@@ -663,11 +660,11 @@ power
     option has only one item: ``ipmitool``. It is used.
 console
     No default is configured. The ``ipmi`` hardware type supports the following
-    console interfaces: ``ipmitool-socat``, ``ipmitool-shellinabox`` and
-    ``no-console`` (in this order). Of these three, only two are enabled:
-    ``no-console`` and ``ipmitool-shellinabox`` (order does not matter). The
-    intersection contains ``ipmitool-shellinabox`` and ``no-console``.
-    The first item is used, and it is ``ipmitool-shellinabox``.
+    console interfaces: ``ipmitool-socat``, and ``no-console`` (in this
+    order). Both are enabled: ``no-console`` and ``ipmitool-socat``
+    (order does not matter). The intersection contains
+    ``ipmitool-socat`` and ``no-console``.
+    The first item is used, and it is ``ipmitool-socat``.
 management
     Following the same calculation as *power*, the ``ipmitool`` management
     interface is used.
@@ -681,4 +678,4 @@ nodes - please see :doc:`/admin/inspection` for details.
 Tenant Networks and Port Groups
 -------------------------------
 
-See :doc:`/admin/multitenancy` and :doc:`/admin/portgroups`.
+See :ref:`admin-networking` and :doc:`/admin/portgroups`.

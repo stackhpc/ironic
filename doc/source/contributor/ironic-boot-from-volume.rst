@@ -8,6 +8,8 @@ which has been supported from the Pike release.
 This scenario shows how to setup DevStack to enable nodes to boot from volumes
 managed by cinder with VMs as baremetal servers.
 
+.. _BFVDevstack:
+
 DevStack Configuration
 ======================
 
@@ -36,15 +38,8 @@ description for DevStack is at :ref:`deploy_devstack`.
     # Set glance's default limit to be baremetal image friendly
     GLANCE_LIMIT_IMAGE_SIZE_TOTAL=5000
 
-    # Enable Neutron which is required by Ironic and disable nova-network.
-    disable_service n-net
+    # Disable novnc
     disable_service n-novnc
-    enable_service q-svc
-    enable_service q-agt
-    enable_service q-dhcp
-    enable_service q-l3
-    enable_service q-meta
-    enable_service neutron
 
     # Enable Swift for the direct deploy interface.
     enable_service s-proxy
@@ -54,9 +49,6 @@ description for DevStack is at :ref:`deploy_devstack`.
 
     # Disable Horizon
     disable_service horizon
-
-    # Disable Heat
-    disable_service heat h-api h-api-cfn h-api-cw h-eng
 
     # Swift temp URL's are required for the direct deploy interface.
     SWIFT_ENABLE_TEMPURLS=True
@@ -80,7 +72,7 @@ description for DevStack is at :ref:`deploy_devstack`.
 
     # The parameters below represent the minimum possible values to create
     # functional nodes.
-    IRONIC_VM_SPECS_RAM=1280
+    IRONIC_VM_SPECS_RAM=2500
     IRONIC_VM_SPECS_DISK=10
 
     # Size of the ephemeral partition in GB. Use 0 for no ephemeral partition.
@@ -106,7 +98,9 @@ description for DevStack is at :ref:`deploy_devstack`.
 After the environment is built, you can create a volume with cinder and request
 an instance with the volume to nova::
 
-    . ~/devstack/openrc
+    # set up the user for authentication purposes
+    # note that all users can be seen in /etc/openstack/clouds.yaml
+    export OS_CLOUD=devstack-admin-demo
 
     # query the image id of the default cirros image
     image=$(openstack image show $DEFAULT_IMAGE_NAME -f value -c id)
@@ -130,6 +124,6 @@ volume with tempest in the environment::
 
 Please note that the storage interface will only indicate errors based upon
 the state of the node and the configuration present. As such a node does not
-exclusively have to boot via a remote volume, and as such `validate` actions
-upon nodes may be slightly misleading. If an appropriate `volume target` is
+exclusively have to boot via a remote volume, and as such ``validate`` actions
+upon nodes may be slightly misleading. If an appropriate ``volume target`` is
 defined, no error should be returned for the boot interface.

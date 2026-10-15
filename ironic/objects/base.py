@@ -26,6 +26,8 @@ from ironic.objects import fields as object_fields
 
 LOG = log.getLogger(__name__)
 
+remotable = object_base.remotable
+
 
 def max_version(versions):
     """Return the maximum version in the list.

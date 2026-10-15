@@ -78,7 +78,7 @@ def parse_field_list(content):
 
 
 def create_bullet_list(input_dict, input_build_env):
-    """Convert input_dict into a sphinx representaion of a bullet list."""
+    """Convert input_dict into a sphinx representation of a bullet list."""
 
     grp_field = GroupedField('grp_field', label='title')
     bullet_list = nodes.paragraph()
@@ -138,7 +138,7 @@ def split_list(input_list):
     """Split input_list into three sub-lists.
 
     This function splits the input_list into three, one list containing the
-    inital non-empty items, one list containing items appearing after the
+    initial non-empty items, one list containing items appearing after the
     string 'Success' in input_list; and the other list containing items
     appearing after the string 'Failure' in input_list.
     """
@@ -272,7 +272,8 @@ class Parameters(Directive):
         for field_name in input_dict:
             old_field_body = input_dict[field_name]
             if old_field_body in yaml_data.keys():
-                input_dict[field_name] = yaml_data[old_field_body]["description"]
+                input_dict[field_name] = \
+                    yaml_data[old_field_body]["description"]
 
         # Convert dictionary to bullet list format
         params_build_env = self.state.document.settings.env
@@ -327,7 +328,8 @@ class Return(Directive):
             failure_detail = create_bullet_list(failure_dict, ret_build_env)
             ret_table_contents += failure_detail
 
-        if len(initial_list) > 0 or len(success_list) > 0 or len(proc_fail_list) > 0:
+        if (len(initial_list) > 0 or len(success_list) > 0 or
+            len(proc_fail_list) > 0):
             # Create a table to display the final Returns directive output
             ret_table = create_table('Returns', ret_table_contents)
             return [ret_table]

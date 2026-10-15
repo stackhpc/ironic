@@ -15,7 +15,7 @@ That being said, it would likely help anyone working to implement
 customization of these policies to consult some reference material
 in hopes of understanding the context.
 
-* `Keystone Adminstrator Guide - Service API Protection <https://docs.openstack.org/keystone/latest/admin/service-api-protection.html>`_
+* `Keystone Administrator Guide - Service API Protection <https://docs.openstack.org/keystone/latest/admin/service-api-protection.html>`_
 * `Ironic Scoped Role Based Access Control Specification <https://specs.openstack.org/openstack/ironic-specs/specs/17.0/secure-rbac.html>`_
 
 Historical Context - How we reached our access model
@@ -64,7 +64,7 @@ indicate an associated ``project_id`` value.
 
 The Secure RBAC model, since the introduction of the base capability has been
 extended as a result of an OpenStack community goal to include a ``manager``
-role in the project scope. By default, this access is equivelent to a Project
+role in the project scope. By default, this access is equivalent to a Project
 scoped ``admin`` user, however it may be delineated further as time moves
 forward.
 
@@ -131,6 +131,66 @@ The ironic project has attempted to generally codify what we believe is
 reasonable, however operators may wish to override these policy settings.
 For details general policy setting details, please see
 :doc:`/configuration/policy`.
+
+.. _secure-rbac-trust-model:
+
+The trust model
+~~~~~~~~~~~~~~~
+
+The ``owner`` and ``lessee`` fields convey two very different levels of
+trust, and operators should keep the distinction in mind when assigning
+either field to a project.
+
+An ``owner`` project is a delegated administrator of the hardware. In many
+environments, the owning project may also have physical access to the
+machines. With the default policies, any user holding only the ``member``
+role in the owning project is able to, among other things:
+
+* deploy, rebuild, clean, and power the node on and off,
+* update ``driver_info``, the field which holds the BMC address and
+  credentials, and read it back, with secret values masked by default,
+* access the node's serial console,
+* run arbitrary cleaning and service steps,
+* attach and detach virtual media,
+* delegate access to the node to any other project by setting the
+  ``lessee`` field.
+
+Users holding the ``admin`` or ``manager`` role in the owning project can
+additionally change the node's driver and driver interfaces, set boot
+devices, inject non-maskable interrupts, and manage traits, ports and port
+groups. While :oslo.config:option:`api.project_admin_can_manage_own_nodes`
+is ``True`` (the default), ``admin`` users may also enroll new nodes owned
+by their project, and delete the nodes their project owns.
+
+.. warning::
+   Members of a project which has been set as a node's ``owner`` have
+   significantly more access than one might intuitively expect: holding
+   the ``member`` role in the owning project is sufficient to reach the
+   BMC configuration and the serial console. It is highly advisable to
+   use a dedicated project with strictly limited membership to own
+   nodes, rather than reusing an existing project whose membership is
+   managed for other purposes.
+
+Ironic also does not fully isolate the nodes of one owner from the nodes
+of another owner. Nodes are serviced by the same conductors and, in many
+deployments, share provisioning and management networks. An owner project
+should therefore be regarded as trusted infrastructure staff, not as just
+another tenant.
+
+A ``lessee`` project, in contrast, represents a *user* of the hardware,
+and in many environments may be a completely untrusted customer, with the
+field potentially populated automatically and non-interactively upon
+deployment, as described in `How do I assign a lessee?`_. The default
+policies are written with this in mind: lessees cannot view the masked
+node fields described in `Field value visibility restrictions`_, have no
+console access, and cannot update most node fields, although a lessee
+``member`` can still update general metadata such as the ``extra``
+field. Lessee users are still able to, among other things, control node
+power state, change the boot mode and secure boot state, and attach or detach
+virtual media with only the ``member`` role, and to reprovision the node or
+run cleaning and service steps with the ``admin`` or ``manager`` role.
+Operators loosening the default policies for lessees should do so with
+care.
 
 Field value visibility restrictions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -257,6 +317,25 @@ How do I assign a lessee?
 
    # baremetal node set --lessee <project_id> <node>
 
+Ironic will, by default, automatically manage lessee at deployment time,
+setting the lessee field on deploy of a node and unset it before the node
+begins cleaning.
+
+Operators can customize or disable this behavior via
+:oslo.config:option:`conductor.automatic_lessee_source` configuration.
+
+If :oslo.config:option:`conductor.automatic_lessee_source` is set to
+``instance`` (the default), this uses ``node.instance_info['project_id']``,
+which is set when OpenStack Nova deploys an instance.
+
+If :oslo.config:option:`conductor.automatic_lessee_source` is set to
+``request``, the lessee is set to the project_id in the request context --
+ideal for standalone Ironic deployments still utilizing OpenStack Keystone.
+
+If :oslo.config:option:`conductor.automatic_lessee_source` is set to to
+``none``, Ironic not will set a lessee on deploy.
+
+
 What is the difference between an owner and lessee?
 ---------------------------------------------------
 
@@ -279,7 +358,7 @@ This functionality is enabled by default, and automatically
 imparts ``owner`` privileges to the created Bare Metal node.
 
 This functionality can be disabled by setting
-``[api]project_admin_can_manage_own_nodes`` to ``False``.
+:oslo.config:option:`api.project_admin_can_manage_own_nodes` to ``False``.
 
 Can I use a service role?
 -------------------------
@@ -297,7 +376,7 @@ usage of the service via a service account.
 A project scoped user with the ``service`` role is able to create
 baremetal nodes, but is not able to delete them. To disable the
 ability to create nodes, set the
-``[api]project_admin_can_manage_own_nodes`` setting to ``False``.
+:oslo.config:option:`api.project_admin_can_manage_own_nodes` setting to ``False``.
 The nodes which can be accessed/managed in the project scope also align
 with the ``owner`` and ``lessee`` access model, and thus if nodes are not
 matching the user's ``project_id``, then Ironic's API will appear not to

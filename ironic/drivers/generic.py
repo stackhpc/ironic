@@ -20,10 +20,12 @@ from ironic.drivers import hardware_type
 from ironic.drivers.modules import agent
 from ironic.drivers.modules import agent_power
 from ironic.drivers.modules.ansible import deploy as ansible_deploy
+from ironic.drivers.modules import autodetect
 from ironic.drivers.modules import fake
 from ironic.drivers.modules import inspector
 from ironic.drivers.modules import ipxe
 from ironic.drivers.modules.network import flat as flat_net
+from ironic.drivers.modules.network import ironic_networking
 from ironic.drivers.modules.network import neutron
 from ironic.drivers.modules.network import noop as noop_net
 from ironic.drivers.modules import noop
@@ -44,13 +46,14 @@ class GenericHardware(hardware_type.AbstractHardwareType):
     @property
     def supported_boot_interfaces(self):
         """List of supported boot interfaces."""
-        return [ipxe.iPXEBoot, pxe.PXEBoot]
+        return [ipxe.iPXEBoot, pxe.PXEBoot, ipxe.iPXEHttpBoot, pxe.HttpBoot]
 
     @property
     def supported_deploy_interfaces(self):
         """List of supported deploy interfaces."""
-        return [agent.AgentDeploy, ansible_deploy.AnsibleDeploy,
-                ramdisk.RamdiskDeploy, pxe.PXEAnacondaDeploy,
+        return [autodetect.AutodetectDeploy, agent.AgentDeploy,
+                ansible_deploy.AnsibleDeploy, ramdisk.RamdiskDeploy,
+                pxe.PXEAnacondaDeploy, agent.BootcAgentDeploy,
                 agent.CustomAgentDeploy]
 
     @property
@@ -58,13 +61,13 @@ class GenericHardware(hardware_type.AbstractHardwareType):
         """List of supported inspect interfaces."""
         # Inspector support should be the default if it's enabled by an
         # operator (implying that the service is installed).
-        return [inspector.Inspector, noop.NoInspect]
+        return [inspector.AgentInspect, noop.NoInspect]
 
     @property
     def supported_network_interfaces(self):
         """List of supported network interfaces."""
         return [flat_net.FlatNetwork, neutron.NeutronNetwork,
-                noop_net.NoopNetwork]
+                ironic_networking.IronicNetworking, noop_net.NoopNetwork]
 
     @property
     def supported_raid_interfaces(self):
@@ -86,6 +89,16 @@ class GenericHardware(hardware_type.AbstractHardwareType):
         return [noop_storage.NoopStorage, cinder.CinderStorage,
                 external_storage.ExternalStorage]
 
+    @property
+    def supported_firmware_interfaces(self):
+        """List of supported firmware interfaces."""
+        return [noop.NoFirmware]
+
+    @property
+    def supported_console_interfaces(self):
+        """List of classes of supported console interfaces."""
+        return [noop.NoConsole, fake.FakeGraphicalConsole]
+
 
 class ManualManagementHardware(GenericHardware):
     """Hardware type that uses manual power and boot management.
@@ -95,6 +108,12 @@ class ManualManagementHardware(GenericHardware):
     when no suitable hardware type exists in ironic, or the existing hardware
     type misbehaves for any reason.
     """
+
+    @property
+    def supported_deploy_interfaces(self):
+        """List of supported deploy interfaces."""
+        return (super().supported_deploy_interfaces
+                + [noop.NoDeploy])
 
     @property
     def supported_management_interfaces(self):

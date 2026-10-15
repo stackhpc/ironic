@@ -13,6 +13,7 @@
 import datetime
 from unittest import mock
 
+from oslo_utils import uuidutils
 from testtools import matchers
 
 from ironic.common import exception
@@ -80,13 +81,18 @@ class TestPortgroupObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
     def test_create(self):
         portgroup = objects.Portgroup(self.context, **self.fake_portgroup)
         with mock.patch.object(self.dbapi, 'create_portgroup',
-                               autospec=True) as mock_create_portgroup:
-            mock_create_portgroup.return_value = db_utils.get_test_portgroup()
+                               autospec=True) as mock_create_pg:
+            with mock.patch.object(self.dbapi, 'get_portgroup_by_id',
+                                   autospec=True) as mock_get_pg:
+                test_pg = db_utils.get_test_portgroup()
+                mock_create_pg.return_value = test_pg
+                mock_get_pg.return_value = test_pg
+                mock_create_pg.return_value = db_utils.get_test_portgroup()
 
-            portgroup.create()
+                portgroup.create()
 
-            args, _kwargs = mock_create_portgroup.call_args
-            self.assertEqual(objects.Portgroup.VERSION, args[0]['version'])
+                args, _kwargs = mock_create_pg.call_args
+                self.assertEqual(objects.Portgroup.VERSION, args[0]['version'])
 
     def test_save(self):
         uuid = self.fake_portgroup['uuid']
@@ -162,9 +168,61 @@ class TestPortgroupObject(db_base.DbTestCase, obj_utils.SchemasTestMixIn):
             self.assertIsInstance(portgroups[0], objects.Portgroup)
             self.assertEqual(self.context, portgroups[0]._context)
 
+    def test_list_by_node_shards(self):
+        with mock.patch.object(self.dbapi, 'get_portgroups_by_shards',
+                               autospec=True) as mock_get_list:
+            mock_get_list.return_value = [self.fake_portgroup]
+            portgroups = objects.Portgroup.list_by_node_shards(
+                self.context, ['shard1'], project='12345')
+            mock_get_list.assert_called_once_with(['shard1'],
+                                                  limit=None, marker=None,
+                                                  sort_key=None, sort_dir=None,
+                                                  project='12345')
+            self.assertThat(portgroups, matchers.HasLength(1))
+            self.assertIsInstance(portgroups[0], objects.Portgroup)
+            self.assertEqual(self.context, portgroups[0]._context)
+
     def test_payload_schemas(self):
         self._check_payload_schemas(objects.portgroup,
                                     objects.Portgroup.fields)
+
+    def test_update_physical_network(self):
+        node = obj_utils.create_test_node(self.context)
+        portgroup = obj_utils.create_test_portgroup(self.context,
+                                                    physical_network='old',
+                                                    node_id=node.id)
+        unaffected_portgroup = obj_utils.create_test_portgroup(
+            self.context, name='unaffected', physical_network='old',
+            uuid=uuidutils.generate_uuid(),
+            address='52:ff:00:cf:2d:01',
+            node_id=node.id)
+
+        ports = []
+        for i in range(0, 5):
+            ports.append(obj_utils.create_test_port(
+                self.context,
+                uuid=uuidutils.generate_uuid(),
+                address=f"52:54:00:cf:2d:0{i}",
+                node_id=node.id,
+                physical_network='old',
+                portgroup_id=portgroup.id))
+
+        unaffected_port = obj_utils.create_test_port(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            address="52:54:00:cf:2d:05",
+            node_id=node.id,
+            physical_network='old',
+            portgroup_id=unaffected_portgroup.id)
+
+        portgroup.update_physical_network('new_physnet', self.context)
+        self.assertEqual(portgroup.physical_network, 'new_physnet')
+        for i in range(0, 5):
+            ports[i].refresh()
+            self.assertEqual(ports[i].physical_network, 'new_physnet')
+
+        self.assertEqual(unaffected_portgroup.physical_network, 'old')
+        self.assertEqual(unaffected_port.physical_network, 'old')
 
 
 class TestConvertToVersion(db_base.DbTestCase):
@@ -201,3 +259,54 @@ class TestConvertToVersion(db_base.DbTestCase):
         portgroup._convert_to_version('1.4', False)
         # no change
         self.assertEqual(vif2, portgroup.internal_info['tenant_vif_port_id'])
+
+    def test_dynamic_portgroup_supported_missing(self):
+        portgroup = objects.Portgroup(self.context, **self.fake_portgroup)
+        delattr(portgroup, 'dynamic_portgroup')
+        portgroup.obj_reset_changes()
+        portgroup._convert_to_version("1.9")
+        self.assertFalse(portgroup.dynamic_portgroup)
+        self.assertIn('dynamic_portgroup', portgroup.obj_get_changes())
+
+    def test_dynamic_portgroup_supported_set(self):
+        portgroup = objects.Portgroup(self.context, **self.fake_portgroup)
+        portgroup.dynamic_portgroup = True
+        portgroup.obj_reset_changes()
+        portgroup._convert_to_version("1.9")
+        self.assertTrue(portgroup.dynamic_portgroup)
+        self.assertNotIn('dynamic_portgroup', portgroup.obj_get_changes())
+
+    def test_dynamic_portgroup_unsupported(self):
+        portgroup = objects.Portgroup(self.context, **self.fake_portgroup)
+        portgroup._convert_to_version("1.8")
+        self.assertNotIn('dynamic_portgroup', portgroup)
+
+    def test_dynamic_portgroup_unsupported_missing(self):
+        portgroup = objects.Portgroup(self.context, **self.fake_portgroup)
+        delattr(portgroup, 'dynamic_portgroup')
+        portgroup.obj_reset_changes()
+        portgroup._convert_to_version("1.8")
+        self.assertNotIn('dynamic_portgroup', portgroup)
+
+    def test_dynamic_portgroup_unsupported_set_remove(self):
+        portgroup = objects.Portgroup(self.context, **self.fake_portgroup)
+        portgroup.dynamic_portgroup = False
+        portgroup.obj_reset_changes()
+        portgroup._convert_to_version("1.8")
+        self.assertNotIn('dynamic_portgroup', portgroup)
+
+    def test_dynamic_portgroup_unsupported_no_remove_non_default(self):
+        portgroup = objects.Portgroup(self.context, **self.fake_portgroup)
+        portgroup.dynamic_portgroup = True
+        portgroup.obj_reset_changes()
+        portgroup._convert_to_version("1.8", False)
+        self.assertFalse(portgroup.dynamic_portgroup)
+        self.assertIn('dynamic_portgroup', portgroup.obj_get_changes())
+
+    def test_dynamic_portgroup_unsupported_no_remove_default(self):
+        portgroup = objects.Portgroup(self.context, **self.fake_portgroup)
+        portgroup.dynamic_portgroup = False
+        portgroup.obj_reset_changes()
+        portgroup._convert_to_version("1.8", False)
+        self.assertFalse(portgroup.dynamic_portgroup)
+        self.assertNotIn('dynamic_portgroup', portgroup.obj_get_changes())

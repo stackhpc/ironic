@@ -13,25 +13,26 @@
 #    under the License.
 
 import contextlib
-import crypt
 import datetime
+from enum import Enum
 import functools
 import os
 import secrets
 import time
 
-from openstack.baremetal import configdrive as os_configdrive
 from oslo_config import cfg
+from oslo_context import context as oslo_context
 from oslo_log import log
-from oslo_serialization import jsonutils
 from oslo_service import loopingcall
-from oslo_utils import excutils
+from oslo_utils import secretutils
 from oslo_utils import strutils
 from oslo_utils import timeutils
 
+from ironic.common import async_steps
 from ironic.common import boot_devices
 from ironic.common import exception
 from ironic.common import faults
+from ironic.common import health_states
 from ironic.common.i18n import _
 from ironic.common import images
 from ironic.common import network
@@ -40,6 +41,7 @@ from ironic.common import states
 from ironic.common import utils
 from ironic.conductor import notification_utils as notify_utils
 from ironic.conductor import task_manager
+from ironic.drivers.modules import deploy_utils
 from ironic.objects import fields
 from ironic.objects import node_history
 
@@ -48,9 +50,16 @@ CONF = cfg.CONF
 
 
 PASSWORD_HASH_FORMAT = {
-    'sha256': crypt.METHOD_SHA256,
-    'sha512': crypt.METHOD_SHA512,
+    'sha256': 'SHA-256',
+    'sha512': 'SHA-512',
 }
+
+
+class StepFlow(Enum):
+    CLEANING_MANUAL = 'manual_cleaning'
+    CLEANING_AUTO = 'automated_cleaning'
+    DEPLOYMENT = 'deployment'
+    SERVICING = 'servicing'
 
 
 @task_manager.require_exclusive_lock
@@ -247,16 +256,16 @@ def _can_skip_state_change(task, new_state):
     try:
         curr_state = task.driver.power.get_power_state(task)
     except Exception as e:
-        with excutils.save_and_reraise_exception():
-            error = _(
-                "Failed to change power state to '%(target)s': %(error)s") % {
-                    'target': new_state, 'error': e}
-            node_history_record(node, event=error, error=True)
-            node['target_power_state'] = states.NOSTATE
-            node.save()
-            notify_utils.emit_power_set_notification(
-                task, fields.NotificationLevel.ERROR,
-                fields.NotificationStatus.ERROR, new_state)
+        error = _(
+            "Failed to change power state to '%(target)s': %(error)s") % {
+                'target': new_state, 'error': e}
+        node_history_record(node, event=error, error=True)
+        node['target_power_state'] = states.NOSTATE
+        node.save()
+        notify_utils.emit_power_set_notification(
+            task, fields.NotificationLevel.ERROR,
+            fields.NotificationStatus.ERROR, new_state)
+        raise
 
     if curr_state == states.POWER_ON:
         if new_state == states.POWER_ON:
@@ -289,22 +298,50 @@ def node_power_action(task, new_state, timeout=None):
              storage interface upon setting power on.
     :raises: other exceptions by the node's power driver if something
              wrong occurred during the power action.
-
+    :raises: ChildNodeLocked when a child node must be acted upon due
+             to this request, but we cannot act upon it due to a lock
+             being held.
+    :raises: ParentNodeLocked when a parent node must be acted upon
+             due to this request, but we cannot act upon it due to a
+             lock being held.
     """
     notify_utils.emit_power_set_notification(
         task, fields.NotificationLevel.INFO, fields.NotificationStatus.START,
         new_state)
     node = task.node
 
-    if _can_skip_state_change(task, new_state):
-        return
     target_state = _calculate_target_state(new_state)
+    if target_state == states.POWER_OFF and node.disable_power_off:
+        LOG.error("Refusing to power off node %s with disable_power_off "
+                  "flag set", node.uuid)
+        raise exception.PowerStateFailure(pstate=new_state)
+
+    if _can_skip_state_change(task, new_state):
+        # NOTE(TheJulia): Even if we are not changing the power state,
+        # we need to wipe the token out, just in case for some reason
+        # the power was turned off outside of our interaction/management.
+        if new_state in (states.POWER_OFF, states.SOFT_POWER_OFF,
+                         states.REBOOT, states.SOFT_REBOOT):
+            wipe_internal_info_on_power_off(node)
+            node.save()
+        return
+
+    # Parent node power required?
+    if task.node.parent_node:
+        # If we have a parent node defined for the device, we likely
+        # need to turn the power on.
+        parent_power_needed = not task.node.driver_info.get(
+            'has_dedicated_power_supply', False)
+    else:
+        parent_power_needed = False
 
     # Set the target_power_state and clear any last_error, if we're
     # starting a new operation. This will expose to other processes
-    # and clients that work is in progress.
-    node['target_power_state'] = target_state
-    node['last_error'] = None
+    # and clients that work is in progress. Keep the last_error intact
+    # if the power action happens as a result of a failure.
+    node.target_power_state = target_state
+    if node.provision_state not in states.FAILURE_STATES:
+        node.last_error = None
     node.timestamp_driver_internal_info('last_power_state_change')
     # NOTE(dtantsur): wipe token on shutting down, otherwise a reboot in
     # fast-track (or an accidentally booted agent) will cause subsequent
@@ -321,6 +358,12 @@ def node_power_action(task, new_state, timeout=None):
             task.driver.storage.attach_volumes(task)
 
         if new_state != states.REBOOT:
+            if new_state == states.POWER_ON and parent_power_needed:
+                _handle_child_power_on(task, target_state, timeout)
+            if new_state == states.POWER_OFF:
+                _handle_child_power_off(task, target_state, timeout)
+            # Parent/Child dependencies handled, we can take care of
+            # the original node now.
             task.driver.power.set_power_state(task, new_state, timeout=timeout)
         else:
             # TODO(TheJulia): We likely ought to consider toggling
@@ -328,19 +371,19 @@ def node_power_action(task, new_state, timeout=None):
             # really verify what cinder has connector wise.
             task.driver.power.reboot(task, timeout=timeout)
     except Exception as e:
-        with excutils.save_and_reraise_exception():
-            node['target_power_state'] = states.NOSTATE
-            error = _(
-                "Failed to change power state to '%(target_state)s' "
-                "by '%(new_state)s': %(error)s") % {
-                    'target_state': target_state,
-                    'new_state': new_state,
-                    'error': e}
-            node_history_record(node, event=error, error=True)
-            node.save()
-            notify_utils.emit_power_set_notification(
-                task, fields.NotificationLevel.ERROR,
-                fields.NotificationStatus.ERROR, new_state)
+        node['target_power_state'] = states.NOSTATE
+        error = _(
+            "Failed to change power state to '%(target_state)s' "
+            "by '%(new_state)s': %(error)s") % {
+                'target_state': target_state,
+                'new_state': new_state,
+                'error': e}
+        node_history_record(node, event=error, error=True)
+        node.save()
+        notify_utils.emit_power_set_notification(
+            task, fields.NotificationLevel.ERROR,
+            fields.NotificationStatus.ERROR, new_state)
+        raise
     else:
         # success!
         node['power_state'] = target_state
@@ -367,6 +410,68 @@ def node_power_action(task, new_state, timeout=None):
                 LOG.warning("Volume detachment for node %(node)s "
                             "failed: %(error)s",
                             {'node': node.uuid, 'error': e})
+
+
+def _handle_child_power_on(task, target_state, timeout):
+    """Actions related to powering on a parent for a child node."""
+    with task_manager.acquire(
+            task.context, task.node.parent_node,
+            shared=True,
+            purpose='power on parent node') as pn_task:
+        if (pn_task.driver.power.get_power_state(pn_task)
+                != states.POWER_ON):
+            try:
+                pn_task.upgrade_lock()
+            except exception.NodeLocked as e:
+                LOG.error('Cannot power on parent_node %(pn)s '
+                          'as it is locked by %(host)s. We are '
+                          'unable to proceed with the current '
+                          'operation for child node %(node)s. '
+                          'Error: %(error)s',
+                          {'pn': pn_task.node.uuid,
+                           'host': pn_task.node.reservation,
+                           'node': task.node.uuid,
+                           'error': e})
+                raise exception.ParentNodeLocked(
+                    node=task.node.uuid, parent=pn_task.node.uuid)
+            node_power_action(pn_task, target_state, timeout)
+
+
+def _handle_child_power_off(task, target_state, timeout):
+    """Actions related to powering off child nodes."""
+    child_nodes = task.node.list_child_node_ids(exclude_dedicated_power=True)
+    cn_tasks = []
+    try:
+        for child in child_nodes:
+            # Get the task for the node, check the status, add
+            # the list of locks to act upon.
+            cn_task = task_manager.acquire(
+                task.context, child, shared=True,
+                purpose='child node power off')
+            if (cn_task.driver.power.get_power_state(cn_task)
+                != states.POWER_OFF):
+                cn_task.upgrade_lock()
+                cn_tasks.append(cn_task)
+        for cn_task in cn_tasks:
+            node_power_action(cn_task, target_state, timeout)
+    except exception.NodeLocked as e:
+        LOG.error(
+            'Cannot power off child node %(cn)s '
+            'as it is locked by %(host)s. We are '
+            'unable to proceed with the current '
+            'operation for parent node %(node)s. '
+            'Error: %(error)s',
+            {'cn': cn_task.node.uuid,
+             'host': cn_task.node.reservation,
+             'node': task.node.uuid,
+             'error': e})
+        raise exception.ChildNodeLocked(
+            node=task.node.uuid, child=cn_task.node.uuid)
+    finally:
+        for cn_task in cn_tasks:
+            # We don't need to do anything else with the child node,
+            # and we need to release the child task's lock.
+            cn_task.release_resources()
 
 
 @task_manager.require_exclusive_lock
@@ -402,7 +507,12 @@ def provisioning_error_handler(e, node, provision_state,
         node.provision_state = provision_state
         node.target_provision_state = target_provision_state
         error = (_("No free conductor workers available"))
-        node_history_record(node, event=error, event_type=states.PROVISIONING,
+        if provision_state in (states.INSPECTING, states.INSPECTWAIT,
+                               states.INSPECTFAIL):
+            event_type = states.INTROSPECTION
+        else:
+            event_type = states.PROVISIONING
+        node_history_record(node, event=error, event_type=event_type,
                             error=True)
         node.save()
         LOG.warning("No free conductor workers available to perform "
@@ -466,7 +576,10 @@ def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
             msg2 = ('Failed to tear down cleaning on node %(uuid)s, '
                     'reason: %(err)s' % {'err': e, 'uuid': node.uuid})
             LOG.exception(msg2)
-            errmsg = _('%s. Also failed to tear down cleaning.') % errmsg
+            errmsg = _(
+                '%(orig_err)s. '
+                'Also %(msg2)s'
+            ) % {'orig_err': errmsg, 'msg2': msg2}
 
     if node.provision_state in (
             states.CLEANING,
@@ -476,12 +589,10 @@ def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
         node.clean_step = {}
         # Clear any leftover metadata about cleaning
         node.del_driver_internal_info('clean_step_index')
-        node.del_driver_internal_info('cleaning_reboot')
-        node.del_driver_internal_info('cleaning_polling')
-        node.del_driver_internal_info('skip_current_clean_step')
-        # We don't need to keep the old agent URL
+        async_steps.remove_node_flags(node)
+        # We don't need to keep the old agent URL, or token
         # as it should change upon the next cleaning attempt.
-        node.del_driver_internal_info('agent_url')
+        wipe_token_and_url(task)
     # For manual cleaning, the target provision state is MANAGEABLE, whereas
     # for automated cleaning, it is AVAILABLE.
     manual_clean = node.target_provision_state == states.MANAGEABLE
@@ -490,11 +601,38 @@ def cleaning_error_handler(task, logmsg, errmsg=None, traceback=False,
     # NOTE(dtantsur): avoid overwriting existing maintenance_reason
     if not node.maintenance_reason and set_maintenance:
         node.maintenance_reason = errmsg
+
+    if CONF.conductor.poweroff_in_cleanfail:
+        # NOTE(NobodyCam): Power off node in clean fail
+        node_power_action(task, states.POWER_OFF)
+
     node.save()
+
+    # Switch back to original interface, if necessary
+    task.driver.deploy.restore_interface(task)
 
     if set_fail_state and node.provision_state != states.CLEANFAIL:
         target_state = states.MANAGEABLE if manual_clean else None
         task.process_event('fail', target_state=target_state)
+
+
+def cleanup_servicewait_timeout(task):
+    """Cleanup a servicing task after timeout.
+
+    :param task: a TaskManager instance.
+    """
+    last_error = (_("Timeout reached while servicing the node. Please "
+                    "check if the ramdisk responsible for the servicing is "
+                    "running on the node. Failed on step %(step)s.") %
+                  {'step': task.node.service_step})
+    logmsg = ("Servicing for node %(node)s failed. %(error)s" %
+              {'node': task.node.uuid, 'error': last_error})
+    # NOTE(janders): this is called from the periodic task for servicewait
+    # timeouts, via the task manager's process_event(). The node has already
+    # been moved to SERVICEFAIL, so the error handler doesn't need to set the
+    # fail state.
+    servicing_error_handler(task, logmsg, errmsg=last_error,
+                            set_fail_state=False)
 
 
 def wipe_internal_info_on_power_off(node):
@@ -510,6 +648,8 @@ def wipe_internal_info_on_power_off(node):
     node.del_driver_internal_info('agent_cached_clean_steps')
     # Remove TLS certificate since it's regenerated on each run.
     node.del_driver_internal_info('agent_verify_ca')
+    # Remove agent start attempt tracking since it doesn't survive power off.
+    node.del_driver_internal_info('agent_start_attempted')
 
 
 def wipe_token_and_url(task):
@@ -534,10 +674,11 @@ def wipe_deploy_internal_info(task):
     node.del_driver_internal_info('user_deploy_steps')
     node.del_driver_internal_info('agent_cached_deploy_steps')
     node.del_driver_internal_info('deploy_step_index')
-    node.del_driver_internal_info('deployment_reboot')
-    node.del_driver_internal_info('deployment_polling')
-    node.del_driver_internal_info('skip_current_deploy_step')
     node.del_driver_internal_info('steps_validated')
+    node.del_driver_internal_info('image_source')
+    # Remove agent start attempt tracking since deployment is complete/aborted
+    node.del_driver_internal_info('agent_start_attempted')
+    async_steps.remove_node_flags(node)
 
 
 def wipe_cleaning_internal_info(task):
@@ -548,11 +689,27 @@ def wipe_cleaning_internal_info(task):
     node.set_driver_internal_info('clean_steps', None)
     node.del_driver_internal_info('agent_cached_clean_steps')
     node.del_driver_internal_info('clean_step_index')
-    node.del_driver_internal_info('cleaning_reboot')
-    node.del_driver_internal_info('cleaning_polling')
     node.del_driver_internal_info('cleaning_disable_ramdisk')
-    node.del_driver_internal_info('skip_current_clean_step')
     node.del_driver_internal_info('steps_validated')
+    node.del_driver_internal_info('declarative_cleaning')
+    # Remove agent start attempt tracking since cleaning is complete/aborted
+    node.del_driver_internal_info('agent_start_attempted')
+    async_steps.remove_node_flags(node)
+
+
+def wipe_service_internal_info(task):
+    """Remove temporary servicing fields from driver_internal_info."""
+    wipe_token_and_url(task)
+    node = task.node
+    node.set_driver_internal_info('service_steps', None)
+    node.del_driver_internal_info('agent_cached_service_steps')
+    node.del_driver_internal_info('service_step_index')
+    node.del_driver_internal_info('service_disable_ramdisk')
+    node.del_driver_internal_info('steps_validated')
+    node.del_driver_internal_info('image_source')
+    # Remove agent start attempt tracking since servicing is complete/aborted
+    node.del_driver_internal_info('agent_start_attempted')
+    async_steps.remove_node_flags(node)
 
 
 def deploying_error_handler(task, logmsg, errmsg=None, traceback=False,
@@ -572,6 +729,11 @@ def deploying_error_handler(task, logmsg, errmsg=None, traceback=False,
                         error=True)
     node.save()
 
+    # NOTE(JayF): Unlike cleaning_error_handler, we deliberately do not call
+    # restore_interface() here. A DEPLOY FAILED node keeps the concrete
+    # interface so that a retried deploy or a tear down operates on the
+    # interface which actually ran. The original interface is restored once
+    # the node is torn down and cleaned.
     cleanup_err = None
     if clean_up:
         try:
@@ -587,6 +749,14 @@ def deploying_error_handler(task, logmsg, errmsg=None, traceback=False,
                          'aborting. More information may be found in the log '
                          'file.')
             cleanup_err = '%(err)s. %(add)s' % {'err': errmsg, 'add': addl}
+    else:
+        if CONF.conductor.clear_image_cache_on_deploy_failure:
+            try:
+                deploy_utils.destroy_images(node.uuid)
+            except Exception as e:
+                LOG.warning('Failed to clean up cached instance images '
+                            'for node %(node)s; reason: %(err)s',
+                            {'node': node.uuid, 'err': e})
 
     node.refresh()
     if node.provision_state in (
@@ -730,6 +900,94 @@ def cleanup_rescuewait_timeout(task):
     rescuing_error_handler(task, msg, set_fail_state=False)
 
 
+def inspecting_error_handler(task, logmsg, errmsg=None, traceback=False,
+                             tear_down_inspection=True):
+    """Handle inspection failures and clean up resources.
+
+    :param task: a TaskManager instance.
+    :param logmsg: Message to be logged.
+    :param errmsg: Message for the user. Optional, if not provided
+        `logmsg` is used.
+    :param traceback: Whether to log a traceback. Defaults to False.
+    :param tear_down_inspection: Whether to clean up the inspection
+        network and boot configuration. Default to True.
+    """
+    errmsg = errmsg or logmsg
+    node = task.node
+    LOG.error(logmsg, exc_info=traceback)
+    node_history_record(node, event=errmsg, event_type=states.INTROSPECTION,
+                        error=True)
+
+    if tear_down_inspection:
+        # Try to call abort() for full cleanup (boot config, etc)
+        try:
+            task.driver.inspect.abort(task)
+        except exception.UnsupportedDriverExtension:
+            LOG.debug('Inspect interface %(intf)s does not support abort '
+                      'for node %(node)s, will clean up manually',
+                      {'intf': node.inspect_interface, 'node': node.uuid})
+            # If abort is not supported, manually clean up boot config
+            try:
+                task.driver.boot.clean_up_ramdisk(task)
+            except Exception as e:
+                msg2 = ('Failed to clean up ramdisk boot for node '
+                        '%(uuid)s, reason: %(err)s'
+                        % {'err': e, 'uuid': node.uuid})
+                LOG.exception(msg2)
+                errmsg = _('%(orig_err)s. Also %(msg2)s') % {
+                    'orig_err': errmsg, 'msg2': msg2}
+        except Exception as e:
+            msg2 = ('Failed to abort inspection on node %(uuid)s, '
+                    'reason: %(err)s' % {'err': e, 'uuid': node.uuid})
+            LOG.exception(msg2)
+            errmsg = _('%(orig_err)s. Also %(msg2)s') % {
+                'orig_err': errmsg, 'msg2': msg2}
+
+        # EXPLICITLY ensure inspection network is removed (VIF cleanup)
+        # This is critical and must happen even if abort() fails or is
+        # unsupported
+        power_state_to_restore = None
+        try:
+            power_state_to_restore = power_on_node_if_needed(task)
+            task.driver.network.remove_inspection_network(task)
+        except Exception as e:
+            msg2 = ('Failed to remove inspection network for node '
+                    '%(uuid)s, reason: %(err)s'
+                    % {'err': e, 'uuid': node.uuid})
+            LOG.exception(msg2)
+            errmsg = _('%(orig_err)s. Also %(msg2)s') % {
+                'orig_err': errmsg, 'msg2': msg2}
+        finally:
+            # Always restore power state even if network cleanup fails
+            try:
+                restore_power_state_if_needed(task, power_state_to_restore)
+            except Exception:
+                LOG.exception('Failed to restore power state for node %s',
+                              node.uuid)
+
+    # Clear inspection-related internal info
+    wipe_token_and_url(task)
+    node.save()
+
+
+@task_manager.require_exclusive_lock
+def cleanup_inspectwait_timeout(task):
+    """Cleanup an inspection task after timeout.
+
+    :param task: a TaskManager instance.
+    """
+    last_error = (_("Timeout reached while inspecting the node. Please "
+                    "check if the ramdisk responsible for the inspection "
+                    "is running on the node."))
+    logmsg = ("Inspection for node %(node)s failed. %(error)s"
+              % {'node': task.node.uuid, 'error': last_error})
+    # NOTE(TheJulia): this is called from the periodic task for
+    # inspectwait timeouts, via the task manager's process_event().
+    # The node has already been moved to INSPECTFAIL, so we just need
+    # to clean up resources.
+    inspecting_error_handler(task, logmsg, errmsg=last_error)
+
+
 def _spawn_error_handler(e, node, operation):
     """Handle error while trying to spawn a process.
 
@@ -758,6 +1016,11 @@ def spawn_cleaning_error_handler(e, node):
 def spawn_deploying_error_handler(e, node):
     """Handle spawning error for node deploying."""
     _spawn_error_handler(e, node, states.DEPLOYING)
+
+
+def spawn_servicing_error_handler(e, node):
+    """Handle spawning error for node servicing."""
+    _spawn_error_handler(e, node, states.SERVICING)
 
 
 def spawn_rescue_error_handler(e, node):
@@ -794,7 +1057,6 @@ def power_state_error_handler(e, node, power_state):
                     {'node': node.uuid, 'power_state': power_state})
 
 
-@task_manager.require_exclusive_lock
 def validate_port_physnet(task, port_obj):
     """Validate the consistency of physical networks of ports in a portgroup.
 
@@ -816,6 +1078,12 @@ def validate_port_physnet(task, port_obj):
     ironic nodes to continue to function after an upgrade to a release
     including physical network support.
 
+    When a port that has a physical network is added to a portgroup which has
+    no other member ports and no physical network of its own, the port's
+    physical network is adopted by the portgroup. This keeps the portgroup and
+    its member ports consistent rather than leaving the portgroup on physical
+    network None while it holds a member port on a real physical network.
+
     :param task: a TaskManager instance
     :param port_obj: a port object to be validated.
     :raises: Conflict if the port is a member of a portgroup which is on a
@@ -833,19 +1101,33 @@ def validate_port_physnet(task, port_obj):
     if not (delta & {'portgroup_id', 'physical_network'}):
         return
 
+    port_physnet = (port_obj.physical_network
+                    if 'physical_network' in port_obj else None)
+
     # Determine the current physical network of the portgroup.
     pg_physnets = network.get_physnets_by_portgroup_id(task,
                                                        port_obj.portgroup_id,
                                                        exclude_port=port_obj)
 
     if not pg_physnets:
-        return
+        portgroup = network.get_portgroup_by_id(task, port_obj.portgroup_id)
+        if portgroup and portgroup.physical_network is not None:
+            pg_physnets = {portgroup.physical_network}
+        elif portgroup and port_physnet is not None:
+            # The portgroup has no other member ports and no physical network
+            # of its own. The port joining it defines the portgroup's physical
+            # network, so that the portgroup does not end up on physical
+            # network None while holding a member port on a real physical
+            # network.
+            portgroup.physical_network = port_physnet
+            portgroup.save()
+            return
+        else:
+            return
 
     # Check that the port has the same physical network as any existing
     # member ports.
     pg_physnet = pg_physnets.pop()
-    port_physnet = (port_obj.physical_network
-                    if 'physical_network' in port_obj else None)
     if port_physnet != pg_physnet:
         portgroup = network.get_portgroup_by_id(task, port_obj.portgroup_id)
         msg = _("Port with physical network %(physnet)s cannot become a "
@@ -938,6 +1220,10 @@ def notify_conductor_resume_deploy(task):
     notify_conductor_resume_operation(task, 'deploy')
 
 
+def notify_conductor_resume_service(task):
+    notify_conductor_resume_operation(task, 'service')
+
+
 def skip_automated_cleaning(node):
     """Checks if node cleaning needs to be skipped for an specific node.
 
@@ -983,8 +1269,11 @@ def power_on_node_if_needed(task):
                       {'host': host_id})
 
             client = neutron.get_client(context=task.context)
-            neutron.wait_for_host_agent(
-                client, host_id, target_state='down')
+            try:
+                neutron.wait_for_host_agent(
+                    client, host_id, target_state='down')
+            finally:
+                client.close()
         return previous_power_state
 
 
@@ -1019,49 +1308,6 @@ def power_state_for_network_configuration(task):
     restore_power_state_if_needed(task, previous)
 
 
-def build_configdrive(node, configdrive):
-    """Build a configdrive from provided meta_data, network_data and user_data.
-
-    If uuid or name are not provided in the meta_data, they're defauled to the
-    node's uuid and name accordingly.
-
-    :param node: an Ironic node object.
-    :param configdrive: A configdrive as a dict with keys ``meta_data``,
-        ``network_data``, ``user_data`` and ``vendor_data`` (all optional).
-    :returns: A gzipped and base64 encoded configdrive as a string.
-    """
-    meta_data = configdrive.setdefault('meta_data', {})
-    meta_data.setdefault('uuid', node.uuid)
-    if node.name:
-        meta_data.setdefault('name', node.name)
-
-    user_data = configdrive.get('user_data')
-    if isinstance(user_data, (dict, list)):
-        user_data = jsonutils.dump_as_bytes(user_data)
-    elif user_data:
-        user_data = user_data.encode('utf-8')
-
-    LOG.debug('Building a configdrive for node %s', node.uuid)
-    return os_configdrive.build(meta_data, user_data=user_data,
-                                network_data=configdrive.get('network_data'),
-                                vendor_data=configdrive.get('vendor_data'))
-
-
-def get_configdrive_image(node):
-    """Get configdrive as an ISO image or a URL.
-
-    Converts the JSON representation into an image. URLs and raw contents
-    are returned unchanged.
-
-    :param node: an Ironic node object.
-    :returns: A gzipped and base64 encoded configdrive as a string.
-    """
-    configdrive = node.instance_info.get('configdrive')
-    if isinstance(configdrive, dict):
-        configdrive = build_configdrive(node, configdrive)
-    return configdrive
-
-
 def fast_track_able(task):
     """Checks if the operation can be a streamlined deployment sequence.
 
@@ -1085,19 +1331,31 @@ def fast_track_able(task):
             # TODO(TheJulia): Should we check the provisioning/deployment
             # networks match config wise? Do we care? #decisionsdecisions
             and task.driver.storage.should_write_image(task)
-            and task.node.last_error is None)
+            and task.node.last_error is None
+            # NOTE(dtantsur): Fast track makes zero sense for servicing and
+            # may prevent normal clean-up from happening.
+            and task.node.provision_state not in states.SERVICING_STATES
+            # NOTE: Firmware updates require proper cleanup (e.g., virtual
+            # media ejection) and should not use fast-track.
+            and not task.node.driver_internal_info.get('redfish_fw_updates')
+            and not task.node.driver_internal_info.get('firmware_updates'))
 
 
 def value_within_timeout(value, timeout):
     """Checks if the time is within the previous timeout seconds from now.
 
-    :param value: a string representing date and time or None.
+    :param value: a datetime or string representing date and time or None.
     :param timeout: timeout in seconds.
     """
     # use native datetime objects for conversion and compare
-    # slightly odd because py2 compatability :(
-    last = datetime.datetime.strptime(value or '1970-01-01T00:00:00.000000',
-                                      "%Y-%m-%dT%H:%M:%S.%f")
+    # slightly odd because py2 compatibility :(
+    if isinstance(value, datetime.datetime):
+        # Converts to a offset-naive datetime(as created by timeutils.utcnow())
+        last = value.replace(tzinfo=None)
+    else:
+        defaultdt = '1970-01-01T00:00:00.000000'
+        last = datetime.datetime.strptime(value or defaultdt,
+                                          '%Y-%m-%dT%H:%M:%S.%f')
     # If we found nothing, we assume that the time is essentially epoch.
     time_delta = datetime.timedelta(seconds=timeout)
     last_valid = timeutils.utcnow() - time_delta
@@ -1107,21 +1365,30 @@ def value_within_timeout(value, timeout):
 def agent_is_alive(node, timeout=None):
     """Check that the agent is likely alive.
 
-    The method then checks for the last agent heartbeat, and if it occured
+    The method then checks for the last agent heartbeat, and if it occurred
     within the timeout set by [deploy]fast_track_timeout, then agent is
     presumed alive.
 
     :param node: A node object.
     :param timeout: Heartbeat timeout, defaults to `fast_track_timeout`.
     """
+
+    timeout = timeout or CONF.deploy.fast_track_timeout
+    if node.power_state == states.POWER_ON and \
+       node.inspection_finished_at and \
+       value_within_timeout(node.inspection_finished_at, timeout):
+        return True
+
     # If no agent_url is present then we have powered down since the
-    # last agent heartbeat
-    if not node.driver_internal_info.get('agent_url'):
+    # last agent heartbeat. Ignore this check while inspection since agent URL
+    # is not available at that point.
+    if (not node.driver_internal_info.get('agent_url')
+            and node.provision_state not in (states.INSPECTING,
+                                             states.INSPECTWAIT)):
         return False
 
     return value_within_timeout(
-        node.driver_internal_info.get('agent_last_heartbeat'),
-        timeout or CONF.deploy.fast_track_timeout)
+        node.driver_internal_info.get('agent_last_heartbeat'), timeout)
 
 
 def is_fast_track(task):
@@ -1132,7 +1399,7 @@ def is_fast_track(task):
     have a ramdisk running through another means like discovery.
     If not valid, False is returned.
 
-    The method then checks for the last agent heartbeat, and if it occured
+    The method then checks for the last agent heartbeat, and if it occurred
     within the timeout set by [deploy]fast_track_timeout and the power
     state for the machine is POWER_ON, then fast track is permitted.
 
@@ -1191,7 +1458,7 @@ def _get_node_next_steps(task, step_type, skip_current_step=True):
     :returns: index of the next step; None if there are none to execute.
 
     """
-    valid_types = set(['clean', 'deploy'])
+    valid_types = set(['clean', 'deploy', 'service'])
     if step_type not in valid_types:
         # NOTE(rloo): No need to i18n this, since this would be a
         # developer error; it isn't user-facing.
@@ -1233,14 +1500,8 @@ def update_next_step_index(task, step_type):
     :param step_type: The type of steps to process: 'clean' or 'deploy'.
     :returns: Index of the next step.
     """
-    skip_current_step = task.node.del_driver_internal_info(
-        'skip_current_%s_step' % step_type, True)
-    if step_type == 'clean':
-        task.node.del_driver_internal_info('cleaning_polling')
-    else:
-        task.node.del_driver_internal_info('deployment_polling')
-    task.node.save()
-
+    skip_current_step = async_steps.prepare_node_for_next_step(
+        task.node, step_type)
     return _get_node_next_steps(task, step_type,
                                 skip_current_step=skip_current_step)
 
@@ -1304,7 +1565,7 @@ def is_agent_token_pregenerated(node):
 
     This method helps us identify WHEN we did so as we don't need to remove
     records of the token prior to rebooting the token. This is important as
-    tokens provided through out of band means presist in the virtual media
+    tokens provided through out of band means persist in the virtual media
     image, are loaded as part of the agent ramdisk, and do not require
     regeneration of the token upon the initial lookup, ultimately making
     the overall usage of virtual media and pregenerated tokens far more
@@ -1324,7 +1585,7 @@ def make_salt():
 
     :returns: a valid salt for use with crypt.crypt
     """
-    return crypt.mksalt(
+    return secretutils.crypt_mksalt(
         method=PASSWORD_HASH_FORMAT[
             CONF.conductor.rescue_password_hash_algorithm])
 
@@ -1334,37 +1595,7 @@ def hash_password(password=''):
 
     :param password: password to be hashed
     """
-    return crypt.crypt(password, make_salt())
-
-
-def get_attached_vif(port):
-    """Get any attached vif ID for the port
-
-    :param port: The port object upon which to check for a vif
-                 record.
-    :returns: Returns a tuple of the vif if found and the use of
-              the vif in the form of a string, 'tenant', 'cleaning'
-              'provisioning', 'rescuing'.
-    :raises: InvalidState exception upon finding a port with a
-             transient state vif on the port.
-    """
-
-    tenant_vif = port.internal_info.get('tenant_vif_port_id')
-    if tenant_vif:
-        return (tenant_vif, 'tenant')
-    clean_vif = port.internal_info.get('cleaning_vif_port_id')
-    if clean_vif:
-        return (clean_vif, 'cleaning')
-    prov_vif = port.internal_info.get('provisioning_vif_port_id')
-    if prov_vif:
-        return (prov_vif, 'provisioning')
-    rescue_vif = port.internal_info.get('rescuing_vif_port_id')
-    if rescue_vif:
-        return (rescue_vif, 'rescuing')
-    inspection_vif = port.internal_info.get('inspection_vif_port_id')
-    if inspection_vif:
-        return (inspection_vif, 'inspecting')
-    return (None, None)
+    return secretutils.crypt_password(password, make_salt())
 
 
 def store_agent_certificate(node, agent_verify_ca):
@@ -1377,9 +1608,9 @@ def store_agent_certificate(node, agent_verify_ca):
                 with open(existing_verify_ca, 'rt') as fp:
                     existing_text = fp.read()
             except EnvironmentError:
-                with excutils.save_and_reraise_exception():
-                    LOG.exception('Could not read the existing TLS certificate'
-                                  ' for node %s', node.uuid)
+                LOG.exception('Could not read the existing TLS certificate'
+                              ' for node %s', node.uuid)
+                raise
 
             if existing_text.strip() != agent_verify_ca.strip():
                 LOG.error('Content mismatch for agent_verify_ca for '
@@ -1400,27 +1631,27 @@ def store_agent_certificate(node, agent_verify_ca):
         with open(fname, 'wt') as fp:
             fp.write(agent_verify_ca)
     except EnvironmentError:
-        with excutils.save_and_reraise_exception():
-            LOG.exception('Could not save the TLS certificate for node %s',
-                          node.uuid)
+        LOG.exception('Could not save the TLS certificate for node %s',
+                      node.uuid)
+        raise
     else:
         LOG.debug('Saved the custom certificate for node %(node)s to %(file)s',
                   {'node': node.uuid, 'file': fname})
         return fname
 
 
-def node_cache_bios_settings(task, node):
+def node_cache_bios_settings(task):
     """Do caching of bios settings if supported by driver"""
     try:
-        LOG.debug('Getting BIOS info for node %s', node.uuid)
+        LOG.debug('Getting BIOS info for node %s', task.node.uuid)
         task.driver.bios.cache_bios_settings(task)
     except exception.UnsupportedDriverExtension:
         LOG.warning('BIOS settings are not supported for node %s, '
-                    'skipping', node.uuid)
-    # TODO(zshi) remove this check when classic drivers are removed
+                    'skipping', task.node.uuid)
     except Exception:
+        # NOTE(dtantsur): the caller expects this function to never fail
         msg = (_('Caching of bios settings failed on node %(node)s.')
-               % {'node': node.uuid})
+               % {'node': task.node.uuid})
         LOG.exception(msg)
 
 
@@ -1442,6 +1673,7 @@ def node_cache_vendor(task):
     except exception.UnsupportedDriverExtension:
         return
     except Exception as exc:
+        # NOTE(dtantsur): the caller expects this function to never fail
         LOG.warning('Unexpected exception when trying to detect vendor '
                     'for node %(node)s. %(class)s: %(exc)s',
                     {'node': task.node.uuid,
@@ -1497,9 +1729,95 @@ def node_cache_boot_mode(task):
         task.node.secure_boot = secure_boot
         task.node.save()
         LOG.info("Updated boot_mode %(boot_mode)s, secure_boot %(secure_boot)s"
-                 "for node %(node)s",
+                 " for node %(node)s",
                  {'boot_mode': boot_mode, 'secure_boot': secure_boot,
                   'node': task.node.uuid})
+
+
+def node_cache_health(task):
+    """Cache node health status from BMC if supported by the driver.
+
+    Attempts to retrieve hardware health status from the node's management
+    interface. If the driver supports health monitoring and the status has
+    changed, the node's health field is updated and an entry is added to
+    node history.
+
+    :param task: a TaskManager instance containing the node to check.
+    """
+    # Skip if health monitoring is disabled
+    if not CONF.conductor.enable_health_monitoring:
+        return
+
+    # Try to retrieve health status from the driver's management interface
+    try:
+        health = task.driver.management.get_node_health(task)
+    except exception.UnsupportedDriverExtension:
+        # Driver doesn't support health monitoring, skip silently
+        return
+    except Exception as exc:
+        # Log error but don't fail if health checking fails
+        LOG.warning(_('Could not retrieve health status for node %(node)s: '
+                      '%(class)s: %(exc)s'),
+                    {'node': task.node.uuid,
+                     'class': type(exc).__name__, 'exc': exc},
+                    exc_info=not isinstance(exc, exception.IronicException))
+        return
+
+    # Validate health value before saving - reject invalid states
+    if (health is not None
+            and not isinstance(health, health_states.HealthState)):
+        LOG.warning(_("Node %(node)s reports invalid health value "
+                      "'%(health)s', ignoring. Expected HealthState enum."),
+                    {'node': task.node.uuid, 'health': health})
+        return
+
+    # Process the health status if retrieved
+    try:
+        # Check if value changed from what's stored
+        old_health = task.node.health
+        # Convert enum to string value for storage and comparison
+        health_value = health.value if health else None
+
+        if health_value != old_health:
+            # Health status changed, need to update node
+            task.upgrade_lock(purpose='caching health status')
+            task.node.health = health_value
+            task.node.save()
+
+            LOG.debug(_("Updated health status for node %(node)s: "
+                        "health=%(health)s (was %(old_health)s)"),
+                      {'node': task.node.uuid, 'health': health_value,
+                       'old_health': old_health})
+
+            # Record change in node history
+            event_msg = (
+                _("Node health status changed: health='%(health)s' "
+                  "(previously '%(old_health)s')") % {
+                    'health': health_value or 'None',
+                    'old_health': old_health or 'None'
+                }
+            )
+            node_history_record(
+                task.node,
+                event=event_msg,
+                event_type='monitoring',
+                error=False
+            )
+
+            # Log warning if health indicates a problem
+            if health in (health_states.HealthState.WARNING,
+                          health_states.HealthState.CRITICAL):
+                LOG.warning(_("Node %(node)s health status indicates a "
+                              "problem: health=%(health)s"),
+                            {'node': task.node.uuid, 'health': health_value})
+
+    except Exception as exc:
+        # Log error but don't fail if health value processing fails
+        LOG.warning(_('Error updating health status for node %(node)s: '
+                      '%(class)s: %(exc)s'),
+                    {'node': task.node.uuid,
+                     'class': type(exc).__name__, 'exc': exc},
+                    exc_info=not isinstance(exc, exception.IronicException))
 
 
 def node_change_boot_mode(task, target_boot_mode):
@@ -1593,10 +1911,9 @@ def node_change_secure_boot(task, secure_boot_target):
         task.node.secure_boot = secure_boot_target
         task.node.save()
 
-
 def node_history_record(node, conductor=None, event=None,
                         event_type=None, user=None,
-                        error=False):
+                        error=False, project=None):
     """Records a node history record
 
     Adds an entry to the node history table with the appropriate fields
@@ -1617,36 +1934,66 @@ def node_history_record(node, conductor=None, event=None,
                        based upon the activity. The purpose is to help guide
                        an API consumer/operator to have a better contextual
                        understanding of what was going on *when* the "event"
-                       occured.
+                       occurred.
     :param user: The user_id value which triggered the request,
                  if available.
+    :param project: The project_id value which triggered the request,
+                    if available.
     :param error: Boolean value, default false, to signify if the event
                   is an error which should be recorded in the node
                   ``last_error`` field.
     :returns: None. No value is returned by this method.
     """
     if not event:
-        # No error has occured, apparently.
+        # No error has occurred, apparently.
         return
+
     if error:
         # When the task exits out or is saved, the event
-        # or error is saved, but that is outside of ceating an
+        # or error is saved, but that is outside of creating an
         # entry in the history table.
         node.last_error = event
     if not conductor:
         conductor = CONF.host
+    # NOTE(edomfeh): Resolved the user ID independently of
+    # the conductor check block to ensure it executes when a
+    # custom conductor string is supplied. We fall back to the
+    # thread-local context if an explicit user parameter is
+    # not passed into the function.
+    actual_user = user
+    if not actual_user:
+        current_context = oslo_context.get_current()
+        if current_context:
+            actual_user = getattr(current_context, 'user_id', None)
     if CONF.conductor.node_history:
+        duration = None
+        if node.provision_updated_at is not None:
+            try:
+                now = timeutils.utcnow(with_timezone=True)
+                time_spent = now - node.provision_updated_at
+                duration = int(time_spent.total_seconds())
+            except TypeError:
+                LOG.debug("Unable to parse duration for node %s. "
+                          "'provision_updated_at' is not a valid "
+                          "datetime type.", node.uuid)
+
         # If the maximum number of entries is not set to zero,
         # then we should record the entry.
         # NOTE(TheJulia): DB API automatically adds in a uuid.
         # TODO(TheJulia): At some point, we should allow custom severity.
+
         node_history.NodeHistory(
             node_id=node.id,
             conductor=CONF.host,
-            user=user,
+            user=actual_user,
+            project=project,
             severity=error and "ERROR" or "INFO",
             event=event,
-            event_type=event_type or "UNKNOWN").create()
+            event_type=event_type or "UNKNOWN",
+            state=node.provision_state,
+            target_provision_state=node.target_provision_state,
+            duration_seconds=duration
+            ).create()
 
 
 def update_image_type(context, node):
@@ -1670,7 +2017,7 @@ def update_image_type(context, node):
         # idea since it is also user-settable, but laregely is just geared
         # to take what is in glance. Line below should we wish to uncomment.
         # node.set_instance_info('image_type', images.IMAGE_TYPE_DIRECTORY)
-        # An alternative is to explictly allow it to be configured by the
+        # An alternative is to explicitly allow it to be configured by the
         # caller/requester.
         return True
 
@@ -1711,7 +2058,7 @@ def get_token_project_from_request(ctx):
     This method evaluates the ``auth_token_info`` field, which is used to
     pass information returned from keystone as a token's
     verification. This information is based upon the actual, original
-    requestor context provided ``auth_token``.
+    requester context provided ``auth_token``.
 
     When a service, such as Nova proxies a request, the request provided
     auth token value is intended to be from the original user.
@@ -1725,5 +2072,182 @@ def get_token_project_from_request(ctx):
             if project:
                 return project.get('id')
     except AttributeError:
-        LOG.warning('Attempted to identify requestor project ID value, '
+        LOG.warning('Attempted to identify requester project ID value, '
                     'however we were unable to do so. Possible older API?')
+
+
+def servicing_error_handler(task, logmsg, errmsg=None, traceback=False,
+                            tear_down_service=True, set_fail_state=True,
+                            set_maintenance=None):
+    """Put a failed node in SERVICEFAIL and maintenance (if needed).
+
+    :param task: a TaskManager instance.
+    :param logmsg: Message to be logged.
+    :param errmsg: Message for the user. Optional, if not provided `logmsg` is
+        used.
+    :param traceback: Whether to log a traceback. Defaults to False.
+    :param tear_down_service: Whether to clean up the PXE and DHCP files after
+        service. Default to True.
+    :param set_fail_state: Whether to set node to failed state. Default to
+        True.
+    :param set_maintenance: Whether to set maintenance mode. If None,
+        maintenance mode will be set if and only if a clean step is being
+        executed on a node.
+    """
+    if set_maintenance is None:
+        set_maintenance = bool(task.node.service_step)
+
+    errmsg = errmsg or logmsg
+    LOG.error(logmsg, exc_info=traceback)
+    node = task.node
+    if set_maintenance:
+        node.fault = faults.SERVICE_FAILURE
+        node.maintenance = True
+
+    if tear_down_service:
+        try:
+            task.driver.deploy.tear_down_service(task)
+        except Exception as e:
+            msg2 = ('Failed to tear down servicing on node %(uuid)s, '
+                    'reason: %(err)s' % {'err': e, 'uuid': node.uuid})
+            LOG.exception(msg2)
+            errmsg = _('%s. Also failed to tear down servicing.') % errmsg
+
+    if node.provision_state in (
+            states.SERVICING,
+            states.SERVICEWAIT,
+            states.SERVICEFAIL):
+        # Clear clean step, msg should already include current step
+        node.service_step = {}
+        # Clear any leftover metadata about cleaning
+        node.del_driver_internal_info('service_step_index')
+        async_steps.remove_node_flags(node)
+        # We don't need to keep the old agent URL, or token
+        # as it should change upon the next cleaning attempt.
+        wipe_token_and_url(task)
+    # For manual cleaning, the target provision state is MANAGEABLE, whereas
+    # for automated cleaning, it is AVAILABLE.
+    node_history_record(node, event=errmsg, event_type=states.SERVICING,
+                        error=True)
+    # NOTE(dtantsur): avoid overwriting existing maintenance_reason
+    if not node.maintenance_reason and set_maintenance:
+        node.maintenance_reason = errmsg
+
+    if CONF.conductor.poweroff_in_servicefail:
+        # NOTE(NobodyCam): Power off node in service fail
+        node_power_action(task, states.POWER_OFF)
+
+    node.save()
+
+    # Switch back to original interface, if necessary
+    task.driver.deploy.restore_interface(task)
+
+    if set_fail_state and node.provision_state != states.SERVICEFAIL:
+        task.process_event('fail')
+
+
+def node_cache_firmware_components(task):
+    """Do caching of firmware components if supported by driver"""
+
+    try:
+        LOG.debug('Getting Firmware Components for node %s', task.node.uuid)
+        task.driver.firmware.validate(task)
+        task.driver.firmware.cache_firmware_components(task)
+    except exception.UnsupportedDriverExtension:
+        LOG.warning('Firmware Components are not supported for node %s, '
+                    'skipping', task.node.uuid)
+    except Exception:
+        # NOTE(dtantsur): the caller expects this function to never fail
+        LOG.exception('Caching of firmware components failed on node %s',
+                      task.node.uuid)
+
+
+def run_node_action(task, call, error_msg, success_msg=None, **kwargs):
+    """Run a node action and report any errors via last_error.
+
+    :param task: A TaskManager instance containing the node to act on.
+    :param call: A callable object to invoke.
+    :param error_msg: A template for a failure message. Can use %(node)s,
+        %(exc)s and any variables from kwargs.
+    :param success_msg: A template for a success message. Can use %(node)s
+        and any variables from kwargs.
+    :param kwargs: Arguments to pass to the call.
+    """
+    error = None
+    try:
+        call(task, **kwargs)
+    except Exception as exc:
+        error = error_msg % dict(kwargs, node=task.node.uuid, exc=exc)
+        node_history_record(task.node, event=error, error=True)
+        LOG.error(
+            error, exc_info=not isinstance(exc, exception.IronicException))
+
+    task.node.save()
+    if not error and success_msg:
+        LOG.info(success_msg, dict(kwargs, node=task.node.uuid))
+
+
+def node_update_cache(task):
+    """Updates various cached information.
+
+    Includes vendor, boot mode, BIOS settings and firmware components.
+
+    :param task: A TaskManager instance containing the node to act on.
+    """
+    # FIXME(dtantsur): in case of Redfish, these 4 calls may result in the
+    # System object loaded at least 4 times. "Cache whatever you can" should
+    # probably be a driver call, just not clear in which interface.
+    node_cache_vendor(task)
+    node_cache_boot_mode(task)
+    node_cache_bios_settings(task)
+    node_cache_firmware_components(task)
+
+
+def log_step_flow_history(node, flow, steps, status, aborted_step=None):
+    """Persist start/end milestones for cleaning / servicing / deploy flows.
+
+    :param node: A Node object
+    :param flow: A StepFlow enum member, e.g. StepFlow.DEPLOYMENT
+    :param steps: full list of step dicts (may be empty/None)
+    :param status: ``'start'`` or ``'done'``
+    :param aborted_step:  name of failed step (optional)
+    """
+    if not (CONF.conductor.record_step_flows_in_history
+            or CONF.conductor.log_step_flows_to_syslog):
+        return
+
+    sanitized = [
+        (
+            dict(st, args=strutils.mask_dict_password(st["args"]))
+            if isinstance(st, dict) and isinstance(st.get("args"), dict)
+            else st
+        )
+        for st in (steps or [])
+    ]
+
+    error = False
+    if status == "start":
+        event_type = "%s_start" % flow.value
+        event = "Starting %s with steps=%s" % (
+            flow.value.replace("_", " "), sanitized)
+    elif status == "end":
+        event_type = "%s_end" % flow.value
+        if aborted_step:
+            error = True
+            event = "%s aborted at step '%s' with steps=%s" % (
+                flow.value.replace("_", " ").title(),
+                aborted_step, sanitized)
+        else:
+            event = "%s completed successfully with steps=%s" % (
+                flow.value.replace("_", " ").title(), sanitized)
+    else:
+        raise ValueError("Unknown status '%s'" % status)
+
+    if CONF.conductor.log_step_flows_to_syslog:
+        log_fn = LOG.warning if error else LOG.info
+        log_fn("Node %(node)s: %(event)s",
+               {'node': node.uuid, 'event': event})
+
+    if CONF.conductor.record_step_flows_in_history:
+        node_history_record(node, event=event, event_type=event_type,
+                            error=error)

@@ -16,6 +16,7 @@
 from oslo_config import cfg
 
 from ironic.common.i18n import _
+from ironic.conf import types as ir_types
 
 opts = [
     cfg.IntOpt('connection_attempts',
@@ -28,6 +29,25 @@ opts = [
                default=4,
                help=_('Number of seconds to wait between attempts to '
                       'connect to Redfish')),
+    cfg.IntOpt('connect_timeout',
+               min=1,
+               default=30,
+               help=_('TCP connection timeout in seconds when connecting '
+                      'to the Redfish BMC. This controls how long to wait '
+                      'for the initial TCP connection to be established. '
+                      'A lower value allows faster failure when a BMC is '
+                      'unreachable.')),
+    cfg.IntOpt('read_timeout',
+               min=1,
+               default=60,
+               help=_('HTTP read timeout in seconds when waiting for a '
+                      'response from the Redfish BMC. Some BMCs hold '
+                      'long-running requests (e.g. BIOS settings updates) '
+                      'open for a long time before responding; increase '
+                      'this value if operations are reported as failed '
+                      'even though the BMC completes them later. A higher '
+                      'value also increases how long a conductor worker '
+                      'waits for an unresponsive but connected BMC.')),
     cfg.IntOpt('connection_cache_size',
                min=0,
                default=1000,
@@ -45,7 +65,7 @@ opts = [
                default='auto',
                help=_('Redfish HTTP client authentication method.')),
     cfg.BoolOpt('use_swift',
-                default=True,
+                default=False,
                 mutable=True,
                 help=_('Upload generated ISO images for virtual media boot to '
                        'Swift, then pass temporary URL to BMC for booting the '
@@ -63,15 +83,16 @@ opts = [
                help=_('Amount of time in seconds for Swift objects to '
                       'auto-expire. Applies only when `use_swift` is '
                       'enabled.')),
-    cfg.StrOpt('kernel_append_params',
-               default='nofb nomodeset vga=normal',
-               mutable=True,
-               help=_('Additional kernel parameters to pass down to the '
-                      'instance kernel. These parameters can be consumed by '
-                      'the kernel or by the applications by reading '
-                      '/proc/cmdline. Mind severe cmdline size limit! Can be '
-                      'overridden by `instance_info/kernel_append_params` '
-                      'property.')),
+    cfg.Opt('kernel_append_params',
+            default='nofb vga=normal',
+            type=ir_types.KernelParameterString(),
+            mutable=True,
+            help=_('Additional kernel parameters to pass down to the '
+                   'instance kernel. These parameters can be consumed by '
+                   'the kernel or by the applications by reading '
+                   '/proc/cmdline. Mind severe cmdline size limit! Can be '
+                   'overridden by `instance_info/kernel_append_params` '
+                   'property.')),
     cfg.IntOpt('file_permission',
                default=0o644,
                help=_('File permission for swift-less image hosting with the '
@@ -90,6 +111,69 @@ opts = [
                default=60,
                help=_('Number of seconds to wait between checking for '
                       'failed firmware update tasks')),
+    cfg.IntOpt('firmware_update_wait_unresponsive_bmc',
+               min=0,
+               default=0,
+               help=_('Number of seconds to wait before proceeding with the '
+                      'reboot to finish the BMC firmware update step')),
+    cfg.IntOpt('firmware_update_required_successes',
+               min=0,
+               default=3,
+               help=_('Number of successful responses required to '
+                      'consider post-upgrade BMC validation a success. '
+                      'Set to 0 to disable post-upgrade validation '
+                      'entirely.')),
+    cfg.IntOpt('firmware_update_validation_interval',
+               min=0,
+               default=30,
+               help=_('Timeout (in seconds) to wait between validation '
+                      'attempts. Set to 0 for rapid succession retries '
+                      'with no delay.')),
+    cfg.IntOpt('firmware_update_resource_validation_timeout',
+               min=0,
+               default=480,
+               help=_('Timeout (in seconds) to wait for BMC resources '
+                      '(System, Manager, NetworkAdapters) to become stable '
+                      'and consistently available after firmware update. '
+                      'Set to 0 to disable post-upgrade validation '
+                      'entirely.')),
+    cfg.IntOpt('firmware_update_bmc_timeout',
+               min=0,
+               default=300,
+               help=_('Timeout (in seconds) for BMC firmware updates. '
+                      'BMC firmware updates may need extended time to handle '
+                      'BMC transitional states during the firmware update '
+                      'process.')),
+    cfg.IntOpt('firmware_update_reboot_delay',
+               min=0,
+               default=300,
+               help=_('Default wait time (in seconds) for component-specific '
+                      'firmware update operations. Used for: BIOS firmware '
+                      'update wait before reboot, BMC firmware version check '
+                      'timeout, and NIC firmware task completion timeout.')),
+    cfg.IntOpt('firmware_update_bmc_version_check_interval',
+               min=0,
+               default=30,
+               help=_('Interval (in seconds) for checking BMC firmware '
+                      'version after BMC firmware update. Used to verify '
+                      'if BMC firmware has been successfully applied.')),
+    cfg.IntOpt('firmware_update_nic_starting_wait',
+               min=0,
+               default=30,
+               help=_('Time (in seconds) to wait for a NIC firmware update '
+                      'task to progress beyond the STARTING state before '
+                      'triggering a reboot. Some NICs need a reboot to '
+                      'start applying firmware, while others can begin '
+                      'immediately. This timeout helps determine which '
+                      'behavior the hardware exhibits.')),
+    cfg.IntOpt('firmware_update_overall_timeout',
+               min=0,
+               default=7200,
+               help=_('Maximum time (in seconds) allowed for the entire '
+                      'firmware update operation to complete. This provides '
+                      'a safety net for firmware updates that get stuck. '
+                      'Set to 0 to disable this timeout (not recommended). '
+                      'Default is 7200 seconds (2 hours).')),
     cfg.StrOpt('firmware_source',
                choices=[('http', _('If firmware source URL is also HTTP, then '
                                    'serve from original location, otherwise '
@@ -115,6 +199,112 @@ opts = [
                default=60,
                help=_('Number of seconds to wait between checking for '
                       'failed raid config tasks')),
+    cfg.IntOpt('boot_mode_config_timeout',
+               min=0,
+               default=900,
+               help=_('Number of seconds to wait for boot mode or secure '
+                      'boot status change to take effect after a reboot. '
+                      'Set to 0 to disable waiting.')),
+    cfg.StrOpt('verify_ca',
+               help=_('The default verify_ca path when redfish_verify_ca '
+                      'in driver_info is missing or set to True.')),
+    cfg.StrOpt(
+        'tls_minimum_version',
+        choices=[
+            ('1.1', _('Require TLS 1.1 as the minimum version.')),
+            ('1.2', _('Require TLS 1.2 as the minimum version.')),
+            ('1.3', _('Require TLS 1.3 as the minimum version. '
+                      'Recommended for Post-Quantum Cryptography '
+                      'readiness.')),
+        ],
+        help=_('Set the minimum TLS protocol version for '
+               'connections to the Redfish BMC. When set, this '
+               'value is passed to the sushy library. Can be '
+               'overridden per-node via driver_info/'
+               'redfish_tls_minimum_version. When not set, '
+               'the system default is used.')),
+    cfg.StrOpt(
+        'tls_ciphers',
+        help=_('Set the list of available ciphers for '
+               'connections to the Redfish BMC using OpenSSL '
+               'cipher list format. Can be overridden per-node '
+               'via driver_info/redfish_tls_ciphers. When not '
+               'set, the system default ciphers are used.')),
+    cfg.BoolOpt('enable_verify_bmc_clock',
+                default=False,
+                help=_('Whether to enable the automated verify step '
+                       'that checks and sets the BMC clock. '
+                       'When enabled, Ironic will automatically attempt '
+                       'to set the BMC\'s clock during node registration '
+                       '(in the verify phase) using Redfish\'s '
+                       'DateTime fields. '
+                       'This helps avoid TLS certificate issues '
+                       'caused by incorrect BMC time.')),
+    cfg.StrOpt('default_inspection_hooks',
+               default='validate-interfaces,ports,architecture',
+               help=_('A comma-separated lists of inspection hooks that are '
+                      'run by default for the "agent" inspection interface. '
+                      'In most cases, the operators will not '
+                      'modify this. The default (somewhat conservative) hooks '
+                      'validate interfaces in the inventory, create '
+                      'ports and set the node\'s cpu architecture property.')),
+    cfg.StrOpt('inspection_hooks',
+               default='$default_inspection_hooks',
+               help=_('Comma-separated list of enabled hooks for processing '
+                      'pipeline when using the "redfish" inspection '
+                      'interface. The default for this is '
+                      '$default_inspection_hooks. Hooks can be added before '
+                      'or after the defaults like this: '
+                      '"prehook,$default_hooks,posthook".')),
+    cfg.IntOpt('post_boot_retry_attempts',
+               min=1,
+               default=6,
+               help=_('Maximum number of retry attempts when BMC rejects '
+                      'boot device changes during POST (Power-On Self-Test). '
+                      'Some BMCs (e.g. HPE iLO) reject boot device '
+                      'modifications while the system is in POST after a '
+                      'firmware update or reboot.')),
+    cfg.IntOpt('post_boot_retry_delay',
+               min=1,
+               default=5,
+               help=_('Minimum delay in seconds between retry attempts '
+                      'for POST-related boot device errors. Exponential '
+                      'backoff is applied, starting from this value up to '
+                      '6x this value.')),
+    cfg.IntOpt('power_on_conflict_retry_attempts',
+               min=0,
+               default=6,
+               help=_('Maximum number of times to retry a power-on when the '
+                      'BMC rejects it with an HTTP 409 '
+                      '"ActionParameterValueConflict". Some BMCs (e.g. Dell '
+                      'iDRAC10) transiently reject the "On" reset type for a '
+                      'short window (observed up to ~60 seconds) after a '
+                      'power-off, until the BMC settles. This is a ceiling: '
+                      'the power-on is retried only until the BMC accepts it, '
+                      'so a node that settles sooner returns sooner. Set to 0 '
+                      'to disable retrying.')),
+    cfg.IntOpt('power_on_conflict_retry_interval',
+               min=1,
+               default=10,
+               help=_('Number of seconds to wait between power-on retries '
+                      'triggered by an HTTP 409 '
+                      '"ActionParameterValueConflict" from the BMC.')),
+    cfg.BoolOpt('enable_vmedia_insert_polling',
+                default=False,
+                help=_('Enable polling of whether virtual media has been '
+                       'inserted, which can help avoid boot failures due to '
+                       'delayed virtual media status reporting.')),
+    cfg.IntOpt('vmedia_insert_timeout',
+               min=1,
+               default=60,
+               help=_('Maximum time (in seconds) to wait for a Redfish '
+                      'InsertMedia operation to report the virtual media '
+                      'as inserted before failing the operation.')),
+    cfg.IntOpt('vmedia_insert_poll_interval',
+               min=1,
+               default=2,
+               help=_('Interval (in seconds) between readback checks while '
+                      'waiting for virtual media to report as inserted.')),
 ]
 
 

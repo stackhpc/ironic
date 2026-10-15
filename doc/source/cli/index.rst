@@ -1,5 +1,5 @@
-Command References
-==================
+Administrator Command References
+================================
 
 Here are references for commands not elsewhere documented.
 
@@ -7,4 +7,5 @@ Here are references for commands not elsewhere documented.
   :maxdepth: 1
 
   ironic-dbsync
+  ironic-manage
   ironic-status

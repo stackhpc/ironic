@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Copyright 2013 Hewlett-Packard Development Company, L.P.
 # All Rights Reserved.
@@ -44,16 +43,15 @@ class BaseApiTest(db_base.DbTestCase):
     """
 
     SOURCE_DATA = {'test_source': {'somekey': '666'}}
+    SKIP_TRACEBACK_OVERRIDE = False
 
     root_controller = 'ironic.api.controllers.root.RootController'
 
     def setUp(self):
         super(BaseApiTest, self).setUp()
-        cfg.CONF.set_override("auth_version", "v3",
-                              group='keystone_authtoken')
-        cfg.CONF.set_override("admin_user", "admin",
-                              group='keystone_authtoken')
         cfg.CONF.set_override("auth_strategy", "noauth")
+        if not self.SKIP_TRACEBACK_OVERRIDE:
+            cfg.CONF.set_override("debug_tracebacks_in_api", True)
         self.app = self._make_app()
 
         def reset_pecan():
@@ -72,8 +70,8 @@ class BaseApiTest(db_base.DbTestCase):
 
     def _make_app(self):
         # Determine where we are so we can set up paths in the config
-        root_dir = self.path_get()
 
+        root_dir = self.path_get()
         self.app_config = {
             'app': {
                 'root': self.root_controller,
@@ -104,7 +102,6 @@ class BaseApiTest(db_base.DbTestCase):
         :param path_prefix: prefix of the url path
         """
         full_path = path_prefix + path
-        print('%s: %s %s' % (method.upper(), full_path, params))
         response = getattr(self.app, "%s_json" % method)(
             str(full_path),
             params=params,
@@ -113,7 +110,7 @@ class BaseApiTest(db_base.DbTestCase):
             extra_environ=extra_environ,
             expect_errors=expect_errors
         )
-        print('GOT:%s' % response)
+        print(method.upper(), full_path, "WITH", params, "GOT", str(response))
         return response
 
     def put_json(self, path, params, expect_errors=False, headers=None,
@@ -187,13 +184,12 @@ class BaseApiTest(db_base.DbTestCase):
         :param path_prefix: prefix of the url path
         """
         full_path = path_prefix + path
-        print('DELETE: %s' % (full_path))
         response = self.app.delete(str(full_path),
                                    headers=headers,
                                    status=status,
                                    extra_environ=extra_environ,
                                    expect_errors=expect_errors)
-        print('GOT:%s' % response)
+        print("DELETE", full_path, "GOT", str(response))
         return response
 
     def get_json(self, path, expect_errors=False, headers=None,
@@ -225,15 +221,14 @@ class BaseApiTest(db_base.DbTestCase):
         all_params.update(params)
         if q:
             all_params.update(query_params)
-        print('GET: %s %r' % (full_path, all_params))
         response = self.app.get(full_path,
                                 params=all_params,
                                 headers=headers,
                                 extra_environ=extra_environ,
                                 expect_errors=expect_errors)
+        print("GET", full_path, "WITH", params, "GOT", str(response))
         if not expect_errors:
             response = response.json
-        print('GOT:%s' % response)
         return response
 
     def validate_link(self, link, bookmark=False, headers=None):

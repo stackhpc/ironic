@@ -7,7 +7,7 @@
 echo_summary "ironic devstack plugin.sh called: $1/$2"
 source $DEST/ironic/devstack/lib/ironic
 
-if is_service_enabled ir-api ir-cond; then
+if is_service_enabled ir-api ir-cond ir-novnc; then
     if [[ "$1" == "stack" ]]; then
         if [[ "$2" == "install" ]]; then
         # stack/install - Called after the layer 1 and 2 projects source and
@@ -21,6 +21,7 @@ if is_service_enabled ir-api ir-cond; then
             install_ironic
             install_ironicclient
             cleanup_ironic_config_files
+            downgrade_dnsmasq
 
         elif [[ "$2" == "post-config" ]]; then
         # stack/post-config - Called after the layer 1 and 2 services have been
@@ -34,9 +35,31 @@ if is_service_enabled ir-api ir-cond; then
                 create_ironic_accounts
             fi
 
+            if [[ "$Q_BUILD_OVS_FROM_GIT" != "True" ]]; then
+                if [[ "$Q_AGENT" == "ovn" ]] || [[ "$IRONIC_BAREMETAL_BASIC_OPS" == "True" && "$IRONIC_IS_HARDWARE" == "False" ]]; then
+                    # NOTE(TheJulia): We are likely doing this to ensure
+                    # OVS is running.
+                    echo_summary "Installing OVS to pre-create bridge"
+                    install_package openvswitch-switch
+                fi
+            fi
+
+            # NOTE(hjensas): When Neutron is configured with OVN and Ironic is
+            # the virt driver, Neutron's devstack plugin will skip starting OVN
+            # services (assuming Ironic will handle it). Therefore, when using
+            # OVN, Ironic must always initialize and start OVN services here,
+            # regardless of whether we're setting up virtual machines or using
+            # real hardware, to ensure OVN is available for network provisioning.
+            if [[ "$Q_AGENT" == "ovn" ]]; then
+                echo_summary "Setting up OVN..."
+                init_ovn
+                start_ovn
+            fi
+
+            # When using virtual machines (IRONIC_IS_HARDWARE == False), we need
+            # to pre-create the bridge for VM networking.
             if [[ "$IRONIC_BAREMETAL_BASIC_OPS" == "True" && "$IRONIC_IS_HARDWARE" == "False" ]]; then
                 echo_summary "Precreating bridge: $IRONIC_VM_NETWORK_BRIDGE"
-                install_package openvswitch-switch
                 sudo ovs-vsctl -- --may-exist add-br $IRONIC_VM_NETWORK_BRIDGE
             fi
 
@@ -52,7 +75,7 @@ if is_service_enabled ir-api ir-cond; then
                 create_bridge_and_vms
             fi
 
-            if is_service_enabled neutron || [[ "$HOST_TOPOLOGY" == "multinode" ]]; then
+            if is_service_enabled q-svc || is_service_enabled neutron || [[ "$HOST_TOPOLOGY" == "multinode" ]]; then
                 echo_summary "Configuring Ironic networks"
                 configure_ironic_networks
             fi
@@ -64,6 +87,15 @@ if is_service_enabled ir-api ir-cond; then
             prepare_baremetal_basic_ops
             echo_summary "Starting Ironic"
             start_ironic
+
+            # Configure neutron DHCP after neutron is fully initialized
+            # but before enrolling nodes which may depend on it
+            if is_service_enabled q-dhcp neutron-dhcp; then
+                echo_summary "Configuring Neutron DHCP for IPv6"
+                async_wait init_neutron
+                configure_neutron_dhcp_enable_addr6_list
+            fi
+
             enroll_nodes
 
         elif [[ "$2" == "test-config" ]]; then

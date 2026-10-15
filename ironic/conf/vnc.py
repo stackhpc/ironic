@@ -1,0 +1,251 @@
+#   Copyright 2025 Red Hat, Inc.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+import os
+
+from oslo_config import cfg
+from oslo_config import types
+
+from ironic.common.i18n import _
+
+
+opts = [
+    cfg.BoolOpt(
+        'enabled',
+        default=False,
+        help='Enable VNC related features. '
+             'Guests will get created with graphical devices to support '
+             'this. Clients (for example Horizon) can then establish a '
+             'VNC connection to the guest.'),
+    cfg.HostAddressOpt(
+        'host_ip',
+        default='0.0.0.0',
+        help='The IP address or hostname on which ironic-novncproxy '
+             'listens.'),
+    cfg.PortOpt(
+        'port',
+        default=6090,
+        help='The TCP port on which ironic-novncproxy listens.'),
+    cfg.StrOpt(
+        'public_url',
+        mutable=True,
+        help='Public URL to use when building the links to the noVNC client '
+             'browser page '
+             '(for example, "http://127.0.0.1:6090/vnc_auto.html"). '
+             'If the API is operating behind a proxy, you '
+             'will want to change this to represent the proxy\'s URL.'),
+    cfg.BoolOpt(
+        'enable_ssl',
+        default=False,
+        help='Enable the integrated stand-alone noVNC to service '
+             'requests via HTTPS instead of HTTP. If there is a '
+             'front-end service performing HTTPS offloading from '
+             'the service, this option should be False; note, you '
+             'will want to configure [vnc]public_endpoint option '
+             'to set URLs in responses to the SSL terminated one.'),
+    cfg.StrOpt(
+        'novnc_web',
+        default='/usr/share/novnc',
+        help='Path to directory with content which will be served by a web '
+             'server.'),
+    cfg.StrOpt(
+        'novnc_record',
+        help='Filename that will be used for storing websocket frames '
+             'received and sent by a VNC proxy service running on this host. '
+             'If this is not set, no recording will be done.'),
+    cfg.ListOpt(
+        'novnc_auth_schemes',
+        item_type=types.String(choices=(
+            ('none', 'Allow connection without authentication'),
+        )),
+        default=['none'],
+        help='The allowed authentication schemes to use with proxied '
+             'VNC connections'),
+    cfg.BoolOpt(
+        'read_only',
+        default=False,
+        help='When True, keyboard and mouse events will not be passed '
+             'to the console.'
+    ),
+    cfg.IntOpt(
+        'token_timeout',
+        default=600,
+        min=10,
+        help='The lifetime of a console auth token (in seconds).'),
+    cfg.IntOpt(
+        'expire_console_session_interval',
+        default=120,
+        min=1,
+        help='Interval (in seconds) between periodic checks to determine '
+             'whether active console sessions have expired and need to be '
+             'closed.'),
+    cfg.StrOpt(
+        'container_provider',
+        default='fake',
+        help='Console container provider which manages the containers that '
+             'expose a VNC service to ironic-novncproxy or nova-novncproxy. '
+             'Each container runs an X11 session and a browser showing the '
+             'actual BMC console. '
+             '"systemd" manages containers as systemd units via podman '
+             'Quadlet support. The default is "fake" which returns an '
+             'unusable VNC host and port. This needs to be changed if enabled '
+             'is True. '
+             '"kubernetes" manages containers as pods using template driven '
+             'resource creation. '
+             '"container" manages containers directly through a Docker '
+             'compatible container engine (Docker or Podman), appropriate '
+             'when ironic-conductor itself runs in a container.'),
+    cfg.StrOpt(
+        'console_image',
+        mutable=True,
+        help='Container image reference for the "systemd", "kubernetes" '
+             'and "container" console container '
+             'providers, and any other out-of-tree provider which requires a '
+             'configurable image reference.'),
+    cfg.StrOpt(
+        'systemd_container_template',
+        default=os.path.join(
+            '$pybasedir',
+            'console/container/ironic-console.container.template'),
+        mutable=True,
+        help='For the systemd provider, path to the template for defining a '
+             'console container. The default template requires that '
+             '"console_image" be set.'),
+    cfg.StrOpt(
+        'systemd_container_publish_port',
+        default='$my_ip::5900',
+        help='Equivalent to the podman run --port argument for the '
+             'mapping of VNC port 5900 to the host. An IP address is '
+             'required to bind to, defaulting to $my_ip. The VNC port '
+             'exposed on the host will be a randomly allocated high port. '
+             'These containers expose VNC servers which must be accessible '
+             'by ironic-novncproxy and/or nova-novncproxy. The VNC servers '
+             'have no authentication or encryption so they also should not '
+             'be exposed to public access. Additionally, the containers '
+             'need to be able to access BMC management endpoints. '),
+    cfg.StrOpt(
+        'kubernetes_container_template',
+        default=os.path.join(
+            '$pybasedir',
+            'console/container/ironic-console-pod.yaml.template'),
+        mutable=True,
+        help='For the kubernetes provider, path to the template for defining '
+             'the console resources. The default template creates one Secret '
+             'to store the app info, and one Pod to run a console '
+             'container. A custom template must include namespace metadata, '
+             'and must define labels which can be used as a delete-all '
+             'selector.'),
+    cfg.IntOpt('kubernetes_pod_timeout',
+               default=120,
+               help='For the kubernetes provider, the time (in seconds) to '
+                    'wait for the console pod to start.'),
+    cfg.StrOpt(
+        'container_executable',
+        default='docker',
+        help='For the container provider, name or absolute path of the '
+             'Docker compatible CLI binary to invoke. Set to "podman" to '
+             'use Podman\'s Docker compatible CLI (Podman 4.0 or later '
+             'recommended).'),
+    cfg.StrOpt(
+        'container_host',
+        help='For the container provider, the container engine endpoint '
+             'URL, for example "unix:///var/run/docker.sock" or a "tcp://" '
+             'URL. When set it is exported to the CLI as both DOCKER_HOST '
+             'and CONTAINER_HOST; when unset the CLI\'s default socket '
+             'resolution applies. The engine is assumed to run on the '
+             'conductor host: a remote engine requires '
+             'container_publish_port to bind an address which is valid and '
+             'routable on the engine host. A TCP endpoint must be '
+             'protected with TLS, configured through the standard Docker '
+             'client environment variables.'),
+    cfg.StrOpt(
+        'container_publish_port',
+        default='$my_ip::5900',
+        help='For the container provider, the value passed to the '
+             '"--publish" argument of the container run command, mapping '
+             'container VNC port 5900 to the host. An IP address is '
+             'required to bind to, defaulting to $my_ip. The VNC port '
+             'exposed on the host will be a randomly allocated high port. '
+             'An IPv6 bind address must be bracketed '
+             '(e.g. "[2001:db8::1]::5900"), so deployments where my_ip is '
+             'IPv6 must set this option explicitly. '
+             'These containers expose VNC servers which must be accessible '
+             'by ironic-novncproxy and/or nova-novncproxy. The VNC servers '
+             'have no authentication or encryption so they also should not '
+             'be exposed to public access. Additionally, the containers '
+             'need to be able to access BMC management endpoints.'),
+    cfg.StrOpt(
+        'container_command_template',
+        default=os.path.join(
+            '$pybasedir',
+            'console/container/ironic-console-container.template'),
+        mutable=True,
+        help='For the container provider, path to the Jinja2 template '
+             'which renders the argument vector for container_executable '
+             'to run a console container. The rendered text is split with '
+             'shlex ("#" starts a comment) and run with no shell. The '
+             'default template requires that "console_image" be set. A '
+             'custom template must keep, as rendered by the default '
+             'template: the container "--name", the '
+             '"org.openstack.ironic.*" labels, "--detach", the publish of '
+             'container port 5900 and the value-less "--env APP_INFO" '
+             'entry (the credentials are supplied through the CLI\'s '
+             'process environment).'),
+    cfg.StrOpt(
+        'cert_file',
+        deprecated_name='ssl_cert_file',
+        help=_("Certificate file to use when starting "
+               "the server securely.")),
+    cfg.StrOpt(
+        'key_file',
+        deprecated_name='ssl_key_file',
+        help=_("Private key file to use when starting "
+               "the server securely.")),
+    cfg.StrOpt(
+        'tls_minimum_version',
+        deprecated_name='ssl_minimum_version',
+        default='1.2',
+        choices=[
+            ('1.2',
+             _('Require TLS 1.2 as the minimum version.')),
+            ('1.3',
+             _('Require TLS 1.3 as the minimum version. '
+               'Recommended for Post-Quantum Cryptography '
+               'readiness as PQC key exchange is only '
+               'available in TLS 1.3.')),
+        ],
+        help=_("Set the minimum TLS protocol version for "
+               "the noVNC proxy server when "
+               "[vnc]enable_ssl is True. Defaults to "
+               "TLS 1.2 since TLS 1.0 and 1.1 are "
+               "deprecated (RFC 8996).")),
+    cfg.StrOpt(
+        'tls_ciphers',
+        deprecated_name='ssl_ciphers',
+        help=_("Set the list of available ciphers for "
+               "the noVNC proxy server. The value should "
+               "be a string in the OpenSSL cipher list "
+               "format. Has no effect when "
+               "[vnc]enable_ssl is False.")),
+    cfg.IntOpt(
+        'wait_for_ready_timeout',
+        default=10,
+        min=1,
+        help='Maximum number of seconds to wait for a console container '
+             'to be ready to accept VNC connections after starting.'),
+]
+
+
+def register_opts(conf):
+    conf.register_opts(opts, group='vnc')

@@ -16,12 +16,15 @@
 
 import copy
 
+from oslo_log import log
 from oslo_serialization import jsonutils
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
 
 from ironic.common import exception
-
+from ironic.common import image_service as service
+from ironic.common import keystone
+from ironic.conf import CONF
 
 _IMAGE_ATTRIBUTES = ['size', 'disk_format', 'owner',
                      'container_format', 'checksum', 'id',
@@ -32,16 +35,32 @@ _IMAGE_ATTRIBUTES = ['size', 'disk_format', 'owner',
                      'os_hash_value']
 
 
+LOG = log.getLogger(__name__)
+_GLANCE_SESSION = None
+
+
 def _extract_attributes(image):
     output = {}
+    # copies attributes from the openstacksdk Image object
+    # to a dictionary
     for attr in _IMAGE_ATTRIBUTES:
         output[attr] = getattr(image, attr, None)
 
-    output['properties'] = {}
+    # copy the properties over to start so that image properties
+    # are not nested in another properties key
+    output['properties'] = getattr(image, 'properties', {})
     output['schema'] = image.schema
 
-    for image_property in set(image) - set(_IMAGE_ATTRIBUTES):
-        output['properties'][image_property] = image[image_property]
+    # attributes already copied so we copy the rest into properties
+    copied = set(_IMAGE_ATTRIBUTES)
+    copied.add('properties')
+
+    for image_property in set(image) - copied:
+        # previously with glanceclient only set things
+        # were on the object that came back but the SDK
+        # defines every possible attribute so we need to filter
+        if image[image_property]:
+            output['properties'][image_property] = image[image_property]
 
     return output
 
@@ -107,18 +126,54 @@ def is_image_available(context, image):
     This check is needed in case Nova and Glance are deployed
     without authentication turned on.
     """
-    # The presence of an auth token implies this is an authenticated
-    # request and we need not handle the noauth use-case.
-    if hasattr(context, 'auth_token') and context.auth_token:
+    # NOTE: Any support for private/shared images in Ironic requires a secure
+    # way for ironic to know the original requester:
+    #  - If we trust node[instance_info][project_id], we are susceptible to a
+    #    node.owner stealing another project's private image by lying in
+    #    instance_info.
+    #  - As of 2025.1, the project_id attached to the auth context at this
+    #    point is more likely to be the nova-computes service user rather
+    #    than the original requester. This is a missing feature from the
+    #    Ironic/Nova virt driver.
+
+    auth_token = getattr(context, 'auth_token', None)
+    conductor_project_id = get_conductor_project_id()
+    image_visibility = getattr(image, 'visibility', None)
+    image_owner = getattr(image, 'owner', None)
+    image_id = getattr(image, 'id', 'unknown')
+    is_admin = 'admin' in getattr(context, 'roles', [])
+    project = getattr(context, 'project', 'unknown')
+
+    # If an auth token is present and the config allows access via auth token,
+    #  allow image access.
+    # NOTE(satoshi): This config should be removed in the H (2026.2) cycle
+    if CONF.allow_image_access_via_auth_token and auth_token:
         # We return true here since we want the *user* request context to
         # be able to be used.
         return True
-
-    if getattr(image, 'visibility', None) == 'public':
+    # If the image visibility is public or community, allow access.
+    if image_visibility in ['public', 'community']:
         return True
-
-    return (context.project_id
-            and getattr(image, 'owner', None) == context.project_id)
+    # If the user is an admin and the config allows ignoring project checks for
+    #  admin tasks, allow access.
+    if is_admin and CONF.ignore_project_check_for_admin_tasks:
+        return True
+    # If the image is private and the owner is the conductor project,
+    #  allow access.
+    if image_visibility == 'private' and image_owner == conductor_project_id:
+        return True
+    # If the image is shared and the conductor_project_id is in the shared
+    # member list, allow access. Glance only permits listing members on
+    # shared images, so only query the member list in that case.
+    if image_visibility == 'shared'\
+            and conductor_project_id in get_image_member_list(image_id,
+                                                              context):
+        return True
+    LOG.info(
+        'Access to %s owned by %s denied to requester %s',
+        image_id, image_owner, project
+    )
+    return False
 
 
 def is_image_active(image):
@@ -135,3 +190,34 @@ def is_glance_image(image_href):
         return False
     return (image_href.startswith('glance://')
             or uuidutils.is_uuid_like(image_href))
+
+
+def get_conductor_project_id():
+    global _GLANCE_SESSION
+    if not _GLANCE_SESSION:
+        _GLANCE_SESSION = keystone.get_session('glance')
+    session = _GLANCE_SESSION
+    service_auth = keystone.get_auth('glance')
+
+    try:
+        if service_auth and hasattr(service_auth, 'get_project_id'):
+            return service_auth.get_project_id(session)
+        elif hasattr(session, 'get_project_id') and session.auth:
+            return session.get_project_id()
+    except Exception as e:
+        LOG.debug("Error getting conductor project ID: %s", str(e))
+    return None
+
+
+def get_image_member_list(image_id, context):
+    try:
+        glance_service = service.GlanceImageService(context=context)
+        members = glance_service.member_list(image_id)
+        return [
+            member.member_id
+            for member in members
+        ]
+    except Exception as e:
+        LOG.error("Unable to retrieve image members for image %s: %s",
+                  image_id, e)
+        return []

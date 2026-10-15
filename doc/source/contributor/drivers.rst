@@ -61,7 +61,7 @@ The minimum required interfaces are:
   .. note::
     Most of the hardware types should not override this interface.
 
-* `power` implements power actions for the hardware. These common
+* ``power`` implements power actions for the hardware. These common
   implementations may be used, if supported by the hardware:
 
   * :py:class:`ironic.drivers.modules.ipmitool.IPMIPower`
@@ -74,16 +74,12 @@ The minimum required interfaces are:
     Power actions in Ironic are blocking - methods of a power interface should
     not return until the power action is finished or errors out.
 
-* `management` implements additional out-of-band management actions, such as
+* ``management`` implements additional out-of-band management actions, such as
   setting a boot device. A few common implementations exist and may be used,
   if supported by the hardware:
 
   * :py:class:`ironic.drivers.modules.ipmitool.IPMIManagement`
   * :py:class:`ironic.drivers.modules.redfish.management.RedfishManagement`
-
-  Some hardware types, such as ``snmp`` do not support out-of-band management.
-  They use the fake implementation in
-  :py:class:`ironic.drivers.modules.fake.FakeManagement` instead.
 
   Otherwise, you need to write your own implementation by subclassing
   :py:class:`ironic.drivers.base.ManagementInterface` and providing missing

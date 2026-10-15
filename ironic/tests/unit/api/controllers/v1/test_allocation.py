@@ -28,6 +28,7 @@ from oslo_utils import uuidutils
 from ironic.api.controllers import base as api_base
 from ironic.api.controllers import v1 as api_v1
 from ironic.api.controllers.v1 import notification_utils
+from ironic.api.controllers.v1 import utils as v1_api_utils
 from ironic.common import exception
 from ironic.common import policy
 from ironic.conductor import rpcapi
@@ -74,15 +75,32 @@ class TestListAllocations(test_api_base.BaseApiTest):
         self.assertNotIn('node_id', data)
 
     def test_get_one_with_json(self):
+        headers = {api_base.Version.string: '1.90'}
         allocation = obj_utils.create_test_allocation(self.context,
                                                       node_id=self.node.id)
         data = self.get_json('/allocations/%s.json' % allocation.uuid,
-                             headers=self.headers)
+                             headers=headers)
         self.assertEqual(allocation.uuid, data['uuid'])
+
+    def test_get_one_with_json_not_found(self):
+        allocation = obj_utils.create_test_allocation(self.context,
+                                                      node_id=self.node.id)
+        data = self.get_json('/allocations/%s.json' % allocation.uuid,
+                             headers=self.headers,
+                             expect_errors=True)
+        self.assertEqual(http_client.NOT_FOUND, data.status_code)
 
     def test_get_one_with_json_in_name(self):
         allocation = obj_utils.create_test_allocation(self.context,
                                                       name='pg.json',
+                                                      node_id=self.node.id)
+        data = self.get_json('/allocations/%s' % allocation.uuid,
+                             headers=self.headers)
+        self.assertEqual(allocation.uuid, data['uuid'])
+
+    def test_get_one_with_double_json_in_name(self):
+        allocation = obj_utils.create_test_allocation(self.context,
+                                                      name='pg.json.json',
                                                       node_id=self.node.id)
         data = self.get_json('/allocations/%s' % allocation.uuid,
                              headers=self.headers)
@@ -418,6 +436,16 @@ class TestListAllocations(test_api_base.BaseApiTest):
                                  expect_errors=True)
         self.assertEqual('application/json', response.content_type)
         self.assertEqual(http_client.NOT_ACCEPTABLE, response.status_code)
+        self.assertTrue(response.json['error_message'])
+
+    @mock.patch.object(v1_api_utils, 'check_list_policy', autospec=True)
+    def test_get_all_by_owner_not_allowed_mismatch(self, mock_check):
+        mock_check.return_value = '54321'
+        response = self.get_json("/allocations?owner=12345",
+                                 headers={api_base.Version.string: '1.60'},
+                                 expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.FORBIDDEN, response.status_code)
         self.assertTrue(response.json['error_message'])
 
     def test_get_all_by_node_name(self):
@@ -1018,7 +1046,6 @@ class TestPost(test_api_base.BaseApiTest):
     def test_create_allocation_owner_not_my_projet_id(self, mock_auth_req):
         # This is only enforced, test wise with the new oslo policy rbac
         # model and enforcement. Likely can be cleaned up past the Xena cycle.
-        cfg.CONF.set_override('enforce_scope', True, group='oslo_policy')
         cfg.CONF.set_override('enforce_new_defaults', True,
                               group='oslo_policy')
         # Tests normally run in noauth, but we need policy
@@ -1033,7 +1060,7 @@ class TestPost(test_api_base.BaseApiTest):
         self.assertEqual(http_client.FORBIDDEN, response.status_int)
         expected_faultstring = ('Cannot create allocation with an owner '
                                 'Project ID value 12345 not matching the '
-                                'requestor Project ID 0987. Policy '
+                                'requester Project ID 0987. Policy '
                                 'baremetal:allocation:create_restricted '
                                 'is required for this capability.')
         error_body = json.loads(response.json['error_message'])
@@ -1301,9 +1328,15 @@ class TestDelete(test_api_base.BaseApiTest):
         self.assertTrue(mock_destroy.called)
 
     def test_delete_allocation_by_name_with_json(self, mock_destroy):
+        headers = {api_base.Version.string: '1.90'}
         self.delete('/allocations/%s.json' % self.allocation.name,
-                    headers=self.headers)
+                    headers=headers)
         self.assertTrue(mock_destroy.called)
+
+    def test_delete_allocation_by_name_with_json_not_found(self, mock_destroy):
+        res = self.delete('/allocations/%s.json' % self.allocation.name,
+                          headers=self.headers, expect_errors=True)
+        self.assertEqual(http_client.NOT_FOUND, res.status_code)
 
     def test_delete_allocation_by_name_not_existed(self, mock_destroy):
         res = self.delete('/allocations/%s' % 'blah', expect_errors=True,

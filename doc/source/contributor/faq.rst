@@ -128,15 +128,26 @@ the preferred process is:
 (This process was suggested in an email thread about
 `process for making decisions`_.)
 
+... get an Ironic themed -- pony shaped feature?
+------------------------------------------------
+
+Also known as: I want a pony! How do I get a pony?
+
+Ironic operates via a consensus driven model of collaboration. Often, others
+want the similarly shaped features, but may not agree on the details.
+Or different words may be used for the exact same meaning. The
+best way to build awareness, consensus, and a common set of words to
+describe the feature which you desire is to join the weekly `IRC`_ meeting
+and bringing up the desire during the ``Open Discussion`` portion of the
+meeting. Often Ironic contributors will ask for an RFE or a specification
+documentation to be started which we can collaborate on.
+
+Persistence and collaboration are key. Often contributors are quite busy
+with numerous other tasks. In other words, if we don't respond quickly or
+on your first attempt, it is not you. Just try again.
+
 .. _Ironic wiki: https://wiki.openstack.org/wiki/Ironic
 .. _weekly Ironic meeting: https://wiki.openstack.org/wiki/Meetings/Ironic
 .. _IRC: https://wiki.openstack.org/wiki/Ironic#IRC
 .. _mailing list: http://lists.openstack.org/cgi-bin/mailman/listinfo/openstack-discuss
 .. _process for making decisions: http://lists.openstack.org/pipermail/openstack-dev/2016-May/095460.html
-
-...add support for GMRs to new executables and extending the GMR?
------------------------------------------------------------------
-
-For more information, see the
-:oslo.reports-doc:`oslo.reports documentation <user/usage.html>`
-page.

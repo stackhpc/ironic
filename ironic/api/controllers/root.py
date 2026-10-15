@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Copyright © 2012 New Dream Network, LLC (DreamHost)
 #
@@ -38,6 +37,7 @@ class RootController(object):
 
     @method.expose()
     def index(self, *args):
+        V1.add_version_attributes()
         if args:
             pecan.abort(404)
         return root()
@@ -49,6 +49,7 @@ class RootController(object):
         It redirects the request to the default version of the ironic API
         if the version number is not specified in the url.
         """
+        V1.add_version_attributes()
 
         # support paths which are missing the first version element
         if primary_key and primary_key != version.ID_VERSION1:

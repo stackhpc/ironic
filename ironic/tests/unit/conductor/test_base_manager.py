@@ -16,17 +16,17 @@ import collections
 from unittest import mock
 import uuid
 
-import eventlet
 import futurist
 from futurist import periodics
-from ironic_lib import mdns
 from oslo_config import cfg
 from oslo_db import exception as db_exception
 from oslo_utils import uuidutils
 
 from ironic.common import driver_factory
 from ironic.common import exception
+from ironic.common import mdns
 from ironic.common import states
+from ironic.common import utils as common_utils
 from ironic.conductor import base_manager
 from ironic.conductor import manager
 from ironic.conductor import notification_utils
@@ -117,7 +117,6 @@ class StartStopTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
             res = objects.Conductor.get_by_hostname(self.context,
                                                     self.hostname)
             self.assertEqual(init_names, res['drivers'])
-            self._stop_service()
 
             # verify that restart registers new driver names
             self.config(enabled_hardware_types=restart_names)
@@ -222,10 +221,17 @@ class StartStopTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         self.assertTrue(log_mock.error.called)
         del_mock.assert_called_once()
 
-    def test_prevent_double_start(self):
-        self._start_service()
-        self.assertRaisesRegex(RuntimeError, 'already running',
-                               self.service.init_host)
+    @mock.patch.object(base_manager, 'LOG', autospec=True)
+    @mock.patch.object(base_manager.BaseConductorManager,
+                       '_register_and_validate_hardware_interfaces',
+                       autospec=True)
+    @mock.patch.object(base_manager.BaseConductorManager, 'del_host',
+                       autospec=True)
+    def test_start_fails_incorrect_workers(self, del_mock, reg_mock, log_mock):
+        CONF.set_override('workers_pool_size', 24, group="conductor")
+        self.assertRaises(exception.IncorrectConfiguration,
+                          self.service.init_host)
+        self.assertTrue(log_mock.error.called)
 
     def test_start_recover_nodes_stuck(self):
         state_trans = [
@@ -243,29 +249,28 @@ class StartStopTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                                             provision_state=state[0])
                  for state in state_trans]
 
+        # Sets the basic environment
         self._start_service()
+        # Trigger the stuck state correction code.
+        self.service._correct_stuck_states()
         for node, state in zip(nodes, state_trans):
             node.refresh()
             self.assertEqual(state[1], node.provision_state,
                              'Test failed when recovering from %s' % state[0])
 
+    @mock.patch.object(base_manager.BaseConductorManager, '_spawn_worker',
+                       autospec=True)
     @mock.patch.object(base_manager, 'LOG', autospec=True)
-    def test_warning_on_low_workers_pool(self, log_mock):
+    def test_warning_on_low_workers_pool(self, log_mock, mock_spawn):
         CONF.set_override('workers_pool_size', 3, 'conductor')
         self._start_service()
         self.assertTrue(log_mock.warning.called)
 
-    @mock.patch.object(eventlet.greenpool.GreenPool, 'waitall', autospec=True)
-    def test_del_host_waits_on_workerpool(self, wait_mock):
-        self._start_service()
-        self.service.del_host()
-        self.assertTrue(wait_mock.called)
-
     def test_conductor_shutdown_flag(self):
         self._start_service()
-        self.assertFalse(self.service._shutdown)
+        self.assertFalse(self.service._shutdown.is_set())
         self.service.del_host()
-        self.assertTrue(self.service._shutdown)
+        self.assertTrue(self.service._shutdown.is_set())
 
     @mock.patch.object(deploy_utils, 'get_ironic_api_url', autospec=True)
     @mock.patch.object(mdns, 'Zeroconf', autospec=True)
@@ -304,11 +309,27 @@ class StartStopTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
     @mock.patch.object(dbapi, 'get_instance', autospec=True)
     def test_start_dbapi_single_call(self, mock_dbapi):
         self._start_service()
-        # NOTE(TheJulia): This seems like it should only be 1, but
-        # the hash ring initailization pulls it's own database connection
-        # instance, which is likely a good thing, thus this is 2 instead of
-        # 3 without reuse of the database connection.
-        self.assertEqual(2, mock_dbapi.call_count)
+        # NOTE(TheJulia): This counts the dbapi instance count
+        # from starting the hash_ring, but since the hashring is
+        # common code, it shouldn't invoke a db call directly.
+        self.assertEqual(0, mock_dbapi.call_count)
+
+    def test_start_with_json_rpc(self):
+        CONF.set_override('rpc_transport', 'json-rpc')
+        CONF.set_override('host', 'foo.bar.baz')
+        self._start_service()
+        res = objects.Conductor.get_by_hostname(self.context, self.hostname)
+        self.assertEqual(self.hostname, res['hostname'])
+
+    def test_start_with_json_rpc_port(self):
+        CONF.set_override('rpc_transport', 'json-rpc')
+        CONF.set_override('host', 'foo.bar.baz')
+        CONF.set_override('port', 8192, group='json_rpc')
+
+        self._start_service()
+        res = objects.Conductor.get_by_hostname(self.context,
+                                                self.service.host)
+        self.assertEqual(f'{self.hostname}:8192', res['hostname'])
 
 
 class KeepAliveTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
@@ -322,12 +343,24 @@ class KeepAliveTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                                    'is_set', autospec=True) as mock_is_set:
                 mock_is_set.side_effect = [False, True]
                 self.service._conductor_service_record_keepalive()
-            mock_touch.assert_called_once_with(self.hostname)
+            mock_touch.assert_not_called()
+            with mock.patch.object(self.service._keepalive_evt,
+                                   'is_set', autospec=True) as mock_is_set:
+                mock_is_set.side_effect = [False, True]
+                with mock.patch.object(common_utils, 'is_ironic_using_sqlite',
+                                       autospec=True) as mock_is_sqlite:
+                    mock_is_sqlite.return_value = False
+                    self.service._conductor_service_record_keepalive()
+                    self.assertEqual(1, mock_is_sqlite.call_count)
+            mock_touch.assert_called_once_with(self.hostname, online=True)
 
-    def test__conductor_service_record_keepalive_failed_db_conn(self):
+    @mock.patch.object(common_utils, 'is_ironic_using_sqlite', autospec=True)
+    def test__conductor_service_record_keepalive_failed_db_conn(
+            self, is_sqlite_mock):
         self._start_service()
         # avoid wasting time at the event.wait()
         CONF.set_override('heartbeat_interval', 0, 'conductor')
+        is_sqlite_mock.return_value = False
         with mock.patch.object(self.dbapi, 'touch_conductor',
                                autospec=True) as mock_touch:
             mock_touch.side_effect = [None, db_exception.DBConnectionError(),
@@ -337,11 +370,15 @@ class KeepAliveTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                 mock_is_set.side_effect = [False, False, False, True]
                 self.service._conductor_service_record_keepalive()
             self.assertEqual(3, mock_touch.call_count)
+        self.assertEqual(1, is_sqlite_mock.call_count)
 
-    def test__conductor_service_record_keepalive_failed_error(self):
+    @mock.patch.object(common_utils, 'is_ironic_using_sqlite', autospec=True)
+    def test__conductor_service_record_keepalive_failed_error(self,
+                                                              is_sqlite_mock):
         self._start_service()
-        # avoid wasting time at the event.wait()
+        # minimal time at the event.wait()
         CONF.set_override('heartbeat_interval', 0, 'conductor')
+        is_sqlite_mock.return_value = False
         with mock.patch.object(self.dbapi, 'touch_conductor',
                                autospec=True) as mock_touch:
             mock_touch.side_effect = [None, Exception(),
@@ -351,26 +388,62 @@ class KeepAliveTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
                 mock_is_set.side_effect = [False, False, False, True]
                 self.service._conductor_service_record_keepalive()
             self.assertEqual(3, mock_touch.call_count)
+        self.assertEqual(1, is_sqlite_mock.call_count)
 
 
 class ManagerSpawnWorkerTestCase(tests_base.TestCase):
     def setUp(self):
         super(ManagerSpawnWorkerTestCase, self).setUp()
         self.service = manager.ConductorManager('hostname', 'test-topic')
-        self.executor = mock.Mock(spec=futurist.GreenThreadPoolExecutor)
-        self.service._executor = self.executor
+        self.service._executor = mock.Mock(
+            spec=futurist.DynamicThreadPoolExecutor)
+        self.service._reserved_executor = mock.Mock(
+            spec=futurist.DynamicThreadPoolExecutor)
+
+        self.func = lambda: None
 
     def test__spawn_worker(self):
-        self.service._spawn_worker('fake', 1, 2, foo='bar', cat='meow')
+        self.service._spawn_worker(self.func, 1, 2, foo='bar', cat='meow')
 
-        self.executor.submit.assert_called_once_with(
-            'fake', 1, 2, foo='bar', cat='meow')
+        self.service._executor.submit.assert_called_once_with(
+            self.func, 1, 2, foo='bar', cat='meow')
+        self.service._reserved_executor.submit.assert_not_called()
 
-    def test__spawn_worker_none_free(self):
-        self.executor.submit.side_effect = futurist.RejectedSubmission()
+    def test__spawn_worker_reserved(self):
+        self.service._executor.submit.side_effect = \
+            futurist.RejectedSubmission()
+
+        self.service._spawn_worker(self.func, 1, 2, foo='bar', cat='meow')
+
+        self.service._executor.submit.assert_called_once_with(
+            self.func, 1, 2, foo='bar', cat='meow')
+        self.service._reserved_executor.submit.assert_called_once_with(
+            self.func, 1, 2, foo='bar', cat='meow')
+
+    def test__spawn_worker_cannot_use_reserved(self):
+        self.service._executor.submit.side_effect = \
+            futurist.RejectedSubmission()
 
         self.assertRaises(exception.NoFreeConductorWorker,
-                          self.service._spawn_worker, 'fake')
+                          self.service._spawn_worker, self.func,
+                          _allow_reserved_pool=False)
+
+    def test__spawn_worker_no_reserved(self):
+        self.service._executor.submit.side_effect = \
+            futurist.RejectedSubmission()
+        self.service._reserved_executor = None
+
+        self.assertRaises(exception.NoFreeConductorWorker,
+                          self.service._spawn_worker, self.func)
+
+    def test__spawn_worker_none_free(self):
+        self.service._executor.submit.side_effect = \
+            futurist.RejectedSubmission()
+        self.service._reserved_executor.submit.side_effect = \
+            futurist.RejectedSubmission()
+
+        self.assertRaises(exception.NoFreeConductorWorker,
+                          self.service._spawn_worker, self.func)
 
 
 @mock.patch.object(objects.Conductor, 'unregister_all_hardware_interfaces',
@@ -386,6 +459,7 @@ class RegisterInterfacesTestCase(mgr_utils.ServiceSetUpMixin,
     def setUp(self):
         super(RegisterInterfacesTestCase, self).setUp()
         self._start_service()
+        self._executor = futurist.SynchronousExecutor()
 
     def test__register_and_validate_hardware_interfaces(self,
                                                         esi_mock,
@@ -557,8 +631,10 @@ class StartConsolesTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         self.assertFalse(mock_notify.called)
 
     @mock.patch.object(base_manager, 'LOG', autospec=True)
-    def test__start_consoles_node_not_found(self, log_mock, mock_notify,
-                                            mock_start_console):
+    @mock.patch.object(base_manager.BaseConductorManager, '_spawn_worker',
+                       autospec=True)
+    def test__start_consoles_node_not_found(self, mock_spawn, log_mock,
+                                            mock_notify, mock_start_console):
         test_node = obj_utils.create_test_node(self.context,
                                                driver='fake-hardware',
                                                console_enabled=True)
@@ -602,3 +678,34 @@ class MiscTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         self.assertEqual('transition', entry['event_type'])
         self.assertEqual('ERROR', entry['severity'])
         self.assertEqual('unknown err', entry['event'])
+
+
+class RejectorTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super(RejectorTestCase, self).setUp()
+        self.rejector = base_manager.reject_when_reached(5)
+
+    def test_reject_when_reached(self):
+        fake_executor = mock.Mock()
+        fake_executor.num_workers = 4
+        error = ('Queued backlog count is 1, and the pool is '
+                 'presently at 4 executors. Adding new work '
+                 'would go beyond 5, the maximum thread '
+                 'pool size.')
+        self.assertRaisesRegex(futurist.RejectedSubmission,
+                               error,
+                               self.rejector, fake_executor, 1)
+        fake_executor.num_workers = 3
+        error = ('Queued backlog count is 2, and the pool is '
+                 'presently at 3 executors. Adding new work '
+                 'would go beyond 5, the maximum thread '
+                 'pool size.')
+        self.assertRaisesRegex(futurist.RejectedSubmission,
+                               error,
+                               self.rejector, fake_executor, 2)
+
+    def test_not_reject_when_reached(self):
+        fake_executor = mock.Mock()
+        fake_executor.num_workers = 3
+        self.rejector(fake_executor, 1)

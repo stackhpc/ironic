@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Copyright © 2012 eNovance <licensing@enovance.com>
 #
@@ -14,50 +13,85 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import signal
 import sys
-import time
 
-from ironic_lib.json_rpc import server as json_rpc
 from oslo_config import cfg
 from oslo_log import log
 import oslo_messaging as messaging
 from oslo_service import service
+from oslo_service import threadgroup
 from oslo_utils import importutils
 
 from ironic.common import context
+from ironic.common.json_rpc import server as json_rpc
 from ironic.common import rpc
+from ironic.common import service as common_service
 from ironic.objects import base as objects_base
 
 LOG = log.getLogger(__name__)
 CONF = cfg.CONF
 
 
-class RPCService(service.Service):
+class BaseRPCService(service.Service):
 
     def __init__(self, host, manager_module, manager_class):
-        super(RPCService, self).__init__()
+        super().__init__()
         self.host = host
         manager_module = importutils.try_import(manager_module)
         manager_class = getattr(manager_module, manager_class)
-        self.manager = manager_class(host, rpc.MANAGER_TOPIC)
+        self.manager = manager_class(host)
         self.topic = self.manager.topic
         self.rpcserver = None
-        self.deregister = True
-        self._failure = None
         self._started = False
+        self._failure = None
 
-    def wait_for_start(self):
-        while not self._started and not self._failure:
-            time.sleep(0.1)
-        if self._failure:
-            LOG.critical(self._failure)
-            sys.exit(self._failure)
+    def __getstate__(self):
+        """Return picklable state for oslo.service's spawn mode.
+
+        oslo.service checks if the service is picklable to determine
+        whether to use the spawn or fork multiprocessing context. The
+        parent oslo.service.Service creates a ThreadGroup containing
+        threading objects that cannot be pickled.
+
+        ``_argv`` saves ``sys.argv`` from the parent process so that
+        ``__setstate__`` can re-configure CONF in a spawned child.
+        The full argv (including the program name at index 0) is needed
+        because ``prepare_command`` passes it to ``config.parse_args``
+        which strips ``argv[1:]`` internally.
+        """
+        state = self.__dict__.copy()
+        state.pop('tg', None)
+        state['_argv'] = sys.argv[:]
+        return state
+
+    def __setstate__(self, state):
+        argv = state.pop('_argv', None)
+        self.__dict__.update(state)
+        # Recreate ThreadGroup; start() will use it for managing threads
+        self.tg = threadgroup.ThreadGroup()
+        if argv is not None:
+            # In a spawned child process CONF starts as an empty singleton
+            # (fresh module import; spawn does not inherit parent memory).
+            # Re-run prepare_command with the parent's argv to restore all
+            # config values before start() is called.
+            common_service.prepare_command(argv)
+            # ironic.conductor.manager may have been imported during unpickle
+            # before prepare_command() (spawn bypasses the LP #1562258 guard
+            # in ironic.command.conductor); refresh lazy periodic flags and
+            # the module-level METRICS logger so get_metrics_data() uses the
+            # configured backend instead of the default NoopMetricLogger.
+            from ironic.common import metrics_utils
+            from ironic.conductor import manager as conductor_manager
+            from ironic.conductor import periodics as conductor_periodics
+            conductor_manager.METRICS = metrics_utils.get_metrics_logger(
+                conductor_manager.__name__)
+            conductor_periodics.refresh_class_periodic_attributes(
+                conductor_manager.ConductorManager)
 
     def start(self):
         self._failure = None
         self._started = False
-        super(RPCService, self).start()
+        super().start()
         try:
             self._real_start()
         except Exception as exc:
@@ -66,16 +100,22 @@ class RPCService(service.Service):
         else:
             self._started = True
 
+    def _rpc_transport(self):
+        return CONF.rpc_transport
+
     def _real_start(self):
         admin_context = context.get_admin_context()
 
         serializer = objects_base.IronicObjectSerializer(is_server=True)
         # Perform preparatory actions before starting the RPC listener
         self.manager.prepare_host()
-        if CONF.rpc_transport == 'json-rpc':
+        if self._rpc_transport() == 'json-rpc':
+            conf_group = getattr(self.manager, 'json_rpc_conf_group',
+                                 'json_rpc')
             self.rpcserver = json_rpc.WSGIService(
-                self.manager, serializer, context.RequestContext.from_dict)
-        elif CONF.rpc_transport != 'none':
+                self.manager, serializer, context.RequestContext.from_dict,
+                conf_group=conf_group)
+        elif self._rpc_transport() != 'none':
             target = messaging.Target(topic=self.topic, server=self.host)
             endpoints = [self.manager]
             self.rpcserver = rpc.get_server(target, endpoints, serializer)
@@ -83,45 +123,9 @@ class RPCService(service.Service):
         if self.rpcserver is not None:
             self.rpcserver.start()
 
-        self.handle_signal()
         self.manager.init_host(admin_context)
-        rpc.set_global_manager(self.manager)
 
         LOG.info('Created RPC server with %(transport)s transport for service '
                  '%(service)s on host %(host)s.',
                  {'service': self.topic, 'host': self.host,
-                  'transport': CONF.rpc_transport})
-
-    def stop(self):
-        try:
-            if self.rpcserver is not None:
-                self.rpcserver.stop()
-                self.rpcserver.wait()
-        except Exception as e:
-            LOG.exception('Service error occurred when stopping the '
-                          'RPC server. Error: %s', e)
-        try:
-            self.manager.del_host(deregister=self.deregister)
-        except Exception as e:
-            LOG.exception('Service error occurred when cleaning up '
-                          'the RPC manager. Error: %s', e)
-
-        super(RPCService, self).stop(graceful=True)
-        LOG.info('Stopped RPC server for service %(service)s on host '
-                 '%(host)s.',
-                 {'service': self.topic, 'host': self.host})
-        rpc.set_global_manager(None)
-
-    def _handle_signal(self, signo, frame):
-        LOG.info('Got signal SIGUSR1. Not deregistering on next shutdown '
-                 'of service %(service)s on host %(host)s.',
-                 {'service': self.topic, 'host': self.host})
-        self.deregister = False
-
-    def handle_signal(self):
-        """Add a signal handler for SIGUSR1.
-
-        The handler ensures that the manager is not deregistered when it is
-        shutdown.
-        """
-        signal.signal(signal.SIGUSR1, self._handle_signal)
+                  'transport': self._rpc_transport()})

@@ -21,13 +21,15 @@ import sys
 import time
 from urllib import parse as urlparse
 
-from glanceclient import client
-from glanceclient import exc as glance_exc
+from keystoneauth1 import exceptions as ks_exception
+import openstack
+from openstack.connection import exceptions as openstack_exc
+from openstack.image import v2 as glance_v2
 from oslo_log import log
 from oslo_utils import uuidutils
-from swiftclient import utils as swift_utils
 import tenacity
 
+from ironic.common import checksum_utils
 from ironic.common import exception
 from ironic.common.glance_service import service_utils
 from ironic.common.i18n import _
@@ -43,14 +45,22 @@ TempUrlCacheElement = collections.namedtuple('TempUrlCacheElement',
 LOG = log.getLogger(__name__)
 _GLANCE_SESSION = None
 
+# Chunk size for streaming image downloads. This MUST be specified explicitly
+# when iterating over a requests.Response object. The default chunk size when
+# iterating directly over a Response (i.e., `for chunk in resp:`) is only
+# 128 bytes, which for a 40GB image results in ~335 million iterations.
+# This causes severe CPU starvation and memory pressure, leading to conductor
+# heartbeat failures and system unresponsiveness.
+# See: https://bugs.launchpad.net/ironic/+bug/2129260
+IMAGE_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+
 
 def _translate_image_exception(image_id, exc_value):
-    if isinstance(exc_value, (glance_exc.Forbidden,
-                              glance_exc.Unauthorized)):
+    if isinstance(exc_value, (openstack_exc.ForbiddenException)):
         return exception.ImageNotAuthorized(image_id=image_id)
-    if isinstance(exc_value, glance_exc.NotFound):
+    if isinstance(exc_value, openstack_exc.NotFoundException):
         return exception.ImageNotFound(image_id=image_id)
-    if isinstance(exc_value, glance_exc.BadRequest):
+    if isinstance(exc_value, openstack_exc.BadRequestException):
         return exception.Invalid(exc_value)
     return exc_value
 
@@ -71,8 +81,6 @@ def check_image_service(func):
         if not _GLANCE_SESSION:
             _GLANCE_SESSION = keystone.get_session('glance')
 
-        # NOTE(pas-ha) glanceclient uses Adapter-based SessionClient,
-        # so we can pass session and auth separately, makes things easier
         service_auth = keystone.get_auth('glance')
 
         self.endpoint = keystone.get_endpoint('glance',
@@ -86,10 +94,15 @@ def check_image_service(func):
         if self.context.auth_token:
             user_auth = keystone.get_service_auth(self.context, self.endpoint,
                                                   service_auth)
-        self.client = client.Client(2, session=_GLANCE_SESSION,
-                                    auth=user_auth or service_auth,
-                                    endpoint_override=self.endpoint,
-                                    global_request_id=self.context.global_id)
+        sess = keystone.get_session('glance',
+                                    auth=user_auth or service_auth)
+        conn = openstack.connection.Connection(
+            session=sess,
+            image_endpoint_override=self.endpoint,
+            image_api_version='2')
+
+        self.client = conn.global_request(self.context.global_id).image
+
         return func(self, *args, **kwargs)
 
     return wrapper
@@ -111,6 +124,7 @@ class GlanceImageService(object):
         self.client = client
         self.context = context
         self.endpoint = None
+        self._transfer_verified_checksum = None
 
     @tenacity.retry(
         retry=tenacity.retry_if_exception_type(
@@ -131,28 +145,22 @@ class GlanceImageService(object):
 
         :raises: GlanceConnectionFailed
         """
-        retry_excs = (glance_exc.ServiceUnavailable,
-                      glance_exc.InvalidEndpoint,
-                      glance_exc.CommunicationError)
-        image_excs = (glance_exc.Forbidden,
-                      glance_exc.Unauthorized,
-                      glance_exc.NotFound,
-                      glance_exc.BadRequest)
-
         try:
-            return getattr(self.client.images, method)(*args, **kwargs)
-        except retry_excs as e:
+            return getattr(self.client, method)(*args, **kwargs)
+        except openstack_exc.SDKException:
+            exc_type, exc_value, exc_trace = sys.exc_info()
+            new_exc = _translate_image_exception(
+                args[0], exc_value)
+            if isinstance(new_exc, exception.IronicException):
+                # exception has been translated to a new one, raise it
+                raise type(new_exc)(new_exc).with_traceback(exc_trace)
+        except ks_exception.ClientException as e:
             error_msg = ("Error contacting glance endpoint "
                          "%(endpoint)s for '%(method)s'")
             LOG.exception(error_msg, {'endpoint': self.endpoint,
                                       'method': method})
             raise exception.GlanceConnectionFailed(
                 endpoint=self.endpoint, reason=e)
-        except image_excs:
-            exc_type, exc_value, exc_trace = sys.exc_info()
-            new_exc = _translate_image_exception(
-                args[0], exc_value)
-            raise type(new_exc)(new_exc).with_traceback(exc_trace)
 
     @check_image_service
     def show(self, image_href):
@@ -168,7 +176,7 @@ class GlanceImageService(object):
                   image_href)
         image_id = service_utils.parse_image_id(image_href)
 
-        image = self.call('get', image_id)
+        image = self.call('get_image', image_id)
 
         if not service_utils.is_image_active(image):
             raise exception.ImageUnacceptable(
@@ -179,16 +187,34 @@ class GlanceImageService(object):
             raise exception.ImageNotFound(image_id=image_id)
 
         base_image_meta = service_utils.translate_from_glance(image)
+
+        # Check if the image is encrypted (requires Barbican key access)
+        image_properties = base_image_meta.get('properties', {})
+        if image_properties.get('cinder_encryption_key_id'):
+            raise exception.ImageUnacceptable(
+                image_id=image_id,
+                reason=_("Ironic does not support encrypted images. The "
+                         "image is encrypted with a key stored in Barbican, "
+                         "and cannot be used for bare metal deployments."))
+
         return base_image_meta
 
     @check_image_service
-    def download(self, image_href, data=None):
+    def download(self, image_href, data=None, checksum=None,
+                 checksum_algo=None):
         """Calls out to Glance for data and writes data.
 
         :param image_href: The opaque image identifier.
         :param data: (Optional) File object to write data to.
+        :param checksum: Expected checksum value for validation during
+                         transfer.
+        :param checksum_algo: Algorithm for checksum (e.g., 'md5',
+                              'sha256').
         """
         image_id = service_utils.parse_image_id(image_href)
+
+        # Reset transfer checksum for new download
+        self._transfer_verified_checksum = None
 
         if 'file' in CONF.glance.allowed_direct_url_schemes:
             location = self._get_location(image_id)
@@ -199,18 +225,69 @@ class GlanceImageService(object):
                     os.sendfile(data.fileno(), f.fileno(), 0, filesize)
                 return
 
-        image_chunks = self.call('data', image_id)
-        # NOTE(dtantsur): when using Glance V2, image_chunks is a wrapper
-        # around real data, so we have to check the wrapped data for None.
-        if image_chunks.wrapped is None:
+        image_size = 0
+        image_data = None
+        if data:
+            # Get streaming response from glance
+            resp = self.call('download_image', image_id, stream=True)
+
+            # If checksum validation is requested, use TransferHelper
+            # to calculate checksum during download
+            if checksum and checksum_algo:
+                try:
+                    download_helper = checksum_utils.TransferHelper(
+                        resp, checksum_algo, checksum,
+                        chunk_size=IMAGE_CHUNK_SIZE)
+                    for chunk in download_helper:
+                        data.write(chunk)
+                        image_size += len(chunk)
+
+                    # Verify checksum matches
+                    if download_helper.checksum_matches:
+                        # Store verified checksum in algo:value format
+                        self._transfer_verified_checksum = (
+                            f"{checksum_algo}:{checksum}")
+                        LOG.debug("Verified checksum during download of image "
+                                  "%(image)s: %(algo)s:%(checksum)s",
+                                  {'image': image_href, 'algo': checksum_algo,
+                                   'checksum': checksum})
+                    else:
+                        raise exception.ImageChecksumError()
+                except (exception.ImageChecksumAlgorithmFailure, ValueError):
+                    # Fall back to download without checksumming
+                    LOG.warning("Checksum algorithm %(algo)s not available, "
+                                "downloading without incremental checksum for "
+                                "image %(image)s",
+                                {'algo': checksum_algo, 'image': image_href})
+                    # NOTE(JayF): Must use iter_content with explicit chunk
+                    # size. See IMAGE_CHUNK_SIZE definition for details.
+                    for chunk in resp.iter_content(
+                            chunk_size=IMAGE_CHUNK_SIZE):
+                        data.write(chunk)
+                        image_size += len(chunk)
+            else:
+                # No checksum requested, just stream and write.
+                # NOTE(JayF): Must use iter_content with explicit chunk
+                # size. See IMAGE_CHUNK_SIZE definition for details.
+                for chunk in resp.iter_content(chunk_size=IMAGE_CHUNK_SIZE):
+                    data.write(chunk)
+                    image_size += len(chunk)
+        else:
+            image_data = self.call('download_image', image_id).content
+            image_size = len(image_data)
+        if image_size == 0:
             raise exception.ImageDownloadFailed(
                 image_href=image_href, reason=_('image contains no data.'))
+        return image_data
 
-        if data is None:
-            return image_chunks
-        else:
-            for chunk in image_chunks:
-                data.write(chunk)
+    @check_image_service
+    def member_list(self, image_id: str) -> list[glance_v2.member.Member]:
+        """Calls out to Glance to find the members for an image_id
+
+        :param image_id: The image ID.
+        :returns: list of member IDs
+        """
+        return self.call('members', image_id)
 
     def _generate_temp_url(self, path, seconds, key, method, endpoint,
                            image_id):
@@ -236,11 +313,12 @@ class GlanceImageService(object):
             if image_id in self._cache:
                 return self._cache[image_id].url
 
-        path = swift_utils.generate_temp_url(
-            path=path, seconds=seconds, key=key, method=method)
+        with swift.SwiftAPI() as swiftapi:
+            path = swiftapi.generate_temp_url(
+                path=path, timeout=seconds, temp_url_key=key, method=method)
 
-        temp_url = '{endpoint_url}{url_path}'.format(
-            endpoint_url=endpoint, url_path=path)
+            temp_url = '{endpoint_url}{url_path}'.format(
+                endpoint_url=endpoint, url_path=path)
 
         if CONF.glance.swift_temp_url_cache_enabled:
             query = urlparse.urlparse(temp_url).query
@@ -320,9 +398,8 @@ class GlanceImageService(object):
             account = '%s%s' % (swift_account_prefix, auth_ref.project_id)
 
         if not key:
-            swift_api = swift.SwiftAPI()
-            key_header = 'x-account-meta-temp-url-key'
-            key = swift_api.connection.head_account().get(key_header)
+            with swift.SwiftAPI() as swift_api:
+                key = swift_api.get_temp_url_key()
 
         if not key:
             raise exception.MissingParameterValue(_(
@@ -401,7 +478,7 @@ class GlanceImageService(object):
         Returns the direct url representing the backend storage location,
         or None if this attribute is not shown by Glance.
         """
-        image_meta = self.call('get', image_id)
+        image_meta = self.call('get_image', image_id)
 
         if not service_utils.is_image_available(self.context, image_meta):
             raise exception.ImageNotFound(image_id=image_id)
@@ -422,3 +499,15 @@ class GlanceImageService(object):
             if (v.url_expires_at < max_valid_time)]
         for k in keys_to_remove:
             del self._cache[k]
+
+    # TODO(TheJulia): Here because the GlanceImageService class is not based
+    # upon the base image service class.
+    @property
+    def is_auth_set_needed(self):
+        """Property to notify the caller if it needs to set authentication."""
+        return False
+
+    @property
+    def transfer_verified_checksum(self):
+        """The transferred artifact checksum."""
+        return self._transfer_verified_checksum

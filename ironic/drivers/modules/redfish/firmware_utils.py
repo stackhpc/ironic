@@ -25,11 +25,12 @@ from ironic.common.i18n import _
 from ironic.common import image_service
 from ironic.common import swift
 from ironic.conf import CONF
+from ironic.drivers.modules.redfish import utils as redfish_utils
 
 LOG = log.getLogger(__name__)
 
 _UPDATE_FIRMWARE_SCHEMA = {
-    "$schema": "http://json-schema.org/schema#",
+    "$schema": "http://json-schema.org/draft-04/schema#",
     "title": "update_firmware clean step schema",
     "type": "array",
     # list of firmware update images
@@ -63,6 +64,40 @@ _UPDATE_FIRMWARE_SCHEMA = {
         "additionalProperties": False
     }
 }
+
+_FIRMWARE_INTERFACE_UPDATE_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "title": "update_firmware clean step schema",
+    "type": "array",
+    "minItems": 1,
+    # list of firmware update images
+    "items": {
+        "type": "object",
+        "required": ["component", "url"],
+        "properties": {
+            "component": {
+                "description": "name of the firmware component to be updated",
+                "type": "string",
+                "anyOf": [
+                    {"enum": redfish_utils.FIRMWARE_COMPONENTS},
+                    {"pattern": "^%s.*" % redfish_utils.NIC_COMPONENT_PREFIX}
+                ]
+            },
+            "url": {
+                "description": "URL for firmware file",
+                "type": "string",
+                "minLength": 1
+            },
+            "wait": {
+                "description": "optional wait time for firmware update",
+                "type": "integer",
+                "minimum": 1
+            }
+        },
+        "additionalProperties": False
+    }
+}
+
 _FIRMWARE_SUBDIR = 'firmware'
 
 
@@ -80,6 +115,20 @@ def validate_update_firmware_args(firmware_images):
             % {'firmware_images': firmware_images, 'err': err})
 
 
+def validate_firmware_interface_update_args(settings):
+    """Validate ``update`` step input argument
+
+    :param settings: args to validate.
+    :raises: InvalidParameterValue When argument is not valid
+    """
+    try:
+        jsonschema.validate(settings, _FIRMWARE_INTERFACE_UPDATE_SCHEMA)
+    except jsonschema.ValidationError as err:
+        raise exception.InvalidParameterValue(
+            _('Invalid firmware update %(settings)s. Errors: %(err)s')
+            % {'settings': settings, 'err': err})
+
+
 def get_swift_temp_url(parsed_url):
     """Gets Swift temporary URL
 
@@ -87,9 +136,10 @@ def get_swift_temp_url(parsed_url):
         swift://container/[sub-folder/]file
     :returns: Swift temporary URL
     """
-    return swift.SwiftAPI().get_temp_url(
-        parsed_url.netloc, parsed_url.path.lstrip('/'),
-        CONF.redfish.swift_object_expiry_timeout)
+    with swift.SwiftAPI() as swift_api:
+        return swift_api.get_temp_url(
+            parsed_url.netloc, parsed_url.path.lstrip('/'),
+            CONF.redfish.swift_object_expiry_timeout)
 
 
 def download_to_temp(node, url):
@@ -137,8 +187,22 @@ def verify_checksum(node, checksum, file_path):
     :param file_path: File path for which to verify checksum
     :raises RedfishError: When checksum does not match
     """
-    calculated_checksum = fileutils.compute_file_checksum(
-        file_path, algorithm='sha1')
+    if len(checksum) <= 41:
+        # SHA1: 40 bytes long
+        calculated_checksum = fileutils.compute_file_checksum(
+            file_path, algorithm='sha1')
+    elif len(checksum) <= 64:
+        calculated_checksum = fileutils.compute_file_checksum(
+            file_path, algorithm='sha256')
+    elif len(checksum) <= 128:
+        calculated_checksum = fileutils.compute_file_checksum(
+            file_path, algorithm='sha512')
+    else:
+        raise exception.RedfishError(
+            _('Unable to identify checksum to perform firmware file checksum '
+              'calculation. Please validate your input in and try again. '
+              'Received: %(checksum)s')
+            % {'checksum': checksum})
     if checksum != calculated_checksum:
         raise exception.RedfishError(
             _('For node %(node)s firmware file %(temp_file)s checksums do not '
@@ -195,19 +259,19 @@ def stage(node, source, temp_file):
     elif source == 'swift':
         container = CONF.redfish.swift_container
         timeout = CONF.redfish.swift_object_expiry_timeout
-        swift_api = swift.SwiftAPI()
-        object_name = "/".join([node.uuid, filename])
-        swift_api.create_object(
-            container,
-            object_name,
-            temp_file,
-            object_headers={'X-Delete-After': str(timeout)})
-        staged_url = swift_api.get_temp_url(
-            container, object_name, timeout)
-        LOG.debug('For node %(node)s temporary file at %(temp_file)s will be '
-                  'served from Swift temporary URL %(staged_url)s',
-                  {'node': node.uuid, 'temp_file': temp_file,
-                   'staged_url': staged_url})
+        with swift.SwiftAPI() as swift_api:
+            object_name = "/".join([node.uuid, filename])
+            swift_api.create_object(
+                container,
+                object_name,
+                temp_file,
+                object_headers={'X-Delete-After': str(timeout)})
+            staged_url = swift_api.get_temp_url(
+                container, object_name, timeout)
+            LOG.debug('For node %(node)s temporary file at %(temp_file)s will '
+                      'be served from Swift temporary URL %(staged_url)s',
+                      {'node': node.uuid, 'temp_file': temp_file,
+                       'staged_url': staged_url})
 
     need_cleanup = 'swift' if source == 'swift' else 'http'
     return staged_url, need_cleanup
@@ -239,19 +303,18 @@ def cleanup(node):
         shutil.rmtree(http_dir, ignore_errors=True)
 
     if 'swift' in cleanup:
-        swift_api = swift.SwiftAPI()
-        container = CONF.redfish.swift_container
-        LOG.debug('For node %(node)s cleaning up files from Swift container '
-                  '%(container)s.',
-                  {'node': node.uuid, 'container': container})
-        _, objects = swift_api.connection.get_container(container)
-        for o in objects:
-            name = o.get('name')
-            if name and name.startswith(node.uuid):
-                try:
-                    swift_api.delete_object(container, name)
-                except exception.SwiftOperationError as error:
-                    LOG.warning('For node %(node)s failed to clean up '
-                                '%(object)s. Error: %(error)s',
-                                {'node': node.uuid, 'object': name,
-                                 'error': error})
+        with swift.SwiftAPI() as swift_api:
+            container = CONF.redfish.swift_container
+            LOG.debug('For node %(node)s cleaning up files from Swift '
+                      'container %(container)s.',
+                      {'node': node.uuid, 'container': container})
+            objects = swift_api.connection.list_objects(container)
+            for o in objects:
+                if o.name and o.name.startswith(node.uuid):
+                    try:
+                        swift_api.delete_object(container, o.name)
+                    except exception.SwiftOperationError as error:
+                        LOG.warning('For node %(node)s failed to clean up '
+                                    '%(object)s. Error: %(error)s',
+                                    {'node': node.uuid, 'object': o.name,
+                                     'error': error})

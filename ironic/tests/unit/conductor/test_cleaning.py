@@ -73,6 +73,48 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
         self.__do_node_clean_validate_fail(mock_validate,
                                            clean_steps=clean_steps)
 
+    @mock.patch.object(n_flat.FlatNetwork, 'validate', autospec=True)
+    @mock.patch.object(fake.FakeDeploy, 'switch_interface', autospec=True)
+    def test__do_node_clean_switches_interface(self, mock_switch,
+                                               mock_net_validate):
+        """Test the deploy interface gets to switch before cleaning.
+
+        Without this, a node whose deploy interface is 'autodetect' has no
+        concrete interface to prepare the ramdisk with, and cleaning is
+        silently skipped.
+        """
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANING,
+            target_provision_state=states.AVAILABLE)
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            cleaning.do_node_clean(task)
+            mock_switch.assert_called_once_with(task.driver.deploy, task)
+
+    @mock.patch.object(fake.FakeDeploy, 'tear_down_cleaning', autospec=True)
+    @mock.patch.object(fake.FakeDeploy, 'switch_interface', autospec=True)
+    def test__do_node_clean_switch_interface_fail(self, mock_switch,
+                                                  mock_tear_down):
+        """Test a failure to resolve an interface fails the clean.
+
+        Nothing has been prepared at that point, so there must be no
+        attempt to tear anything down.
+        """
+        mock_switch.side_effect = exception.InvalidParameterValue('error')
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANING,
+            target_provision_state=states.AVAILABLE)
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            cleaning.do_node_clean(task)
+        node.refresh()
+        self.assertEqual(states.CLEANFAIL, node.provision_state)
+        self.assertIn('Failed to select a deploy interface',
+                      node.last_error)
+        self.assertFalse(mock_tear_down.called)
+
     @mock.patch('ironic.drivers.modules.fake.FakePower.validate',
                 autospec=True)
     def test__do_node_clean_automated_power_validate_fail(self, mock_validate):
@@ -165,9 +207,10 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
     def test__do_node_clean_automated_cache_bios_unsupported(self):
         self._test__do_node_clean_cache_bios(enable_unsupported=True)
 
+    @mock.patch.object(cleaning, 'LOG', autospec=True)
     @mock.patch('ironic.drivers.modules.fake.FakePower.validate',
                 autospec=True)
-    def test__do_node_clean_automated_disabled(self, mock_validate):
+    def test__do_node_clean_automated_disabled(self, mock_validate, mock_log):
         self.config(automated_clean=False, group='conductor')
 
         node = obj_utils.create_test_node(
@@ -187,6 +230,12 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
         self.assertEqual({}, node.clean_step)
         self.assertNotIn('clean_steps', node.driver_internal_info)
         self.assertNotIn('clean_step_index', node.driver_internal_info)
+        mock_log.info.assert_called_once_with("Automated cleaning is disabled "
+                                              "via %(how)s, node %(node)s has "
+                                              "been successfully moved to "
+                                              "AVAILABLE state",
+                                              {'how': 'configuration',
+                                               'node': node.uuid})
 
     @mock.patch('ironic.drivers.modules.fake.FakePower.validate',
                 autospec=True)
@@ -432,9 +481,48 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
         node.refresh()
         self.assertEqual(states.CLEANFAIL, node.provision_state)
         self.assertEqual(tgt_prov_state, node.target_provision_state)
-        mock_steps.assert_called_once_with(mock.ANY, disable_ramdisk=False)
+        if clean_steps and invalid_exc:
+            # Early validation catches InvalidParameterValue for manual
+            # cleaning (expecting IPA may provide steps later), then late
+            # validation raises it again.
+            self.assertEqual(2, mock_steps.call_count)
+        else:
+            mock_steps.assert_called_once_with(
+                mock.ANY, disable_ramdisk=False,
+                use_existing_steps=mock.ANY)
         self.assertFalse(node.maintenance)
         self.assertIsNone(node.fault)
+
+    @mock.patch('ironic.drivers.modules.fake.FakePower.set_power_state',
+                autospec=True)
+    @mock.patch.object(n_flat.FlatNetwork, 'validate', autospec=True)
+    @mock.patch.object(conductor_steps, 'set_node_cleaning_steps',
+                       autospec=True)
+    def test_do_node_clean_steps_fail_poweroff(self, mock_steps, mock_validate,
+                                               mock_power, clean_steps=None,
+                                               invalid_exc=True):
+        if invalid_exc:
+            mock_steps.side_effect = exception.InvalidParameterValue('invalid')
+        else:
+            mock_steps.side_effect = exception.NodeCleaningFailure('failure')
+        tgt_prov_state = states.MANAGEABLE if clean_steps else states.AVAILABLE
+        self.config(poweroff_in_cleanfail=True, group='conductor')
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            uuid=uuidutils.generate_uuid(),
+            provision_state=states.CLEANING,
+            power_state=states.POWER_ON,
+            target_provision_state=tgt_prov_state)
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            cleaning.do_node_clean(task, clean_steps=clean_steps)
+            mock_validate.assert_called_once_with(mock.ANY, task)
+        node.refresh()
+        self.assertEqual(states.CLEANFAIL, node.provision_state)
+        self.assertEqual(tgt_prov_state, node.target_provision_state)
+        mock_steps.assert_called_once_with(mock.ANY, disable_ramdisk=False,
+                                           use_existing_steps=mock.ANY)
+        self.assertTrue(mock_power.called)
 
     def test__do_node_clean_automated_steps_fail(self):
         for invalid in (True, False):
@@ -454,13 +542,13 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
                 autospec=True)
     def __do_node_clean(self, mock_power_valid, mock_network_valid,
                         mock_next_step, mock_steps, clean_steps=None,
-                        disable_ramdisk=False):
-        if clean_steps:
+                        disable_ramdisk=False, automated_with_steps=False):
+        if clean_steps and not automated_with_steps:
             tgt_prov_state = states.MANAGEABLE
         else:
             tgt_prov_state = states.AVAILABLE
 
-            def set_steps(task, disable_ramdisk=None):
+            def set_steps(task, disable_ramdisk=None, use_existing_steps=None):
                 dii = task.node.driver_internal_info
                 dii['clean_steps'] = self.clean_steps
                 task.node.driver_internal_info = dii
@@ -479,7 +567,8 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
         with task_manager.acquire(
                 self.context, node.uuid, shared=False) as task:
             cleaning.do_node_clean(task, clean_steps=clean_steps,
-                                   disable_ramdisk=disable_ramdisk)
+                                   disable_ramdisk=disable_ramdisk,
+                                   automated_with_steps=automated_with_steps)
 
             node.refresh()
 
@@ -492,7 +581,8 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
             mock_next_step.assert_called_once_with(
                 task, 0, disable_ramdisk=disable_ramdisk)
             mock_steps.assert_called_once_with(
-                task, disable_ramdisk=disable_ramdisk)
+                task, disable_ramdisk=disable_ramdisk,
+                use_existing_steps=mock.ANY)
             if clean_steps:
                 self.assertEqual(clean_steps,
                                  node.driver_internal_info['clean_steps'])
@@ -512,6 +602,105 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
     def test__do_node_clean_manual_disable_ramdisk(self):
         self.__do_node_clean(clean_steps=[self.deploy_raid],
                              disable_ramdisk=True)
+
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.prepare_cleaning',
+                autospec=True)
+    @mock.patch.object(conductor_steps, '_get_cleaning_steps', autospec=True)
+    @mock.patch.object(conductor_steps, 'set_node_cleaning_steps',
+                       autospec=True)
+    @mock.patch.object(cleaning, 'do_next_clean_step', autospec=True)
+    @mock.patch('ironic.drivers.modules.network.flat.FlatNetwork.validate',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.validate',
+                autospec=True)
+    def test__do_node_clean_manual_auto_disable_ramdisk(
+            self, mock_power_valid, mock_network_valid,
+            mock_next_step, mock_steps, mock_get_steps, mock_prepare):
+        bios_step = {
+            'step': 'apply_configuration', 'priority': 0,
+            'interface': 'bios',
+            'args': {'settings': [{'name': 'foo', 'value': 'bar'}]}
+        }
+        driver_bios_step = {
+            'step': 'apply_configuration', 'priority': 0,
+            'interface': 'bios', 'abortable': False,
+            'argsinfo': mock.ANY,
+            'requires_ramdisk': False,
+        }
+
+        def enrich_steps(task, disable_ramdisk=None,
+                         use_existing_steps=None):
+            dii = task.node.driver_internal_info
+            dii['clean_steps'] = [
+                dict(bios_step, abortable=False)
+            ]
+            task.node.driver_internal_info = dii
+            task.node.save()
+
+        mock_steps.side_effect = enrich_steps
+        mock_get_steps.return_value = [driver_bios_step]
+
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANING,
+            target_provision_state=states.MANAGEABLE,
+            last_error=None,
+            power_state=states.POWER_OFF)
+
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            cleaning.do_node_clean(task, clean_steps=[bios_step])
+
+            node.refresh()
+
+            mock_power_valid.assert_called_once_with(mock.ANY, task)
+            mock_network_valid.assert_called_once_with(mock.ANY, task)
+            mock_steps.assert_called_once_with(
+                task, disable_ramdisk=False, use_existing_steps=True)
+            mock_get_steps.assert_called_once_with(
+                task, enabled=False, sort=False)
+            mock_next_step.assert_called_once_with(
+                task, 0, disable_ramdisk=True)
+            mock_prepare.assert_not_called()
+            self.assertTrue(
+                node.driver_internal_info['cleaning_disable_ramdisk'])
+
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.prepare_cleaning',
+                autospec=True)
+    @mock.patch.object(conductor_steps, 'set_node_cleaning_steps',
+                       autospec=True)
+    @mock.patch.object(cleaning, 'do_next_clean_step', autospec=True)
+    @mock.patch('ironic.drivers.modules.network.flat.FlatNetwork.validate',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.validate',
+                autospec=True)
+    def test__do_node_clean_manual_early_validation_fails(
+            self, mock_power_valid, mock_network_valid,
+            mock_next_step, mock_steps, mock_prepare):
+        """When early validation fails, IPA boots and late validation runs."""
+        mock_steps.side_effect = [
+            exception.InvalidParameterValue('unknown step'),
+            None,
+        ]
+        mock_prepare.return_value = None
+
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANING,
+            target_provision_state=states.MANAGEABLE,
+            last_error=None,
+            power_state=states.POWER_OFF)
+
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            cleaning.do_node_clean(task, clean_steps=[self.deploy_raid])
+
+            node.refresh()
+
+            self.assertEqual(2, mock_steps.call_count)
+            mock_prepare.assert_called_once_with(mock.ANY, task)
+            mock_next_step.assert_called_once_with(
+                task, 0, disable_ramdisk=False)
 
     @mock.patch('ironic.drivers.modules.fake.FakeDeploy.execute_clean_step',
                 autospec=True)
@@ -570,7 +759,8 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
             target_provision_state=tgt_prov_state,
             last_error=None,
             driver_internal_info={'clean_steps': self.clean_steps,
-                                  'clean_step_index': 0},
+                                  'clean_step_index': 0,
+                                  'cleaning_polling': True},
             clean_step=self.clean_steps[0])
         mock_execute.return_value = return_state
 
@@ -586,6 +776,7 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
         self.assertEqual(1, node.driver_internal_info['clean_step_index'])
         mock_execute.assert_called_once_with(
             mock.ANY, mock.ANY, self.clean_steps[1])
+        self.assertNotIn('cleaning_polling', node.driver_internal_info)
 
     def test_do_next_clean_step_continue_from_last_cleaning(self):
         self._do_next_clean_step_continue_from_last_cleaning(states.CLEANWAIT)
@@ -1106,6 +1297,36 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
     def test__do_next_clean_step_manual_bad_step_return_value(self):
         self._do_next_clean_step_bad_step_return_value(manual=True)
 
+    def _test_do_next_clean_step_handles_hold(self, start_state):
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=start_state,
+            driver_internal_info={
+                'clean_steps': [
+                    {
+                        'step': 'hold',
+                        'priority': 10,
+                        'interface': 'power'
+                    }
+                ],
+                'clean_step_index': None},
+            clean_step=None)
+
+        with task_manager.acquire(
+                self.context, node.uuid, shared=False) as task:
+            cleaning.do_next_clean_step(task, 0)
+        node.refresh()
+
+        self.assertEqual(states.CLEANHOLD, node.provision_state)
+
+    def test_do_next_clean_step_handles_hold_from_active(self):
+        # Start is from the conductor
+        self._test_do_next_clean_step_handles_hold(states.CLEANING)
+
+    def test_do_next_clean_step_handles_hold_from_wait(self):
+        # Start is the continuation from a heartbeat.
+        self._test_do_next_clean_step_handles_hold(states.CLEANWAIT)
+
     @mock.patch.object(cleaning, 'do_next_clean_step', autospec=True)
     def _continue_node_clean(self, mock_next_step, skip=True):
         # test that skipping current step mechanism works
@@ -1135,15 +1356,22 @@ class DoNodeCleanTestCase(db_base.DbTestCase):
     def test_continue_node_clean_no_skip_step(self):
         self._continue_node_clean(skip=False)
 
+    def test__do_node_clean_automated_with_steps(self):
+        """Test automated cleaning with steps from runbook."""
+        self.__do_node_clean(
+            clean_steps=self.clean_steps,
+            automated_with_steps=True)
+
 
 class DoNodeCleanAbortTestCase(db_base.DbTestCase):
     @mock.patch.object(fake.FakeDeploy, 'tear_down_cleaning', autospec=True)
-    def _test__do_node_clean_abort(self, step_name, tear_mock):
+    def _test_do_node_clean_abort(self, clean_step,
+                                  tear_mock=None):
         node = obj_utils.create_test_node(
             self.context, driver='fake-hardware',
-            provision_state=states.CLEANFAIL,
+            provision_state=states.CLEANWAIT,
             target_provision_state=states.AVAILABLE,
-            clean_step={'step': 'foo', 'abortable': True},
+            clean_step=clean_step,
             driver_internal_info={
                 'agent_url': 'some url',
                 'agent_secret_token': 'token',
@@ -1153,11 +1381,11 @@ class DoNodeCleanAbortTestCase(db_base.DbTestCase):
                 'skip_current_clean_step': True})
 
         with task_manager.acquire(self.context, node.uuid) as task:
-            cleaning.do_node_clean_abort(task, step_name=step_name)
+            cleaning.do_node_clean_abort(task)
             self.assertIsNotNone(task.node.last_error)
             tear_mock.assert_called_once_with(task.driver.deploy, task)
-            if step_name:
-                self.assertIn(step_name, task.node.last_error)
+            if clean_step:
+                self.assertIn(clean_step['step'], task.node.last_error)
             # assert node's clean_step and metadata was cleaned up
             self.assertEqual({}, task.node.clean_step)
             self.assertNotIn('clean_step_index',
@@ -1173,11 +1401,30 @@ class DoNodeCleanAbortTestCase(db_base.DbTestCase):
             self.assertNotIn('agent_secret_token',
                              task.node.driver_internal_info)
 
-    def test__do_node_clean_abort(self):
-        self._test__do_node_clean_abort(None)
+    def test_do_node_clean_abort_early(self):
+        self._test_do_node_clean_abort(None)
 
-    def test__do_node_clean_abort_with_step_name(self):
-        self._test__do_node_clean_abort('foo')
+    @mock.patch.object(fake.FakeDeploy, 'restore_interface', autospec=True)
+    @mock.patch.object(fake.FakeDeploy, 'tear_down_cleaning', autospec=True)
+    def test_do_node_clean_abort_restores_interface(self, tear_mock,
+                                                    restore_mock):
+        """Test the deploy interface is restored after an aborted clean.
+
+        do_node_clean() switches the interface for us, so aborting must
+        switch it back like the success and failure paths do.
+        """
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANWAIT,
+            target_provision_state=states.AVAILABLE)
+
+        with task_manager.acquire(self.context, node.uuid) as task:
+            cleaning.do_node_clean_abort(task)
+            restore_mock.assert_called_once_with(task.driver.deploy, task)
+
+    def test_do_node_clean_abort_with_step(self):
+        self._test_do_node_clean_abort({'step': 'foo', 'interface': 'deploy',
+                                        'abortable': True})
 
     @mock.patch.object(fake.FakeDeploy, 'tear_down_cleaning', autospec=True)
     def test__do_node_clean_abort_tear_down_fail(self, tear_mock):
@@ -1196,3 +1443,216 @@ class DoNodeCleanAbortTestCase(db_base.DbTestCase):
             self.assertIsNotNone(task.node.maintenance_reason)
             self.assertTrue(task.node.maintenance)
             self.assertEqual('clean failure', task.node.fault)
+
+    @mock.patch.object(fake.FakeDeploy, 'tear_down_cleaning', autospec=True)
+    def test__do_node_cleanhold_abort_tear_down_fail(self, tear_mock):
+        tear_mock.side_effect = Exception('Surprise')
+
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANHOLD,
+            target_provision_state=states.MANAGEABLE,
+            clean_step={'step': 'hold', 'abortable': True})
+
+        with task_manager.acquire(self.context, node.uuid) as task:
+            cleaning.do_node_clean_abort(task)
+            tear_mock.assert_called_once_with(task.driver.deploy, task)
+            self.assertIsNotNone(task.node.last_error)
+            self.assertIsNotNone(task.node.maintenance_reason)
+            self.assertTrue(task.node.maintenance)
+            self.assertEqual('clean failure', task.node.fault)
+
+
+class DoNodeCleanTestChildNodes(db_base.DbTestCase):
+    def setUp(self):
+        super(DoNodeCleanTestChildNodes, self).setUp()
+        self.config(automated_clean=True, group='conductor')
+        self.power_on_parent = {
+            'step': 'power_on', 'priority': 4, 'interface': 'power'}
+        self.power_on_children = {
+            'step': 'power_on', 'priority': 5, 'interface': 'power',
+            'execute_on_child_nodes': True}
+        self.update_firmware_on_children = {
+            'step': 'update_firmware', 'priority': 10,
+            'interface': 'management', 'execute_on_child_nodes': True}
+        self.reboot_children = {
+            'step': 'reboot', 'priority': 5, 'interface': 'power',
+            'execute_on_child_nodes': True}
+        self.power_on_parent = {
+            'step': 'power_on', 'priority': 15, 'interface': 'power'}
+        self.clean_steps = [
+            self.power_on_parent,
+            self.power_on_children,
+            self.update_firmware_on_children,
+            self.reboot_children,
+            self.power_on_parent]
+        self.node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.CLEANING,
+            target_provision_state=states.MANAGEABLE,
+            last_error=None,
+            power_state=states.POWER_ON,
+            driver_internal_info={'agent_secret_token': 'old',
+                                  'clean_steps': self.clean_steps})
+
+    @mock.patch('ironic.drivers.modules.fake.FakePower.get_power_state',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.reboot',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.set_power_state',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.network.flat.FlatNetwork.validate',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.validate',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.execute_clean_step',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeManagement.'
+                'execute_clean_step', autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.execute_clean_step',
+                autospec=True)
+    def test_do_next_clean_step_with_children(
+            self, mock_deploy, mock_mgmt, mock_power, mock_pv, mock_nv,
+            mock_sps, mock_reboot, mock_gps):
+        child_node1 = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            last_error=None,
+            power_state=states.POWER_OFF,
+            parent_node=self.node.uuid)
+        child_node2 = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            last_error=None,
+            power_state=states.POWER_OFF,
+            parent_node=self.node.uuid)
+        mock_gps.side_effect = [states.POWER_OFF,
+                                states.POWER_ON,
+                                states.POWER_OFF,
+                                states.POWER_ON,
+                                states.POWER_OFF,
+                                states.POWER_ON]
+        mock_deploy.return_value = None
+        mock_mgmt.return_value = None
+        mock_power.return_value = None
+        child1_updated_at = str(child_node1.updated_at)
+        child2_updated_at = str(child_node2.updated_at)
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            cleaning.do_next_clean_step(task, 0,
+                                        disable_ramdisk=True)
+        self.node.refresh()
+        child_node1.refresh()
+        child_node2.refresh()
+
+        # Confirm the objects *did* receive locks.
+        self.assertNotEqual(child1_updated_at, child_node1.updated_at)
+        self.assertNotEqual(child2_updated_at, child_node2.updated_at)
+
+        # Confirm the child nodes have no errors
+        self.assertFalse(child_node1.maintenance)
+        self.assertFalse(child_node2.maintenance)
+        self.assertIsNone(child_node1.last_error)
+        self.assertIsNone(child_node2.last_error)
+        self.assertIsNone(self.node.last_error)
+
+        # Confirm the call counts expected
+        self.assertEqual(0, mock_deploy.call_count)
+        self.assertEqual(2, mock_mgmt.call_count)
+        self.assertEqual(0, mock_power.call_count)
+        self.assertEqual(0, mock_nv.call_count)
+        self.assertEqual(0, mock_pv.call_count)
+        self.assertEqual(3, mock_sps.call_count)
+        self.assertEqual(2, mock_reboot.call_count)
+        mock_sps.assert_has_calls([
+            mock.call(mock.ANY, mock.ANY, 'power on', timeout=None),
+            mock.call(mock.ANY, mock.ANY, 'power on', timeout=None),
+            mock.call(mock.ANY, mock.ANY, 'power on', timeout=None)])
+
+    @mock.patch('ironic.drivers.modules.fake.FakePower.get_power_state',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.set_power_state',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.network.flat.FlatNetwork.validate',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.validate',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakePower.execute_clean_step',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeManagement.'
+                'execute_clean_step', autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.execute_clean_step',
+                autospec=True)
+    def test_do_next_clean_step_with_children_by_uuid(
+            self, mock_deploy, mock_mgmt, mock_power, mock_pv, mock_nv,
+            mock_sps, mock_gps):
+        child_node1 = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            last_error=None,
+            parent_node=self.node.uuid)
+        child_node2 = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver='fake-hardware',
+            last_error=None,
+            parent_node=self.node.uuid)
+        # NOTE(TheJulia): This sets the stage for the test,
+        # child node power is off, parent node power is on.
+        mock_gps.side_effect = [states.POWER_OFF,
+                                states.POWER_ON]
+        power_on_children = {
+            'step': 'power_on', 'priority': 5, 'interface': 'power',
+            'execute_on_child_nodes': True,
+            'limit_child_node_execution': [child_node1.uuid]}
+        update_firmware_on_children = {
+            'step': 'update_firmware', 'priority': 10,
+            'interface': 'management',
+            'execute_on_child_nodes': True,
+            'limit_child_node_execution': [child_node1.uuid]}
+        power_on_parent = {
+            'step': 'not_power', 'priority': 15, 'interface': 'power'}
+        clean_steps = [power_on_children, update_firmware_on_children,
+                       power_on_parent]
+        dii = self.node.driver_internal_info
+        dii['clean_steps'] = clean_steps
+        self.node.driver_internal_info = dii
+        self.node.save()
+
+        mock_deploy.return_value = None
+        mock_mgmt.return_value = None
+        mock_power.return_value = None
+        child1_updated_at = str(child_node1.updated_at)
+
+        with task_manager.acquire(
+                self.context, self.node.uuid, shared=False) as task:
+
+            cleaning.do_next_clean_step(task, 0,
+                                        disable_ramdisk=True)
+        self.node.refresh()
+        child_node1.refresh()
+        child_node2.refresh()
+
+        # Confirm the objects *did* receive locks.
+        self.assertNotEqual(child1_updated_at, child_node1.updated_at)
+        self.assertIsNone(child_node2.updated_at)
+
+        # Confirm the child nodes have no errors
+        self.assertFalse(child_node1.maintenance)
+        self.assertFalse(child_node2.maintenance)
+        self.assertIsNone(child_node1.last_error)
+        self.assertIsNone(child_node2.last_error)
+        self.assertIsNone(self.node.last_error)
+
+        # Confirm the call counts expected
+        self.assertEqual(0, mock_deploy.call_count)
+        self.assertEqual(1, mock_mgmt.call_count)
+        self.assertEqual(1, mock_power.call_count)
+        self.assertEqual(0, mock_nv.call_count)
+        self.assertEqual(0, mock_pv.call_count)
+        mock_sps.assert_has_calls([
+            mock.call(mock.ANY, mock.ANY, 'power on', timeout=None)])

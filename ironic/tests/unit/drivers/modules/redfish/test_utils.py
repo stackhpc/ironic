@@ -20,16 +20,14 @@ import time
 from unittest import mock
 
 from oslo_config import cfg
-from oslo_utils import importutils
 import requests
+import sushy
 
 from ironic.common import exception
 from ironic.drivers.modules.redfish import utils as redfish_utils
 from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.db import utils as db_utils
 from ironic.tests.unit.objects import utils as obj_utils
-
-sushy = importutils.try_import('sushy')
 
 INFO_DICT = db_utils.get_test_redfish_info()
 
@@ -60,6 +58,14 @@ class RedfishUtilsTestCase(db_base.DbTestCase):
     def test_parse_driver_info(self):
         response = redfish_utils.parse_driver_info(self.node)
         self.assertEqual(self.parsed_driver_info, response)
+
+    def test_parse_driver_info_firmware_update_unresponsive_bmc_wait_set(
+            self):
+        self.node.driver_info['firmware_update_unresponsive_bmc_wait'] = 30
+        self.parsed_driver_info = redfish_utils.parse_driver_info(self.node)
+        self.assertEqual(
+            self.parsed_driver_info['firmware_update_unresponsive_bmc_wait'],
+            30)
 
     def test_parse_driver_info_default_scheme(self):
         self.node.driver_info['redfish_address'] = 'example.com'
@@ -161,11 +167,61 @@ class RedfishUtilsTestCase(db_base.DbTestCase):
                                    'The value should be one of ',
                                    redfish_utils.parse_driver_info, self.node)
 
+    def test_parse_driver_info_tls_minimum_version_driver_info(self):
+        for value in '1.1', '1.2', '1.3':
+            self.node.driver_info['redfish_tls_minimum_version'] = value
+            response = redfish_utils.parse_driver_info(self.node)
+            self.assertEqual(value, response['tls_min_version'])
+
+    def test_parse_driver_info_tls_minimum_version_config(self):
+        self.config(tls_minimum_version='1.2', group='redfish')
+        response = redfish_utils.parse_driver_info(self.node)
+        self.assertEqual('1.2', response['tls_min_version'])
+
+    def test_parse_driver_info_tls_minimum_version_override(self):
+        self.config(tls_minimum_version='1.2', group='redfish')
+        self.node.driver_info['redfish_tls_minimum_version'] = '1.3'
+        response = redfish_utils.parse_driver_info(self.node)
+        self.assertEqual('1.3', response['tls_min_version'])
+
+    def test_parse_driver_info_tls_minimum_version_invalid(self):
+        self.node.driver_info['redfish_tls_minimum_version'] = '1.0'
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue,
+            'The value should be one of',
+            redfish_utils.parse_driver_info, self.node)
+
+    def test_parse_driver_info_tls_minimum_version_unset(self):
+        response = redfish_utils.parse_driver_info(self.node)
+        self.assertNotIn('tls_min_version', response)
+
+    def test_parse_driver_info_tls_ciphers_driver_info(self):
+        self.node.driver_info['redfish_tls_ciphers'] = 'ECDHE+AESGCM'
+        response = redfish_utils.parse_driver_info(self.node)
+        self.assertEqual('ECDHE+AESGCM', response['tls_ciphers'])
+
+    def test_parse_driver_info_tls_ciphers_config(self):
+        self.config(tls_ciphers='ECDHE+AESGCM', group='redfish')
+        response = redfish_utils.parse_driver_info(self.node)
+        self.assertEqual('ECDHE+AESGCM', response['tls_ciphers'])
+
+    def test_parse_driver_info_tls_ciphers_unset(self):
+        response = redfish_utils.parse_driver_info(self.node)
+        self.assertNotIn('tls_ciphers', response)
+
     def test_parse_driver_info_with_root_prefix(self):
         test_redfish_address = 'https://example.com/test/redfish/v0/'
         self.node.driver_info['redfish_address'] = test_redfish_address
         self.parsed_driver_info['root_prefix'] = '/test/redfish/v0/'
         response = redfish_utils.parse_driver_info(self.node)
+        self.assertEqual(self.parsed_driver_info, response)
+
+    def test_parse_driver_info_default_scheme_ipv6_brackets_added(self):
+        test_redfish_address = '2001:DB8::1'
+        self.node.driver_info['redfish_address'] = test_redfish_address
+        response = redfish_utils.parse_driver_info(self.node)
+        self.parsed_driver_info['address'] = ("https://[%s]"
+                                              % test_redfish_address)
         self.assertEqual(self.parsed_driver_info, response)
 
     def test_get_task_monitor(self):
@@ -204,6 +260,22 @@ class RedfishUtilsTestCase(db_base.DbTestCase):
         self.assertRaises(exception.RedfishError,
                           redfish_utils.get_update_service, self.node)
 
+    def test_get_root_vendor(self):
+        redfish_utils._get_connection = mock.Mock()
+        redfish_utils._get_connection.return_value = "AMI"
+
+        result = redfish_utils.get_root_vendor(self.node)
+
+        self.assertEqual("AMI", result)
+
+    def test_get_root_vendor_error(self):
+        redfish_utils._get_connection = mock.Mock()
+        redfish_utils._get_connection.side_effect = Exception('conn failed')
+
+        result = redfish_utils.get_root_vendor(self.node)
+
+        self.assertIsNone(result)
+
     def test_get_event_service(self):
         redfish_utils._get_connection = mock.Mock()
         mock_event_service = mock.Mock()
@@ -220,6 +292,41 @@ class RedfishUtilsTestCase(db_base.DbTestCase):
 
         self.assertRaises(exception.RedfishError,
                           redfish_utils.get_event_service, self.node)
+
+    def test_get_enabled_macs_normalizes_mac_addresses(self):
+        system = mock.Mock()
+        system.ethernet_interfaces.summary = {
+            '00:11:22:33:44:55': sushy.STATE_ENABLED,
+            '66:77:88:99:AA:BB': sushy.STATE_ENABLED,
+            'aa:bb:cc:dd:ee:ff': sushy.STATE_DISABLED,
+        }
+
+        result = redfish_utils.get_enabled_macs(mock.Mock(node=self.node),
+                                                system)
+
+        self.assertEqual(
+            {'00:11:22:33:44:55': sushy.STATE_ENABLED,
+             '66:77:88:99:aa:bb': sushy.STATE_ENABLED},
+            result)
+
+    def test_get_system_collection(self):
+        redfish_utils._get_connection = mock.Mock()
+        mock_system_collection = mock.Mock()
+        redfish_utils._get_connection.return_value = mock_system_collection
+
+        result = redfish_utils.get_system_collection(self.node)
+
+        self.assertEqual(mock_system_collection, result)
+
+    def test_get_system_collection_error(self):
+        redfish_utils._get_connection = mock.Mock()
+        redfish_utils._get_connection.side_effect =\
+            sushy.exceptions.ResourceNotFoundError('GET',
+                                                   '/',
+                                                   requests.Response())
+
+        self.assertRaises(exception.RedfishError,
+                          redfish_utils.get_system_collection, self.node)
 
 
 class RedfishUtilsAuthTestCase(db_base.DbTestCase):
@@ -242,6 +349,7 @@ class RedfishUtilsAuthTestCase(db_base.DbTestCase):
             'password': 'password',
             'verify_ca': True,
             'auth_type': 'auto',
+            'firmware_update_unresponsive_bmc_wait': 300,
             'node_uuid': self.node.uuid
         }
 
@@ -297,6 +405,8 @@ class RedfishUtilsAuthTestCase(db_base.DbTestCase):
         mock_sushy.assert_called_with(
             mock.ANY, verify=mock.ANY,
             auth=mock_session_or_basic_auth.return_value,
+            connect_timeout=30,
+            read_timeout=60,
         )
         self.assertEqual(len(redfish_utils.SessionCache._sessions), 1)
 
@@ -337,7 +447,9 @@ class RedfishUtilsAuthTestCase(db_base.DbTestCase):
         mock_sushy.assert_called_with(
             self.parsed_driver_info['address'],
             auth=mock_session_or_basic_auth.return_value,
-            verify=True)
+            verify=True,
+            connect_timeout=30,
+            read_timeout=60)
 
     @mock.patch.object(sushy, 'Sushy', autospec=True)
     @mock.patch('ironic.drivers.modules.redfish.utils.'
@@ -354,7 +466,9 @@ class RedfishUtilsAuthTestCase(db_base.DbTestCase):
         )
         mock_sushy.assert_called_with(
             mock.ANY, verify=mock.ANY,
-            auth=mock_session_auth.return_value
+            auth=mock_session_auth.return_value,
+            connect_timeout=30,
+            read_timeout=60,
         )
 
     @mock.patch.object(sushy, 'Sushy', autospec=True)
@@ -372,8 +486,173 @@ class RedfishUtilsAuthTestCase(db_base.DbTestCase):
         )
         sushy.Sushy.assert_called_with(
             mock.ANY, verify=mock.ANY,
-            auth=mock_basic_auth.return_value
+            auth=mock_basic_auth.return_value,
+            connect_timeout=30,
+            read_timeout=60,
         )
+
+    @mock.patch.object(sushy, 'Sushy', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache.AUTH_CLASSES', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache._sessions', {})
+    def test_connect_timeout_passed(self, mock_auth, mock_sushy):
+        cfg.CONF.set_override('connect_timeout', 10, 'redfish')
+        mock_session_or_basic_auth = mock_auth['auto']
+        redfish_utils.get_system(self.node)
+        mock_sushy.assert_called_with(
+            self.parsed_driver_info['address'],
+            auth=mock_session_or_basic_auth.return_value,
+            verify=True,
+            connect_timeout=10,
+            read_timeout=60)
+
+    @mock.patch.object(sushy, 'Sushy', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache.AUTH_CLASSES', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache._sessions', {})
+    def test_connect_timeout_default(self, mock_auth, mock_sushy):
+        mock_session_or_basic_auth = mock_auth['auto']
+        redfish_utils.get_system(self.node)
+        mock_sushy.assert_called_with(
+            self.parsed_driver_info['address'],
+            auth=mock_session_or_basic_auth.return_value,
+            verify=True,
+            connect_timeout=30,
+            read_timeout=60)
+
+    @mock.patch.object(sushy, 'Sushy', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache.AUTH_CLASSES', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache._sessions', {})
+    def test_connect_timeout_with_root_prefix(self, mock_auth, mock_sushy):
+        cfg.CONF.set_override('connect_timeout', 15, 'redfish')
+        self.node.driver_info['redfish_address'] = (
+            'https://example.com/custom/redfish/v1/')
+        mock_session_or_basic_auth = mock_auth['auto']
+        redfish_utils.get_system(self.node)
+        mock_sushy.assert_called_with(
+            'https://example.com',
+            auth=mock_session_or_basic_auth.return_value,
+            verify=True,
+            root_prefix='/custom/redfish/v1/',
+            connect_timeout=15,
+            read_timeout=60)
+
+    @mock.patch.object(sushy, 'Sushy', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache.AUTH_CLASSES', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache._sessions', {})
+    def test_read_timeout_passed(self, mock_auth, mock_sushy):
+        cfg.CONF.set_override('read_timeout', 300, 'redfish')
+        mock_session_or_basic_auth = mock_auth['auto']
+        redfish_utils.get_system(self.node)
+        mock_sushy.assert_called_with(
+            self.parsed_driver_info['address'],
+            auth=mock_session_or_basic_auth.return_value,
+            verify=True,
+            connect_timeout=30,
+            read_timeout=300)
+
+    @mock.patch.object(sushy, 'Sushy', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache.AUTH_CLASSES', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache._sessions', {})
+    def test_read_timeout_default(self, mock_auth, mock_sushy):
+        mock_session_or_basic_auth = mock_auth['auto']
+        redfish_utils.get_system(self.node)
+        mock_sushy.assert_called_with(
+            self.parsed_driver_info['address'],
+            auth=mock_session_or_basic_auth.return_value,
+            verify=True,
+            connect_timeout=30,
+            read_timeout=60)
+
+
+class RedfishUtilsTLSTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super(RedfishUtilsTLSTestCase, self).setUp()
+        self.config(enabled_hardware_types=['redfish'],
+                    enabled_power_interfaces=['redfish'],
+                    enabled_boot_interfaces=['redfish-virtual-media'],
+                    enabled_management_interfaces=['redfish'])
+        self.config(connection_attempts=1, group='redfish')
+        self.node = obj_utils.create_test_node(
+            self.context, driver='redfish', driver_info=INFO_DICT)
+
+    @mock.patch.object(sushy, 'Sushy', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache.AUTH_CLASSES', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache._sessions', {})
+    def test_tls_minimum_version_passed(
+            self, mock_auth, mock_sushy):
+        self.node.driver_info['redfish_tls_minimum_version'] = '1.2'
+        redfish_utils.get_system(self.node)
+        call_kwargs = mock_sushy.call_args[1]
+        self.assertEqual('1.2', call_kwargs['tls_min_version'])
+
+    @mock.patch.object(sushy, 'Sushy', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache.AUTH_CLASSES', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache._sessions', {})
+    def test_tls_ciphers_passed(
+            self, mock_auth, mock_sushy):
+        self.node.driver_info['redfish_tls_ciphers'] = (
+            'ECDHE+AESGCM')
+        redfish_utils.get_system(self.node)
+        call_kwargs = mock_sushy.call_args[1]
+        self.assertEqual('ECDHE+AESGCM',
+                         call_kwargs['tls_ciphers'])
+
+    @mock.patch.object(sushy, 'Sushy', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache.AUTH_CLASSES', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache._sessions', {})
+    def test_tls_params_from_config(
+            self, mock_auth, mock_sushy):
+        cfg.CONF.set_override(
+            'tls_minimum_version', '1.3', 'redfish')
+        cfg.CONF.set_override(
+            'tls_ciphers', 'ECDHE+AESGCM', 'redfish')
+        redfish_utils.get_system(self.node)
+        call_kwargs = mock_sushy.call_args[1]
+        self.assertEqual('1.3', call_kwargs['tls_min_version'])
+        self.assertEqual('ECDHE+AESGCM',
+                         call_kwargs['tls_ciphers'])
+
+    @mock.patch.object(sushy, 'Sushy', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache.AUTH_CLASSES', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache._sessions', {})
+    def test_tls_not_passed_when_unset(
+            self, mock_auth, mock_sushy):
+        redfish_utils.get_system(self.node)
+        call_kwargs = mock_sushy.call_args[1]
+        self.assertNotIn('tls_min_version', call_kwargs)
+        self.assertNotIn('tls_ciphers', call_kwargs)
+
+    @mock.patch.object(sushy, 'Sushy', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache.AUTH_CLASSES', autospec=True)
+    @mock.patch('ironic.drivers.modules.redfish.utils.'
+                'SessionCache._sessions', {})
+    def test_tls_driver_info_overrides_config(
+            self, mock_auth, mock_sushy):
+        cfg.CONF.set_override(
+            'tls_minimum_version', '1.2', 'redfish')
+        self.node.driver_info['redfish_tls_minimum_version'] = '1.3'
+        redfish_utils.get_system(self.node)
+        call_kwargs = mock_sushy.call_args[1]
+        self.assertEqual('1.3', call_kwargs['tls_min_version'])
 
 
 class RedfishUtilsSystemTestCase(db_base.DbTestCase):
@@ -396,6 +675,7 @@ class RedfishUtilsSystemTestCase(db_base.DbTestCase):
             'password': 'password',
             'verify_ca': True,
             'auth_type': 'auto',
+            'firmware_update_unresponsive_bmc_wait': 300,
             'node_uuid': self.node.uuid
         }
 

@@ -30,8 +30,8 @@ You should make the following changes to ``/etc/ironic/ironic.conf``:
     auth_strategy=http_basic
     http_basic_auth_user_file=/etc/ironic/htpasswd
 
-   Only the ``bcrypt`` format is supported, and the Apache `htpasswd` utility can
-   be used to populate the file with entries, for example:
+   Only the ``bcrypt`` format is supported, and the Apache ``htpasswd``
+   utility can be used to populate the file with entries, for example:
 
    .. code-block:: shell
 
@@ -66,7 +66,7 @@ You should make the following changes to ``/etc/ironic/ironic.conf``:
       rpc_transport = json-rpc
 
    JSON RPC also has its own authentication strategy. If it is not specified then
-   the stategy defaults to ``[DEFAULT]``  ``auth_strategy``. The following will
+   the strategy defaults to ``[DEFAULT]``  ``auth_strategy``. The following will
    set JSON RPC to ``noauth``:
 
    .. code-block:: ini
@@ -92,8 +92,21 @@ You should make the following changes to ``/etc/ironic/ironic.conf``:
     username = myName
     password = myPassword
 
-#. Starting with the Yoga release series, you can use a combined API+conductor
-   service and completely disable the RPC. Set
+#. To make graphical consoles available for local viewing, set the following,
+   including an appropriate container image reference for console_image.
+
+   .. code-block:: ini
+
+    [vnc]
+    enabled=True
+    port=6090
+    host_ip=127.0.0.1
+    public_url=http://127.0.0.1:6090/vnc_lite.html
+    container_provider=systemd
+    console_image=<image reference>
+
+#. Starting with the Yoga release series, you can use a combined
+   API+conductor+novncproxy service and completely disable the RPC. Set
 
    .. code-block:: ini
 

@@ -10,10 +10,8 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import collections
 from http import client as http_client
 
-from ironic_lib import metrics_utils
 from oslo_log import log
 from oslo_utils import strutils
 from oslo_utils import uuidutils
@@ -27,9 +25,12 @@ from ironic.api.controllers.v1 import collection
 from ironic.api.controllers.v1 import notification_utils as notify
 from ironic.api.controllers.v1 import utils as api_utils
 from ironic.api import method
+from ironic.api.schemas.v1 import deploy_template as schema
+from ironic.api import validation
 from ironic.common import args
 from ironic.common import exception
 from ironic.common.i18n import _
+from ironic.common import metrics_utils
 import ironic.conf
 from ironic import objects
 
@@ -57,44 +58,11 @@ PATCH_ALLOWED_FIELDS = ['extra', 'name', 'steps', 'description']
 STEP_PATCH_ALLOWED_FIELDS = ['args', 'interface', 'priority', 'step']
 
 
-def duplicate_steps(name, value):
-    """Argument validator to check template for duplicate steps"""
-    # TODO(mgoddard): Determine the consequences of allowing duplicate
-    # steps.
-    # * What if one step has zero priority and another non-zero?
-    # * What if a step that is enabled by default is included in a
-    #   template? Do we override the default or add a second invocation?
-
-    # Check for duplicate steps. Each interface/step combination can be
-    # specified at most once.
-    counter = collections.Counter((step['interface'], step['step'])
-                                  for step in value['steps'])
-    duplicates = {key for key, count in counter.items() if count > 1}
-    if duplicates:
-        duplicates = {"interface: %s, step: %s" % (interface, step)
-                      for interface, step in duplicates}
-        err = _("Duplicate deploy steps. A deploy template cannot have "
-                "multiple deploy steps with the same interface and step. "
-                "Duplicates: %s") % "; ".join(duplicates)
-        raise exception.InvalidDeployTemplate(err=err)
-    return value
-
-
 TEMPLATE_VALIDATOR = args.and_valid(
     args.schema(TEMPLATE_SCHEMA),
-    duplicate_steps,
+    api_utils.duplicate_steps,
     args.dict_valid(uuid=args.uuid)
 )
-
-
-def convert_steps(rpc_steps):
-    for step in rpc_steps:
-        yield {
-            'interface': step['interface'],
-            'step': step['step'],
-            'args': step['args'],
-            'priority': step['priority'],
-        }
 
 
 def convert_with_links(rpc_template, fields=None, sanitize=True):
@@ -104,7 +72,7 @@ def convert_with_links(rpc_template, fields=None, sanitize=True):
         fields=('name', 'extra'),
         link_resource='deploy_templates',
     )
-    template['steps'] = list(convert_steps(rpc_template.steps))
+    template['steps'] = list(api_utils.convert_steps(rpc_template.steps))
 
     if fields is not None:
         api_utils.check_for_invalid_fields(fields, template)
@@ -168,6 +136,8 @@ class DeployTemplatesController(rest.RestController):
     @args.validate(marker=args.name, limit=args.integer, sort_key=args.string,
                    sort_dir=args.string, fields=args.string_list,
                    detail=args.boolean)
+    @validation.request_query_schema(schema.index_request_query)
+    @validation.response_body_schema(schema.index_response_body)
     def get_all(self, marker=None, limit=None, sort_key='id', sort_dir='asc',
                 fields=None, detail=None):
         """Retrieve a list of deploy templates.
@@ -220,6 +190,9 @@ class DeployTemplatesController(rest.RestController):
     @METRICS.timer('DeployTemplatesController.get_one')
     @method.expose()
     @args.validate(template_ident=args.uuid_or_name, fields=args.string_list)
+    @validation.request_parameter_schema(schema.show_request_parameter)
+    @validation.request_query_schema(schema.show_request_query)
+    @validation.response_body_schema(schema.show_response_body)
     def get_one(self, template_ident, fields=None):
         """Retrieve information about the given deploy template.
 
@@ -240,6 +213,8 @@ class DeployTemplatesController(rest.RestController):
     @method.expose(status_code=http_client.CREATED)
     @method.body('template')
     @args.validate(template=TEMPLATE_VALIDATOR)
+    @validation.request_body_schema(schema.create_request_body)
+    @validation.response_body_schema(schema.create_response_body)
     def post(self, template):
         """Create a new deploy template.
 
@@ -269,6 +244,9 @@ class DeployTemplatesController(rest.RestController):
     @method.expose()
     @method.body('patch')
     @args.validate(template_ident=args.uuid_or_name, patch=args.patch)
+    @validation.request_parameter_schema(schema.update_request_parameter)
+    @validation.request_body_schema(schema.update_request_body)
+    @validation.response_body_schema(schema.update_response_body)
     def patch(self, template_ident, patch=None):
         """Update an existing deploy template.
 
@@ -313,7 +291,7 @@ class DeployTemplatesController(rest.RestController):
         # This is due to the fact that the patch operation is always applied in
         # the API. Ways to avoid this include passing the patch to the
         # conductor to apply while holding a lock, or a collision detection
-        # & retry mechansim using e.g. the updated_at field.
+        # & retry mechanism using e.g. the updated_at field.
         notify.emit_start_notification(context, rpc_template, 'update')
         with notify.handle_error_notification(context, rpc_template, 'update'):
             rpc_template.save()
@@ -326,6 +304,7 @@ class DeployTemplatesController(rest.RestController):
     @METRICS.timer('DeployTemplatesController.delete')
     @method.expose(status_code=http_client.NO_CONTENT)
     @args.validate(template_ident=args.uuid_or_name)
+    @validation.request_parameter_schema(schema.delete_request_parameter)
     def delete(self, template_ident):
         """Delete a deploy template.
 

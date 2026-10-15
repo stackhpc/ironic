@@ -18,6 +18,15 @@ capable of running an Operating System. Each Node must be associated with a
   the ``node_ident``. Responses clearly indicate whether a given field is a
   ``uuid`` or a ``name``.
 
+.. versionchanged:: 1.91
+  In older API versions, we have a pecan feature enabled that strips .json
+  extensions from the end of a resource reference query and treat it as if it
+  was referenced by just its UUID or ``node_ident``. E.g.
+  ``0178-0c2c-9c26-ca69-3011-a9dd.json``, is treated as
+  ``0178-0c2c-9c26-ca69-3011-a9dd``. This feature is now disabled in newer API
+  versions.
+
+
 Depending on the Roles assigned to the authenticated OpenStack User, and upon
 the configuration of the Bare Metal service, API responses may change. For
 example, the default value of the "show_password" settings cause all API
@@ -104,6 +113,18 @@ supplied when the Node is created, or the resource may be updated later.
 .. versionadded:: 1.65
   Introduced the ``lessee`` field.
 
+.. versionadded:: 1.82
+  Introduced the ``shard`` field.
+
+.. versionadded:: 1.83
+  Introduced the ``parent_node`` field.
+
+.. versionadded:: 1.95
+  Introduced the ``disable_power_off`` field.
+
+.. versionadded:: 1.104
+  Introduced the ``instance_name`` field.
+
 Normal response codes: 201
 
 Error codes: 400,403,406
@@ -117,6 +138,7 @@ Request
     - conductor_group: req_conductor_group
     - console_interface: req_console_interface
     - deploy_interface: req_deploy_interface
+    - disable_power_off: req_disable_power_off
     - driver_info: req_driver_info
     - driver: req_driver_name
     - extra: req_extra
@@ -135,14 +157,17 @@ Request
     - owner: owner
     - description: req_n_description
     - lessee: lessee
+    - shard: shard
     - automated_clean: req_automated_clean
     - bios_interface: req_bios_interface
     - chassis_uuid: req_chassis_uuid
     - instance_info: req_instance_info
     - instance_uuid: req_instance_uuid
+    - instance_name: req_instance_name
     - maintenance: req_maintenance
     - maintenance_reason: maintenance_reason
     - network_data: network_data
+    - parent_node: parent_node
     - protected: protected
     - protected_reason: protected_reason
     - retired: retired
@@ -161,7 +186,7 @@ and any defaults added for non-specified fields. Most fields default to "null"
 or "".
 
 The list and example below are representative of the response as of API
-microversion 1.48.
+microversion 1.95.
 
 .. rest_parameters:: parameters.yaml
 
@@ -182,6 +207,7 @@ microversion 1.48.
     - properties: n_properties
     - instance_info: instance_info
     - instance_uuid: instance_uuid
+    - instance_name: instance_name
     - chassis_uuid: chassis_uuid
     - extra: extra
     - console_enabled: console_enabled
@@ -208,11 +234,13 @@ microversion 1.48.
     - vendor_interface: vendor_interface
     - volume: n_volume
     - conductor_group: conductor_group
+    - parent_node: parent_node
     - protected: protected
     - protected_reason: protected_reason
     - conductor: conductor
     - owner: owner
     - lessee: lessee
+    - shard: shard
     - description: n_description
     - allocation_uuid: allocation_uuid
     - automated_clean: automated_clean
@@ -220,6 +248,7 @@ microversion 1.48.
     - network_data: network_data
     - retired: retired
     - retired_reason: retired_reason
+    - disable_power_off: disable_power_off
 
 **Example JSON representation of a Node:**
 
@@ -280,6 +309,19 @@ provision state, and maintenance setting for each Node.
 .. versionadded:: 1.65
   Introduced the ``lessee`` field.
 
+.. versionadded:: 1.82
+  Introduced the ``shard`` field. Introduced the ``sharded`` request parameter.
+
+.. versionadded:: 1.83
+  Introduced the ``parent_node`` field and query parameter to identify
+  matching nodes.
+  Introduced the ``include_children`` parameter which allows for all child
+  nodes to be enumerated, which are normally hidden as child nodes are not
+  normally intended for direct consumption by end users.
+
+.. versionadded:: 1.104
+  Introduced the ``instance_name`` query parameter and response field.
+
 Normal response codes: 200
 
 Error codes: 400,403,406
@@ -290,6 +332,7 @@ Request
 .. rest_parameters:: parameters.yaml
 
    - instance_uuid: r_instance_uuid
+   - instance_name: r_instance_name
    - maintenance: r_maintenance
    - associated: r_associated
    - provision_state: r_provision_state
@@ -300,6 +343,8 @@ Request
    - fault: r_fault
    - owner: owner
    - lessee: lessee
+   - shard: req_shard
+   - sharded: req_sharded
    - description_contains: r_description_contains
    - fields: fields
    - limit: limit
@@ -307,6 +352,8 @@ Request
    - sort_dir: sort_dir
    - sort_key: sort_key
    - detail: detail
+   - parent_node: parent_node
+   - include_children: include_children
 
 Response
 --------
@@ -371,6 +418,13 @@ Nova instance, eg. with a request to ``v1/nodes/detail?instance_uuid={NOVA INSTA
 .. versionadded:: 1.65
   Introduced the ``lessee`` field.
 
+.. versionadded:: 1.82
+  Introduced the ``shard`` field. Introduced the ``sharded`` request parameter.
+
+.. versionadded:: 1.104
+  Introduced the ``instance_name`` field.
+
+
 Normal response codes: 200
 
 Error codes: 400,403,406
@@ -381,6 +435,7 @@ Request
 .. rest_parameters:: parameters.yaml
 
    - instance_uuid: r_instance_uuid
+   - instance_name: r_instance_name
    - maintenance: r_maintenance
    - fault: r_fault
    - associated: r_associated
@@ -391,6 +446,8 @@ Request
    - conductor: r_conductor
    - owner: owner
    - lessee: lessee
+   - shard: req_shard
+   - sharded: req_sharded
    - description_contains: r_description_contains
    - limit: limit
    - marker: marker
@@ -419,6 +476,7 @@ Response
     - properties: n_properties
     - instance_info: instance_info
     - instance_uuid: instance_uuid
+    - instance_name: instance_name
     - chassis_uuid: chassis_uuid
     - extra: extra
     - console_enabled: console_enabled
@@ -446,16 +504,27 @@ Response
     - vendor_interface: vendor_interface
     - volume: n_volume
     - conductor_group: conductor_group
+    - parent_node: parent_node
     - protected: protected
     - protected_reason: protected_reason
     - owner: owner
     - lessee: lessee
+    - shard: shard
     - description: n_description
     - conductor: conductor
     - allocation_uuid: allocation_uuid
     - retired: retired
     - retired_reason: retired_reason
     - network_data: network_data
+    - automated_clean: automated_clean
+    - service_step: service_step
+    - firmware_interface: firmware_interface
+    - provision_updated_at: provision_updated_at
+    - inspection_started_at: inspection_started_at
+    - inspection_finished_at: inspection_finished_at
+    - created_at: created_at
+    - updated_at: updated_at
+    - disable_power_off: disable_power_off
 
 **Example detailed list of Nodes:**
 
@@ -508,6 +577,18 @@ only the specified set.
 .. versionadded:: 1.66
   Introduced the ``network_data`` field.
 
+.. versionadded:: 1.82
+  Introduced the ``shard`` field.
+
+.. versionadded:: 1.83
+  Introduced the ``parent_node`` field.
+
+.. versionadded:: 1.95
+  Introduced the ``disable_power_off`` field.
+
+.. versionadded:: 1.104
+  Introduced the ``instance_name`` field.
+
 Normal response codes: 200
 
 Error codes: 400,403,404,406
@@ -542,6 +623,7 @@ Response
     - properties: n_properties
     - instance_info: instance_info
     - instance_uuid: instance_uuid
+    - instance_name: instance_name
     - chassis_uuid: chassis_uuid
     - extra: extra
     - console_enabled: console_enabled
@@ -573,10 +655,12 @@ Response
     - protected_reason: protected_reason
     - owner: owner
     - lessee: lessee
+    - shard: shard
     - description: n_description
     - conductor: conductor
     - allocation_uuid: allocation_uuid
     - network_data: network_data
+    - disable_power_off: disable_power_off
 
 **Example JSON representation of a Node:**
 
@@ -600,6 +684,12 @@ managed through sub-resources.
 .. versionadded:: 1.51
   Introduced the ability to set/unset a node's description.
 
+.. versionadded:: 1.82
+  Introduced the ability to set/unset a node's shard.
+
+.. versionadded:: 1.104
+  Introduced the ability to set/unset node's instance_name.
+
 Normal response codes: 200
 
 Error codes: 400,403,404,406,409
@@ -609,6 +699,13 @@ Request
 
 The BODY of the PATCH request must be a JSON PATCH document, adhering to
 `RFC 6902 <https://tools.ietf.org/html/rfc6902>`_.
+
+.. note::
+    The ``instance_uuid`` field is an exception to the RFC 6902 behavior.
+    The "add" operator cannot replace an existing ``instance_uuid`` value.
+    Attempting to do so will result in a 409 Conflict error (NodeAssociated
+    exception). This protection prevents race conditions when multiple
+    Nova compute agents try to associate the same node.
 
 .. rest_parameters:: parameters.yaml
 
@@ -640,6 +737,7 @@ Response
     - properties: n_properties
     - instance_info: instance_info
     - instance_uuid: instance_uuid
+    - instance_name: instance_name
     - chassis_uuid: chassis_uuid
     - extra: extra
     - console_enabled: console_enabled
@@ -670,10 +768,12 @@ Response
     - protected_reason: protected_reason
     - owner: owner
     - lessee: lessee
+    - shard: shard
     - description: n_description
     - conductor: conductor
     - allocation_uuid: allocation_uuid
     - network_data: network_data
+    - disable_power_off: disable_power_off
 
 **Example JSON representation of a Node:**
 

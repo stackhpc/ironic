@@ -51,7 +51,9 @@ opts = [
                 help=_('Kill `ipmitool` process invoked by ironic to read '
                        'node power state if `ipmitool` process does not exit '
                        'after `command_retry_timeout` timeout expires. '
-                       'Recommended setting is True')),
+                       'Recommended setting is True. Setting to False may '
+                       'present an operational issue and will result in '
+                       'unexpected and undesirable behavior.')),
     cfg.BoolOpt('disable_boot_timeout',
                 default=True,
                 mutable=True,
@@ -73,11 +75,19 @@ opts = [
                        'additional debugging output. This is a separate '
                        'option as ipmitool can log a substantial amount '
                        'of misleading text when in this mode.')),
+    cfg.BoolOpt('store_cred_in_env',
+                default=False,
+                help=_('Boolean flag to determine IPMI password persistence '
+                       'method. When True, credentials are stored in '
+                       'environemnt variables, Otherwise, credentials are '
+                       'stored in a file')),
     cfg.ListOpt('cipher_suite_versions',
                 default=[],
                 help=_('List of possible cipher suites versions that can '
                        'be supported by the hardware in case the field '
-                       '`cipher_suite` is not set for the node.')),
+                       '`cipher_suite` is not set for the node. The items '
+                       'are listed in the reverse priority order: the last '
+                       'one is tried first.')),
 ]
 
 

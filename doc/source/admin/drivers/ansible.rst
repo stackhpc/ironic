@@ -115,7 +115,7 @@ Logging
 
 Logging is implemented as custom Ansible callback module,
 that makes use of ``oslo.log`` and ``oslo.config`` libraries
-and can re-use logging configuration defined in the main ironic configuration
+and can reuse logging configuration defined in the main ironic configuration
 file to set logging for Ansible events, or use a separate file for this purpose.
 
 It works best when ``journald`` support for logging is enabled.
@@ -141,10 +141,8 @@ Bootstrap image requirements
 - python-requests (for ironic callback and streaming image download)
 - python-netifaces (for ironic callback)
 
-A set of scripts to build a suitable deploy ramdisk based on TinyCore Linux
-and ``tinyipa`` ramdisk, and an element for ``diskimage-builder`` can be found
-in ironic-staging-drivers_ project but will be eventually migrated to the new
-ironic-python-agent-builder_ project.
+An element for ``diskimage-builder`` to build a suitable deploy ramdisk
+can be found in the ironic-python-agent-builder_ project.
 
 Setting up your environment
 ===========================
@@ -156,8 +154,7 @@ Setting up your environment
      and the Bare Metal service is configured accordingly, see
      :doc:`Configure the Image service for temporary URLs <../../install/configure-glance-swift>`.
 
-#. Install Ansible version as specified in ``ironic/driver-requirements.txt``
-   file
+#. Install Ansible version as specified in the optional dependencies.
 #. Edit ironic configuration file
 
    A. Add ``ansible`` to the list of deploy interfaces defined in
@@ -378,26 +375,26 @@ Those values are then accessible in your plays as well
     passed inside this variable. Some extra notes and fields:
 
     - ``mem_req`` is calculated from image size (if available) and config
-      option ``[ansible]extra_memory``.
+      option :oslo.config:option:`ansible.extra_memory`.
     - if ``checksum`` is not in the form ``<hash-algo>:<hash-sum>``, hashing
       algorithm is assumed to be ``md5`` (default in Glance).
     - ``validate_certs`` - boolean (``yes/no``) flag that turns validating
       image store SSL certificate on or off (default is 'yes').
-      Governed by ``[ansible]image_store_insecure`` option
+      Governed by :oslo.config:option:`ansible.image_store_insecure` option
       in ironic configuration file.
     - ``cafile`` - custom CA bundle to use for validating image store
       SSL certificate.
-      Takes value of ``[ansible]image_store_cafile`` if that is defined.
+      Takes value of :oslo.config:option:`ansible.image_store_cafile` if that is defined.
       Currently is not used by default playbooks, as Ansible has no way to
       specify the custom CA bundle to use for single HTTPS actions,
       however you can use this value in your custom playbooks to for example
       upload and register this CA in the ramdisk at deploy time.
     - ``client_cert`` - cert file for client-side SSL authentication.
-      Takes value of ``[ansible]image_store_certfile`` option if defined.
+      Takes value of :oslo.config:option:`ansible.image_store_certfile` option if defined.
       Currently is not used by default playbooks,
       however you can use this value in your custom playbooks.
     - ``client_key`` - private key file for client-side SSL authentication.
-      Takes value of ``[ansible]image_store_keyfile`` option if defined.
+      Takes value of :oslo.config:option:`ansible.image_store_keyfile` option if defined.
       Currently is not used by default playbooks,
       however you can use this value in your custom playbooks.
 
@@ -465,6 +462,23 @@ You can use these modules in your playbooks as well.
     for more information about this module and its arguments.
     The name is chosen so that the ``parted`` module included in Ansible
     is not shadowed.
+
+Security Considerations
+=======================
+
+The bundled ``ansible.cfg`` sets ``host_key_checking = False`` because
+the deploy ramdisk generates ephemeral SSH host keys on every boot.
+There is no secure channel to learn these keys ahead of time, so
+strict host key verification cannot be enforced in the general case.
+
+Operators should ensure the provisioning network is isolated from
+tenant and public networks. For additional hardening, a static host
+key can be baked into the deploy ramdisk and added to
+``~/.ssh/known_hosts`` on all conductor nodes, allowing
+``host_key_checking`` to be set to ``True`` in ``ansible.cfg``.
+
+See `bug 2162820 <https://bugs.launchpad.net/ironic/+bug/2162820>`_
+for further details.
 
 .. _Ansible: https://docs.ansible.com/ansible/latest/index.html
 .. _ironic-staging-drivers: https://opendev.org/x/ironic-staging-drivers/src/branch/stable/pike/imagebuild

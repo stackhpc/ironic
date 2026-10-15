@@ -14,8 +14,8 @@
 
 from unittest import mock
 
-from oslo_utils import importutils
 from oslo_utils import units
+import sushy
 
 from ironic.common import exception
 from ironic.common import states
@@ -28,8 +28,6 @@ from ironic.drivers.modules.redfish import utils as redfish_utils
 from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.db import utils as db_utils
 from ironic.tests.unit.objects import utils as obj_utils
-
-sushy = importutils.try_import('sushy')
 
 INFO_DICT = db_utils.get_test_redfish_info()
 
@@ -47,23 +45,23 @@ def _mock_drive(identity, block_size_bytes=None, capacity_bytes=None,
     )
 
 
-def _mock_volume(identity, volume_type=None, raid_type=None,
-                 capacity_bytes=units.Gi):
+def _mock_volume(identity, raid_type=None,
+                 capacity_bytes=units.Gi, volume_name=None):
     volume = mock.MagicMock(
         _path='/redfish/v1/Systems/1/Storage/1/Volumes/' + identity,
         identity=identity,
-        volume_type=volume_type,
         raid_type=raid_type,
         capacity_bytes=capacity_bytes
     )
-    volume.name = 'Volume ' + identity
+    if volume_name:
+        volume.name = volume_name
+    else:
+        volume.name = 'Volume ' + identity
     # Mocking Immediate that does not return anything
     volume.delete.return_value = None
     return volume
 
 
-@mock.patch('oslo_utils.eventletutils.EventletEvent.wait',
-            lambda *args, **kwargs: None)
 @mock.patch.object(redfish_utils, 'get_system', autospec=True)
 class RedfishRAIDTestCase(db_base.DbTestCase):
 
@@ -108,13 +106,6 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         self.free_space_bytes = {d: d.capacity_bytes for d in
                                  mock_drives}
         self.physical_disks = mock_drives
-
-    @mock.patch.object(redfish_raid, 'sushy', None)
-    def test_loading_error(self, mock_get_system):
-        self.assertRaisesRegex(
-            exception.DriverLoadError,
-            'Unable to import the sushy library',
-            redfish_raid.RedfishRAID)
 
     def test__max_volume_size_bytes_raid0(self, mock_get_system):
         spans = redfish_raid._calculate_spans('0', 3)
@@ -188,13 +179,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_1a(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -222,13 +210,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_1b(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -245,14 +230,16 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         mock_get_system.return_value.storage.get_members.return_value = [
             self.mock_storage]
         self.node.target_raid_config = target_raid_config
+        self.node.deploy_step = {'step': 'create_configuration',
+                                 'interface': 'raid'}
         self.node.save()
+        mock_sdii = mock.Mock()
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
+            task.node.set_driver_internal_info = mock_sdii
             task.driver.raid.create_configuration(task)
             pre = '/redfish/v1/Systems/1/Storage/1/Drives/'
             expected_payload = {
-                'Encrypted': False,
-                'VolumeType': 'StripedWithParity',
                 'RAIDType': 'RAID5',
                 'CapacityBytes': 107374182400,
                 'Links': {
@@ -268,18 +255,16 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
             )
             # Async operation, raid_config shouldn't be updated yet
             self.assertEqual({}, task.node.raid_config)
+        self.assertEqual(2, mock_sdii.call_count)
 
     @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_1b_apply_time_immediate(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -289,13 +274,14 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                 {
                     'size_gb': 100,
                     'raid_level': '5',
-                    'is_root_volume': True
+                    'is_root_volume': True,
+                    'volume_name': 'test-volume'
                 }
             ]
         }
-        created_volumes = [_mock_volume(
-            '1', raid_type=sushy.RAIDType.RAID5,
-            capacity_bytes=100 * units.Gi)]
+        created_volumes = [_mock_volume('1', raid_type=sushy.RAIDType.RAID5,
+                                        capacity_bytes=100 * units.Gi,
+                                        volume_name='test-volume')]
         volumes = mock.MagicMock()
         # Called after volumes created
         volumes.get_members.return_value = created_volumes
@@ -313,11 +299,9 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         self.node.save()
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
-            task.driver.raid.create_configuration(task)
+            self.assertIsNone(task.driver.raid.create_configuration(task))
             pre = '/redfish/v1/Systems/1/Storage/1/Drives/'
             expected_payload = {
-                'Encrypted': False,
-                'VolumeType': 'StripedWithParity',
                 'RAIDType': 'RAID5',
                 'CapacityBytes': 107374182400,
                 'Links': {
@@ -326,13 +310,13 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                         {'@odata.id': pre + self.drive_id2},
                         {'@odata.id': pre + self.drive_id3}
                     ]
-                }
+                },
+                'Name': 'test-volume'
             }
             self.mock_storage.volumes.create.assert_called_once_with(
                 expected_payload, apply_time=sushy.APPLY_TIME_IMMEDIATE)
             mock_set_async_step_flags.assert_called_once_with(
                 task.node, reboot=False, skip_current_step=True, polling=True)
-            self.assertEqual(mock_get_async_step_return_state.call_count, 0)
             self.assertEqual(mock_node_power_action.call_count, 0)
             self.assertEqual(mock_build_agent_options.call_count, 0)
             self.assertEqual(mock_prepare_ramdisk.call_count, 0)
@@ -341,7 +325,7 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
             self.assertEqual(
                 [{'controller': 'RAID controller 1',
                   'id': '1',
-                  'name': 'Volume 1',
+                  'name': 'test-volume',
                   'raid_level': '5',
                   'size_gb': 100}],
                 task.node.raid_config['logical_disks'])
@@ -350,13 +334,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_1b_apply_time_on_reset(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -382,14 +363,15 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         task_mon.task_monitor_uri = '/TaskService/123'
         volumes.create.return_value = task_mon
         self.node.target_raid_config = target_raid_config
+        self.node.deploy_step = {'step': 'create_configuration',
+                                 'interface': 'raid'}
         self.node.save()
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
-            task.driver.raid.create_configuration(task)
+            result = task.driver.raid.create_configuration(task)
+            self.assertEqual(states.DEPLOYWAIT, result)
             pre = '/redfish/v1/Systems/1/Storage/1/Drives/'
             expected_payload = {
-                'Encrypted': False,
-                'VolumeType': 'StripedWithParity',
                 'RAIDType': 'RAID5',
                 'CapacityBytes': 107374182400,
                 'Links': {
@@ -404,9 +386,8 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                 expected_payload, apply_time=sushy.APPLY_TIME_ON_RESET)
             mock_set_async_step_flags.assert_called_once_with(
                 task.node, reboot=True, skip_current_step=True, polling=True)
-            mock_get_async_step_return_state.assert_called_once_with(
-                task.node)
-            mock_node_power_action.assert_called_once_with(task, states.REBOOT)
+            mock_node_power_action.assert_called_once_with(
+                task, states.REBOOT)
             mock_build_agent_options.assert_called_once_with(task.node)
             self.assertEqual(mock_prepare_ramdisk.call_count, 1)
             # Async operation, raid_config shouldn't be updated yet
@@ -416,13 +397,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_2(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -462,8 +440,6 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
             task.driver.raid.create_configuration(task)
             pre = '/redfish/v1/Systems/1/Storage/1/Drives/'
             expected_payload1 = {
-                'Encrypted': False,
-                'VolumeType': 'StripedWithParity',
                 'RAIDType': 'RAID5',
                 'CapacityBytes': 107374182400,
                 'Links': {
@@ -475,8 +451,6 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                 }
             }
             expected_payload2 = {
-                'Encrypted': False,
-                'VolumeType': 'Mirrored',
                 'RAIDType': 'RAID1',
                 'CapacityBytes': 536870912000,
                 'Links': {
@@ -511,13 +485,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_2_on_reset(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -550,14 +521,14 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         task_mon.task_monitor_uri = '/TaskService/123'
         volumes.create.return_value = task_mon
         self.node.target_raid_config = target_raid_config
+        self.node.deploy_step = {'step': 'create_configuration',
+                                 'interface': 'raid'}
         self.node.save()
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
             task.driver.raid.create_configuration(task)
             pre = '/redfish/v1/Systems/1/Storage/1/Drives/'
             expected_payload = {
-                'Encrypted': False,
-                'VolumeType': 'Mirrored',
                 'RAIDType': 'RAID1',
                 'CapacityBytes': 536870912000,
                 'Links': {
@@ -595,13 +566,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_3(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -625,14 +593,16 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         mock_get_system.return_value.storage.get_members.return_value = [
             self.mock_storage]
         self.node.target_raid_config = target_raid_config
+        self.node.deploy_step = {'step': 'create_configuration',
+                                 'interface': 'raid'}
         self.node.save()
+        sdii_mock = mock.Mock()
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
+            task.node.set_driver_internal_info = sdii_mock
             task.driver.raid.create_configuration(task)
             pre = '/redfish/v1/Systems/1/Storage/1/Drives/'
             expected_payload = {
-                'Encrypted': False,
-                'VolumeType': 'StripedWithParity',
                 'RAIDType': 'RAID5',
                 'CapacityBytes': 107374182400,
                 'Links': {
@@ -648,18 +618,20 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
             )
             # Async operation, raid_config shouldn't be updated yet
             self.assertEqual({}, task.node.raid_config)
+        sdii_mock.assert_has_calls([
+            mock.call('raid_configs', {'operation': 'create',
+                                       'pending': {},
+                                       'task_monitor_uri': mock.ANY}),
+            mock.call('agent_start_attempted', True)])
 
     @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_4(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -724,8 +696,6 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
             task.driver.raid.create_configuration(task)
             pre = '/redfish/v1/Systems/1/Storage/1/Drives/'
             expected_payload1 = {
-                'Encrypted': False,
-                'VolumeType': 'SpannedMirrors',
                 'RAIDType': 'RAID10',
                 'CapacityBytes': 53687091200,
                 'Links': {
@@ -735,11 +705,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                         {'@odata.id': pre + self.drive_id3},
                         {'@odata.id': pre + self.drive_id4}
                     ]
-                }
+                },
+                'Name': 'root_volume'
             }
             expected_payload2 = {
-                'Encrypted': False,
-                'VolumeType': 'StripedWithParity',
                 'RAIDType': 'RAID5',
                 'CapacityBytes': 107374182400,
                 'Links': {
@@ -748,7 +717,8 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                         {'@odata.id': pre + self.drive_id3},
                         {'@odata.id': pre + self.drive_id4}
                     ]
-                }
+                },
+                'Name': 'data_volume'
             }
             self.assertEqual(
                 self.mock_storage.volumes.create.call_count, 2)
@@ -776,13 +746,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_5a(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -815,13 +782,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_5b(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -852,8 +816,6 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
             task.driver.raid.create_configuration(task)
             pre = '/redfish/v1/Systems/1/Storage/1/Drives/'
             expected_payload1 = {
-                'Encrypted': False,
-                'VolumeType': 'Mirrored',
                 'RAIDType': 'RAID1',
                 'CapacityBytes': 107374182400,
                 'Links': {
@@ -864,8 +826,6 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                 }
             }
             expected_payload2 = {
-                'Encrypted': False,
-                'VolumeType': 'NonRedundant',
                 'RAIDType': 'RAID0',
                 'CapacityBytes': 536870912000,
                 'Links': {
@@ -887,13 +847,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_case_6(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -927,13 +884,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_create_config_interface_type(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -975,8 +929,6 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
             task.driver.raid.create_configuration(task)
             pre = '/redfish/v1/Systems/1/Storage/1/Drives/'
             expected_payload1 = {
-                'Encrypted': False,
-                'VolumeType': 'StripedWithParity',
                 'RAIDType': 'RAID5',
                 'CapacityBytes': 107374182400,
                 'Links': {
@@ -988,8 +940,6 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                 }
             }
             expected_payload2 = {
-                'Encrypted': False,
-                'VolumeType': 'Mirrored',
                 'RAIDType': 'RAID1',
                 'CapacityBytes': 536870912000,
                 'Links': {
@@ -1024,13 +974,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_delete_config_immediate(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -1038,7 +985,7 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         mock_volumes = []
         for i in ["1", "2"]:
             mock_volumes.append(_mock_volume(
-                i, volume_type='Mirrored', raid_type=sushy.RAIDType.RAID1))
+                i, raid_type=sushy.RAIDType.RAID1))
         op_apply_time_support = mock.MagicMock()
         op_apply_time_support.mapped_supported_values = [
             sushy.APPLY_TIME_IMMEDIATE, sushy.APPLY_TIME_ON_RESET]
@@ -1059,12 +1006,11 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                     'raid_level': '1',
                     'size_gb': 100}],
                 'last_updated': last_updated}
-            task.driver.raid.delete_configuration(task)
+            self.assertIsNone(task.driver.raid.delete_configuration(task))
             self.assertEqual(mock_volumes[0].delete.call_count, 1)
             self.assertEqual(mock_volumes[1].delete.call_count, 1)
             mock_set_async_step_flags.assert_called_once_with(
                 task.node, reboot=False, skip_current_step=True, polling=True)
-            self.assertEqual(mock_get_async_step_return_state.call_count, 0)
             self.assertEqual(mock_node_power_action.call_count, 0)
             self.assertEqual(mock_build_agent_options.call_count, 0)
             self.assertEqual(mock_prepare_ramdisk.call_count, 0)
@@ -1078,13 +1024,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                        spec_set=True, autospec=True)
     @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
-    @mock.patch.object(deploy_utils, 'get_async_step_return_state',
-                       autospec=True)
     @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
     def test_delete_config_on_reset(
             self,
             mock_set_async_step_flags,
-            mock_get_async_step_return_state,
             mock_node_power_action,
             mock_build_agent_options,
             mock_prepare_ramdisk,
@@ -1092,7 +1035,7 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         mock_volumes = []
         for i in ["1", "2"]:
             mock_volumes.append(_mock_volume(
-                i, volume_type='Mirrored', raid_type=sushy.RAIDType.RAID1))
+                i, raid_type=sushy.RAIDType.RAID1))
         op_apply_time_support = mock.MagicMock()
         op_apply_time_support.mapped_supported_values = [
             sushy.APPLY_TIME_ON_RESET]
@@ -1116,14 +1059,17 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                     'size_gb': 100}],
                 'last_updated': '2022-05-18 08:49:17.585443'}
             task.node.raid_config = raid_config
-            task.driver.raid.delete_configuration(task)
+            task.node.deploy_step = {
+                'step': 'delete_configuration',
+                'interface': 'raid'}
+            result = task.driver.raid.delete_configuration(task)
+            self.assertEqual(states.DEPLOYWAIT, result)
             self.assertEqual(mock_volumes[0].delete.call_count, 1)
             self.assertEqual(mock_volumes[1].delete.call_count, 0)
             mock_set_async_step_flags.assert_called_once_with(
                 task.node, reboot=True, skip_current_step=True, polling=True)
-            mock_get_async_step_return_state.assert_called_once_with(
-                task.node)
-            mock_node_power_action.assert_called_once_with(task, states.REBOOT)
+            mock_node_power_action.assert_called_once_with(
+                task, states.REBOOT)
             mock_build_agent_options.assert_called_once_with(task.node)
             self.assertEqual(mock_prepare_ramdisk.call_count, 1)
             self.assertEqual(
@@ -1133,6 +1079,97 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
                 task.node.driver_internal_info.get('raid_configs'))
             # Async operation, raid_config shouldn't be updated yet
             self.assertEqual(raid_config, task.node.raid_config)
+
+    def test__submit_delete_configuration_pending_not_overwritten(
+            self, mock_get_system):
+        # First controller has one leftover volume after ON_RESET break.
+        # Second controller has no leftovers but pending must stay True.
+        first_controller_volumes = []
+        for i in ["1", "2"]:
+            first_controller_volumes.append(_mock_volume(
+                i, raid_type=sushy.RAIDType.RAID1))
+        on_reset_support = mock.MagicMock()
+        on_reset_support.mapped_supported_values = [
+            sushy.APPLY_TIME_ON_RESET]
+        self.mock_storage.volumes.operation_apply_time_support = (
+            on_reset_support)
+        self.mock_storage.volumes.get_members.return_value = (
+            first_controller_volumes)
+
+        second_storage = mock.MagicMock(identity='RAID controller 2')
+        second_storage.controllers = mock.MagicMock()
+        second_storage.controllers.get_members.return_value = [mock.Mock()]
+        second_controller_volume = _mock_volume(
+            '3', raid_type=sushy.RAIDType.RAID1)
+        second_storage.volumes = mock.MagicMock()
+        immediate_support = mock.MagicMock()
+        immediate_support.mapped_supported_values = [
+            sushy.APPLY_TIME_IMMEDIATE]
+        second_storage.volumes.operation_apply_time_support = (
+            immediate_support)
+        second_storage.volumes.get_members.return_value = [
+            second_controller_volume]
+
+        mock_get_system.return_value.storage.get_members.return_value = [
+            self.mock_storage, second_storage]
+        task_mon = mock.MagicMock()
+        task_mon.task_monitor_uri = '/TaskService/123'
+        first_controller_volumes[0].delete.return_value = task_mon
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            raid_iface = redfish_raid.RedfishRAID()
+            raid_configs, reboot_required = (
+                raid_iface._submit_delete_configuration(task))
+
+            self.assertTrue(reboot_required)
+            self.assertEqual(first_controller_volumes[0].delete.call_count, 1)
+            self.assertEqual(first_controller_volumes[1].delete.call_count, 0)
+            self.assertEqual(second_controller_volume.delete.call_count, 1)
+            self.assertEqual(
+                {'operation': 'delete',
+                 'pending': True,
+                 'task_monitor_uri': ['/TaskService/123']},
+                raid_configs)
+
+    @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot, 'prepare_ramdisk',
+                       spec_set=True, autospec=True)
+    @mock.patch.object(deploy_utils, 'build_agent_options', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(deploy_utils, 'set_async_step_flags', autospec=True)
+    def test_delete_config_no_volumes_collection(
+            self,
+            mock_set_async_step_flags,
+            mock_node_power_action,
+            mock_build_agent_options,
+            mock_prepare_ramdisk,
+            mock_get_system):
+        # A controller without a Volumes collection (MissingAttributeError)
+        # should be skipped; remaining controllers proceed normally.
+        no_vol_storage = mock.MagicMock(identity='SATA controller')
+        no_vol_storage.volumes.get_members.side_effect = (
+            sushy.exceptions.MissingAttributeError)
+        mock_volumes = [_mock_volume('1', raid_type=sushy.RAIDType.RAID1)]
+        op_apply_time_support = mock.MagicMock()
+        op_apply_time_support.mapped_supported_values = [
+            sushy.APPLY_TIME_IMMEDIATE, sushy.APPLY_TIME_ON_RESET]
+        self.mock_storage.volumes.operation_apply_time_support = (
+            op_apply_time_support)
+        self.mock_storage.volumes.get_members.side_effect = [mock_volumes, []]
+        mock_get_system.return_value.storage.get_members.return_value = [
+            no_vol_storage, self.mock_storage]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            task.node.raid_config = {
+                'logical_disks': [{
+                    'controller': 'RAID controller 1',
+                    'id': '1',
+                    'name': 'Volume 1',
+                    'raid_level': '1',
+                    'size_gb': 100}]}
+            self.assertIsNone(task.driver.raid.delete_configuration(task))
+            self.assertEqual(mock_volumes[0].delete.call_count, 1)
+            self.assertEqual([], task.node.raid_config['logical_disks'])
 
     def test_volume_create_error_handler(self, mock_get_system):
         volume_collection = self.mock_storage.volumes
@@ -1146,16 +1183,10 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         capacity_bytes = 53739520000
         pre = '/redfish/v1/Systems/1/Storage/1/Drives/'
         expected_payload = {
-            'Encrypted': False,
-            'VolumeType': 'Mirrored',
             'RAIDType': 'RAID1',
             'CapacityBytes': capacity_bytes,
             'Links': {
-                'Drives': [
-                    {
-                        '@odata.id': pre + drive_id
-                    }
-                ]
+                'Drives': [{'@odata.id': pre + drive_id}]
             }
         }
         with task_manager.acquire(self.context, self.node.uuid,
@@ -1216,7 +1247,9 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         nonraid_controller = mock.Mock()
         nonraid_controller.raid_types = []
         nonraid_storage = mock.MagicMock()
-        nonraid_storage.storage_controllers = [nonraid_controller]
+        nonraid_storage.controllers = mock.MagicMock()
+        nonraid_storage.controllers.get_members.return_value = [
+            nonraid_controller]
         nonraid_storage.drives = [_mock_drive(
             identity='Drive1', block_size_bytes=512,
             capacity_bytes=899527000000,
@@ -1241,6 +1274,7 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
         nonraid_controller = mock.Mock()
         nonraid_controller.raid_types = []
         nonraid_storage = mock.MagicMock()
+        nonraid_storage.controllers = None
         nonraid_storage.storage_controllers = [nonraid_controller]
         nonraid_storage.drives = mock.Mock()
 
@@ -1254,6 +1288,73 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
 
             self.assertEqual(storage, self.mock_storage)
             nonraid_storage.drives.assert_not_called()
+
+    def test__get_controller(self, mock_get_system):
+        nonraid_controller = mock.Mock()
+        nonraid_controller.raid_types = []
+        nonraid_storage = mock.MagicMock()
+        nonraid_storage.get_members.return_value = [nonraid_controller]
+        nonraid_storage.controllers = mock.MagicMock()
+        nonraid_storage.controllers.get_members.return_value = [
+            nonraid_controller]
+        nonraid_storage.drives = [_mock_drive(
+            identity='Drive1', block_size_bytes=512,
+            capacity_bytes=899527000000,
+            media_type='HDD', name='Drive', protocol='SAS')]
+
+        mock_get_system.return_value.storage.get_members.return_value = [
+            nonraid_storage, self.mock_storage]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            storage = redfish_raid._get_storage_controller(
+                task.node, mock_get_system.return_value, ['32ADF365C6C1B7BD'])
+
+            self.assertEqual(storage, self.mock_storage)
+
+    def test__get_first_controller_controllers(self, mock_get_system):
+        controller1 = mock.Mock(name="controller")
+        controller2 = mock.Mock(name="storage_controller")
+
+        storage = mock.MagicMock()
+        storage.get_members.return_value = [controller1]
+
+        storage.storage_controllers = mock.MagicMock()
+        storage.controllers = mock.MagicMock()
+
+        storage.controllers.get_members.return_value = [controller1]
+        storage.storage_controllers.return_value = [controller2]
+
+        result = redfish_utils.get_first_controller(storage)
+        self.assertEqual(result, controller1)
+
+    def test__get_first_controller_storage_controllers(self, mock_get_system):
+        storage = mock.Mock()
+        controller_mock = mock.Mock()
+        storage.storage_controllers = [controller_mock]
+        type(storage).controllers = mock.PropertyMock(
+            side_effect=sushy.exceptions.MissingAttributeError)
+
+        result = redfish_utils.get_first_controller(storage)
+        self.assertEqual(result, controller_mock)
+
+    def test__get_controller_no_controllers(self, mock_get_system):
+        storage = mock.Mock()
+        storage.get_members.return_value = None
+        storage.controllers.return_value = None
+        storage.controllers.get_members.return_value = None
+        storage.storage_controllers.return_value = None
+
+        result = redfish_utils.get_first_controller(storage)
+        self.assertIsNone(result)
+
+    def test__get_first_controller_empty(self, mock_get_system):
+        storage = mock.Mock()
+        storage.controllers = mock.Mock()
+        storage.controllers.get_members.return_value = []
+
+        result = redfish_utils.get_first_controller(storage)
+        self.assertIsNone(result)
 
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
     @mock.patch.object(redfish_raid.LOG, 'info', autospec=True)
@@ -1506,3 +1607,204 @@ class RedfishRAIDTestCase(db_base.DbTestCase):
 
         self.assertEqual([], self.node.raid_config['logical_disks'])
         mock_log.warning.assert_called_once()
+
+    @mock.patch.object(redfish_raid, 'LOG', autospec=True)
+    def test_update_raid_config_no_volumes_collection(
+            self, mock_log, mock_get_system):
+        # Controller without a Volumes link
+        # should be silently skipped rather than raising MissingAttributeError.
+        no_vol_storage = mock.MagicMock(identity='SATA controller')
+        no_vol_storage.volumes.get_members.side_effect = (
+            sushy.exceptions.MissingAttributeError)
+        mock_get_system.return_value.storage.get_members.return_value = [
+            no_vol_storage]
+
+        redfish_raid.update_raid_config(self.node)
+
+        self.assertEqual([], self.node.raid_config['logical_disks'])
+        mock_log.debug.assert_called_once()
+
+
+@mock.patch.object(redfish_utils, 'get_system', autospec=True)
+class RedfishRAIDMAXSizeTestCase(db_base.DbTestCase):
+    """Test cases for MAX size_gb handling in Redfish RAID."""
+
+    def setUp(self):
+        super(RedfishRAIDMAXSizeTestCase, self).setUp()
+        self.config(enabled_hardware_types=['redfish'],
+                    enabled_power_interfaces=['redfish'],
+                    enabled_boot_interfaces=['redfish-virtual-media'],
+                    enabled_management_interfaces=['redfish'],
+                    enabled_inspect_interfaces=['redfish'],
+                    enabled_bios_interfaces=['redfish'],
+                    enabled_raid_interfaces=['redfish'])
+        self.node = obj_utils.create_test_node(
+            self.context, driver='redfish', driver_info=INFO_DICT)
+        self.mock_storage = mock.MagicMock(identity='RAID controller 1')
+        self.drive_id1 = '35D38F11ACEF7BD3'
+        self.drive_id2 = '3F5A8C54207B7233'
+        mock_drives = []
+        for i in [self.drive_id1, self.drive_id2]:
+            mock_drives.append(_mock_drive(
+                identity=i, block_size_bytes=512,
+                capacity_bytes=899527000000,
+                media_type='HDD', name='Drive',
+                protocol=sushy.PROTOCOL_TYPE_SAS))
+        self.mock_storage.drives = mock_drives
+
+    def test_construct_volume_payload_omits_capacity_bytes_for_max(
+            self, mock_get_system):
+        """Test that CapacityBytes is omitted when size_bytes is 'MAX'."""
+        node = self.node
+        storage = self.mock_storage
+
+        payload = redfish_raid._construct_volume_payload(
+            node, storage, 'controller1', [self.drive_id1, self.drive_id2],
+            '1', 'MAX')
+
+        self.assertNotIn('CapacityBytes', payload)
+        self.assertEqual(payload['RAIDType'], 'RAID1')
+        self.assertIn('Links', payload)
+
+    def test_construct_volume_payload_includes_capacity_bytes_for_exact_size(
+            self, mock_get_system):
+        """Test that CapacityBytes is included when size_bytes is exact."""
+        node = self.node
+        storage = self.mock_storage
+        size_bytes = 100 * units.Gi
+
+        payload = redfish_raid._construct_volume_payload(
+            node, storage, 'controller1', [self.drive_id1, self.drive_id2],
+            '1', size_bytes)
+
+        self.assertIn('CapacityBytes', payload)
+        self.assertEqual(payload['CapacityBytes'], size_bytes)
+        self.assertEqual(payload['RAIDType'], 'RAID1')
+
+    def test_calculate_volume_props_preserves_max(
+            self, mock_get_system):
+        """Test that _calculate_volume_props preserves 'MAX' as size_bytes."""
+        logical_disk = {
+            'size_bytes': 'MAX',
+            'raid_level': '1',
+            'physical_disks': [self.drive_id1, self.drive_id2]
+        }
+        physical_disks = self.mock_storage.drives
+        free_space_bytes = {
+            disk: disk.capacity_bytes for disk in physical_disks}
+        disk_to_storage = {
+            disk: self.mock_storage for disk in physical_disks}
+
+        redfish_raid._calculate_volume_props(
+            logical_disk, physical_disks, free_space_bytes, disk_to_storage)
+
+        # MAX should be preserved
+        self.assertEqual(logical_disk['size_bytes'], 'MAX')
+        # Controller should be set
+        self.assertIn('controller', logical_disk)
+
+    def test_create_configuration_with_max_size_omits_capacity_bytes(
+            self, mock_get_system):
+        """Test that create_configuration omits CapacityBytes for MAX size."""
+        target_raid_config = {
+            'logical_disks': [
+                {
+                    'size_gb': 'MAX',
+                    'raid_level': '1',
+                    'is_root_volume': True,
+                    'physical_disks': [self.drive_id1, self.drive_id2]
+                }
+            ]
+        }
+        created_volumes = [
+            _mock_volume('1', raid_type=sushy.RAIDType.RAID1,
+                         capacity_bytes=899527000000)
+        ]
+        volumes = mock.MagicMock()
+        volumes.get_members.return_value = created_volumes
+        volumes.operation_apply_time_support = None
+        self.mock_storage.volumes = volumes
+        mock_get_system.return_value.storage.get_members.return_value = [
+            self.mock_storage]
+        resource = mock.MagicMock(spec=['resource_name'])
+        resource.resource_name = 'volume'
+        volumes.create.return_value = resource
+        self.node.target_raid_config = target_raid_config
+        self.node.save()
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            task.driver.raid.create_configuration(task)
+
+            # Verify CapacityBytes was NOT in the payload
+            call_args = volumes.create.call_args
+            payload = call_args[0][0]
+            self.assertNotIn('CapacityBytes', payload)
+            self.assertEqual(payload['RAIDType'], 'RAID1')
+
+            # Verify volume was created
+            self.assertEqual(volumes.create.call_count, 1)
+
+    def test_create_configuration_with_exact_size_includes_capacity_bytes(
+            self, mock_get_system):
+        """Test inclusion of CapacityBytes for exact size."""
+        target_raid_config = {
+            'logical_disks': [
+                {
+                    'size_gb': 100,
+                    'raid_level': '1',
+                    'is_root_volume': True,
+                    'physical_disks': [self.drive_id1, self.drive_id2]
+                }
+            ]
+        }
+        created_volumes = [
+            _mock_volume('1', raid_type=sushy.RAIDType.RAID1,
+                         capacity_bytes=100 * units.Gi)
+        ]
+        volumes = mock.MagicMock()
+        volumes.get_members.return_value = created_volumes
+        volumes.operation_apply_time_support = None
+        self.mock_storage.volumes = volumes
+        mock_get_system.return_value.storage.get_members.return_value = [
+            self.mock_storage]
+        resource = mock.MagicMock(spec=['resource_name'])
+        resource.resource_name = 'volume'
+        volumes.create.return_value = resource
+        self.node.target_raid_config = target_raid_config
+        self.node.save()
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            task.driver.raid.create_configuration(task)
+
+            # Verify CapacityBytes WAS in the payload
+            call_args = volumes.create.call_args
+            payload = call_args[0][0]
+            self.assertIn('CapacityBytes', payload)
+            self.assertEqual(payload['CapacityBytes'], 100 * units.Gi)
+            self.assertEqual(payload['RAIDType'], 'RAID1')
+
+    def test_update_raid_config_stores_actual_size_for_max_volume(
+            self, mock_get_system):
+        """Test that update_raid_config queries and stores actual size."""
+        # Create a volume with actual size (simulating what controller created)
+        actual_size_bytes = 899527000000  # Actual size from controller
+        created_volumes = [
+            _mock_volume('1', raid_type=sushy.RAIDType.RAID1,
+                         capacity_bytes=actual_size_bytes)
+        ]
+        volumes = mock.MagicMock()
+        volumes.get_members.return_value = created_volumes
+        self.mock_storage.volumes = volumes
+        mock_get_system.return_value.storage.get_members.return_value = [
+            self.mock_storage]
+
+        redfish_raid.update_raid_config(self.node)
+
+        # Verify the actual size was stored (not 'MAX')
+        self.assertIn('logical_disks', self.node.raid_config)
+        logical_disk = self.node.raid_config['logical_disks'][0]
+        expected_size_gb = int(actual_size_bytes / units.Gi)
+        self.assertEqual(logical_disk['size_gb'], expected_size_gb)
+        self.assertNotEqual(logical_disk['size_gb'], 'MAX')

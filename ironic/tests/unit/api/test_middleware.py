@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -15,16 +14,27 @@
 Tests to assert that various incorporated middleware works as expected.
 """
 
+import bcrypt
 from http import client as http_client
 import os
 import tempfile
+from unittest import mock
 
 from oslo_config import cfg
 import oslo_middleware.cors as cors_middleware
 
 from ironic.tests.unit.api import base
-from ironic.tests.unit.api import utils
 from ironic.tests.unit.db import utils as db_utils
+
+
+class TestRequestIdMiddleware(base.BaseApiTest):
+
+    def test_request_id(self):
+        response = self.app.get('/chassis')
+        self.assertIn('X-OpenStack-Request-Id', response.headers)
+        self.assertIn('OpenStack-Request-Id', response.headers)
+        self.assertEqual(response.headers['X-OpenStack-Request-Id'],
+                         response.headers['OpenStack-Request-Id'])
 
 
 class TestCORSMiddleware(base.BaseApiTest):
@@ -40,7 +50,7 @@ class TestCORSMiddleware(base.BaseApiTest):
 
         # Load up our valid domain values before the application is created.
         cfg.CONF.set_override("allowed_origin",
-                              "http://valid.example.com",
+                              ["http://valid.example.com"],
                               group='cors')
 
         # Create the application.
@@ -132,7 +142,7 @@ class TestBasicAuthMiddleware(base.BaseApiTest):
 
     def setUp(self):
         super(TestBasicAuthMiddleware, self).setUp()
-        self.environ = {'fake.cache': utils.FakeMemcache()}
+        self.environ = {}
         self.fake_db_node = db_utils.get_test_node(chassis_id=None)
 
     def test_not_authenticated(self):
@@ -147,6 +157,20 @@ class TestBasicAuthMiddleware(base.BaseApiTest):
         auth_header = {'Authorization': 'Basic bXlOYW1lOm15UGFzc3dvcmQ='}
         response = self.get_json('/chassis', headers=auth_header)
         self.assertEqual({'chassis': []}, response)
+
+    @mock.patch.object(bcrypt, 'checkpw', autospec=True)
+    def test_authenticated_cached(self, mock_checkpw):
+        def checkpw(password, hashed):
+            return password == b'myPassword'
+        mock_checkpw.side_effect = checkpw
+
+        auth_header = {'Authorization': 'Basic bXlOYW1lOm15UGFzc3dvcmQ='}
+        for i in range(10):
+            response = self.get_json('/chassis', headers=auth_header)
+            self.assertEqual({'chassis': []}, response)
+        # call count will be zero or one, depending on already cached
+        # results from other tests
+        self.assertLessEqual(mock_checkpw.call_count, 1)
 
     def test_public_unauthenticated(self):
         response = self.get_json('/')

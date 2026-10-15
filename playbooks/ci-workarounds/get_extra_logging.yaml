@@ -3,6 +3,9 @@
     - name: Get tftpd info from journald
       shell: "journalctl -t in.tftpd  > {{ zuul_output_dir }}/logs/tftpd-journal.txt"
       become: yes
+    - name: Get tftpd info from journald
+      shell: "ls -laR /opt/stack/data/ironic/tftpboot /opt/stack/data/ironic/httpboot > {{ zuul_output_dir }}/logs/ironic-files.txt"
+      become: yes
     - name: Get network connection information for ironic process
       shell: "netstat -apn  > {{ zuul_output_dir }}/logs/post-job-network-connections.txt"
       become: yes
@@ -14,3 +17,14 @@
       shell: "ip -6 route > {{ zuul_output_dir }}/logs/post-job-network-routes-v6.txt"
       ignore_errors: True
       become: yes
+    - name: Get interfaces
+      shell: "ip -s -s link > {{ zuul_output_dir }}/logs/post-job-network-interfaces.txt"
+      ignore_errors: True
+      become: yes
+    - name: Get addresses
+      shell: "ip addr > {{ zuul_output_dir }}/logs/post-job-network-addresses.txt"
+      ignore_errors: True
+      become: yes
+    - name: Get OVS
+      shell: "ovs-vsctl show > {{ zuul_output_dir }}/logs/post-job-network-ovs.txt"
+      ignore_errors: True

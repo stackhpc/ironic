@@ -21,19 +21,112 @@ from ironic.common.i18n import _
 
 
 opts = [
-    cfg.StrOpt('http_url',
+    cfg.URIOpt('http_url',
+               schemes=['http', 'https'],
                help=_("ironic-conductor node's HTTP server URL. "
                       "Example: http://192.1.2.3:8080")),
     cfg.StrOpt('http_root',
                default='/httpboot',
                help=_("ironic-conductor node's HTTP root path.")),
-    cfg.StrOpt('external_http_url',
+    cfg.StrOpt('image_server_auth_strategy',
+               default='noauth',
+               choices=[('noauth', _('No authentication')),
+                        ('http_basic', _('HTTP Basic authentication'))],
+               mutable=True,
+               help=_("Used to select authentication strategy against the "
+                       "image hosting HTTP(S) server. When set to http_basic "
+                       "it enables HTTP(S) Basic Authentication. "
+                       "Exception is thrown in case of missing credentials. "
+                       "When this option has a valid value such as http_basic"
+                       ", the same single set of credentials will be used "
+                       "against all user-image sources! Currently only the "
+                       "http_basic option has any functionality.")),
+    cfg.StrOpt('image_server_user',
+               mutable=True,
+               help=_("Can be used by any authentication strategy that "
+                      "requires username credential. Currently utilized by "
+                      "the http_basic authentication strategy. This "
+                      "option has no effect when "
+                      "``image_server_auth_strategy`` is set to "
+                      "``noauth`` (the default). WARNING: When "
+                      "``image_server_auth_strategy`` is set to "
+                      "``http_basic`` and ``image_server_auth_hosts`` "
+                      "is not configured, this credential will be sent "
+                      "to every host from which images are requested, "
+                      "including user-supplied URLs. Operators are "
+                      "strongly encouraged to configure "
+                      "``image_server_auth_hosts`` to restrict which "
+                      "hosts receive credentials.")),
+    cfg.StrOpt('image_server_password',
+               mutable=True,
+               secret=True,
+               help=_("Can be used by any authentication strategy that "
+                      "requires password credential. Currently utilized by "
+                      "the http_basic authentication strategy. This "
+                      "option has no effect when "
+                      "``image_server_auth_strategy`` is set to "
+                      "``noauth`` (the default). WARNING: When "
+                      "``image_server_auth_strategy`` is set to "
+                      "``http_basic`` and ``image_server_auth_hosts`` "
+                      "is not configured, this credential will be sent "
+                      "to every host from which images are requested, "
+                      "including user-supplied URLs. Operators are "
+                      "strongly encouraged to configure "
+                      "``image_server_auth_hosts`` to restrict which "
+                      "hosts receive credentials.")),
+    cfg.ListOpt('image_server_auth_hosts',
+                default=[],
+                mutable=True,
+                help=_("Operators may optionally configure a list of "
+                       "host names which credentials may be supplied "
+                       "to as a part of image retrieval. This option "
+                       "only takes effect when "
+                       "``image_server_auth_strategy`` is set to a "
+                       "value other than ``noauth`` (the default). "
+                       "When ``image_server_auth_strategy`` is "
+                       "``noauth``, no credentials are sent regardless "
+                       "of this setting. If this option is not "
+                       "configured, image server credentials will be "
+                       "sent to every host which images are requested "
+                       "from. If configured, only matching hosts will "
+                       "be sent credentials. Entries may be exact "
+                       "hostnames (e.g. ``images.example.com``) or "
+                       "domain suffixes prefixed with a dot "
+                       "(e.g. ``.example.com`` to match all hosts "
+                       "under that domain). This is a security feature "
+                       "to prevent leakage of image server credentials "
+                       "to untrusted hosts.")),
+    cfg.BoolOpt('image_server_auth_permit_unknown_hosts',
+                default=True,
+                mutable=True,
+                help=_("This option only takes effect when "
+                       "``image_server_auth_strategy`` is set to a "
+                       "value other than ``noauth`` (the default) and "
+                       "``image_server_auth_hosts`` is not configured. "
+                       "When set to True, image server credentials "
+                       "will be sent to all hosts from which images "
+                       "are requested. This preserves backwards "
+                       "compatible behavior but risks leaking "
+                       "credentials to untrusted hosts. When set to "
+                       "False, credentials will only be sent to hosts "
+                       "explicitly listed in "
+                       "``image_server_auth_hosts``. "
+                       "DEPRECATED: The default value of this option "
+                       "will change to False in the 2026.2 release. "
+                       "Operators who have configured "
+                       "``image_server_auth_strategy`` to ``http_basic``"
+                       " should configure ``image_server_auth_hosts`` "
+                       "and set this option to False before that "
+                       "release.")),
+    cfg.URIOpt('external_http_url',
+               schemes=['http', 'https'],
                help=_("URL of the ironic-conductor node's HTTP server for "
                       "boot methods such as virtual media, "
                       "where images could be served outside of the "
                       "provisioning network. Does not apply when Swift is "
                       "used. Defaults to http_url.")),
-    cfg.StrOpt('external_callback_url',
+    cfg.URIOpt('external_callback_url',
+               schemes=['http', 'https'],
                help=_("Agent callback URL of the bare metal API for boot "
                       "methods such as virtual media, where images could be "
                       "served outside of the provisioning network. Defaults "
@@ -42,15 +135,14 @@ opts = [
                 default=True,
                 mutable=True,
                 help=_('Whether to support the use of ATA Secure Erase '
-                       'during the cleaning process. Defaults to True.')),
+                       'during the cleaning process.')),
     cfg.BoolOpt('enable_nvme_secure_erase',
                 default=True,
                 mutable=True,
                 help=_('Whether to support the use of NVMe Secure Erase '
                        'during the cleaning process. Currently nvme-cli '
                        'format command is supported with user-data and '
-                       'crypto modes, depending on device capabilities.'
-                       'Defaults to True.')),
+                       'crypto modes, depending on device capabilities.')),
     cfg.IntOpt('erase_devices_priority',
                mutable=True,
                help=_('Priority to run in-band erase devices via the Ironic '
@@ -88,7 +180,7 @@ opts = [
                mutable=True,
                help=_('During shred, overwrite all block devices N times with '
                       'random data. This is only used if a device could not '
-                      'be ATA Secure Erased. Defaults to 1.')),
+                      'be ATA Secure Erased.')),
     cfg.BoolOpt('shred_final_overwrite_with_zeros',
                 default=True,
                 mutable=True,
@@ -97,7 +189,7 @@ opts = [
                        "the device even when "
                        "deploy.shred_random_overwrite_iterations is 0. This "
                        "option is only used if a device could not be ATA "
-                       "Secure Erased. Defaults to True.")),
+                       "Secure Erased.")),
     cfg.BoolOpt('continue_if_disk_secure_erase_fails',
                 default=False,
                 mutable=True,
@@ -118,8 +210,7 @@ opts = [
     cfg.BoolOpt('power_off_after_deploy_failure',
                 default=True,
                 mutable=True,
-                help=_('Whether to power off a node after deploy failure. '
-                       'Defaults to True.')),
+                help=_('Whether to power off a node after deploy failure.')),
     cfg.StrOpt('default_boot_mode',
                choices=[(boot_modes.UEFI, _('UEFI boot mode')),
                         (boot_modes.LEGACY_BIOS, _('Legacy BIOS boot mode'))],

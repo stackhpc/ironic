@@ -14,6 +14,9 @@
 #    under the License.
 
 import collections
+from enum import Enum
+import random
+import string
 
 from openstack.connection import exceptions as openstack_exc
 from oslo_config import cfg
@@ -26,12 +29,31 @@ from ironic.common import network
 from ironic.common import neutron
 from ironic.common.pxe_utils import DHCP_CLIENT_ID
 from ironic.common import states
+from ironic.common.trait_based_networking import base as tbn_base
+from ironic.common.trait_based_networking import defaults as tbn_defaults
+from ironic.common.trait_based_networking import plan
 from ironic import objects
 
 CONF = cfg.CONF
 LOG = log.getLogger(__name__)
 
-TENANT_VIF_KEY = 'tenant_vif_port_id'
+
+class NetType(Enum):
+    CLEANING = "cleaning"
+    PROVISIONING = "provisioning"
+    RESCUING = "rescuing"
+    INSPECTION = "inspection"
+    SERVICING = "servicing"
+    # tenant should always be last to preserve the order of using
+    # the other vifs first
+    TENANT = "tenant"
+
+    def __str__(self):
+        return self.value
+
+    @property
+    def vif_key(self):
+        return f"{self!s}_vif_port_id"
 
 
 def _vif_attached(port_like_obj, vif_id):
@@ -46,7 +68,7 @@ def _vif_attached(port_like_obj, vif_id):
         False otherwise.
     :raises: VifAlreadyAttached, if vif_id is attached to port_like_obj.
     """
-    attached_vif_id = port_like_obj.internal_info.get(TENANT_VIF_KEY)
+    attached_vif_id = port_like_obj.internal_info.get(NetType.TENANT.vif_key)
     if attached_vif_id == vif_id:
         raise exception.VifAlreadyAttached(
             object_type=port_like_obj.__class__.__name__,
@@ -232,7 +254,7 @@ def plug_port_to_tenant_network(task, port_like_obj, client=None):
     local_group_info = None
     client_id_opt = None
 
-    vif_id = port_like_obj.internal_info.get(TENANT_VIF_KEY)
+    vif_id = port_like_obj.internal_info.get(NetType.TENANT.vif_key)
 
     if not vif_id:
         obj_name = port_like_obj.__class__.__name__.lower()
@@ -272,6 +294,11 @@ def plug_port_to_tenant_network(task, port_like_obj, client=None):
     binding_profile = {'local_link_information': local_link_info}
     if local_group_info:
         binding_profile['local_group_information'] = local_group_info
+
+    # Include physical_network if available
+    if port_like_obj.physical_network:
+        binding_profile['physical_network'] = port_like_obj.physical_network
+
     port_attrs['binding:profile'] = binding_profile
 
     if client_id_opt:
@@ -286,22 +313,118 @@ def plug_port_to_tenant_network(task, port_like_obj, client=None):
         port_attrs['binding:host_id'] = link_info['hostname']
         port_attrs['binding:vnic_type'] = neutron.VNIC_SMARTNIC
 
+    client_to_close = None
     if not client:
-        client = neutron.get_client(context=task.context)
+        client = client_to_close = neutron.get_client(context=task.context)
 
     if is_smart_nic:
         neutron.wait_for_host_agent(client, port_attrs['binding:host_id'])
 
     try:
         neutron.update_neutron_port(task.context, vif_id, port_attrs)
-        if is_smart_nic:
-            neutron.wait_for_port_status(client, vif_id, 'ACTIVE')
+
+        binding_fail_fatal = False
+        is_neutron_iface = node.network_interface == 'neutron'
+
+        if is_neutron_iface:
+            binding_fail_fatal = getattr(
+                CONF.neutron, 'fail_on_port_binding_failure', False)
+
+        default_failure_behavior = is_smart_nic or binding_fail_fatal
+
+        fail_on_binding_failure = node.driver_info.get(
+            'fail_on_binding_failure', default_failure_behavior)
+
+        # NOTE(cid): Only check port status if it's a smart NIC or if we're
+        # configured to fail on binding failures. This avoids unnecessary
+        # failures when using network interfaces where binding may fail but
+        # we want to continue anyway (like in the case of flat networks).
+        if fail_on_binding_failure:
+            neutron.wait_for_port_status(
+                client, vif_id, 'ACTIVE',
+                fail_on_binding_failure=fail_on_binding_failure)
     except openstack_exc.OpenStackCloudException as e:
         msg = (_('Could not add public network VIF %(vif)s '
                  'to node %(node)s, possible network issue. %(exc)s') %
                {'vif': vif_id, 'node': node.uuid, 'exc': e})
         LOG.error(msg)
+        if client_to_close:
+            client_to_close.close()
         raise exception.NetworkError(msg)
+    finally:
+        if client_to_close:
+            client_to_close.close()
+
+
+def update_port_host_id(task, vif_id, client=None):
+    """Send an initial host_id value to Neutron to enable allocation.
+
+    :param task: A TaskManager instance.
+    :param vif_id: The VIF ID to "attach" to the host.
+    :param client: A neutron client object
+    :raises: NetworkError if failed to update Neutron port.
+    :raises: VifNotAttached if tenant VIF is not associated with port_like_obj.
+    """
+
+    node = task.node
+
+    if not vif_id:
+        # Nothing to do here, there *is* no VIF to update.
+        return
+
+    client_to_close = None
+    if not client:
+        client = client_to_close = neutron.get_client(task.context)
+
+    LOG.debug('Seeding network configuration for VIF %(vif_id)s to node '
+              '%(node_id)s',
+              {'vif_id': vif_id, 'node_id': node.uuid})
+    # We cannot perform an initial/early bind if the port is already
+    # bound. For example, Metalsmith users pre-pass the host_id to
+    # neutron, but then causes this patch to fail in such a case.
+    neutron.unbind_neutron_port_if_bound(vif_id, context=task.context,
+                                         client=client)
+
+    # NOTE(TheJulia): Just provide enough data through to neutron
+    # to start initial binding, but ultimately this entire binding
+    # sequence won't succeed because it cannot succeed. No binding
+    # profile is included, so an ML2 plugin cannot act on the change
+    # and effectively neutron should treat the port update as a NOOP,
+    # except if deferred addressing is the case, then that should
+    # trigger.
+    port_attrs = {'binding:vnic_type': neutron.VNIC_BAREMETAL,
+                  'binding:host_id': node.uuid,
+                  'binding:profile': {}}
+    try:
+        # This cannot be done with the prior/existing client, because they
+        # bring a different context and thus API rights. In other words,
+        # we, as an adminy service need to do this.
+        neutron.update_neutron_port(task.context, vif_id, port_attrs,
+                                    client=None)
+    except openstack_exc.OpenStackCloudException as e:
+        # If his action has failed, the possibility exists that the port
+        # was previously bound *and* allocated to another network, and thus
+        # cannot be properly bound later *either*. This exception should
+        # cause the deployment flow to never be triggered if there is an
+        # underlying issue which only neutron can see like wrong segment
+        # for the vif.
+        msg = (_('Could not seed network configuration for VIF %(vif)s'
+                 'to node %(node)s, possible network, state, or access '
+                 'permission issue. %(exc)s') %
+               {'vif': vif_id, 'node': node.uuid, 'exc': e})
+        LOG.error(msg)
+        if client_to_close:
+            client_to_close.close()
+        raise exception.NetworkError(msg)
+    finally:
+        if client_to_close:
+            client_to_close.close()
+
+
+def _is_dynamic_portgroup(portlike_obj):
+    """Determine if the supplied portlike is a dynamic portgroup"""
+    return hasattr(portlike_obj, 'dynamic_portgroup') \
+        and getattr(portlike_obj, 'dynamic_portgroup', False)
 
 
 class VIFPortIDMixin(object):
@@ -323,7 +446,7 @@ class VIFPortIDMixin(object):
         :param vif_id: VIF ID to save.
         """
         int_info = port_like_obj.internal_info
-        int_info[TENANT_VIF_KEY] = vif_id
+        int_info[NetType.TENANT.vif_key] = vif_id
         port_like_obj.internal_info = int_info
         port_like_obj.save()
 
@@ -335,7 +458,7 @@ class VIFPortIDMixin(object):
         """
         int_info = port_like_obj.internal_info
         extra = port_like_obj.extra
-        int_info.pop(TENANT_VIF_KEY, None)
+        int_info.pop(NetType.TENANT.vif_key, None)
         extra.pop('vif_port_id', None)
         port_like_obj.extra = extra
         port_like_obj.internal_info = int_info
@@ -362,7 +485,7 @@ class VIFPortIDMixin(object):
         :param port_like_obj: A port or portgroup to check.
         :returns: The ID of the attached VIF, or None.
         """
-        return port_like_obj.internal_info.get(TENANT_VIF_KEY)
+        return port_like_obj.internal_info.get(NetType.TENANT.vif_key)
 
     def vif_list(self, task):
         """List attached VIF IDs for a node
@@ -391,12 +514,10 @@ class VIFPortIDMixin(object):
         :param p_obj: Ironic port or portgroup object.
         :returns: VIF ID associated with p_obj or None.
         """
-
-        return (p_obj.internal_info.get('cleaning_vif_port_id')
-                or p_obj.internal_info.get('provisioning_vif_port_id')
-                or p_obj.internal_info.get('rescuing_vif_port_id')
-                or p_obj.internal_info.get('inspection_vif_port_id')
-                or self._get_vif_id_by_port_like_obj(p_obj) or None)
+        for net_type in NetType.__members__.values():
+            if net_type.vif_key in p_obj.internal_info:
+                return p_obj.internal_info.get(net_type.vif_key)
+        return None
 
 
 class NeutronVIFPortIDMixin(VIFPortIDMixin):
@@ -509,6 +630,184 @@ class NeutronVIFPortIDMixin(VIFPortIDMixin):
                                'reason': ', '.join(reason)})
                         raise exception.Conflict(msg)
 
+    def _create_dynamic_portgroup(self, task, first_port):
+        """Creates a dynamic portgroup"""
+
+        def pick_random_suffix():
+            return ''.join(random.choices(string.ascii_letters + string.digits,
+                                          k=8))
+
+        def generate_name():
+            return f'tbn_dyn_portgroup_{pick_random_suffix()}'
+
+        # Retries a few times if there's a name collision.
+        for i in range(0, 3):
+            dyn_portgroup = objects.Portgroup(
+                context=task.context,
+                name=generate_name(),
+                node_id=task.node.id,
+                node_uuid=task.node.uuid,
+                physical_network=first_port.physical_network,
+                dynamic_portgroup=True
+            )
+
+            # Create the dynamic portgroup.
+            try:
+                dyn_portgroup.create(context=task.context)
+                LOG.info('Created dynamic portgroup \'%(name)s\'',
+                         {'name': dyn_portgroup.name})
+                return dyn_portgroup
+            except exception.PortgroupDuplicateName:
+                # Try again with a new name
+                continue
+            except (exception.MACAlreadyExists,
+                    exception.PortgroupAlreadyExists) as e:
+                msg = (_('Could not create dynamic portgroup. '
+                         '%(exc)s') % {'exc': e})
+                LOG.error(msg)
+                raise exception.NetworkError(msg)
+
+        msg = (_('Could not create dynamic portgroup due to duplicate name '
+                 'collisions despite several retries.'))
+        raise exception.NetworkError(msg)
+
+    def _vif_attach_tbn(self, task, vif_info):
+        """Attach a virtual network interface to a node using traits from TBN
+
+        Attach a virtual interface to a node while allowing Trait Based
+        Networking to plan the actions to take while considering traits
+        defined on the node.
+
+        :param task: A TaskManager instance.
+        :param vif_info: a dictionary of information about a VIF.
+                         It must have an 'id' key, whose value is a unique
+                         identifier for that VIF.
+        :raises: NetworkError, VifAlreadyAttached, NoFreePhysicalPorts
+        :raises: PortgroupPhysnetInconsistent if one of the node's portgroups
+                 has ports which are not all assigned the same physical
+                 network.
+
+        """
+        applicable_traits = plan.filter_traits_for_node(task.node,
+                                                        task.tbn_traits)
+
+        if len(applicable_traits) == 0:
+            if CONF.conductor.trait_based_networking_enable_default_trait:
+                applicable_traits = [tbn_defaults.default_network_trait()]
+            elif CONF.conductor.trait_based_networking_raise_when_no_match:
+                raise exception.TBNNoTraitsApplicableToNode(
+                        node=task.node.uuid)
+            else:
+                LOG.warning(('_vif_attach_tbn: No applicable traits found '
+                             'for node %(node)s. Trait Based Networking '
+                             'unable to plan networking actions without '
+                             'any traits.'),
+                            {'node': task.node.uuid})
+                return
+
+        actions = plan.plan_vif_attach(applicable_traits, task, vif_info)
+
+        if len(actions) == 0 or plan.all_no_match(actions):
+            if CONF.conductor.trait_based_networking_raise_when_no_match:
+                raise exception.TBNNoPortMatchesFound(node=task.node.uuid,
+                                                      vif_id=vif_info['id'])
+            else:
+                LOG.warning(('_vif_attach_tbn: No trait generated networking '
+                             'actions to apply or ports to attach to the '
+                             'node %(node)s.'),
+                            {'node': task.node.uuid})
+                return
+
+        # NOTE(clif) Filter out any no matches, there will be some actual
+        # actions left over.
+        actions = [action for action in actions if
+                   not isinstance(action, tbn_base.NoMatch)]
+
+        # NOTE(cardoe): Only execute the first matching action. A single VIF
+        # can only be bound once, so executing additional actions (e.g. a
+        # portgroup match followed by a match on one of its member ports)
+        # would attempt a second binding of the same VIF and fail the whole
+        # vif_attach() call.
+        action = actions[0]
+
+        client = neutron.get_client(context=task.context)
+        try:
+            match type(action):
+                case tbn_base.AttachPort | tbn_base.AttachPortgroup:
+                    port_like_obj = action.get_portlike_object(task)
+                    self._attach_port_to_vif(task, client, port_like_obj,
+                                             vif_info['id'])
+
+                case tbn_base.GroupAndAttachPorts:
+                    # Get each constituent port information
+                    try:
+                        dyn_pg_ports = [
+                            objects.Port.get_by_uuid(task.context, uuid)
+                            for uuid in action.port_uuids
+                        ]
+                    except exception.PortNotFound as e:
+                        msg = (_("A selected port for the dynamic "
+                                 "portgroup was not found. %(exc)s")
+                               % {'exc': e})
+                        raise exception.NetworkError(msg)
+
+                    dyn_portgroup = self._create_dynamic_portgroup(
+                        task, dyn_pg_ports[0])
+
+                    # Update every port so it is part of the new portgroup
+                    for port in dyn_pg_ports:
+                        port.portgroup_id = dyn_portgroup.id
+                        try:
+                            port.save()
+                        except (exception.PortNotFound,
+                                exception.MACAlreadyExists) as e:
+                            msg = (_('Could not update port to belong to '
+                                     'dynamic portgroup. '
+                                     '%(exc)s') % {'exc': e})
+                            LOG.error(msg)
+                            raise exception.NetworkError(msg)
+
+                    # Attach the dynamic portgroup to the network.
+                    self._attach_port_to_vif(task, client, dyn_portgroup,
+                                             vif_info['id'])
+
+                case _:
+                    LOG.warning(('_vif_attach_tbn: Unhandled action '
+                                 'encountered: \'s(action)%\'.',
+                                 {'action': type(action)}))
+        finally:
+            client.close()
+
+
+    def _attach_port_to_vif(self, task, client, port_like_obj, vif_id):
+        """Do the actual work of attaching a port to a vif
+
+        Common helper function used by vif_attach and _vif_attach_tbn
+        """
+        # Address is optional for portgroups
+        if port_like_obj.address:
+            try:
+                neutron.update_port_address(vif_id, port_like_obj.address,
+                                            context=task.context)
+            except exception.FailedToUpdateMacOnPort:
+                raise exception.NetworkError(_(
+                    "Unable to attach VIF %(vif)s because Ironic can not "
+                    "update Neutron port %(port)s MAC address to match "
+                    "physical MAC address %(mac)s") % {
+                        'vif': vif_id, 'port': vif_id,
+                        'mac': port_like_obj.address})
+
+        self._save_vif_to_port_like_obj(port_like_obj, vif_id)
+
+        # NOTE(vsaienko) allow to attach VIF to active instance.
+        if task.node.provision_state == states.ACTIVE:
+            plug_port_to_tenant_network(task, port_like_obj, client=client)
+        else:
+            # Sends *just* a host_id to trigger neutron to do the initial
+            # address work (if needed...)
+            update_port_host_id(task, vif_id, client=client)
+
+
     def vif_attach(self, task, vif_info):
         """Attach a virtual network interface to a node
 
@@ -532,50 +831,32 @@ class NeutronVIFPortIDMixin(VIFPortIDMixin):
                  has ports which are not all assigned the same physical
                  network.
         """
+
+        # NOTE(clif) Use TBN to pick the port <-> vif mapping if enabled.
+        if CONF.conductor.enable_trait_based_networking:
+            return self._vif_attach_tbn(task, vif_info)
+
         vif_id = vif_info['id']
         client = neutron.get_client(context=task.context)
-
-        # Determine whether any of the node's ports have a physical network. If
-        # not, we don't need to check the VIF's network's physical networks as
-        # they will not affect the VIF to port mapping.
-        physnets = set()
-        if any(port.physical_network is not None for port in task.ports):
+        try:
             physnets = neutron.get_physnets_by_port_uuid(client, vif_id)
+            port_like_obj = get_free_port_like_object(
+                task, vif_id, physnets, vif_info)
 
-            if len(physnets) > 1:
-                # NOTE(mgoddard): Neutron cannot currently handle hosts which
-                # are mapped to multiple segments in the same routed network.
-                node_physnets = network.get_physnets_for_node(task)
-                if len(node_physnets.intersection(physnets)) > 1:
-                    reason = _("Node has ports which map to multiple segments "
-                               "of the routed network to which the VIF is "
-                               "attached. Currently neutron only supports "
-                               "hosts which map to one segment of a routed "
-                               "network")
-                    raise exception.VifInvalidForAttach(
-                        node=task.node.uuid, vif=vif_id, reason=reason)
+            self._attach_port_to_vif(task, client, port_like_obj, vif_id)
+        finally:
+            client.close()
 
-        port_like_obj = get_free_port_like_object(
-            task, vif_id, physnets, vif_info)
+    def _teardown_dynamic_portgroup(self, task, dynamic_portgroup):
+        """Teardown and delete dynamic portgroup"""
+        ports = objects.Port.list_by_portgroup_id(task.context,
+                                                  dynamic_portgroup.id)
+        # Remove all constituent ports
+        for port in ports:
+            port.portgroup_id = None
+            port.save()
 
-        # Address is optional for portgroups
-        if port_like_obj.address:
-            try:
-                neutron.update_port_address(vif_id, port_like_obj.address,
-                                            context=task.context)
-            except exception.FailedToUpdateMacOnPort:
-                raise exception.NetworkError(_(
-                    "Unable to attach VIF %(vif)s because Ironic can not "
-                    "update Neutron port %(port)s MAC address to match "
-                    "physical MAC address %(mac)s") % {
-                        'vif': vif_id, 'port': vif_id,
-                        'mac': port_like_obj.address})
-
-        self._save_vif_to_port_like_obj(port_like_obj, vif_id)
-
-        # NOTE(vsaienko) allow to attach VIF to active instance.
-        if task.node.provision_state == states.ACTIVE:
-            plug_port_to_tenant_network(task, port_like_obj, client=client)
+        dynamic_portgroup.destroy()
 
     def vif_detach(self, task, vif_id):
         """Detach a virtual network interface from a node
@@ -591,23 +872,30 @@ class NeutronVIFPortIDMixin(VIFPortIDMixin):
 
         self._clear_vif_from_port_like_obj(port_like_obj)
 
+        # NOTE(clif): Dynamic portgroups go away once they are detached.
+        if _is_dynamic_portgroup(port_like_obj):
+            self._teardown_dynamic_portgroup(task, port_like_obj)
+
         # NOTE(vsaienko): allow to unplug VIFs from ACTIVE instance.
         # NOTE(TheJulia): Also ensure that we delete the vif when in
         # DELETING state.
-        if task.node.provision_state in [states.ACTIVE, states.DELETING]:
+        if task.node.provision_state in [states.ACTIVE, states.DELETING,
+                                         states.AVAILABLE]:
             neutron.unbind_neutron_port(vif_id, context=task.context)
 
     def get_node_network_data(self, task):
         """Get network configuration data for node ports.
 
         Pull network data from ironic node object if present, otherwise
-        collect it for Neutron VIFs.
+        collect it for Neutron VIFs. The intended use of this method is to
+        generate data *for* virtual media based deployments so a minimal
+        configuration can be injected into the ramdisk.
 
         :param task: A TaskManager instance.
         :raises: InvalidParameterValue, if the network interface configuration
             is invalid.
         :raises: MissingParameterValue, if some parameters are missing.
-        :returns: a dict holding network configuration information adhearing
+        :returns: a dict holding network configuration information adhering
             Nova network metadata layout (`network_data.json`).
         """
         # NOTE(etingof): static network data takes precedence
@@ -624,6 +912,10 @@ class NeutronVIFPortIDMixin(VIFPortIDMixin):
         network_data = collections.defaultdict(list)
 
         for port_obj in task.ports:
+            # FIXME(TheJulia) This code ignores portgroups, but also nobody
+            # has complained about this issue *and* it uses get_current_vif
+            # which doesn't handle *tenant* vifs. The model of this is
+            # around deployment, not instances, really.
             vif_port_id = self.get_current_vif(task, port_obj)
 
             LOG.debug('Considering node %(node)s port %(port)s, VIF %(vif)s',

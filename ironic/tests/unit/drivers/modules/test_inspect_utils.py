@@ -13,23 +13,23 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-
+import json
+import socket
 from unittest import mock
 
-from oslo_utils import importutils
+from oslo_utils import uuidutils
 
 from ironic.common import context as ironic_context
 from ironic.common import exception
+from ironic.common import states
 from ironic.common import swift
 from ironic.conductor import task_manager
+from ironic.conf import CONF
 from ironic.drivers.modules import inspect_utils as utils
-from ironic.drivers.modules import inspector
+from ironic.drivers.modules.inspector.hooks import base as hooks_base
 from ironic import objects
 from ironic.tests.unit.db import base as db_base
 from ironic.tests.unit.objects import utils as obj_utils
-
-sushy = importutils.try_import('sushy')
-CONF = inspector.CONF
 
 
 @mock.patch('time.sleep', lambda sec: None)
@@ -94,6 +94,74 @@ class InspectFunctionTestCase(db_base.DbTestCase):
             self.assertEqual(2, port_mock.return_value.create.call_count)
 
 
+class SwiftCleanUp(db_base.DbTestCase):
+
+    def setUp(self):
+        super(SwiftCleanUp, self).setUp()
+        self.node = obj_utils.create_test_node(self.context)
+
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_clean_up_swift_entries(self, swift_api_mock):
+        CONF.set_override('data_backend', 'swift', group='inventory')
+        container = 'inspection_data'
+        CONF.set_override('swift_data_container', container, group='inventory')
+        swift_obj_mock = swift_api_mock.return_value
+        swift_obj_mock.__enter__.return_value = swift_obj_mock
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            utils.clean_up_swift_entries(task)
+            object_name = 'inspector_data-' + str(self.node.uuid)
+            swift_obj_mock.delete_object.assert_has_calls([
+                mock.call(object_name + '-inventory', container),
+                mock.call(object_name + '-plugin', container)])
+            swift_obj_mock.__exit__.assert_called_once()
+
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_clean_up_swift_entries_with_404_exception(self, swift_api_mock):
+        CONF.set_override('data_backend', 'swift', group='inventory')
+        container = 'inspection_data'
+        CONF.set_override('swift_data_container', container, group='inventory')
+        swift_obj_mock = swift_api_mock.return_value
+        swift_obj_mock.__enter__.return_value = swift_obj_mock
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            swift_obj_mock.delete_object.side_effect = [
+                exception.SwiftObjectNotFoundError("not found"),
+                exception.SwiftObjectNotFoundError("not found")]
+            utils.clean_up_swift_entries(task)
+
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_clean_up_swift_entries_with_fail_exception(self, swift_api_mock):
+        CONF.set_override('data_backend', 'swift', group='inventory')
+        container = 'inspection_data'
+        CONF.set_override('swift_data_container', container, group='inventory')
+        swift_obj_mock = swift_api_mock.return_value
+        swift_obj_mock.__enter__.return_value = swift_obj_mock
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            swift_obj_mock.delete_object.side_effect = [
+                exception.SwiftOperationError("failed"),
+                exception.SwiftObjectNotFoundError("not found")]
+            self.assertRaises(exception.SwiftObjectStillExists,
+                              utils.clean_up_swift_entries, task)
+
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_clean_up_swift_entries_with_fail_exceptions(self, swift_api_mock):
+        CONF.set_override('data_backend', 'swift', group='inventory')
+        container = 'inspection_data'
+        CONF.set_override('swift_data_container', container, group='inventory')
+        swift_obj_mock = swift_api_mock.return_value
+        swift_obj_mock.__enter__.return_value = swift_obj_mock
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            swift_obj_mock.delete_object.side_effect = [
+                exception.SwiftOperationError("failed"),
+                exception.SwiftOperationError("failed")]
+            self.assertRaises((exception.SwiftObjectStillExists,
+                               exception.SwiftObjectStillExists),
+                              utils.clean_up_swift_entries, task)
+
+
 class IntrospectionDataStorageFunctionsTestCase(db_base.DbTestCase):
     fake_inventory_data = {"cpu": "amd"}
     fake_plugin_data = {"disks": [{"name": "/dev/vda"}]}
@@ -102,110 +170,453 @@ class IntrospectionDataStorageFunctionsTestCase(db_base.DbTestCase):
         super(IntrospectionDataStorageFunctionsTestCase, self).setUp()
         self.node = obj_utils.create_test_node(self.context)
 
-    def test_store_introspection_data_db(self):
-        CONF.set_override('data_backend', 'database',
-                          group='inventory')
-        fake_introspection_data = {'inventory': self.fake_inventory_data,
-                                   **self.fake_plugin_data}
+    def test_store_inspection_data_db(self):
+        CONF.set_override('data_backend', 'database', group='inventory')
         fake_context = ironic_context.RequestContext()
-        utils.store_introspection_data(self.node, fake_introspection_data,
-                                       fake_context)
+        utils.store_inspection_data(self.node, self.fake_inventory_data,
+                                    self.fake_plugin_data, fake_context)
         stored = objects.NodeInventory.get_by_node_id(self.context,
                                                       self.node.id)
         self.assertEqual(self.fake_inventory_data, stored["inventory_data"])
         self.assertEqual(self.fake_plugin_data, stored["plugin_data"])
 
-    @mock.patch.object(utils, '_store_introspection_data_in_swift',
+    @mock.patch.object(utils, '_store_inspection_data_in_swift',
                        autospec=True)
-    def test_store_introspection_data_swift(self, mock_store_data):
+    def test_store_inspection_data_swift(self, mock_store_data):
         CONF.set_override('data_backend', 'swift', group='inventory')
         CONF.set_override(
-            'swift_data_container', 'introspection_data',
+            'swift_data_container', 'inspection_data',
             group='inventory')
-        fake_introspection_data = {
-            "inventory": self.fake_inventory_data, **self.fake_plugin_data}
         fake_context = ironic_context.RequestContext()
-        utils.store_introspection_data(self.node, fake_introspection_data,
-                                       fake_context)
+        utils.store_inspection_data(self.node, self.fake_inventory_data,
+                                    self.fake_plugin_data, fake_context)
         mock_store_data.assert_called_once_with(
             self.node.uuid, inventory_data=self.fake_inventory_data,
             plugin_data=self.fake_plugin_data)
 
-    def test_store_introspection_data_nostore(self):
+    def test_store_inspection_data_nostore(self):
         CONF.set_override('data_backend', 'none', group='inventory')
-        fake_introspection_data = {
-            "inventory": self.fake_inventory_data, **self.fake_plugin_data}
         fake_context = ironic_context.RequestContext()
-        ret = utils.store_introspection_data(self.node,
-                                             fake_introspection_data,
-                                             fake_context)
-        self.assertIsNone(ret)
+        utils.store_inspection_data(self.node, self.fake_inventory_data,
+                                    self.fake_plugin_data, fake_context)
+        self.assertRaises(exception.NodeInventoryNotFound,
+                          objects.NodeInventory.get_by_node_id,
+                          self.context, self.node.id)
 
-    def test__node_inventory_convert(self):
-        required_output = {"inventory": self.fake_inventory_data,
-                           "plugin_data": self.fake_plugin_data}
-        input_given = {}
-        input_given["inventory_data"] = self.fake_inventory_data
-        input_given["plugin_data"] = self.fake_plugin_data
-        input_given["booom"] = "boom"
-        ret = utils._node_inventory_convert(input_given)
-        self.assertEqual(required_output, ret)
-
-    @mock.patch.object(utils, '_node_inventory_convert', autospec=True)
-    @mock.patch.object(objects, 'NodeInventory', spec_set=True, autospec=True)
-    def test_get_introspection_data_db(self, mock_inventory, mock_convert):
-        CONF.set_override('data_backend', 'database',
-                          group='inventory')
-        fake_introspection_data = {'inventory': self.fake_inventory_data,
-                                   'plugin_data': self.fake_plugin_data}
+    def test_get_inspection_data_db(self):
+        CONF.set_override('data_backend', 'database', group='inventory')
+        obj_utils.create_test_inventory(
+            self.context, self.node,
+            inventory_data=self.fake_inventory_data,
+            plugin_data=self.fake_plugin_data)
         fake_context = ironic_context.RequestContext()
-        mock_inventory.get_by_node_id.return_value = fake_introspection_data
-        utils.get_introspection_data(self.node, fake_context)
-        mock_convert.assert_called_once_with(fake_introspection_data)
+        ret = utils.get_inspection_data(self.node, fake_context)
+        fake_inspection_data = {'inventory': self.fake_inventory_data,
+                                'plugin_data': self.fake_plugin_data}
+        self.assertEqual(ret, fake_inspection_data)
 
-    @mock.patch.object(utils, '_get_introspection_data_from_swift',
-                       autospec=True)
-    def test_get_introspection_data_swift(self, mock_get_data):
+    def test_get_inspection_data_db_exception(self):
+        CONF.set_override('data_backend', 'database', group='inventory')
+        fake_context = ironic_context.RequestContext()
+        self.assertRaises(
+            exception.NodeInventoryNotFound, utils.get_inspection_data,
+            self.node, fake_context)
+
+    @mock.patch.object(utils, '_get_inspection_data_from_swift', autospec=True)
+    def test_get_inspection_data_swift(self, mock_get_data):
         CONF.set_override('data_backend', 'swift', group='inventory')
         CONF.set_override(
-            'swift_data_container', 'introspection_data',
+            'swift_data_container', 'inspection_data',
             group='inventory')
         fake_context = ironic_context.RequestContext()
-        utils.get_introspection_data(self.node, fake_context)
-        mock_get_data.assert_called_once_with(
-            self.node.uuid)
+        ret = utils.get_inspection_data(self.node, fake_context)
+        mock_get_data.assert_called_once_with(self.node.uuid)
+        self.assertEqual(mock_get_data.return_value, ret)
 
-    def test_get_introspection_data_nostore(self):
+    @mock.patch.object(utils, '_get_inspection_data_from_swift', autospec=True)
+    def test_get_inspection_data_swift_exception(self, mock_get_data):
+        CONF.set_override('data_backend', 'swift', group='inventory')
+        CONF.set_override(
+            'swift_data_container', 'inspection_data',
+            group='inventory')
+        fake_context = ironic_context.RequestContext()
+        mock_get_data.side_effect = exception.SwiftObjectNotFoundError()
+        self.assertRaises(
+            exception.NodeInventoryNotFound, utils.get_inspection_data,
+            self.node, fake_context)
+
+    def test_get_inspection_data_nostore(self):
         CONF.set_override('data_backend', 'none', group='inventory')
         fake_context = ironic_context.RequestContext()
         self.assertRaises(
-            exception.NotFound, utils.get_introspection_data,
+            exception.NodeInventoryNotFound, utils.get_inspection_data,
             self.node, fake_context)
 
     @mock.patch.object(swift, 'SwiftAPI', autospec=True)
-    def test__store_introspection_data_in_swift(self, swift_api_mock):
-        container = 'introspection_data'
+    def test__store_inspection_data_in_swift(self, swift_api_mock):
+        container = 'inspection_data'
         CONF.set_override('swift_data_container', container, group='inventory')
-        utils._store_introspection_data_in_swift(
-            self.node.uuid, self.fake_inventory_data, self.fake_plugin_data)
         swift_obj_mock = swift_api_mock.return_value
+        swift_obj_mock.__enter__.return_value = swift_obj_mock
+        utils._store_inspection_data_in_swift(
+            self.node.uuid, self.fake_inventory_data, self.fake_plugin_data)
         object_name = 'inspector_data-' + str(self.node.uuid)
         swift_obj_mock.create_object_from_data.assert_has_calls([
-            mock.call(object_name + '-inventory', self.fake_inventory_data,
+            mock.call(object_name + '-inventory',
+                      json.dumps(self.fake_inventory_data),
                       container),
-            mock.call(object_name + '-plugin', self.fake_plugin_data,
+            mock.call(object_name + '-plugin',
+                      json.dumps(self.fake_plugin_data),
                       container)])
+        swift_obj_mock.__exit__.assert_called_once()
 
     @mock.patch.object(swift, 'SwiftAPI', autospec=True)
-    def test__get_introspection_data_from_swift(self, swift_api_mock):
-        container = 'introspection_data'
+    def test__get_inspection_data_from_swift(self, swift_api_mock):
+        container = 'inspection_data'
         CONF.set_override('swift_data_container', container, group='inventory')
         swift_obj_mock = swift_api_mock.return_value
+        swift_obj_mock.__enter__.return_value = swift_obj_mock
         swift_obj_mock.get_object.side_effect = [
-            self.fake_inventory_data,
-            self.fake_plugin_data
+            json.dumps(self.fake_inventory_data),
+            json.dumps(self.fake_plugin_data)
         ]
-        ret = utils._get_introspection_data_from_swift(self.node.uuid)
+        ret = utils._get_inspection_data_from_swift(self.node.uuid)
         req_ret = {"inventory": self.fake_inventory_data,
                    "plugin_data": self.fake_plugin_data}
         self.assertEqual(req_ret, ret)
+        swift_obj_mock.__exit__.assert_called_once()
+
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test__get_inspection_data_from_swift_exception(self, swift_api_mock):
+        container = 'inspection_data'
+        CONF.set_override('swift_data_container', container, group='inventory')
+        swift_obj_mock = swift_api_mock.return_value
+        swift_obj_mock.__enter__.return_value = swift_obj_mock
+        swift_obj_mock.get_object.side_effect = [
+            exception.SwiftOperationError,
+            self.fake_plugin_data
+        ]
+        self.assertRaises(exception.SwiftObjectNotFoundError,
+                          utils._get_inspection_data_from_swift,
+                          self.node.uuid)
+
+
+class LookupNodeTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.bmc = '192.0.2.1'
+        self.node = obj_utils.create_test_node(
+            self.context,
+            driver_internal_info={utils.LOOKUP_CACHE_FIELD: [self.bmc]},
+            provision_state=states.INSPECTWAIT)
+
+        self.macs = ['11:22:33:44:55:66', '12:34:56:78:90:ab']
+        self.unknown_mac = '66:55:44:33:22:11'
+        self.ports = [
+            obj_utils.create_test_port(self.context,
+                                       uuid=uuidutils.generate_uuid(),
+                                       node_id=self.node.id,
+                                       address=addr)
+            for addr in self.macs
+        ]
+
+        self.bmc2 = '1.2.1.2'
+        self.mac2 = '00:11:00:11:00:11'
+        self.node2 = obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver_internal_info={utils.LOOKUP_CACHE_FIELD: [self.bmc2]},
+            provision_state=states.INSPECTWAIT)
+        obj_utils.create_test_port(self.context,
+                                   node_id=self.node2.id,
+                                   address=self.mac2)
+
+    def test_no_input(self):
+        self.assertRaises(exception.BadRequest, utils.lookup_node,
+                          self.context, [], [], None)
+
+    def test_by_macs(self):
+        result = utils.lookup_node(self.context, self.macs[::-1], [], None)
+        self.assertEqual(self.node.uuid, result.uuid)
+
+    def test_by_macs_partial(self):
+        macs = [self.macs[1], self.unknown_mac]
+        result = utils.lookup_node(self.context, macs, [], None)
+        self.assertEqual(self.node.uuid, result.uuid)
+
+    def test_by_mac_not_found(self):
+        self.assertRaises(utils.AutoEnrollPossible, utils.lookup_node,
+                          self.context, [self.unknown_mac], [], None)
+
+    def test_by_mac_wrong_state(self):
+        self.node.provision_state = states.AVAILABLE
+        self.node.save()
+        self.assertRaises(exception.NotFound, utils.lookup_node,
+                          self.context, self.macs, [], None)
+
+    def test_conflicting_macs(self):
+        self.assertRaises(exception.NotFound, utils.lookup_node,
+                          self.context, [self.macs[0], self.mac2], [], None)
+
+    def test_by_bmc(self):
+        result = utils.lookup_node(self.context, [], ['192.0.2.1'], None)
+        self.assertEqual(self.node.uuid, result.uuid)
+
+    def test_by_bmc_and_mac(self):
+        result = utils.lookup_node(
+            self.context, [self.macs[0]], [self.bmc], None)
+        self.assertEqual(self.node.uuid, result.uuid)
+
+    def test_by_unknown_bmc_and_mac(self):
+        result = utils.lookup_node(
+            self.context, [self.unknown_mac], [self.bmc], None)
+        self.assertEqual(self.node.uuid, result.uuid)
+
+    def test_by_bmc_and_mac_and_uuid(self):
+        result = utils.lookup_node(
+            self.context, [self.macs[0]], [self.bmc], self.node.uuid)
+        self.assertEqual(self.node.uuid, result.uuid)
+
+    def test_by_bmc_not_found(self):
+        self.assertRaises(utils.AutoEnrollPossible, utils.lookup_node,
+                          self.context, [], ['192.168.1.1'], None)
+
+    def test_by_bmc_and_mac_not_found(self):
+        self.assertRaises(utils.AutoEnrollPossible, utils.lookup_node,
+                          self.context, [self.unknown_mac],
+                          ['192.168.1.1'], None)
+
+    def test_by_bmc_wrong_state(self):
+        self.node.provision_state = states.AVAILABLE
+        self.node.save()
+        # Limitation of auto-discovery: cannot de-duplicate nodes by BMC
+        # addresses only. Should not happen too often in reality.
+        # If it does happen, auto-discovery will create a duplicate node.
+        self.assertRaises(utils.AutoEnrollPossible, utils.lookup_node,
+                          self.context, [], [self.bmc], None)
+
+    def test_conflicting_macs_and_bmc(self):
+        self.assertRaises(exception.NotFound, utils.lookup_node,
+                          self.context, self.macs, [self.bmc2], None)
+
+    def test_duplicate_bmc(self):
+        # This can happen with Redfish. There is no way to resolve the conflict
+        # other than by using MACs.
+        obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver_internal_info={utils.LOOKUP_CACHE_FIELD: [self.bmc]},
+            provision_state=states.INSPECTWAIT)
+        self.assertRaises(exception.NotFound, utils.lookup_node,
+                          self.context, [], [self.bmc], None)
+
+    def test_duplicate_bmc_and_unknown_mac(self):
+        obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver_internal_info={utils.LOOKUP_CACHE_FIELD: [self.bmc]},
+            provision_state=states.INSPECTWAIT)
+        self.assertRaises(exception.NotFound, utils.lookup_node,
+                          self.context, [self.unknown_mac], [self.bmc], None)
+
+    def test_duplicate_bmc_resolved_by_macs(self):
+        obj_utils.create_test_node(
+            self.context,
+            uuid=uuidutils.generate_uuid(),
+            driver_internal_info={utils.LOOKUP_CACHE_FIELD: [self.bmc]},
+            provision_state=states.INSPECTWAIT)
+        result = utils.lookup_node(
+            self.context, [self.macs[0]], [self.bmc], None)
+        self.assertEqual(self.node.uuid, result.uuid)
+
+    def test_by_uuid(self):
+        result = utils.lookup_node(self.context, [], [], self.node.uuid)
+        self.assertEqual(self.node.uuid, result.uuid)
+
+    def test_by_uuid_and_unknown_macs(self):
+        result = utils.lookup_node(
+            self.context, [self.unknown_mac], [], self.node.uuid)
+        self.assertEqual(self.node.uuid, result.uuid)
+
+    def test_by_uuid_not_found(self):
+        self.assertRaises(exception.NotFound, utils.lookup_node,
+                          self.context, [], [], uuidutils.generate_uuid())
+
+    def test_by_uuid_wrong_state(self):
+        self.node.provision_state = states.AVAILABLE
+        self.node.save()
+        self.assertRaises(exception.NotFound, utils.lookup_node,
+                          self.context, [], [], self.node.uuid)
+
+    def test_conflicting_macs_and_uuid(self):
+        self.assertRaises(exception.NotFound, utils.lookup_node,
+                          self.context, self.macs, [], self.node2.uuid)
+
+    def test_conflicting_bmc_and_uuid(self):
+        self.assertRaises(exception.NotFound, utils.lookup_node,
+                          self.context, self.macs, [self.bmc], self.node2.uuid)
+
+
+class GetBMCAddressesTestCase(db_base.DbTestCase):
+
+    def test_localhost_ignored(self):
+        node = obj_utils.create_test_node(
+            self.context,
+            driver_info={'ipmi_address': '127.0.0.1'})
+        self.assertEqual(set(), utils._get_bmc_addresses(node))
+
+    def test_localhost_as_url_ignored(self):
+        node = obj_utils.create_test_node(
+            self.context,
+            driver_info={'redfish_address': 'https://localhost/redfish'})
+        self.assertEqual(set(), utils._get_bmc_addresses(node))
+
+    def test_normal_ip(self):
+        node = obj_utils.create_test_node(
+            self.context,
+            driver_info={'ipmi_address': '192.0.2.1'})
+        self.assertEqual({'192.0.2.1'}, utils._get_bmc_addresses(node))
+
+    def test_normal_ip_as_url(self):
+        node = obj_utils.create_test_node(
+            self.context,
+            driver_info={'redfish_address': 'https://192.0.2.1/redfish'})
+        self.assertEqual({'192.0.2.1'}, utils._get_bmc_addresses(node))
+
+    def test_normal_ipv6_as_url(self):
+        node = obj_utils.create_test_node(
+            self.context,
+            driver_info={'redfish_address': 'https://[2001:db8::42]/redfish'})
+        self.assertEqual({'2001:db8::42'}, utils._get_bmc_addresses(node))
+
+    @mock.patch.object(socket, 'getaddrinfo', autospec=True)
+    def test_resolved_host(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET6, socket.SOCK_STREAM, socket.SOL_TCP,
+             '', ('2001:db8::42', None)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.SOL_TCP,
+             '', ('192.0.2.1', None)),
+        ]
+        node = obj_utils.create_test_node(
+            self.context,
+            driver_info={'ipmi_address': 'example.com'})
+        self.assertEqual({'example.com', '192.0.2.1', '2001:db8::42'},
+                         utils._get_bmc_addresses(node))
+        mock_getaddrinfo.assert_called_once_with(
+            'example.com', None, proto=socket.SOL_TCP)
+
+    @mock.patch.object(socket, 'getaddrinfo', autospec=True)
+    def test_resolved_host_in_url(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET6, socket.SOCK_STREAM, socket.SOL_TCP,
+             '', ('2001:db8::42', None)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.SOL_TCP,
+             '', ('192.0.2.1', None)),
+        ]
+        node = obj_utils.create_test_node(
+            self.context,
+            driver_info={'redfish_address': 'https://example.com:8080/v1'})
+        self.assertEqual({'example.com', '192.0.2.1', '2001:db8::42'},
+                         utils._get_bmc_addresses(node))
+        mock_getaddrinfo.assert_called_once_with(
+            'example.com', None, proto=socket.SOL_TCP)
+
+    def test_redfish_bmc_address_ipv6_brackets_no_scheme(self):
+        node = obj_utils.create_test_node(
+            self.context,
+            driver_info={'redfish_address': '[2001:db8::42]'})
+        self.assertEqual({'2001:db8::42'}, utils._get_bmc_addresses(node))
+
+
+class LookupCacheTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.bmc = '192.0.2.1'
+        self.node = obj_utils.create_test_node(
+            self.context,
+            driver_internal_info={utils.LOOKUP_CACHE_FIELD: [self.bmc]},
+            provision_state=states.INSPECTWAIT)
+
+    def test_clear(self):
+        result = utils.clear_lookup_addresses(self.node)
+        self.assertEqual([self.bmc], result)
+        self.assertEqual({}, self.node.driver_internal_info)
+
+    @mock.patch.object(utils, '_get_bmc_addresses', autospec=True)
+    def test_new_value(self, mock_get_addr):
+        mock_get_addr.return_value = {'192.0.2.42'}
+        utils.cache_lookup_addresses(self.node)
+        self.assertEqual({utils.LOOKUP_CACHE_FIELD: ['192.0.2.42']},
+                         self.node.driver_internal_info)
+
+    @mock.patch.object(utils, '_get_bmc_addresses', autospec=True)
+    def test_replace_with_empty(self, mock_get_addr):
+        mock_get_addr.return_value = set()
+        utils.cache_lookup_addresses(self.node)
+        self.assertEqual({}, self.node.driver_internal_info)
+
+
+class RunInspectionHooksTestCase(db_base.DbTestCase):
+    def setUp(self):
+        super().setUp()
+        CONF.set_override('enabled_inspect_interfaces',
+                          ['agent', 'no-inspect'])
+        self.node = obj_utils.create_test_node(
+            self.context,
+            inspect_interface='agent',
+            provision_state=states.INSPECTING)
+        self.task = mock.Mock(spec=task_manager.TaskManager, node=self.node)
+        self.hooks = [
+            mock.Mock(name=str(i),
+                      obj=mock.MagicMock(spec=hooks_base.InspectionHook))
+            for i in range(2)
+        ]
+        self.on_error_plugin_data = mock.MagicMock()
+        self.inventory = {"interfaces": [42]}
+        self.plugin_data = {"logs": "abcd"}
+
+    def test_no_on_error(self):
+        utils.run_inspection_hooks(self.task, self.inventory,
+                                   self.plugin_data, self.hooks,
+                                   None)
+        for hook in self.hooks:
+            hook.obj.preprocess.assert_called_once_with(
+                self.task, self.inventory, self.plugin_data)
+            hook.obj.assert_called_once_with(
+                self.task, self.inventory, self.plugin_data)
+
+        self.on_error_plugin_data.assert_not_called()
+
+    def test_pre_hook_on_error_callback(self):
+        failing_pre_hook = mock.MagicMock(spec=hooks_base.InspectionHook)
+        failing_pre_hook.preprocess.side_effect = (
+            exception.HardwareInspectionFailure("fake exception")
+        )
+        failing_hooks = self.hooks.copy()
+        failing_hooks.append(mock.Mock(name="failing", obj=failing_pre_hook))
+
+        self.assertRaises(exception.HardwareInspectionFailure,
+                          utils.run_inspection_hooks,
+                          self.task, self.inventory, self.plugin_data,
+                          failing_hooks,
+                          self.on_error_plugin_data)
+
+        self.on_error_plugin_data.assert_called_once()
+
+    def test_post_hook_on_error_callback(self):
+        failing_post_hook = mock.MagicMock(spec=hooks_base.InspectionHook)
+        failing_post_hook.__call__ = mock.Mock(
+            side_effect=exception.HardwareInspectionFailure("fake exception")
+        )
+        failing_hooks = self.hooks.copy()
+        failing_hooks.append(mock.Mock(name="failing", obj=failing_post_hook))
+
+        self.assertRaises(exception.HardwareInspectionFailure,
+                          utils.run_inspection_hooks,
+                          self.task, self.inventory, self.plugin_data,
+                          failing_hooks,
+                          self.on_error_plugin_data)
+
+        self.on_error_plugin_data.assert_called_once()

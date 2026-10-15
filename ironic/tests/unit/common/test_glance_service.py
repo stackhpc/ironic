@@ -19,9 +19,10 @@ import importlib
 import time
 from unittest import mock
 
-from glanceclient import client as glance_client
-from glanceclient import exc as glance_exc
+from keystoneauth1 import exceptions as ks_exception
 from keystoneauth1 import loading as ks_loading
+import openstack
+from openstack.connection import exceptions as openstack_exc
 from oslo_config import cfg
 from oslo_utils import uuidutils
 import testtools
@@ -30,6 +31,7 @@ from ironic.common import context
 from ironic.common import exception
 from ironic.common.glance_service import image_service
 from ironic.common.glance_service import service_utils
+from ironic.common import swift
 from ironic.tests import base
 from ironic.tests.unit import stubs
 
@@ -98,9 +100,12 @@ class TestGlanceImageService(base.TestCase):
     @staticmethod
     def _make_fixture(**kwargs):
         fixture = {'name': None,
-                   'status': "active"}
+                   'owner': None,
+                   'properties': {},
+                   'status': "active",
+                   'visibility': "public"}
         fixture.update(kwargs)
-        return stubs.FakeImage(fixture)
+        return openstack.image.v2.image.Image.new(**fixture)
 
     @property
     def endpoint(self):
@@ -140,16 +145,16 @@ class TestGlanceImageService(base.TestCase):
             'schema': None,
             'size': None,
             'status': "active",
-            'tags': None,
+            'tags': [],
             'updated_at': None,
-            'visibility': None,
+            'visibility': "public",
             'os_hash_algo': None,
             'os_hash_value': None,
         }
         with mock.patch.object(self.service, 'call', autospec=True):
             self.service.call.return_value = image
             image_meta = self.service.show(image_id)
-            self.service.call.assert_called_with('get', image_id)
+            self.service.call.assert_called_with('get_image', image_id)
             self.assertEqual(expected, image_meta)
 
     def test_show_makes_datetimes(self):
@@ -158,7 +163,7 @@ class TestGlanceImageService(base.TestCase):
         with mock.patch.object(self.service, 'call', autospec=True):
             self.service.call.return_value = image
             image_meta = self.service.show(image_id)
-            self.service.call.assert_called_with('get', image_id)
+            self.service.call.assert_called_with('get_image', image_id)
             self.assertEqual(self.NOW_DATETIME, image_meta['created_at'])
             self.assertEqual(self.NOW_DATETIME, image_meta['updated_at'])
 
@@ -179,15 +184,46 @@ class TestGlanceImageService(base.TestCase):
             self.assertRaises(exception.ImageUnacceptable,
                               self.service.show, image_id)
 
+    def test_show_raises_when_image_encrypted(self):
+        image_id = uuidutils.generate_uuid()
+        encryption_key_id = uuidutils.generate_uuid()
+        image = self._make_fixture(
+            name='encrypted-image',
+            id=image_id,
+            status="active",
+            properties={'cinder_encryption_key_id': encryption_key_id}
+        )
+        with mock.patch.object(self.service, 'call', autospec=True):
+            self.service.call.return_value = image
+            exc = self.assertRaises(exception.ImageUnacceptable,
+                                    self.service.show, image_id)
+            self.assertIn('does not support encrypted images', str(exc))
+
+    def test_show_success_without_encryption(self):
+        image_id = uuidutils.generate_uuid()
+        image = self._make_fixture(
+            name='normal-image',
+            id=image_id,
+            status="active",
+            properties={'some_other_property': 'value'}
+        )
+        with mock.patch.object(self.service, 'call', autospec=True):
+            self.service.call.return_value = image
+            result = self.service.show(image_id)
+            self.assertEqual(image_id, result['id'])
+            self.assertNotIn('cinder_encryption_key_id',
+                             result.get('properties', {}))
+
     def test_download_with_retries(self):
         tries = [0]
 
         class MyGlanceStubClient(stubs.StubGlanceClient):
             """A client that fails the first time, then succeeds."""
-            def get(self, image_id):
+
+            def get_image(self, image_id):
                 if tries[0] == 0:
                     tries[0] = 1
-                    raise glance_exc.ServiceUnavailable('')
+                    raise ks_exception.ServiceUnavailable()
                 else:
                     return {}
 
@@ -215,20 +251,22 @@ class TestGlanceImageService(base.TestCase):
         stub_service.download(image_id, writer)
 
     def test_download_no_data(self):
-        self.client.fake_wrapped = None
+        self.client.image_data = b''
         image_id = uuidutils.generate_uuid()
 
         image = self._make_datetime_fixture()
-        with mock.patch.object(self.client, 'get', return_value=image,
+        with mock.patch.object(self.client, 'get_image', return_value=image,
                                autospec=True):
             self.assertRaisesRegex(exception.ImageDownloadFailed,
                                    'image contains no data',
                                    self.service.download, image_id)
 
+    @mock.patch.object(service_utils, '_GLANCE_SESSION', autospec=True)
     @mock.patch('os.sendfile', autospec=True)
     @mock.patch('os.path.getsize', autospec=True)
     @mock.patch('%s.open' % __name__, new=mock.mock_open(), create=True)
-    def test_download_file_url(self, mock_getsize, mock_sendfile):
+    def test_download_file_url(self, mock_getsize, mock_sendfile,
+                               mock_serviceutils_glance):
         # NOTE: only in v2 API
         class MyGlanceStubClient(stubs.StubGlanceClient):
 
@@ -236,9 +274,10 @@ class TestGlanceImageService(base.TestCase):
 
             s_tmpfname = '/whatever/source'
 
-            def get(self, image_id):
+            def get_image(self, image_id):
+                direct_url = "file://%s" + self.s_tmpfname
                 return type('GlanceTestDirectUrlMeta', (object,),
-                            {'direct_url': 'file://%s' + self.s_tmpfname})
+                            dict(visibility='public', direct_url=direct_url))
 
         stub_context = context.RequestContext(auth_token=True)
         stub_context.user_id = 'fake'
@@ -247,6 +286,7 @@ class TestGlanceImageService(base.TestCase):
 
         stub_service = image_service.GlanceImageService(stub_client,
                                                         context=stub_context)
+        mock_serviceutils_glance.return_value = stub_service
         image_id = uuidutils.generate_uuid()
 
         self.config(allowed_direct_url_schemes=['file'], group='glance')
@@ -274,25 +314,9 @@ class TestGlanceImageService(base.TestCase):
     def test_client_forbidden_converts_to_imagenotauthed(self):
         class MyGlanceStubClient(stubs.StubGlanceClient):
             """A client that raises a Forbidden exception."""
-            def get(self, image_id):
-                raise glance_exc.Forbidden(image_id)
 
-        stub_client = MyGlanceStubClient()
-        stub_context = context.RequestContext(auth_token=True)
-        stub_context.user_id = 'fake'
-        stub_context.project_id = 'fake'
-        stub_service = image_service.GlanceImageService(stub_client,
-                                                        stub_context)
-        image_id = uuidutils.generate_uuid()
-        writer = NullWriter()
-        self.assertRaises(exception.ImageNotAuthorized, stub_service.download,
-                          image_id, writer)
-
-    def test_client_httpforbidden_converts_to_imagenotauthed(self):
-        class MyGlanceStubClient(stubs.StubGlanceClient):
-            """A client that raises a HTTPForbidden exception."""
-            def get(self, image_id):
-                raise glance_exc.HTTPForbidden(image_id)
+            def get_image(self, image_id):
+                raise openstack_exc.ForbiddenException()
 
         stub_client = MyGlanceStubClient()
         stub_context = context.RequestContext(auth_token=True)
@@ -308,8 +332,9 @@ class TestGlanceImageService(base.TestCase):
     def test_client_notfound_converts_to_imagenotfound(self):
         class MyGlanceStubClient(stubs.StubGlanceClient):
             """A client that raises a NotFound exception."""
-            def get(self, image_id):
-                raise glance_exc.NotFound(image_id)
+
+            def get_image(self, image_id):
+                raise openstack_exc.NotFoundException()
 
         stub_client = MyGlanceStubClient()
         stub_context = context.RequestContext(auth_token=True)
@@ -322,22 +347,11 @@ class TestGlanceImageService(base.TestCase):
         self.assertRaises(exception.ImageNotFound, stub_service.download,
                           image_id, writer)
 
-    def test_client_httpnotfound_converts_to_imagenotfound(self):
-        class MyGlanceStubClient(stubs.StubGlanceClient):
-            """A client that raises a HTTPNotFound exception."""
-            def get(self, image_id):
-                raise glance_exc.HTTPNotFound(image_id)
-
-        stub_client = MyGlanceStubClient()
-        stub_context = context.RequestContext(auth_token=True)
-        stub_context.user_id = 'fake'
-        stub_context.project_id = 'fake'
-        stub_service = image_service.GlanceImageService(stub_client,
-                                                        stub_context)
+    def test_member_list(self):
         image_id = uuidutils.generate_uuid()
-        writer = NullWriter()
-        self.assertRaises(exception.ImageNotFound, stub_service.download,
-                          image_id, writer)
+        result = self.service.member_list(image_id)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].member_id, self.client.member_id)
 
 
 @mock.patch('ironic.common.keystone.get_auth', autospec=True,
@@ -347,7 +361,7 @@ class TestGlanceImageService(base.TestCase):
 @mock.patch('ironic.common.keystone.get_adapter', autospec=True)
 @mock.patch('ironic.common.keystone.get_session', autospec=True,
             return_value=mock.sentinel.session)
-@mock.patch.object(glance_client, 'Client', autospec=True)
+@mock.patch.object(openstack.connection, 'Connection', autospec=True)
 class CheckImageServiceTestCase(base.TestCase):
     def setUp(self):
         super(CheckImageServiceTestCase, self).setUp()
@@ -384,13 +398,11 @@ class CheckImageServiceTestCase(base.TestCase):
         self.assertEqual(0, mock_auth.call_count)
         self.assertEqual(0, mock_sauth.call_count)
 
-    def _assert_client_call(self, mock_gclient, url, user=False):
+    def _assert_connnection_call(self, mock_gclient, url):
         mock_gclient.assert_called_once_with(
-            2,
             session=mock.sentinel.session,
-            global_request_id='global',
-            auth=mock.sentinel.sauth if user else mock.sentinel.auth,
-            endpoint_override=url)
+            image_endpoint_override=url,
+            image_api_version='2')
 
     def test_check_image_service__config_auth(self, mock_gclient, mock_sess,
                                               mock_adapter, mock_sauth,
@@ -405,9 +417,12 @@ class CheckImageServiceTestCase(base.TestCase):
 
         wrapped_func = image_service.check_image_service(func)
         self.assertEqual(((), params), wrapped_func(self.service, **params))
-        self._assert_client_call(mock_gclient, 'glance_url')
+        self._assert_connnection_call(mock_gclient, 'glance_url')
         mock_auth.assert_called_once_with('glance')
-        mock_sess.assert_called_once_with('glance')
+        mock_sess.assert_has_calls([
+            mock.call('glance'),
+            mock.call('glance', auth=mock.sentinel.auth)
+        ])
         mock_adapter.assert_called_once_with('glance',
                                              session=mock.sentinel.session,
                                              auth=mock.sentinel.auth)
@@ -429,8 +444,11 @@ class CheckImageServiceTestCase(base.TestCase):
 
         wrapped_func = image_service.check_image_service(func)
         self.assertEqual(((), params), wrapped_func(self.service, **params))
-        self._assert_client_call(mock_gclient, 'glance_url', user=True)
-        mock_sess.assert_called_once_with('glance')
+        self._assert_connnection_call(mock_gclient, 'glance_url')
+        mock_sess.assert_has_calls([
+            mock.call('glance'),
+            mock.call('glance', auth=mock.sentinel.sauth)
+        ])
         mock_adapter.assert_called_once_with('glance',
                                              session=mock.sentinel.session,
                                              auth=mock.sentinel.auth)
@@ -454,24 +472,15 @@ class CheckImageServiceTestCase(base.TestCase):
         wrapped_func = image_service.check_image_service(func)
         self.assertEqual(((), params), wrapped_func(self.service, **params))
         self.assertEqual('none', image_service.CONF.glance.auth_type)
-        self._assert_client_call(mock_gclient, 'foo')
-        mock_sess.assert_called_once_with('glance')
+        self._assert_connnection_call(mock_gclient, 'foo')
+        mock_sess.assert_has_calls([
+            mock.call('glance'),
+            mock.call('glance', auth=mock.sentinel.auth)
+        ])
         mock_adapter.assert_called_once_with('glance',
                                              session=mock.sentinel.session,
                                              auth=mock.sentinel.auth)
         self.assertEqual(0, mock_sauth.call_count)
-
-
-def _create_failing_glance_client(info):
-    class MyGlanceStubClient(stubs.StubGlanceClient):
-        """A client that fails the first time, then succeeds."""
-        def get(self, image_id):
-            info['num_calls'] += 1
-            if info['num_calls'] == 1:
-                raise glance_exc.ServiceUnavailable('')
-            return {}
-
-    return MyGlanceStubClient()
 
 
 class TestGlanceSwiftTempURL(base.TestCase):
@@ -499,12 +508,15 @@ class TestGlanceSwiftTempURL(base.TestCase):
             'id': '757274c4-2856-4bd2-bb20-9a4a231e187b'
         }
 
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_swift_temp_url(self, tempurl_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_swift_temp_url(self, swift_mock):
 
         path = ('/v1/AUTH_a422b2-91f3-2f46-74b7-d7c9e8958f5d30'
                 '/glance'
                 '/757274c4-2856-4bd2-bb20-9a4a231e187b')
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=1400001200')
 
@@ -517,19 +529,25 @@ class TestGlanceSwiftTempURL(base.TestCase):
                          temp_url)
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key=CONF.glance.swift_temp_url_key,
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key=CONF.glance.swift_temp_url_key,
             method='GET')
+        swift_api_mock.__exit__.assert_called_once()
+        swift_api_mock.__exit__.assert_called_once()
 
+    @mock.patch('ironic.common.swift.get_swift_session', autospec=True)
     @mock.patch('ironic.common.keystone.get_adapter', autospec=True)
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_swift_temp_url_endpoint_detected(self, tempurl_mock,
-                                              adapter_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_swift_temp_url_endpoint_detected(self, swift_mock,
+                                              adapter_mock, session_mock):
         self.config(swift_endpoint_url=None, group='glance')
 
         path = ('/v1/AUTH_a422b2-91f3-2f46-74b7-d7c9e8958f5d30'
                 '/glance'
                 '/757274c4-2856-4bd2-bb20-9a4a231e187b')
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=1400001200')
         endpoint = 'http://another.example.com:8080'
@@ -543,19 +561,23 @@ class TestGlanceSwiftTempURL(base.TestCase):
                          temp_url)
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key=CONF.glance.swift_temp_url_key,
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key=CONF.glance.swift_temp_url_key,
             method='GET')
 
+    @mock.patch('ironic.common.swift.get_swift_session', autospec=True)
     @mock.patch('ironic.common.keystone.get_adapter', autospec=True)
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_swift_temp_url_endpoint_with_suffix(self, tempurl_mock,
-                                                 adapter_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_swift_temp_url_endpoint_with_suffix(self, swift_mock,
+                                                 adapter_mock, session_mock):
         self.config(swift_endpoint_url=None, group='glance')
 
         path = ('/v1/AUTH_a422b2-91f3-2f46-74b7-d7c9e8958f5d30'
                 '/glance'
                 '/757274c4-2856-4bd2-bb20-9a4a231e187b')
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=1400001200')
         endpoint = 'http://another.example.com:8080'
@@ -570,20 +592,24 @@ class TestGlanceSwiftTempURL(base.TestCase):
                          temp_url)
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key=CONF.glance.swift_temp_url_key,
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key=CONF.glance.swift_temp_url_key,
             method='GET')
+        swift_api_mock.__exit__.assert_called_once()
 
     @mock.patch('ironic.common.swift.get_swift_session', autospec=True)
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_swift_temp_url_account_detected(self, tempurl_mock, swift_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_swift_temp_url_account_detected(self, swift_mock, session_mock):
         self.config(swift_account=None, group='glance')
 
         path = ('/v1/AUTH_42/glance'
                 '/757274c4-2856-4bd2-bb20-9a4a231e187b')
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=1400001200')
-        auth_ref = swift_mock.return_value.auth.get_auth_ref.return_value
+        auth_ref = session_mock.return_value.auth.get_auth_ref.return_value
         auth_ref.project_id = '42'
 
         self.service._validate_temp_url_config = mock.Mock()
@@ -595,23 +621,26 @@ class TestGlanceSwiftTempURL(base.TestCase):
                          temp_url)
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key=CONF.glance.swift_temp_url_key,
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key=CONF.glance.swift_temp_url_key,
             method='GET')
-        swift_mock.assert_called_once_with()
+        session_mock.assert_called_once_with()
 
     @mock.patch('ironic.common.swift.get_swift_session', autospec=True)
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_swift_temp_url_account_detected_with_prefix(self, tempurl_mock,
-                                                         swift_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_swift_temp_url_account_detected_with_prefix(self, swift_mock,
+                                                         session_mock):
         self.config(swift_account=None, group='glance')
         self.config(swift_account_prefix='SWIFTPREFIX', group='glance')
 
         path = ('/v1/SWIFTPREFIX_42/glance'
                 '/757274c4-2856-4bd2-bb20-9a4a231e187b')
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=1400001200')
-        auth_ref = swift_mock.return_value.auth.get_auth_ref.return_value
+        auth_ref = session_mock.return_value.auth.get_auth_ref.return_value
         auth_ref.project_id = '42'
 
         self.service._validate_temp_url_config = mock.Mock()
@@ -623,23 +652,27 @@ class TestGlanceSwiftTempURL(base.TestCase):
                          temp_url)
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key=CONF.glance.swift_temp_url_key,
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key=CONF.glance.swift_temp_url_key,
             method='GET')
-        swift_mock.assert_called_once_with()
+        swift_api_mock.__exit__.assert_called_once()
+        session_mock.assert_called_once_with()
 
     @mock.patch('ironic.common.swift.get_swift_session', autospec=True)
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
     def test_swift_temp_url_account_detected_with_prefix_underscore(
-            self, tempurl_mock, swift_mock):
+            self, swift_mock, session_mock):
         self.config(swift_account=None, group='glance')
         self.config(swift_account_prefix='SWIFTPREFIX_', group='glance')
 
         path = ('/v1/SWIFTPREFIX_42/glance'
                 '/757274c4-2856-4bd2-bb20-9a4a231e187b')
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=1400001200')
-        auth_ref = swift_mock.return_value.auth.get_auth_ref.return_value
+        auth_ref = session_mock.return_value.auth.get_auth_ref.return_value
         auth_ref.project_id = '42'
 
         self.service._validate_temp_url_config = mock.Mock()
@@ -651,25 +684,24 @@ class TestGlanceSwiftTempURL(base.TestCase):
                          temp_url)
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key=CONF.glance.swift_temp_url_key,
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key=CONF.glance.swift_temp_url_key,
             method='GET')
-        swift_mock.assert_called_once_with()
+        session_mock.assert_called_once_with()
 
-    @mock.patch('ironic.common.swift.SwiftAPI', autospec=True)
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_swift_temp_url_key_detected(self, tempurl_mock, swift_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_swift_temp_url_key_detected(self, swift_mock):
         self.config(swift_temp_url_key=None, group='glance')
 
         path = ('/v1/AUTH_a422b2-91f3-2f46-74b7-d7c9e8958f5d30'
                 '/glance'
                 '/757274c4-2856-4bd2-bb20-9a4a231e187b')
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=1400001200')
-        conn = swift_mock.return_value.connection
-        conn.head_account.return_value = {
-            'x-account-meta-temp-url-key': 'secret'
-        }
+        swift_api_mock.get_temp_url_key.return_value = 'secret'
 
         self.service._validate_temp_url_config = mock.Mock()
 
@@ -680,35 +712,38 @@ class TestGlanceSwiftTempURL(base.TestCase):
                          temp_url)
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key='secret',
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key='secret',
             method='GET')
-        conn.head_account.assert_called_once_with()
+        self.assertEqual(2, swift_api_mock.__exit__.call_count)
 
-    @mock.patch('ironic.common.swift.SwiftAPI', autospec=True)
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_swift_temp_url_no_key_detected(self, tempurl_mock, swift_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_swift_temp_url_no_key_detected(self, swift_mock):
         self.config(swift_temp_url_key=None, group='glance')
 
         path = ('/v1/AUTH_a422b2-91f3-2f46-74b7-d7c9e8958f5d30'
                 '/glance'
                 '/757274c4-2856-4bd2-bb20-9a4a231e187b')
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=1400001200')
-        conn = swift_mock.return_value.connection
-        conn.head_account.return_value = {}
+        swift_api_mock.get_temp_url_key.return_value = None
 
         self.service._validate_temp_url_config = mock.Mock()
 
         self.assertRaises(exception.InvalidParameterValue,
                           self.service.swift_temp_url,
                           image_info=self.fake_image)
-        conn.head_account.assert_called_once_with()
 
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_swift_temp_url_invalid_image_info(self, tempurl_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_swift_temp_url_invalid_image_info(self, swift_mock):
         self.service._validate_temp_url_config = mock.Mock()
         image_info = {}
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         self.assertRaises(exception.ImageUnacceptable,
                           self.service.swift_temp_url, image_info)
         image_info = {'id': 'not an id'}
@@ -716,8 +751,8 @@ class TestGlanceSwiftTempURL(base.TestCase):
                           self.service.swift_temp_url, image_info)
         self.assertFalse(tempurl_mock.called)
 
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_swift_temp_url_multiple_containers(self, tempurl_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_swift_temp_url_multiple_containers(self, swift_mock):
 
         self.config(swift_store_multiple_containers_seed=8,
                     group='glance')
@@ -725,6 +760,9 @@ class TestGlanceSwiftTempURL(base.TestCase):
         path = ('/v1/AUTH_a422b2-91f3-2f46-74b7-d7c9e8958f5d30'
                 '/glance_757274c4'
                 '/757274c4-2856-4bd2-bb20-9a4a231e187b')
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=1400001200')
 
@@ -737,8 +775,8 @@ class TestGlanceSwiftTempURL(base.TestCase):
                          temp_url)
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key=CONF.glance.swift_temp_url_key,
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key=CONF.glance.swift_temp_url_key,
             method='GET')
 
     def test_swift_temp_url_url_bad_no_info(self):
@@ -804,8 +842,8 @@ class TestSwiftTempUrlCache(base.TestCase):
         self.glance_service = image_service.GlanceImageService(
             client, context=self.context)
 
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_add_items_to_cache(self, tempurl_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_add_items_to_cache(self, swift_mock):
         fake_image = {
             'id': uuidutils.generate_uuid()
         }
@@ -814,6 +852,9 @@ class TestSwiftTempUrlCache(base.TestCase):
                 '/glance'
                 '/%s' % fake_image['id'])
         exp_time = int(time.time()) + 1200
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=%s' % exp_time)
 
@@ -830,14 +871,14 @@ class TestSwiftTempUrlCache(base.TestCase):
         cleanup_mock.assert_called_once_with()
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key=CONF.glance.swift_temp_url_key,
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key=CONF.glance.swift_temp_url_key,
             method='GET')
         self.assertEqual((temp_url, exp_time),
                          self.glance_service._cache[fake_image['id']])
 
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_return_cached_tempurl(self, tempurl_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_return_cached_tempurl(self, swift_mock):
         fake_image = {
             'id': uuidutils.generate_uuid()
         }
@@ -850,6 +891,9 @@ class TestSwiftTempUrlCache(base.TestCase):
             '?temp_url_sig=hmacsig&temp_url_expires=%(exp_time)s' %
             {'uuid': fake_image['id'], 'exp_time': exp_time}
         )
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         self.glance_service._cache[fake_image['id']] = (
             image_service.TempUrlCacheElement(url=temp_url,
                                               url_expires_at=exp_time)
@@ -866,8 +910,8 @@ class TestSwiftTempUrlCache(base.TestCase):
         cleanup_mock.assert_called_once_with()
         self.assertFalse(tempurl_mock.called)
 
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def test_do_not_return_expired_tempurls(self, tempurl_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def test_do_not_return_expired_tempurls(self, swift_mock):
         fake_image = {
             'id': uuidutils.generate_uuid()
         }
@@ -886,6 +930,9 @@ class TestSwiftTempUrlCache(base.TestCase):
         )
 
         new_exp_time = int(time.time()) + 1200
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + query % new_exp_time)
 
@@ -899,8 +946,8 @@ class TestSwiftTempUrlCache(base.TestCase):
                          fresh_temp_url)
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key=CONF.glance.swift_temp_url_key,
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key=CONF.glance.swift_temp_url_key,
             method='GET')
         self.assertEqual(
             (fresh_temp_url, new_exp_time),
@@ -936,11 +983,14 @@ class TestSwiftTempUrlCache(base.TestCase):
         for uuid in expired_items:
             self.assertNotIn(uuid, self.glance_service._cache)
 
-    @mock.patch('swiftclient.utils.generate_temp_url', autospec=True)
-    def _test__generate_temp_url(self, fake_image, tempurl_mock):
+    @mock.patch.object(swift, 'SwiftAPI', autospec=True)
+    def _test__generate_temp_url(self, fake_image, swift_mock):
         path = ('/v1/AUTH_a422b2-91f3-2f46-74b7-d7c9e8958f5d30'
                 '/glance'
                 '/%s' % fake_image['id'])
+        swift_api_mock = swift_mock.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        tempurl_mock = swift_api_mock.generate_temp_url
         tempurl_mock.return_value = (
             path + '?temp_url_sig=hmacsig&temp_url_expires=1400001200')
 
@@ -958,8 +1008,8 @@ class TestSwiftTempUrlCache(base.TestCase):
                          temp_url)
         tempurl_mock.assert_called_with(
             path=path,
-            seconds=CONF.glance.swift_temp_url_duration,
-            key=CONF.glance.swift_temp_url_key,
+            timeout=CONF.glance.swift_temp_url_duration,
+            temp_url_key=CONF.glance.swift_temp_url_key,
             method='GET')
 
     def test_swift_temp_url_cache_enabled(self):
@@ -1022,3 +1072,82 @@ class TestServiceUtils(base.TestCase):
         self.assertFalse(service_utils.is_glance_image(image_href))
         image_href = None
         self.assertFalse(service_utils.is_glance_image(image_href))
+
+
+class TestIsImageAvailable(base.TestCase):
+
+    def setUp(self):
+        super(TestIsImageAvailable, self).setUp()
+        self.image = mock.Mock()
+        self.context = context.RequestContext()
+        self.context.roles = []
+
+    def test_allow_access_via_auth_token_enabled(self):
+        self.context.auth_token = 'fake-token'
+        self.config(allow_image_access_via_auth_token=True)
+        self.assertTrue(service_utils.is_image_available(
+            self.context, self.image))
+
+    def test_allow_public_image(self):
+        self.image.visibility = 'public'
+        self.assertTrue(service_utils.is_image_available(
+            self.context, self.image))
+
+    def test_allow_community_image(self):
+        self.image.visibility = 'community'
+        self.assertTrue(service_utils.is_image_available(
+            self.context, self.image))
+
+    def test_allow_admin_if_config_enabled(self):
+        self.context.roles = ['admin']
+        self.config(ignore_project_check_for_admin_tasks=True)
+        self.assertTrue(service_utils.is_image_available(
+            self.context, self.image))
+
+    def test_allow_private_image_owned_by_conductor(self):
+        self.image.visibility = 'private'
+        self.image.owner = service_utils.get_conductor_project_id()
+        self.assertTrue(service_utils.is_image_available(
+            self.context, self.image))
+
+    @mock.patch.object(service_utils, 'get_image_member_list', autospec=True)
+    def test_allow_shared_image_if_member(self, mock_get_members):
+        self.image.visibility = 'shared'
+        self.image.id = 'shared-image-id'
+        self.image.owner = 'some-other-project'
+
+        self.context.project = 'test-project'
+
+        # Mock the conductor project ID and the shared member list
+        conductor_id = service_utils.get_conductor_project_id()
+        mock_get_members.return_value = [conductor_id]
+
+        self.assertTrue(service_utils.is_image_available(
+            self.context, self.image))
+        mock_get_members.assert_called_once_with('shared-image-id',
+                                                 self.context)
+
+    @mock.patch.object(service_utils, 'get_image_member_list', autospec=True)
+    def test_no_member_list_query_for_non_shared_images(self,
+                                                        mock_get_members):
+        # Glance rejects member listing on non-shared images with a 403,
+        # so ensure we never query members unless visibility is 'shared'.
+        for visibility in ('public', 'community', 'private'):
+            self.image.visibility = visibility
+            self.image.owner = service_utils.get_conductor_project_id()
+            service_utils.is_image_available(self.context, self.image)
+        mock_get_members.assert_not_called()
+
+    def test_deny_private_image_different_owner(self):
+        self.config(ignore_project_check_for_admin_tasks=False)
+
+        self.image.visibility = 'private'
+        self.image.owner = 'other-owner'
+        self.image.id = 'fake-id'
+
+        self.context.project = 'test-project'
+        self.context.roles = []
+        self.context.auth_token = None
+
+        result = service_utils.is_image_available(self.context, self.image)
+        self.assertFalse(result)

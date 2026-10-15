@@ -146,15 +146,18 @@ class FirmwareUtilsTestCase(base.TestCase):
 
     @mock.patch.object(swift, 'SwiftAPI', autospec=True)
     def test_get_swift_temp_url(self, mock_swift_api):
-        mock_swift_api.return_value.get_temp_url.return_value = 'http://temp'
+        swift_api_mock = mock_swift_api.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        swift_api_mock.get_temp_url.return_value = 'http://temp'
         parsed_url = urlparse("swift://firmware/sub/bios.exe")
 
         result = firmware_utils.get_swift_temp_url(parsed_url)
 
         self.assertEqual(result, 'http://temp')
-        mock_swift_api.return_value.get_temp_url.assert_called_with(
+        swift_api_mock.get_temp_url.assert_called_with(
             'firmware', 'sub/bios.exe',
             CONF.redfish.swift_object_expiry_timeout)
+        swift_api_mock.__exit__.assert_called_once()
 
     @mock.patch.object(tempfile, 'gettempdir', autospec=True)
     @mock.patch.object(os, 'makedirs', autospec=True)
@@ -188,7 +191,9 @@ class FirmwareUtilsTestCase(base.TestCase):
         mock_gettempdir.return_value = '/tmp'
         swift_url = 'swift://firmware/sub/bios.exe'
         temp_swift_url = 'http://swift_temp'
-        mock_swift_api.return_value.get_temp_url.return_value = temp_swift_url
+        swift_api_mock = mock_swift_api.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        swift_api_mock.get_temp_url.return_value = temp_swift_url
 
         with mock.patch.object(firmware_utils, 'open', mock.mock_open(),
                                create=True) as mock_open:
@@ -201,6 +206,7 @@ class FirmwareUtilsTestCase(base.TestCase):
             mock_http_image_service.return_value.download.assert_called_with(
                 temp_swift_url, mock_open.return_value)
             mock_open.assert_has_calls([mock.call(exp_result, 'wb')])
+            swift_api_mock.__exit__.assert_called_once()
 
     @mock.patch.object(tempfile, 'gettempdir', autospec=True)
     @mock.patch.object(os, 'makedirs', autospec=True)
@@ -255,6 +261,30 @@ class FirmwareUtilsTestCase(base.TestCase):
             checksum2, file_path)
         mock_compute_file_checksum.assert_called_with(
             file_path, algorithm='sha1')
+
+    @mock.patch.object(fileutils, 'compute_file_checksum', autospec=True)
+    def test_verify_checksum_sha256(self, mock_compute_file_checksum):
+        checksum = 'a' * 64
+        file_path = '/tmp/bios.exe'
+        mock_compute_file_checksum.return_value = checksum
+        node = mock.Mock(uuid='9f0f6795-f74e-4b5a-850e-72f586a92435')
+
+        firmware_utils.verify_checksum(node, checksum, file_path)
+
+        mock_compute_file_checksum.assert_called_with(
+            file_path, algorithm='sha256')
+
+    @mock.patch.object(fileutils, 'compute_file_checksum', autospec=True)
+    def test_verify_checksum_sha512(self, mock_compute_file_checksum):
+        checksum = 'a' * 128
+        file_path = '/tmp/bios.exe'
+        mock_compute_file_checksum.return_value = checksum
+        node = mock.Mock(uuid='9f0f6795-f74e-4b5a-850e-72f586a92435')
+
+        firmware_utils.verify_checksum(node, checksum, file_path)
+
+        mock_compute_file_checksum.assert_called_with(
+            file_path, algorithm='sha512')
 
     @mock.patch.object(os, 'makedirs', autospec=True)
     @mock.patch.object(shutil, 'copyfile', autospec=True)
@@ -379,7 +409,9 @@ class FirmwareUtilsTestCase(base.TestCase):
     @mock.patch.object(swift, 'SwiftAPI', autospec=True)
     def test_stage_swift(self, mock_swift_api):
         node = mock.Mock(uuid='55cdaba0-1123-4622-8b37-bb52dd6285d3')
-        mock_swift_api.return_value.get_temp_url.return_value = 'http://temp'
+        swift_api_mock = mock_swift_api.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        swift_api_mock.get_temp_url.return_value = 'http://temp'
         temp_file = '/tmp/55cdaba0-1123-4622-8b37-bb52dd6285d3/file.exe'
 
         staged_url, need_cleanup = firmware_utils.stage(
@@ -388,14 +420,15 @@ class FirmwareUtilsTestCase(base.TestCase):
         self.assertEqual(staged_url, 'http://temp')
         self.assertEqual(need_cleanup, 'swift')
         exp_object_name = '55cdaba0-1123-4622-8b37-bb52dd6285d3/file.exe'
-        mock_swift_api.return_value.create_object.assert_called_with(
+        swift_api_mock.create_object.assert_called_with(
             CONF.redfish.swift_container,
             exp_object_name, temp_file,
             object_headers={'X-Delete-After':
                             str(CONF.redfish.swift_object_expiry_timeout)})
-        mock_swift_api.return_value.get_temp_url.assert_called_with(
+        swift_api_mock.get_temp_url.assert_called_with(
             CONF.redfish.swift_container, exp_object_name,
             CONF.redfish.swift_object_expiry_timeout)
+        swift_api_mock.__exit__.assert_called_once()
 
     @mock.patch.object(shutil, 'rmtree', autospec=True)
     @mock.patch.object(tempfile, 'gettempdir', autospec=True)
@@ -407,8 +440,14 @@ class FirmwareUtilsTestCase(base.TestCase):
             uuid='55cdaba0-1123-4622-8b37-bb52dd6285d3',
             driver_internal_info={'firmware_cleanup': ['http', 'swift']})
         object_name = '55cdaba0-1123-4622-8b37-bb52dd6285d3/file.exe'
-        get_container = mock_swift_api.return_value.connection.get_container
-        get_container.return_value = (mock.Mock(), [{'name': object_name}])
+        obj = mock.Mock()
+        obj.name = object_name
+
+        swift_api_mock = mock_swift_api.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        connection = mock.MagicMock()
+        swift_api_mock.connection = connection
+        connection.list_objects.return_value = [obj]
 
         firmware_utils.cleanup(node)
 
@@ -418,8 +457,9 @@ class FirmwareUtilsTestCase(base.TestCase):
         mock_rmtree.assert_any_call(
             '/httproot/firmware/55cdaba0-1123-4622-8b37-bb52dd6285d3',
             ignore_errors=True)
-        mock_swift_api.return_value.delete_object.assert_called_with(
+        swift_api_mock.delete_object.assert_called_with(
             CONF.redfish.swift_container, object_name)
+        swift_api_mock.__exit__.assert_called_once()
 
     @mock.patch.object(shutil, 'rmtree', autospec=True)
     @mock.patch.object(tempfile, 'gettempdir', autospec=True)
@@ -446,16 +486,95 @@ class FirmwareUtilsTestCase(base.TestCase):
             uuid='55cdaba0-1123-4622-8b37-bb52dd6285d3',
             driver_internal_info={'firmware_cleanup': ['swift']})
         object_name = '55cdaba0-1123-4622-8b37-bb52dd6285d3/file.exe'
-        get_container = mock_swift_api.return_value.connection.get_container
-        get_container.return_value = (mock.Mock(), [{'name': object_name}])
-        mock_swift_api.return_value.delete_object.side_effect =\
-            exception.SwiftOperationError
+        obj = mock.Mock()
+        obj.name = object_name
+
+        swift_api_mock = mock_swift_api.return_value
+        swift_api_mock.__enter__.return_value = swift_api_mock
+        connection = mock.MagicMock()
+        swift_api_mock.connection = connection
+        connection.list_objects.return_value = [obj]
+        swift_api_mock.delete_object.side_effect = (
+            exception.SwiftOperationError)
 
         firmware_utils.cleanup(node)
 
         mock_rmtree.assert_any_call(
             '/tmp/55cdaba0-1123-4622-8b37-bb52dd6285d3',
             ignore_errors=True)
-        mock_swift_api.return_value.delete_object.assert_called_with(
+        swift_api_mock.delete_object.assert_called_with(
             CONF.redfish.swift_container, object_name)
         mock_warning.assert_called_once()
+        swift_api_mock.__exit__.assert_called_once()
+
+    def test_validate_firmware_interface_update_args(self):
+        settings = [
+            {
+                "component": "bios",
+                "url": "http://192.168.0.1/bios.exe"
+            },
+            {
+                "component": "bmc",
+                "url": "http://192.168.0.1/bmc.exe"
+            },
+            {
+                "component": "nic:DX00-9",
+                "url": "http://192.168.0.1/dx009.exe"
+            }
+        ]
+        firmware_utils.validate_firmware_interface_update_args(settings)
+
+    def test_validate_firmware_interface_update_args_not_list(self):
+        settings = {
+            "component": "bios",
+            "url": "http://192.168.0.1/bios.exe"
+        }
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue, "is not of type 'array'",
+            firmware_utils.validate_firmware_interface_update_args,
+            settings)
+
+    def test_validate_firmware_interface_update_args_unknown_key(self):
+        settings = [
+            {
+                "component": "bios",
+                "url": "https://192.168.0.1/bios.exe",
+                "something": "unknown"
+            }
+        ]
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue, "'something' was unexpected",
+            firmware_utils.validate_firmware_interface_update_args, settings)
+
+    def test_validate_update_firmware_args_invalid_url(self):
+        settings = [{"component": "bios"}]
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue,
+            "'url' is a required property",
+            firmware_utils.validate_firmware_interface_update_args, settings)
+        settings2 = [
+            {
+                "component": "bios",
+                "url": 123
+            }
+        ]
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue, "123 is not of type 'string'",
+            firmware_utils.validate_firmware_interface_update_args, settings2)
+
+    def test_validate_update_firmware_args_invalid_component(self):
+        settings = [{"component": "BIOS", "url": "http://url/bios.exe"}]
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue,
+            "'BIOS' is not valid under any of the given schemas",
+            firmware_utils.validate_firmware_interface_update_args, settings)
+        settings2 = [{"component": "BMC", "url": "http://url/bmc.exe"}]
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue,
+            "'BMC' is not valid under any of the given schemas",
+            firmware_utils.validate_firmware_interface_update_args, settings2)
+        settings3 = [{"component": "NICX1", "url": "http://url/nic.exe"}]
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue,
+            "'NICX1' is not valid under any of the given schemas",
+            firmware_utils.validate_firmware_interface_update_args, settings3)

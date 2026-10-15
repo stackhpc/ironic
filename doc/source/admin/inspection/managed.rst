@@ -1,0 +1,67 @@
+Managed and unmanaged inspection
+================================
+
+Agent inspection can be *managed* or *unmanaged*. This document explains the
+difference between these two concepts and applies both to the built-in agent
+inspection and to :doc:`/admin/inspection`.
+
+Managed inspection
+~~~~~~~~~~~~~~~~~~
+
+Inspection is *managed* when the Bare Metal conductor fully configures the node
+for inspection, including setting boot device, boot mode and power state. This
+is the only way to conduct inspection using :ref:`redfish-virtual-media` or
+with :doc:`/admin/dhcp-less`. This mode is engaged automatically when the node
+has sufficient information to configure boot (e.g. ports in case of iPXE).
+
+For network interfaces based on OpenStack Networking (e.g. ``flat`` and
+``neutron``), the UUID or name of the inspection network must be provided via
+configuration or ``driver_info``, for example:
+
+.. code-block:: ini
+
+   [neutron]
+   inspection_network = <NETWORK UUID>
+
+There are a few configuration options that tune managed inspection, the most
+important is ``extra_kernel_params``, which allows adding kernel parameters for
+inspection specifically. This is where you can configure
+:ironic-python-agent-doc:`inspection collectors and other parameters
+<admin/how_it_works.html#inspection>`, for example:
+
+.. code-block:: ini
+
+   [inspector]
+   extra_kernel_params = ipa-inspection-collectors=default,logs ipa-collect-lldp=1
+
+For the built-in inspection, the bare metal API endpoint can be overridden
+instead:
+
+.. code-block:: ini
+
+   [service_catalog]
+   endpoint_override = https://example.com/baremetal
+
+.. _unmanaged-inspection:
+
+Unmanaged inspection
+~~~~~~~~~~~~~~~~~~~~
+
+Under *unmanaged* inspection we understand agent inspection where the boot
+configuration (iPXE scripts, DHCP options,  etc) is not provided
+by the Bare Metal service. In this case, the node is simply set to boot from
+network and powered on. The operator is responsible for the correct network
+boot configuration, e.g. as explained in :ref:`configure-unmanaged-inspection`.
+
+Unmanaged inspection was the only inspection mode before the Ussuri release,
+and it is still used when the node's boot cannot be configured by the
+conductor. The options described above do not affect unmanaged inspection.
+
+Because of the complex installation and operation requirements, unmanaged
+inspection is disabled by default. To enable it, set ``require_managed_boot``
+to ``False``:
+
+.. code-block:: ini
+
+   [inspector]
+   require_managed_boot = False

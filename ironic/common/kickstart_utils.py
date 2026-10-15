@@ -17,12 +17,15 @@ import io
 import os
 import tempfile
 
-from ironic_lib import utils as ironic_utils
 from oslo_log import log as logging
+from oslo_utils import strutils
 import pycdlib
 import requests
 
 from ironic.common import exception
+from ironic.common import image_service
+from ironic.common import utils
+from ironic.conf import CONF
 
 LOG = logging.getLogger(__name__)
 
@@ -50,6 +53,11 @@ def _get_config_drive_dict_from_iso(
             # server.
             posix_file_path = posix_file_path.lstrip('/')
             target_file_path = os.path.join(target_path, posix_file_path)
+            real_target_file_path = os.path.realpath(target_file_path)
+            if not target_file_path.startswith(real_target_file_path):
+                LOG.error('Discovered transversal attempt while reading '
+                          'the configuration drive contents.')
+                raise exception.InvalidContent()
             b_buf = io.BytesIO()
             iso_reader.get_file_from_iso_fp(
                 iso_path=iso_file_path, outfp=b_buf
@@ -107,7 +115,16 @@ def decode_and_extract_config_drive_iso(config_drive_iso_gz):
 
 def _fetch_config_drive_from_url(url):
     try:
-        config_drive = requests.get(url).content
+        verify = strutils.bool_from_string(
+            CONF.webserver_verify_ca, strict=True)
+    except ValueError:
+        verify = CONF.webserver_verify_ca
+
+    try:
+        session = image_service._build_webserver_session()
+        config_drive = session.get(
+            url, verify=verify,
+            timeout=CONF.webserver_connection_timeout).content
     except requests.exceptions.RequestException as e:
         raise exception.InstanceDeployFailure(
             "Can't download the configdrive content from '%(url)s'. "
@@ -151,7 +168,7 @@ def prepare_config_drive(task,
     if not config_drive:
         return ks_config_drive
 
-    if ironic_utils.is_http_url(config_drive):
+    if utils.is_http_url(config_drive):
         config_drive = _fetch_config_drive_from_url(config_drive)
 
     if not isinstance(config_drive, dict):

@@ -229,7 +229,6 @@ default:
     amqp=WARNING
     amqplib=WARNING
     eventlet.wsgi.server=INFO
-    glanceclient=WARNING
     iso8601=WARNING
     keystoneauth.session=INFO
     keystonemiddleware.auth_token=INFO
@@ -369,23 +368,6 @@ glance:
   swift_temp_url_key = ***
   timeout = None
 
-ilo:
-  ca_file = None
-  clean_priority_clear_secure_boot_keys = 0
-  clean_priority_erase_devices = None
-  clean_priority_reset_bios_to_default = 10
-  clean_priority_reset_ilo = 0
-  clean_priority_reset_ilo_credential = 30
-  clean_priority_reset_secure_boot_keys_to_default = 20
-  client_port = 443
-  client_timeout = 60
-  default_boot_mode = auto
-  power_retry = 6
-  power_wait = 2
-  swift_ilo_container = ironic_ilo_container
-  swift_object_expiry_timeout = 900
-  use_web_server_for_images = False
-
 inspector:
   auth_section = None
   auth_type = password
@@ -401,23 +383,6 @@ inspector:
 ipmi:
   min_command_interval = 5
   retry_timeout = 60
-
-irmc:
-  auth_method = basic
-  client_timeout = 60
-  port = 443
-  remote_image_server = None
-  remote_image_share_name = share
-  remote_image_share_root = /remote_image_share_root
-  remote_image_share_type = CIFS
-  remote_image_user_domain =
-  remote_image_user_name = None
-  remote_image_user_password = ***
-  sensor_method = ipmitool
-  snmp_community = public
-  snmp_port = 161
-  snmp_security = None
-  snmp_version = v2c
 
 ironic_lib:
   fatal_exception_format_errors = False
@@ -605,10 +570,6 @@ service_catalog:
   insecure = False
   keyfile = None
   timeout = None
-
-snmp:
-  power_timeout = 10
-  reboot_delay = 0
 
 swift:
   auth_section = None

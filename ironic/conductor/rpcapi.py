@@ -20,13 +20,13 @@ Client side of the conductor RPC API.
 
 import random
 
-from ironic_lib.json_rpc import client as json_rpc
 from oslo_log import log
 import oslo_messaging as messaging
 
 from ironic.common import exception
 from ironic.common import hash_ring
 from ironic.common.i18n import _
+from ironic.common.json_rpc import client as json_rpc
 from ironic.common import release_mappings as versions
 from ironic.common import rpc
 from ironic.conf import CONF
@@ -35,6 +35,8 @@ from ironic.objects import base as objects_base
 
 
 LOG = log.getLogger(__name__)
+
+DBAPI = dbapi.get_instance()
 
 
 class LocalContext:
@@ -152,12 +154,19 @@ class ConductorAPI(object):
     |    1.54 - Added optional agent_status and agent_status_message to
                 heartbeat
     |    1.55 - Added change_node_boot_mode
+    |    1.56 - Added continue_inspection
+    |    1.57 - Added do_node_service
+    |    1.58 - Added support for json-rpc port usage
+    |    1.59 - Added support for attaching/detaching virtual media
+    |    1.60 - Added continue_node_service
+    |    1.61 - Added get virtual media support
+    |    1.62 - Added update_portgroup_physical_network
     """
 
     # NOTE(rloo): This must be in sync with manager.ConductorManager's.
     # NOTE(pas-ha): This also must be in sync with
     #               ironic.common.release_mappings.RELEASE_MAPPING['master']
-    RPC_API_VERSION = '1.55'
+    RPC_API_VERSION = '1.62'
 
     def __init__(self, topic=None):
         super(ConductorAPI, self).__init__()
@@ -200,7 +209,7 @@ class ConductorAPI(object):
         # the hostname to match it against the current host.
         host = topic[len(self.topic) + 1:]
 
-        if rpc.GLOBAL_MANAGER is not None and host == CONF.host:
+        if self.client is None and host == CONF.host:
             # Short-cut to a local function call if there is a built-in
             # conductor.
             return _LOCAL_CONTEXT
@@ -212,8 +221,28 @@ class ConductorAPI(object):
                 _("Cannot use 'none' RPC to connect to remote conductor %s")
                 % host)
 
-        # Normal RPC path
-        return self.client.prepare(topic=topic, version=version)
+        # The JSON RPC client addresses the conductor purely by the
+        # per-host topic string (it parses host/port back out of the
+        # topic), so it must keep receiving the <prefix>.<host> topic.
+        if CONF.rpc_transport == 'json-rpc':
+            return self.client.prepare(topic=topic, version=version)
+
+        # For oslo.messaging, express the destination the idiomatic way:
+        # a constant topic plus an explicit ``server``.  This is exactly
+        # how the conductor binds its listener (see
+        # ironic/common/rpc_service.py:
+        # ``Target(topic=self.topic, server=self.host)``) and how other
+        # OpenStack services (nova/cinder/neutron) address a specific
+        # host.  oslo.messaging builds the same ``<topic>.<server>``
+        # routing key as the historical per-host topic string, so this is
+        # behaviourally identical on the current rabbit driver -- but it
+        # lets any oslo.messaging transport route directed conductor RPC
+        # natively via ``Target.server`` instead of having to re-parse the
+        # host out of the topic.  ``host`` is empty for the bare topic
+        # (any-conductor) case, which oslo.messaging treats as an
+        # anycast, matching the previous behaviour.
+        return self.client.prepare(topic=self.topic, server=host or None,
+                                   version=version)
 
     def get_conductor_for(self, node):
         """Get the conductor which the node is mapped to.
@@ -230,7 +259,8 @@ class ConductorAPI(object):
             return dest.pop()
         except exception.DriverNotFound:
             reason = (_('No conductor service registered which supports '
-                        'driver %(driver)s for conductor group "%(group)s".') %
+                        'driver %(driver)s for conductor group "%(group)s". '
+                        'Ensure the driver is valid and enabled.') %
                       {'driver': node.driver, 'group': node.conductor_group})
             raise exception.NoValidHost(reason=reason)
 
@@ -247,7 +277,7 @@ class ConductorAPI(object):
 
     def get_random_topic(self):
         """Get an RPC topic for a random conductor service."""
-        conductors = dbapi.get_instance().get_online_conductors()
+        conductors = DBAPI.get_online_conductors()
         try:
             hostname = random.choice(conductors)
         except IndexError:
@@ -615,6 +645,20 @@ class ConductorAPI(object):
         """
         cctxt = self._prepare_call(topic=topic, version='1.45')
         return cctxt.cast(context, 'continue_node_deploy',
+                          node_id=node_id)
+
+    def continue_node_service(self, context, node_id, topic=None):
+        """Signal to conductor service to start the next service action.
+
+        NOTE(janders): this is an RPC cast, there will be no response or
+        exception raised by the conductor for this RPC.
+
+        :param context: request context.
+        :param node_id: node id or uuid.
+        :param topic: RPC topic. Defaults to self.topic.
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.60')
+        return cctxt.cast(context, 'continue_node_service',
                           node_id=node_id)
 
     def validate_driver_interfaces(self, context, node_id, topic=None):
@@ -1393,3 +1437,125 @@ class ConductorAPI(object):
         """
         cctxt = self._prepare_call(topic=topic, version='1.49')
         return cctxt.call(context, 'get_node_with_token', node_id=node_id)
+
+    def continue_inspection(self, context, node_id, inventory,
+                            plugin_data=None, topic=None):
+        """Continue in-band inspection.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param inventory: hardware inventory from the node.
+        :param plugin_data: optional plugin-specific data.
+        :param topic: RPC topic. Defaults to self.topic.
+        :raises: NodeLocked if node is locked by another conductor.
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.56')
+        return cctxt.call(context, 'continue_inspection', node_id=node_id,
+                          inventory=inventory, plugin_data=plugin_data)
+
+    def do_node_service(self, context, node_id, service_steps,
+                        disable_ramdisk=None, topic=None):
+        """Signal to conductor service to perform manual cleaning on a node.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param service_steps: a list of service step dictionaries.
+        :param disable_ramdisk: Whether to skip booting ramdisk for service.
+        :param topic: RPC topic. Defaults to self.topic.
+        :raises: InvalidParameterValue if validation of power driver interface
+                 failed.
+        :raises: InvalidStateRequested if cleaning can not be performed.
+        :raises: NodeInMaintenance if node is in maintenance mode.
+        :raises: NodeLocked if node is locked by another conductor.
+        :raises: NoFreeConductorWorker when there is no free worker to start
+                 async task.
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.57')
+        return cctxt.call(
+            context, 'do_node_service',
+            node_id=node_id,
+            service_steps=service_steps,
+            disable_ramdisk=disable_ramdisk)
+
+    def attach_virtual_media(self, context, node_id, device_type, image_url,
+                             image_download_source=None, topic=None):
+        """Attach a virtual media device to the node.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param image_url: URL of the image to attach, HTTP or HTTPS.
+        :param image_download_source: Which way to serve the image to the BMC:
+            "http" to serve it from the provided location, "local" to serve
+            it from the local web server.
+        :param topic: RPC topic. Defaults to self.topic.
+        :raises: UnsupportedDriverExtension if the driver does not support
+                 this call.
+        :raises: InvalidParameterValue if validation of management driver
+                 interface failed.
+        :raises: NodeLocked if node is locked by another conductor.
+        :raises: NoFreeConductorWorker when there is no free worker to start
+                 async task.
+
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.59')
+        return cctxt.call(
+            context, 'attach_virtual_media',
+            node_id=node_id,
+            device_type=device_type,
+            image_url=image_url)
+
+    def detach_virtual_media(self, context, node_id, device_types=None,
+                             topic=None):
+        """Detach some or all virtual media devices from the node.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param device_types: A collection of device type, ones from
+            :data:`ironic.common.boot_devices.VMEDIA_DEVICES`.
+            If not provided, all devices are detached.
+        :param topic: RPC topic. Defaults to self.topic.
+        :raises: UnsupportedDriverExtension if the driver does not support
+                 this call.
+        :raises: InvalidParameterValue if validation of management driver
+                 interface failed.
+        :raises: NodeLocked if node is locked by another conductor.
+        :raises: NoFreeConductorWorker when there is no free worker to start
+                 async task.
+
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.59')
+        return cctxt.call(
+            context, 'detach_virtual_media',
+            node_id=node_id,
+            device_types=device_types)
+
+    def get_virtual_media(self, context, node_id, topic=None):
+        """Get all virtual media devices from the node.
+
+        :param context: request context.
+        :param node_id: node ID or UUID.
+        :param topic: RPC topic. Defaults to self.topic.
+        :raises: UnsupportedDriverExtension if the driver does not support
+                 this call.
+        :raises: InvalidParameterValue if validation of management driver
+                 interface failed.
+        :raises: NodeLocked if node is locked by another conductor.
+
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.61')
+        return cctxt.call(
+            context, 'get_virtual_media',
+            node_id=node_id)
+
+    def update_portgroup_physical_network(self, context, portgroup_obj,
+                                          new_physical_network, topic=None):
+        """Update the physical_network for a given portgroup and its ports.
+
+        :param context: request context.
+        :param topic: RPC topic. Defaults to self.topic.
+        :raises: NodeLocked if node is locked by another conductor.
+        """
+        cctxt = self._prepare_call(topic=topic, version='1.62')
+        return cctxt.call(context, 'update_portgroup_physical_network',
+                          portgroup=portgroup_obj,
+                          new_physical_network=new_physical_network)

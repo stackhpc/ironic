@@ -77,10 +77,17 @@ class TestListDeployTemplates(BaseDeployTemplatesAPITest):
             self.assertEqual(t_dict_step['priority'], t_step['priority'])
 
     def test_get_one_with_json(self):
+        headers = {api_base.Version.string: '1.90'}
         template = obj_utils.create_test_deploy_template(self.context)
         data = self.get_json('/deploy_templates/%s.json' % template.uuid,
-                             headers=self.headers)
+                             headers=headers)
         self.assertEqual(template.uuid, data['uuid'])
+
+    def test_get_one_with_json_not_found(self):
+        template = obj_utils.create_test_deploy_template(self.context)
+        response = self.get_json('/deploy_templates/%s.json' % template.uuid,
+                                 headers=self.headers, expect_errors=True)
+        self.assertEqual(http_client.NOT_FOUND, response.status_int)
 
     def test_get_one_with_suffix(self):
         template = obj_utils.create_test_deploy_template(self.context,
@@ -378,16 +385,29 @@ class TestPatch(BaseDeployTemplatesAPITest):
         self.assertEqual(steps, response.json['steps'])
 
     def test_update_by_name_with_json(self, mock_save):
+        headers = {api_base.Version.string: '1.90'}
         interface = 'bios'
         path = '/deploy_templates/%s.json' % self.template.name
         response = self.patch_json(path,
                                    [{'path': '/steps/0/interface',
                                      'value': interface,
                                      'op': 'replace'}],
-                                   headers=self.headers)
+                                   headers=headers)
         self.assertEqual('application/json', response.content_type)
         self.assertEqual(http_client.OK, response.status_code)
         self.assertEqual(interface, response.json['steps'][0]['interface'])
+
+    def test_update_by_name_with_json_not_found(self, mock_save):
+        interface = 'bios'
+        path = '/deploy_templates/%s.json' % self.template.name
+        response = self.patch_json(path,
+                                   [{'path': '/steps/0/interface',
+                                     'value': interface,
+                                     'op': 'replace'}],
+                                   headers=self.headers,
+                                   expect_errors=True)
+        self.assertEqual('application/json', response.content_type)
+        self.assertEqual(http_client.NOT_FOUND, response.status_code)
 
     def test_update_name_standard_trait(self, mock_save):
         name = 'HW_CPU_X86_VMX'
@@ -525,8 +545,12 @@ class TestPatch(BaseDeployTemplatesAPITest):
 
     def test_replace_empty_step_list_fail(self, mock_save):
         patch = [{'path': '/steps', 'op': 'replace', 'value': []}]
-        self._test_update_bad_request(
-            mock_save, patch, '[] is too short')
+        try:
+            self._test_update_bad_request(
+                mock_save, patch, "[] is too short")
+        except Exception:
+            self._test_update_bad_request(
+                mock_save, patch, "[] should be non-empty")
 
     def _test_remove_not_allowed(self, mock_save, field, error_msg=None):
         patch = [{'path': '/%s' % field, 'op': 'remove'}]
@@ -621,8 +645,12 @@ class TestPatch(BaseDeployTemplatesAPITest):
 
     def test_remove_only_step_fail(self, mock_save):
         patch = [{'path': '/steps/0', 'op': 'remove'}]
-        self._test_update_bad_request(
-            mock_save, patch, "[] is too short")
+        try:
+            self._test_update_bad_request(
+                mock_save, patch, "[] is too short")
+        except Exception:
+            self._test_update_bad_request(
+                mock_save, patch, "[] should be non-empty")
 
     def test_remove_non_existent_step_property_fail(self, mock_save):
         patch = [{'path': '/steps/0/non-existent', 'op': 'remove'}]
@@ -841,8 +869,12 @@ class TestPost(BaseDeployTemplatesAPITest):
             'steps', {}, "{} is not of type 'array'")
 
     def test_create_invalid_field_empty_steps(self):
-        self._test_create_invalid_field(
-            'steps', [], "[] is too short")
+        try:
+            self._test_create_invalid_field(
+                'steps', [], "[] is too short")
+        except Exception:
+            self._test_create_invalid_field(
+                'steps', [], "[] should be non-empty")
 
     def test_create_invalid_field_extra(self):
         self._test_create_invalid_field(
@@ -926,9 +958,16 @@ class TestDelete(BaseDeployTemplatesAPITest):
                                       obj_fields.NotificationStatus.END)])
 
     def test_delete_by_uuid_with_json(self, mock_destroy):
+        headers = {api_base.Version.string: '1.90'}
         self.delete('/deploy_templates/%s.json' % self.template.uuid,
-                    headers=self.headers)
+                    headers=headers)
         mock_destroy.assert_called_once_with(mock.ANY)
+
+    def test_delete_by_uuid_with_json_not_found(self, mock_destroy):
+        response = self.delete('/deploy_templates/%s.json' %
+                               self.template.uuid, headers=self.headers,
+                               expect_errors=True)
+        self.assertEqual(http_client.NOT_FOUND, response.status_int)
 
     def test_delete_by_name(self, mock_destroy):
         self.delete('/deploy_templates/%s' % self.template.name,
@@ -936,9 +975,16 @@ class TestDelete(BaseDeployTemplatesAPITest):
         mock_destroy.assert_called_once_with(mock.ANY)
 
     def test_delete_by_name_with_json(self, mock_destroy):
+        headers = {api_base.Version.string: '1.90'}
         self.delete('/deploy_templates/%s.json' % self.template.name,
-                    headers=self.headers)
+                    headers=headers)
         mock_destroy.assert_called_once_with(mock.ANY)
+
+    def test_delete_by_name_with_json_not_found(self, mock_destroy):
+        response = self.delete('/deploy_templates/%s.json' %
+                               self.template.name, headers=self.headers,
+                               expect_errors=True)
+        self.assertEqual(http_client.NOT_FOUND, response.status_int)
 
     def test_delete_invalid_api_version(self, mock_dpt):
         response = self.delete('/deploy_templates/%s' % self.template.uuid,

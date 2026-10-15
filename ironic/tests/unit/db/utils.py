@@ -26,11 +26,14 @@ from ironic.objects import bios
 from ironic.objects import chassis
 from ironic.objects import conductor
 from ironic.objects import deploy_template
+from ironic.objects import firmware
+from ironic.objects import inspection_rule as rule
 from ironic.objects import node
 from ironic.objects import node_history
 from ironic.objects import node_inventory
 from ironic.objects import port
 from ironic.objects import portgroup
+from ironic.objects import runbook
 from ironic.objects import trait
 from ironic.objects import volume_connector
 from ironic.objects import volume_target
@@ -78,36 +81,12 @@ def get_test_pxe_instance_info():
     }
 
 
-def get_test_ilo_info():
-    return {
-        "ilo_address": "1.2.3.4",
-        "ilo_username": "admin",
-        "ilo_password": "fake",
-    }
-
-
 def get_test_drac_info():
     return {
-        "drac_address": "1.2.3.4",
-        "drac_port": 443,
-        "drac_path": "/wsman",
-        "drac_protocol": "https",
-        "drac_username": "admin",
-        "drac_password": "fake",
         "redfish_address": "1.2.3.4",
         "redfish_system_id": "/redfish/v1/Systems/System.Embedded.1",
         "redfish_username": "admin",
         "redfish_password": "fake"
-    }
-
-
-def get_test_irmc_info():
-    return {
-        "irmc_address": "1.2.3.4",
-        "irmc_username": "admin0",
-        "irmc_password": "fake0",
-        "irmc_port": "80",
-        "irmc_auth_method": "digest",
     }
 
 
@@ -136,38 +115,11 @@ def get_test_agent_driver_internal_info():
     }
 
 
-def get_test_snmp_info(**kw):
-    result = {
-        "snmp_driver": kw.get("snmp_driver", "teltronix"),
-        "snmp_address": kw.get("snmp_address", "1.2.3.4"),
-        "snmp_port": kw.get("snmp_port", "161"),
-        "snmp_outlet": kw.get("snmp_outlet", "1"),
-        "snmp_version": kw.get("snmp_version", "1")
-    }
-    if result["snmp_version"] in ("1", "2c"):
-        result["snmp_community"] = kw.get("snmp_community", "public")
-        if "snmp_community_read" in kw:
-            result["snmp_community_read"] = kw["snmp_community_read"]
-        if "snmp_community_write" in kw:
-            result["snmp_community_write"] = kw["snmp_community_write"]
-    elif result["snmp_version"] == "3":
-        result["snmp_user"] = kw.get(
-            "snmp_user", kw.get("snmp_security", "snmpuser")
-        )
-        for option in ('snmp_auth_protocol', 'snmp_auth_key',
-                       'snmp_priv_protocol', 'snmp_priv_key',
-                       'snmp_context_engine_id', 'snmp_context_name'):
-            if option in kw:
-                result[option] = kw[option]
-    return result
-
-
 def get_test_node(**kw):
     properties = {
         "cpu_arch": "x86_64",
-        "cpus": "8",
-        "local_gb": "10",
-        "memory_mb": "4096",
+        "local_gb": 10,
+        "memory_mb": '4096',
     }
     # NOTE(tenbrae): API unit tests confirm that sensitive fields in
     #                instance_info and driver_info will get scrubbed
@@ -201,6 +153,7 @@ def get_test_node(**kw):
         'provision_updated_at': kw.get('provision_updated_at'),
         'last_error': kw.get('last_error'),
         'instance_uuid': kw.get('instance_uuid'),
+        'instance_name': kw.get('instance_name'),
         'instance_info': kw.get('instance_info', fake_instance_info),
         'driver': kw.get('driver', 'fake-hardware'),
         'driver_info': kw.get('driver_info', fake_driver_info),
@@ -237,6 +190,11 @@ def get_test_node(**kw):
         'network_data': kw.get('network_data'),
         'boot_mode': kw.get('boot_mode', None),
         'secure_boot': kw.get('secure_boot', None),
+        'shard': kw.get('shard', None),
+        'parent_node': kw.get('parent_node', None),
+        'service_step': kw.get('service_step'),
+        'disable_power_off': kw.get('disable_power_off', False),
+        'health': kw.get('health', None),
     }
 
     for iface in drivers_base.ALL_INTERFACES:
@@ -259,7 +217,7 @@ def create_test_node(**kw):
     # Let DB generate an ID if one isn't specified explicitly.
     # Creating a node with tags or traits will raise an exception. If tags or
     # traits are not specified explicitly just delete them.
-    for field in {'id', 'tags', 'traits'}:
+    for field in {'id', 'uuid', 'tags', 'traits'}:
         if field not in kw:
             del node[field]
     dbapi = db_api.get_instance()
@@ -288,6 +246,11 @@ def get_test_port(**kw):
         'physical_network': kw.get('physical_network'),
         'is_smartnic': kw.get('is_smartnic', False),
         'name': kw.get('name'),
+        'description': kw.get('description'),
+        'vendor': kw.get('vendor'),
+        'category': kw.get('category'),
+        'available_for_dynamic_portgroup': kw.get(
+            'available_for_dynamic_portgroup', True),
     }
 
 
@@ -302,8 +265,9 @@ def create_test_port(**kw):
     """
     port = get_test_port(**kw)
     # Let DB generate ID if it isn't specified explicitly
-    if 'id' not in kw:
-        del port['id']
+    for field in ('id', 'uuid'):
+        if field not in kw:
+            del port[field]
     dbapi = db_api.get_instance()
     return dbapi.create_port(port)
 
@@ -334,8 +298,9 @@ def create_test_volume_connector(**kw):
     """
     connector = get_test_volume_connector(**kw)
     # Let DB generate ID if it isn't specified explicitly
-    if 'id' not in kw:
-        del connector['id']
+    for field in ('id', 'uuid'):
+        if field not in kw:
+            del connector[field]
     dbapi = db_api.get_instance()
     return dbapi.create_volume_connector(connector)
 
@@ -368,8 +333,9 @@ def create_test_volume_target(**kw):
     """
     target = get_test_volume_target(**kw)
     # Let DB generate ID if it isn't specified explicitly
-    if 'id' not in kw:
-        del target['id']
+    for field in ('id', 'uuid'):
+        if field not in kw:
+            del target[field]
     dbapi = db_api.get_instance()
     return dbapi.create_volume_target(target)
 
@@ -397,8 +363,9 @@ def create_test_chassis(**kw):
     """
     chassis = get_test_chassis(**kw)
     # Let DB generate ID if it isn't specified explicitly
-    if 'id' not in kw:
-        del chassis['id']
+    for field in ('id', 'uuid'):
+        if field not in kw:
+            del chassis[field]
     dbapi = db_api.get_instance()
     return dbapi.create_chassis(chassis)
 
@@ -412,6 +379,7 @@ def get_test_conductor(**kw):
         'conductor_group': kw.get('conductor_group', ''),
         'created_at': kw.get('created_at', timeutils.utcnow()),
         'updated_at': kw.get('updated_at', timeutils.utcnow()),
+        'online': kw.get('online', True)
     }
 
 
@@ -448,6 +416,8 @@ def get_test_portgroup(**kw):
         'uuid': kw.get('uuid', '6eb02b44-18a3-4659-8c0b-8d2802581ae4'),
         'name': kw.get('name', 'fooname'),
         'node_id': kw.get('node_id', 123),
+        'node_uuid': kw.get('node_uuid',
+                            '40481b96-306b-4a33-901f-795a3dc2f397'),
         'address': kw.get('address', '52:54:00:cf:2d:31'),
         'extra': kw.get('extra', {}),
         'created_at': kw.get('created_at'),
@@ -457,6 +427,9 @@ def get_test_portgroup(**kw):
                                              True),
         'mode': kw.get('mode'),
         'properties': kw.get('properties', {}),
+        'physical_network': kw.get('physical_network'),
+        'category': kw.get('category'),
+        'dynamic_portgroup': kw.get('dynamic_portgroup', False),
     }
 
 
@@ -471,8 +444,9 @@ def create_test_portgroup(**kw):
     """
     portgroup = get_test_portgroup(**kw)
     # Let DB generate ID if it isn't specified explicitly
-    if 'id' not in kw:
-        del portgroup['id']
+    for field in ('id', 'uuid'):
+        if field not in kw:
+            del portgroup[field]
     dbapi = db_api.get_instance()
     return dbapi.create_portgroup(portgroup)
 
@@ -501,25 +475,6 @@ def create_test_node_tag(**kw):
     tag = get_test_node_tag(**kw)
     dbapi = db_api.get_instance()
     return dbapi.add_node_tag(tag['node_id'], tag['tag'])
-
-
-def get_test_xclarity_properties():
-    return {
-        "cpu_arch": "x86_64",
-        "cpus": "8",
-        "local_gb": "10",
-        "memory_mb": "4096",
-    }
-
-
-def get_test_xclarity_driver_info():
-    return {
-        'xclarity_manager_ip': "1.2.3.4",
-        'xclarity_username': "USERID",
-        'xclarity_password': "fake",
-        'xclarity_port': 443,
-        'xclarity_hardware_id': 'fake_sh_id',
-    }
 
 
 def get_test_node_trait(**kw):
@@ -687,13 +642,58 @@ def create_test_deploy_template(**kw):
     return dbapi.create_deploy_template(template)
 
 
-def get_test_ibmc_info():
+def get_test_runbook(**kw):
+    default_uuid = uuidutils.generate_uuid()
     return {
-        "ibmc_address": "https://example.com",
-        "ibmc_username": "username",
-        "ibmc_password": "password",
-        "verify_ca": False,
+        'version': kw.get('version', runbook.Runbook.VERSION),
+        'created_at': kw.get('created_at'),
+        'updated_at': kw.get('updated_at'),
+        'id': kw.get('id', 234),
+        'name': kw.get('name', u'CUSTOM_DT1'),
+        'uuid': kw.get('uuid', default_uuid),
+        'steps': kw.get('steps', [get_test_runbook_step(
+            runbook_id=kw.get('id', 234))]),
+        'traits': kw.get('traits', []),
+        'disable_ramdisk': kw.get('disable_ramdisk', False),
+        'extra': kw.get('extra', {}),
+        'public': kw.get('public', False),
+        'owner': kw.get('owner', None),
     }
+
+
+def get_test_runbook_step(**kw):
+    return {
+        'created_at': kw.get('created_at'),
+        'updated_at': kw.get('updated_at'),
+        'id': kw.get('id', 345),
+        'runbook_id': kw.get('runbook_id', 234),
+        'interface': kw.get('interface', 'raid'),
+        'step': kw.get('step', 'create_configuration'),
+        'args': kw.get('args', {'logical_disks': []}),
+        'order': kw.get('order', 1)
+    }
+
+
+def create_test_runbook(**kw):
+    """Create a runbook in the DB and return Runbook model.
+
+    :param kw: kwargs with overriding values for the runbook.
+    :returns: Test Runbook DB object.
+    """
+    runbook = get_test_runbook(**kw)
+    dbapi = db_api.get_instance()
+    # Let DB generate an ID if one isn't specified explicitly.
+    if 'id' not in kw:
+        del runbook['id']
+    if 'steps' not in kw:
+        for step in runbook['steps']:
+            del step['id']
+            del step['runbook_id']
+    else:
+        for kw_step, runbook_step in zip(kw['steps'], runbook['steps']):
+            if 'id' not in kw_step:
+                del runbook_step['id']
+    return dbapi.create_runbook(runbook)
 
 
 def get_test_history(**kw):
@@ -707,8 +707,12 @@ def get_test_history(**kw):
         'severity': kw.get('severity', 'ERROR'),
         'event_type': kw.get('event_type', 'provisioning'),
         'user': kw.get('user', 'fake-user'),
+        'project': kw.get('project', 'fake-project'),
         'created_at': kw.get('created_at'),
         'updated_at': kw.get('updated_at'),
+        'state': kw.get('state', 'available'),
+        'target_provision_state': kw.get('target_provision_state'),
+        'duration_seconds': kw.get('duration_seconds'),
     }
 
 
@@ -741,7 +745,7 @@ def get_test_inventory(**kw):
 def create_test_inventory(**kw):
     """Create test inventory entry in DB and return NodeInventory DB object.
 
-    :param kw: kwargs with overriding values for port's attributes.
+    :param kw: kwargs with overriding values for inventory attributes.
     :returns: Test NodeInventory DB object.
     """
     inventory = get_test_inventory(**kw)
@@ -750,3 +754,105 @@ def create_test_inventory(**kw):
         del inventory['id']
     dbapi = db_api.get_instance()
     return dbapi.create_node_inventory(inventory)
+
+
+def create_test_firmware_component(**kw):
+    """Create test Firmware Component entry in DB and return object.
+
+    Function to be used to create test FirmwareComponent object in the DB.
+
+    :param kw: kwargs with overriding values for firmware component
+    :returns: Test FirmwareComponent DB object
+    """
+    fw_cmp_values = get_test_firmware_component(**kw)
+    if 'id' not in kw:
+        del fw_cmp_values['id']
+    dbapi = db_api.get_instance()
+    return dbapi.create_firmware_component(fw_cmp_values)
+
+
+def get_test_firmware_component(**kw):
+    # NOTE(iurygregory): update version to get from the object in the object
+    # patch.
+    return {
+        'id': kw.get('id', 256),
+        'node_id': kw.get('node_id', 123),
+        'component': kw.get('component', 'bmc'),
+        'initial_version': kw.get('initial_version', 'v1.0.0'),
+        'current_version': kw.get('current_version', 'v1.0.0'),
+        'last_version_flashed': kw.get('last_version_flashed', None),
+        'vendor': kw.get('vendor', None),
+        'model': kw.get('model', None),
+        'serial_number': kw.get('serial_number', None),
+        'version': kw.get('version', firmware.FirmwareComponent.VERSION),
+        'created_at': kw.get('created_at'),
+        'updated_at': kw.get('updated_at'),
+    }
+
+
+def get_test_firmware_component_list():
+    return [
+        {'component': 'bmc', 'initial_version': 'v1.0.0',
+         'current_version': 'v1.0.0', 'last_version_flashed': None,
+         'vendor': None, 'model': None, 'serial_number': None},
+        {'component': 'BIOS', 'initial_version': 'v1.5.0',
+         'current_version': 'v1.5.0', 'last_version_flashed': None,
+         'vendor': None, 'model': None, 'serial_number': None},
+    ]
+
+
+def get_test_inspection_rule(**kw):
+    default_uuid = uuidutils.generate_uuid()
+    return {
+        'version': kw.get('version', rule.InspectionRule.VERSION),
+        'uuid': kw.get('uuid', default_uuid),
+        'description': kw.get('description', 'an inspection rule'),
+        'sensitive': kw.get('sensitive', False),
+        'phase': kw.get('phase', 'main'),
+        'priority': kw.get('priority', 0),
+        'actions': kw.get('actions', [get_test_inspection_rule_action(
+            inspection_rule_id=kw.get('uuid'))]),
+        'conditions': kw.get('conditions', [
+            get_test_inspection_rule_condition(
+                inspection_rule_id=kw.get('uuid'))]),
+    }
+
+
+def get_test_inspection_rule_action(**kw):
+    action = {
+        'op': kw.get('op', 'set-attribute'),
+        'args': kw.get('args', ["/driver", "idrac"]),
+    }
+
+    if 'id' in kw:
+        action['id'] = kw['id']
+
+    action.update({k: v for k, v in kw.items() if k not in action})
+    return action
+
+
+def get_test_inspection_rule_condition(**kw):
+    condition = {
+        'op': kw.get('op', 'is-true'),
+        'args': kw.get('args', ["{node.auto_discovered}"]),
+        'multiple': kw.get('multiple', 'any'),
+    }
+
+    if 'id' in kw:
+        condition['id'] = kw['id']
+
+    condition.update({k: v for k, v in kw.items() if k not in condition})
+    return condition
+
+
+def create_test_inspection_rule(**kw):
+    """Create a inspection rule in the DB and return InspectionRule model.
+
+    :param kw: kwargs with overriding values for the inspection rule.
+    :returns: Test InspectionRule DB object.
+    """
+    inspection_rule = get_test_inspection_rule(**kw)
+    dbapi = db_api.get_instance()
+    if 'uuid' not in kw:
+        del inspection_rule['uuid']
+    return dbapi.create_inspection_rule(inspection_rule)

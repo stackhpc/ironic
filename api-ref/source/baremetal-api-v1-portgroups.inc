@@ -32,6 +32,10 @@ By default, this query will return the UUID, name and address for each Portgroup
   Added the ``detail`` boolean request parameter. When specified ``True`` this
   causes the response to include complete details about each portgroup.
 
+.. versionadded:: 1.99
+  Added the ability to filter portgroups based on the ``conductor_group`` of the
+  node they are associated with.
+
 Normal response code: 200
 
 Error codes: 400,401,403,404
@@ -49,6 +53,7 @@ Request
     - sort_dir: sort_dir
     - sort_key: sort_key
     - detail: detail
+    - conductor_group: r_conductor_group_port
 
 Response
 --------
@@ -77,6 +82,12 @@ Creates a new Portgroup resource.
 This method requires a Node UUID and the physical hardware address for the
 Portgroup (MAC address in most cases).
 
+.. versionadded:: 1.102
+  Added the ``physical_network`` field.
+
+.. versionadded:: 1.103
+  Added the ``category`` field.
+
 Normal response code: 201
 
 Error codes: 400,401,403,404
@@ -94,6 +105,8 @@ Request
     - properties: req_portgroup_properties
     - extra: req_extra
     - uuid: req_uuid
+    - physical_network: req_physical_network
+    - category : req_portgroup_category
 
 **Example Portgroup creation request:**
 
@@ -118,6 +131,8 @@ Response
     - updated_at: updated_at
     - links: links
     - ports: pg_ports
+    - physical_network: physical_network
+    - category : portgroup_category
 
 **Example Portgroup creation response:**
 
@@ -131,6 +146,12 @@ List Detailed Portgroups
 .. rest_method:: GET /v1/portgroups/detail
 
 Return a list of bare metal Portgroups, with detailed information.
+
+.. versionadded:: 1.102
+  Added the ``physical_network`` field.
+
+.. versionadded:: 1.103
+  Added the ``category`` field.
 
 Normal response code: 200
 
@@ -167,6 +188,8 @@ Response
     - updated_at: updated_at
     - links: links
     - ports: pg_ports
+    - physical_network: physical_network
+    - category: portgroup_category
 
 **Example detailed Portgroup list response:**
 
@@ -180,6 +203,12 @@ Show Portgroup Details
 .. rest_method:: GET /v1/portgroups/{portgroup_ident}
 
 Show details for the given Portgroup.
+
+.. versionadded:: 1.102
+  Added the ``physical_network`` field.
+
+.. versionadded:: 1.103
+  Added the ``category`` field.
 
 Normal response code: 200
 
@@ -211,6 +240,8 @@ Response
     - updated_at: updated_at
     - links: links
     - ports: pg_ports
+    - physical_network: physical_network
+    - category: portgroup_category
 
 **Example Portgroup details:**
 
@@ -224,6 +255,12 @@ Update a Portgroup
 .. rest_method:: PATCH /v1/portgroups/{portgroup_ident}
 
 Update a Portgroup.
+
+.. versionadded:: 1.102
+  Added the ``physical_network`` field.
+
+.. versionadded:: 1.103
+  Added the ``category`` field.
 
 Normal response code: 200
 
@@ -262,6 +299,8 @@ Response
     - updated_at: updated_at
     - links: links
     - ports: pg_ports
+    - physical_network: physical_network
+    - category: portgroup_category
 
 **Example Portgroup update response:**
 

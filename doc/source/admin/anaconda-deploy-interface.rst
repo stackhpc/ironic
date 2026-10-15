@@ -2,7 +2,7 @@ Deploying with anaconda deploy interface
 ========================================
 
 Ironic supports deploying an OS with the `anaconda`_ installer.
-This anaconda deploy interface works with ``pxe`` and ``ipxe`` boot interfaces.
+This anaconda deploy interface *ONLY* works with ``pxe`` and ``ipxe`` boot interfaces.
 
 Configuration
 -------------
@@ -22,13 +22,13 @@ This change takes effect after all the ironic conductors have been
 restarted.
 
 The default kickstart template is specified via the configuration option
-``[anaconda]default_ks_template``. It is set to this `ks.cfg.template`_
+:oslo.config:option:`anaconda.default_ks_template`. It is set to this `ks.cfg.template`_
 but can be modified to be some other template.
 
 .. code-block::  ini
 
    [anaconda]
-   default_ks_template = file:///etc/ironic/ks.cfg.template
+   default_ks_template = /etc/ironic/ks.cfg.template
 
 
 When creating an ironic node, specify ``anaconda`` as the deploy interface.
@@ -64,7 +64,7 @@ package groups that need to be in the image:
         install cloud-init
         ts run
 
-An OS tarball can be created using following set of commands, along with the above
+An OS tarball can be created using the following set of commands, along with the above
 ``baremetal.yum`` file:
 
 .. code-block:: shell
@@ -102,48 +102,104 @@ The kernel and ramdisk can be found at ``/images/pxeboot/vmlinuz`` and
 image can be normally found at ``/LiveOS/squashfs.img`` or
 ``/images/install.img``.
 
-The OS tarball must be configured with the following properties in glance, in
-order to be used with the anaconda deploy driver:
+The anaconda deploy driver uses the following image properties from glance,
+which are all optional depending on how you create your bare metal server:
 
 * ``kernel_id``
 * ``ramdisk_id``
 * ``stage2_id``
-* ``disk_file_extension`` (optional)
+* ``ks_template``
+* ``disk_file_extension``
 
-Valid ``disk_file_extension`` values are ``.img``, ``.tar``, ``.tbz``,
-``.tgz``, ``.txz``, ``.tar.gz``, ``.tar.bz2``, and ``.tar.xz``. When
-``disk_file_extension`` property is not set to one of the above valid values
-the anaconda installer will assume that the image provided is a mountable
+All except ``disk_file_extension`` are glance image IDs. They can be prefixed
+with ``glance://``.
+
+Valid ``disk_file_extension`` values are:
+
+* ``.img``
+* ``.tar``
+* ``.tbz``
+* ``.tgz``
+* ``.txz``
+* ``.tar.gz``
+* ``.tar.bz2``
+* ``.tar.xz``
+
+When the ``disk_file_extension`` property is not set to one of the above valid
+values the anaconda installer will assume that the image provided is a mountable
 OS disk.
 
-This is an example of adding the anaconda-related images and the OS tarball to
-glance:
+An example of creating the necessary glance images with the anaconda files
+and the OS tarball and setting properties to refer to components can be seen below.
+
+.. Note:: The various images must be shared except for the OS image
+          with the properties set. This image must be set to public.
+          See `bug 2099276 <https://bugs.launchpad.net/ironic/+bug/2099276>`_ for
+          more details.
 
 .. code-block:: shell
 
-        openstack image create --file ./vmlinuz --container-format aki \
-            --disk-format aki --shared anaconda-kernel-<version>
-        openstack image create --file ./initrd.img --container-format ari \
-            --disk-format ari --shared anaconda-ramdisk-<version>
-        openstack image create --file ./squashfs.img --container-format ari \
-            --disk-format ari --shared anaconda-stage-<verison>
-        openstack image create --file ./os-image.tar.gz \
-            --container-format bare --disk-format raw --shared \
-            --property kernel_id=<glance_uuid_vmlinuz> \
-            --property ramdisk_id=<glance_uuid_ramdisk> \
-            --property stage2_id=<glance_uuid_stage2> disto-name-version \
-            --property disk_file_extension=.tgz
+        # vmlinuz
+        openstack image create --container-format aki --disk-format aki --shared \
+            --file ./vmlinuz anaconda-kernel-<version>
 
-Creating a bare metal server
-----------------------------
+        # initrd/initramfs/ramdisk
+        openstack image create --container-format ari --disk-format ari --shared \
+            --file ./initrd.img anaconda-ramdisk-<version>
 
-Apart from uploading a custom kickstart template to glance and associating it
-with the OS image via the ``ks_template`` property in glance, operators can
-also set the kickstart template in the ironic node's ``instance_info`` field.
-The kickstart template set in ``instance_info`` takes precedence over the one
-specified via the OS image in glance. If no kickstart template is specified
-(via the node's ``instance_info``  or ``ks_template`` glance image property),
-the default kickstart template will be used to deploy the OS.
+        # squashfs/stage2
+        openstack image create --container-format ari --disk-format ari --shared \
+            --file ./squashfs.img anaconda-stage2-<version>
+
+        KERNEL_ID=$(openstack image show -f value -c id anaconda-kernel-<version>)
+        RAMDISK_ID=$(openstack image show -f value -c id anaconda-ramdisk-<version>)
+        STAGE2_ID=$(openstack image show -f value -c id anaconda-stage2-<version>)
+
+        # the actual OS image we'll use as our source
+        openstack image create --container-format bare --disk-format raw --public \
+            --property kernel_id=${KERNEL_ID} \
+            --property ramdisk_id=${RAMDISK_ID} \
+            --property stage2_id=${STAGE2_ID} \
+            --property disk_file_extension=.tgz \
+            --file ./os-image.tar.gz \
+            my-anaconda-based-os-<version>
+
+
+Deploying a node
+----------------
+
+To be able to deploy a node with the anaconda deploy interface the node's
+``instance_info`` must have an ``image_source`` at a minimum but depending
+on how your node is being deployed more fields must be populated.
+
+If you are using Ironic via Nova then it will only set the ``image_source``
+on ``instance_info`` so the following image properties are required:
+
+* ``kernel_id``
+* ``ramdisk_id``
+* ``stage2_id``
+
+You may optionally upload a custom kickstart template to glance an associate
+it to the OS image via the ``ks_template`` property.
+
+.. code-block:: shell
+
+        openstack server create --image my-anaconda-based-os-<version> ...
+
+If you are not using Ironic via Nova then all properties except
+``disk_file_extension`` can be supplied via ``instance_info`` or via the
+OS image properties. The values in ``instance_info`` will take precedence
+over those specified in the OS image. However most of their names are
+slightly altered.
+
+* ``kernel_id`` OS image property is ``kernel`` in ``instance_info``
+* ``ramdisk_id`` OS image property is ``ramdisk`` in ``instance_info``
+* ``stage2_id`` OS image property is ``stage2`` in ``instance_info``
+
+Only the ``ks_template`` property remains the same in ``instance_info``.
+
+.. Note:: If no ``ks_template`` is supplied then
+          :oslo.config:option:`anaconda.default_ks_template` will be used.
 
 This is an example of how to set the kickstart template for a specific
 ironic node:
@@ -153,23 +209,32 @@ ironic node:
         openstack baremetal node set <node> \
             --instance_info ks_template=glance://uuid
 
+Ultimately to deploy your node it must be able to find the kernel, the
+ramdisk, the stage2 file, and your OS image via glance image properties
+or via ``instance_info``.
+
+.. code-block:: shell
+
+        openstack baremetal node set <node> \
+            --instance_info image_source=glance://uuid
+
 .. warning::
    In the Ironic Project terminology, the word ``template`` often refers to
-   a file which is supplied to the deployment, which Ironic supplies
+   a file that is supplied to the deployment, which Ironic supplies
    parameters to render a specific output. One critical example of this in
    the Ironic workflow, specifically with this driver, is that the generated
    ``agent token`` is conveyed to the booting ramdisk, facilitating it to call
    back to Ironic and indicate the state. This token is randomly generated
-   for every deploy, and is required. Specifically this is leveraged in the
+   for every deploy and is required. Specifically, this is leveraged in the
    template's ``pre``, ``onerror``, and ``post`` steps.
-   For more infomation on Agent Token, please see :doc:`/admin/agent-token`.
+   For more information on Agent Token, please see :doc:`/admin/agent-token`.
 
 Standalone deployments
 ----------------------
 
 While this deployment interface driver was developed around the use of other
-OpenStack services, it is not explicitly required. For example HTTP(S) URLs
-can be supplied by the API user to explictly set the expected baremetal node
+OpenStack services, it is not explicitly required. For example, HTTP(S) URLs
+can be supplied by the API user to explicitly set the expected baremetal node
 ``instance_info`` fields
 
 .. code-block:: shell
@@ -182,7 +247,7 @@ can be supplied by the API user to explictly set the expected baremetal node
 
 When doing so, you may wish to also utilize a customized kickstart template,
 which can also be a URL. Please reference the ironic community provided
-template *ks.cfg.template* and use it as a basis of your own kickstart
+template *ks.cfg.template* and use it as a basis for your own kickstart
 as it accounts for the particular stages and appropriate callbacks to
 Ironic.
 
@@ -223,7 +288,7 @@ At this point, you should be able to request the baremetal node to deploy.
 Standalone using a repository
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Anaconda supports a concept of passing a repository as opposed to a dedicated
+Anaconda supports the concept of passing a repository as opposed to a dedicated
 URL path which has a ``.treeinfo`` file, which tells the initial boot scripts
 where to get various dependencies, such as what would be used as the anaconda
 ``stage2`` ramdisk. Unfortunately, this functionality is not well documented.
@@ -252,11 +317,11 @@ parameter, and the node deployed.
 Deployment Process
 ------------------
 
-At a high level, the mechanics of the anaconda driver works in the following
+At a high level, the mechanics of the anaconda driver work in the following
 flow, where we also note the stages and purpose of each part for informational
 purposes.
 
-#. Network Boot Program (Such as iPXE) downloads the kernel, and initial
+#. Network Boot Program (Such as iPXE) downloads the kernel and initial
    ramdisk.
 #. Kernel launches, uncompresses initial ramdisk, and executes init inside
    of the ramdisk.
@@ -280,17 +345,17 @@ part due to the general defaults being set to much lower values for image
 based deployments, but the way the anaconda deployment interface works,
 you may need to make some adjustments.
 
-* ``[conductor]deploy_callback_timeout`` likely needs to be adjusted
-  for most ``anaconda`` deployment interface users. By default this
-  is a timer which looks for "agents" which have not checked in with
+* :oslo.config:option:`conductor.deploy_callback_timeout` likely needs to be adjusted
+  for most ``anaconda`` deployment interface users. By default, this
+  is a timer that looks for "agents" that have not checked in with
   Ironic, or agents which may have crashed or failed after they
   started. If the value is reached, then the current operation is failed.
   This value should be set to a number of seconds which exceeds your
   average anaconda deployment time.
-* ``[pxe]boot_retry_timeout`` can also be triggered and result in
+* :oslo.config:option:`pxe.boot_retry_timeout` can also be triggered and result in
   an anaconda deployment in progress getting reset as it is intended
-  to reboot nodes which might have failed their initial PXE operation.
-  Depending on sizes of images, and the exact nature of what was deployed,
+  to reboot nodes that might have failed their initial PXE operation.
+  Depending on the sizes of images, and the exact nature of what was deployed,
   it may be necessary to ensure this is a much higher value.
 
 Limitations
@@ -299,7 +364,7 @@ Limitations
 * This deploy interface has only been tested with Red Hat based operating
   systems that use anaconda. Other systems are not supported.
 
-* Runtime TLS certifiate injection into ramdisks is not supported. Assets
+* Runtime TLS certificate injection into ramdisks is not supported. Assets
   such as ``ramdisk`` or a ``stage2`` ramdisk image need to have trusted
   Certificate Authority certificates present within the images *or* the
   Ironic API endpoint utilized should utilize a known trusted Certificate

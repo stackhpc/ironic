@@ -66,6 +66,19 @@ if  [[ -d $IRONIC_CONF_DIR ]] && [[ ! -d $SAVE_DIR/etc.ironic ]] ; then
     cp -pr $IRONIC_CONF_DIR $SAVE_DIR/etc.ironic
 fi
 
+# Ironic has an early consumer of a new neutron API, and grenade nor devstack
+# has any concept of restarting neutron-rpc-server as it was added in late
+# 2024. Ultimately networking-baremetal adding an rpc call which needs the
+# updated service running means we need to restart it, for now.
+sudo systemctl stop devstack@neutron-rpc-server.service || true
+sudo systemctl stop devstack@q-l3.service || true
+sudo systemctl stop devstack@q-agt.service || true
+sleep 1
+sudo systemctl start devstack@neutron-rpc-server.service || true
+sudo systemctl start devstack@q-l3.service || true
+sudo systemctl start devstack@q-agt.service || true
+sleep 1
+
 stack_install_service ironic
 
 # calls upgrade-ironic for specific release
@@ -96,7 +109,7 @@ $IRONIC_BIN_DIR/ironic-dbsync --config-file=$IRONIC_CONF_FILE
 if [[ "${HOST_TOPOLOGY}" == "multinode" ]]; then
     iniset $IRONIC_CONF_FILE DEFAULT pin_release_version ${BASE_DEVSTACK_BRANCH#*/}
 else
-    ironic-dbsync online_data_migrations
+    $IRONIC_BIN_DIR/ironic-dbsync online_data_migrations
 fi
 
 ensure_started='ironic-conductor nova-compute '
@@ -144,7 +157,7 @@ ensure_services_started $ensure_started
 # internal tag, that was assigned to network will be the same. As result we need to update
 # tag on link between br-int and brbm to new value after restart.
 if [[ -z "${IRONIC_PROVISION_NETWORK_NAME}" ]]; then
-    net_id=$(openstack network show ironic_grenade -f value -c id)
+    net_id=$(openstack --os-cloud devstack-admin network show ironic_grenade -f value -c id)
     create_ovs_taps $net_id
 fi
 

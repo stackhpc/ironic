@@ -13,17 +13,21 @@
 import random
 from unittest import mock
 
+from oslo_config import cfg
 from oslo_db.sqlalchemy import utils as db_utils
 from oslo_utils import uuidutils
 import sqlalchemy as sa
-from testtools import matchers
 
 from ironic.common import context
 from ironic.common import exception
 from ironic.common import release_mappings
+from ironic.common import states
 from ironic.db import api as db_api
 from ironic.tests.unit.db import base
 from ironic.tests.unit.db import utils
+
+
+CONF = cfg.CONF
 
 
 class UpgradingTestCase(base.DbTestCase):
@@ -55,10 +59,25 @@ class UpgradingTestCase(base.DbTestCase):
 
     @mock.patch.object(release_mappings, 'get_object_versions', autospec=True)
     @mock.patch.object(db_utils, 'column_exists', autospec=True)
-    def test_check_versions_raises_missing_table(
+    def test_check_versions_handles_missing_table_with_multiple_versions(
             self, column_exists, mock_release_mappings):
+        # When an object was introduced at 1.0 and later bumped to 1.1,
+        # the table may still be missing during an upgrade from an older
+        # release. This should be handled gracefully as long as 1.0 is
+        # in the supported versions set.
         column_exists.side_effect = sa.exc.NoSuchTableError('meow')
         mock_release_mappings.return_value = {'Node': {'1.0', '1.1'}}
+        self.assertTrue(
+            self.dbapi.check_versions(permit_initial_version=True))
+        self.assertEqual(1, column_exists.call_count)
+
+    @mock.patch.object(release_mappings, 'get_object_versions', autospec=True)
+    @mock.patch.object(db_utils, 'column_exists', autospec=True)
+    def test_check_versions_raises_missing_table(
+            self, column_exists, mock_release_mappings):
+        # A table that was never at version 1.0 should not be missing.
+        column_exists.side_effect = sa.exc.NoSuchTableError('meow')
+        mock_release_mappings.return_value = {'Node': {'1.5', '1.6'}}
         self.assertRaises(sa.exc.NoSuchTableError, self.dbapi.check_versions)
         self.assertEqual(1, column_exists.call_count)
 
@@ -103,45 +122,6 @@ class UpgradingTestCase(base.DbTestCase):
         conductor = self.dbapi.get_conductor(conductor.hostname)
         self.assertEqual('1.0', conductor.version)
         self.assertFalse(self.dbapi.check_versions())
-
-
-class GetNotVersionsTestCase(base.DbTestCase):
-
-    def setUp(self):
-        super(GetNotVersionsTestCase, self).setUp()
-        self.dbapi = db_api.get_instance()
-
-    def test_get_not_versions(self):
-        versions = ['1.1', '1.2', '1.3']
-        node_uuids = []
-        for v in versions:
-            node = utils.create_test_node(uuid=uuidutils.generate_uuid(),
-                                          version=v)
-            node_uuids.append(node.uuid)
-        self.assertEqual([], self.dbapi.get_not_versions('Node', versions))
-
-        res = self.dbapi.get_not_versions('Node', ['2.0'])
-        self.assertThat(res, matchers.HasLength(len(node_uuids)))
-        res_uuids = [n.uuid for n in res]
-        self.assertEqual(node_uuids, res_uuids)
-
-        res = self.dbapi.get_not_versions('Node', versions[1:])
-        self.assertThat(res, matchers.HasLength(1))
-        self.assertEqual(node_uuids[0], res[0].uuid)
-
-    def test_get_not_versions_null(self):
-        node = utils.create_test_node(uuid=uuidutils.generate_uuid(),
-                                      version=None)
-        node = self.dbapi.get_node_by_id(node.id)
-        self.assertIsNone(node.version)
-        res = self.dbapi.get_not_versions('Node', ['1.6'])
-        self.assertThat(res, matchers.HasLength(1))
-        self.assertEqual(node.uuid, res[0].uuid)
-
-    def test_get_not_versions_no_model(self):
-        utils.create_test_node(uuid=uuidutils.generate_uuid(), version='1.4')
-        self.assertRaises(exception.IronicException,
-                          self.dbapi.get_not_versions, 'NotExist', ['1.6'])
 
 
 class UpdateToLatestVersionsTestCase(base.DbTestCase):
@@ -226,6 +206,11 @@ class UpdateToLatestVersionsTestCase(base.DbTestCase):
         for i in range(0, num_nodes):
             node = utils.create_test_node(version=version,
                                           uuid=uuidutils.generate_uuid())
+            # Create entries on the tables so we force field upgrades
+            utils.create_test_node_trait(node_id=node.id, trait='foo',
+                                         version='0.0')
+            utils.create_test_bios_setting(node_id=node.id, version='1.0')
+
             nodes.append(node.uuid)
         for uuid in nodes:
             node = self.dbapi.get_node_by_uuid(uuid)
@@ -238,10 +223,15 @@ class UpdateToLatestVersionsTestCase(base.DbTestCase):
             return
 
         nodes = self._create_nodes(5)
+        # Check/migrate 2, 10 remain.
         self.assertEqual(
-            (5, 2), self.dbapi.update_to_latest_versions(self.context, 2))
+            (10, 2), self.dbapi.update_to_latest_versions(self.context, 2))
+        # Check/migrate 10, 8 migrated, 8 remain.
         self.assertEqual(
-            (3, 3), self.dbapi.update_to_latest_versions(self.context, 10))
+            (8, 8), self.dbapi.update_to_latest_versions(self.context, 10))
+        # Just make sure it is still 0, 0 in case more things are added.
+        self.assertEqual(
+            (0, 0), self.dbapi.update_to_latest_versions(self.context, 10))
         for uuid in nodes:
             node = self.dbapi.get_node_by_uuid(uuid)
             self.assertEqual(self.node_ver, node.version)
@@ -250,10 +240,189 @@ class UpdateToLatestVersionsTestCase(base.DbTestCase):
         if self.node_version_same:
             # can't test if we don't have diff versions of the node
             return
-
-        nodes = self._create_nodes(5)
+        vm_count = 5
+        nodes = self._create_nodes(vm_count)
+        # NOTE(TheJulia): Under current testing, 5 node will result in 10
+        # records implicitly needing to be migrated.
+        migrate_count = vm_count * 2
         self.assertEqual(
-            (5, 5), self.dbapi.update_to_latest_versions(self.context, 5))
+            (migrate_count, migrate_count),
+            self.dbapi.update_to_latest_versions(self.context,
+                                                 migrate_count))
+        self.assertEqual(
+            (0, 0), self.dbapi.update_to_latest_versions(self.context,
+                                                         migrate_count))
+
         for uuid in nodes:
             node = self.dbapi.get_node_by_uuid(uuid)
             self.assertEqual(self.node_ver, node.version)
+
+
+class MigrateToBuiltinInspectionTestCase(base.DbTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.context = context.get_admin_context()
+        self.dbapi = db_api.get_instance()
+        CONF.set_override('enabled_inspect_interfaces', 'agent,no-inspect')
+
+        for _ in range(3):
+            utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                                   inspect_interface='inspector')
+        for _ in range(2):
+            utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                                   inspect_interface='agent')
+        utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                               inspect_interface='no-inspect')
+
+    def _check(self, migrated, left):
+        current = sorted(x[0] for x in self.dbapi.get_nodeinfo_list(
+            columns=['inspect_interface']))
+        self.assertEqual(['agent'] * migrated + ['inspector'] * left
+                         + ['no-inspect'], current)
+
+    def test_migrate_all(self):
+        total, migrated = self.dbapi.migrate_to_builtin_inspection(
+            self.context, 0)
+        self.assertEqual(3, total)
+        self.assertEqual(3, migrated)
+        self._check(5, 0)
+
+    def test_cannot_migrate(self):
+        CONF.set_override('enabled_inspect_interfaces', 'inspector,no-inspect')
+        total, migrated = self.dbapi.migrate_to_builtin_inspection(
+            self.context, 0)
+        self.assertEqual(0, total)
+        self.assertEqual(0, migrated)
+        self._check(2, 3)
+
+    def test_cannot_migrate_some(self):
+        for state in [states.INSPECTING, states.INSPECTWAIT,
+                      states.INSPECTFAIL]:
+            utils.create_test_node(uuid=uuidutils.generate_uuid(),
+                                   inspect_interface='inspector',
+                                   provision_state=state)
+        total, migrated = self.dbapi.migrate_to_builtin_inspection(
+            self.context, 0)
+        self.assertEqual(6, total)
+        self.assertEqual(3, migrated)
+        self._check(5, 3)
+
+    def test_migrate_with_limit(self):
+        total, migrated = self.dbapi.migrate_to_builtin_inspection(
+            self.context, 2)
+        self.assertEqual(3, total)
+        self.assertEqual(2, migrated)
+        self._check(4, 1)
+
+
+class MigrateRunbookNamesToTraitsTestCase(base.DbTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.context = context.get_admin_context()
+        self.dbapi = db_api.get_instance()
+
+        # Create test runbooks without traits (simulating pre-migration state)
+        self.runbook1 = utils.create_test_runbook(
+            name='CUSTOM_FIRMWARE_UPDATE',
+            uuid=uuidutils.generate_uuid())
+        self.runbook2 = utils.create_test_runbook(
+            name='CUSTOM_BIOS_CONFIG',
+            uuid=uuidutils.generate_uuid())
+        self.runbook3 = utils.create_test_runbook(
+            name='HW_CPU_X86_VMX',
+            uuid=uuidutils.generate_uuid())
+
+    def _check_traits_migrated(self, runbook_id, expected_trait):
+        """Helper to verify a runbook has the expected trait."""
+        traits = self.dbapi.get_runbook_traits_by_runbook_id(runbook_id)
+        self.assertEqual(1, len(traits))
+        self.assertEqual(expected_trait, traits[0].trait)
+
+    def test_migrate_all_runbooks(self):
+        """Test migrating all runbooks without limits."""
+        total, migrated = self.dbapi.migrate_runbook_names_to_traits(
+            self.context, 0)
+
+        self.assertEqual(3, total)
+        self.assertEqual(3, migrated)
+
+        # Verify all runbooks got their traits
+        self._check_traits_migrated(self.runbook1['id'],
+                                    'CUSTOM_FIRMWARE_UPDATE')
+        self._check_traits_migrated(self.runbook2['id'], 'CUSTOM_BIOS_CONFIG')
+        self._check_traits_migrated(self.runbook3['id'], 'HW_CPU_X86_VMX')
+
+    def test_migrate_with_limit(self):
+        """Test migrating with a limit on number of runbooks."""
+        total, migrated = self.dbapi.migrate_runbook_names_to_traits(
+            self.context, 2)
+
+        self.assertEqual(3, total)
+        self.assertEqual(2, migrated)
+
+        # Should have 2 runbooks with traits and 1 without
+        all_traits = []
+        runbook_ids = [self.runbook1['id'], self.runbook2['id'],
+                       self.runbook3['id']]
+        for runbook_id in runbook_ids:
+            traits = self.dbapi.get_runbook_traits_by_runbook_id(runbook_id)
+            all_traits.append(len(traits))
+
+        # Should have exactly 2 runbooks with traits (1 trait each) and 1
+        # without
+        self.assertEqual([0, 1, 1], sorted(all_traits))
+
+    def test_migrate_already_migrated(self):
+        """Test that already migrated runbooks are not migrated again."""
+        # First migration
+        total, migrated = self.dbapi.migrate_runbook_names_to_traits(
+            self.context, 0)
+        self.assertEqual(3, total)
+        self.assertEqual(3, migrated)
+
+        # Second migration should find nothing to do
+        total, migrated = self.dbapi.migrate_runbook_names_to_traits(
+            self.context, 0)
+        self.assertEqual(0, total)
+        self.assertEqual(0, migrated)
+
+    def test_migrate_partial_then_complete(self):
+        """Test completing migration after partial migration."""
+        # Partial migration
+        total, migrated = self.dbapi.migrate_runbook_names_to_traits(
+            self.context, 1)
+        self.assertEqual(3, total)
+        self.assertEqual(1, migrated)
+
+        # Complete the migration
+        total, migrated = self.dbapi.migrate_runbook_names_to_traits(
+            self.context, 0)
+        self.assertEqual(2, total)  # 2 remaining
+        self.assertEqual(2, migrated)
+
+        # Verify all are now migrated
+        total, migrated = self.dbapi.migrate_runbook_names_to_traits(
+            self.context, 0)
+        self.assertEqual(0, total)
+        self.assertEqual(0, migrated)
+
+    def test_migrate_mixed_runbooks(self):
+        """Test migration with mix of migrated and unmigrated runbooks."""
+        # Manually add traits to one runbook (simulate partially migrated
+        # state)
+        self.dbapi.add_runbook_trait(
+            self.runbook1['id'], 'MANUAL_TRAIT', '1.0')
+
+        # Now migrate - should only migrate the 2 without traits
+        total, migrated = self.dbapi.migrate_runbook_names_to_traits(
+            self.context, 0)
+        self.assertEqual(2, total)
+        self.assertEqual(2, migrated)
+
+        # Verify the manually added trait wasn't touched
+        traits = self.dbapi.get_runbook_traits_by_runbook_id(
+            self.runbook1['id'])
+        self.assertEqual(1, len(traits))
+        self.assertEqual('MANUAL_TRAIT', traits[0].trait)
