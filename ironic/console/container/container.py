@@ -38,6 +38,11 @@ class ContainerConsoleContainer(base.BaseConsoleContainer):
 
     provider_name = 'container'
 
+    # [vnc] option holding the path to the run command template
+    # rendered by _render_template; subclasses with their own template
+    # override it
+    template_option = 'container_command_template'
+
     def __init__(self):
         # confirm the CLI is available and can talk to the engine
         try:
@@ -57,7 +62,7 @@ class ContainerConsoleContainer(base.BaseConsoleContainer):
         except Exception as e:
             raise exception.ConsoleContainerError(
                 provider=self.provider_name,
-                reason=f'Parsing {CONF.vnc.container_command_template} '
+                reason=f'Parsing {getattr(CONF.vnc, self.template_option)} '
                        f'failed: {e}')
 
     def _execute(self, *args, env=None, **kwargs):
