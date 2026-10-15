@@ -273,6 +273,38 @@ cleanup persist until that conductor restarts. The
 
     docker ps --all --filter label=org.openstack.ironic.console=true
 
+Kolla container provider
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``container-kolla`` provider is a variant of the ``container`` provider
+for containerised deployments such as Kolla, where the console container
+cannot publish ports to the host. Instead of port publication, the provider
+runs the console container with host networking (``--network host``), so the
+VNC server listens on port 5900 of the conductor host. The endpoint is then
+known without querying the engine, and ``[vnc]container_publish_port`` does
+not apply. Because the port is fixed, only one console container can be
+running on a conductor host at a time.
+
+A minimal configuration:
+
+.. code-block:: ini
+
+   [vnc]
+   enabled = True
+   container_provider = container-kolla
+   console_image = localhost/ironic-vnc-container
+
+The provider otherwise behaves like the ``container`` provider: it invokes
+``[vnc]container_executable`` (honouring ``[vnc]container_host``) with the
+arguments rendered from ``[vnc]container_kolla_command_template``. The
+engine must run on the conductor host, as the console container joins the
+host network.
+
+Note that with host networking the unauthenticated VNC server is bound to
+all interfaces of the conductor host, so port 5900 must be restricted to
+the networks hosting ironic-novncproxy or nova-novncproxy by the
+deployment's network policy or firewall rules.
+
 Creating an external container provider
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -312,7 +344,9 @@ using the Ironic driver.
 
 For the ``systemd`` and ``container`` providers the VNC server will be
 published on a random high port number. For the ``kubernetes`` pod the VNC
-server is running on port ``5900`` on the pod's ``hostIP``.
+server is running on port ``5900`` on the pod's ``hostIP``. For the
+``container-kolla`` provider the VNC server is running on port ``5900`` on
+the conductor host.
 
 Console containers need access to the management network to access the BMC web
 interface. If driver_info ``redfish_verify_ca=False`` then web requests will

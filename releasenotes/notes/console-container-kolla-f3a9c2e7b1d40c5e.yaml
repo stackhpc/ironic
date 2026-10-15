@@ -1,0 +1,11 @@
+---
+features:
+  - |
+    A new ``ironic.console.container`` provider is added called
+    ``container-kolla`` for containerised deployments, such as Kolla, where
+    port publication is not possible. The provider runs the console
+    container with host networking (``--network host``) so the VNC server
+    listens on port 5900 of the conductor host, and the published port
+    discovery step of the ``container`` provider is not required. The
+    arguments of the container run command are rendered from
+    ``[vnc]container_kolla_command_template``.
