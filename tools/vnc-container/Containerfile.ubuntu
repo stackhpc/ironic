@@ -5,6 +5,7 @@ FROM ubuntu:noble
 
 ENV FIREFOX_USER=firefox
 ENV FIREFOX_USER_HOME=/home/${FIREFOX_USER}
+ENV FIREFOX_CONFIG_DIR=${FIREFOX_USER_HOME}/.mozilla
 
 RUN apt-get update && \
     apt-get install -y \
