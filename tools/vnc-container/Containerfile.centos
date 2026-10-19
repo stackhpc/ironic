@@ -2,6 +2,7 @@ FROM quay.io/centos/centos:stream9
 
 ENV FIREFOX_USER=firefox
 ENV FIREFOX_USER_HOME=/home/${FIREFOX_USER}
+ENV FIREFOX_CONFIG_DIR=${FIREFOX_USER_HOME}/.mozilla
 
 RUN dnf -y install \
     epel-release && \

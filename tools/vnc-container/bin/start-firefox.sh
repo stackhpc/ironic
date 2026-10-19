@@ -18,9 +18,7 @@ if pgrep -x $FIREFOX >/dev/null; then
 fi
 
 # Wipe the profile registry too so -CreateProfile can always claim the name.
-# It lives under the root named by application.ini's Profile=, which only
-# $FIREFOX knows, hence the profile itself is kept outside of it.
-rm -rf "$FIREFOX_USER_HOME/.mozilla" "$FIREFOX_PROFILE_DIR"
+rm -rf "$FIREFOX_CONFIG_DIR" "$FIREFOX_PROFILE_DIR"
 
 # Start headless purely to write the profile, which exits as soon as it is
 # done. Headless means this no longer depends on $DISPLAY being up, as
