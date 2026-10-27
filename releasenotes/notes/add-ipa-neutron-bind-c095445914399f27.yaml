@@ -1,0 +1,5 @@
+---
+features:
+  - |
+    Provide a method to limit which ports are attached during provisioning and
+    similar workflows by setting ``ipa-neutron-bind``.

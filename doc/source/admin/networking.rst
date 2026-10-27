@@ -251,7 +251,8 @@ When provisioning, Ironic will attempt to attach all PXE enabled
 ports to the *provisioning network*. A modifier for this behavior is the
 :oslo.config:option:`neutron.add_all_ports` option, where ironic will
 attempt to bind all ports to the required service network beyond the
-ironic ports with ``pxe_enabled`` set to ``True``.
+ironic ports with ``pxe_enabled`` set to ``True``. It will also do this
+if the node is not using PXE boot.
 
 After provisioning work has been completed, and prior to the node being
 moved to the ``ACTIVE`` ``provision_state``, the previously attached ports
@@ -267,6 +268,29 @@ deleted as part of the baremetal node's movement through the state machine.
 
 The same flow and logic applies to *cleaning*, *service*, and *rescue*
 workflows.
+
+Limiting Ports Attached for Provisioning
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+It is possible to limit which ports Ironic attempts to attach during
+provisioning by setting ``ipa-neutron-bind`` in the ``extra`` field of the
+ironic ports.
+
+If any of the node's ports have ``ipa-neutron-bind`` set to ``allow``, then
+binding will only be attempted for those ports.
+
+If not, binding will be attempted for all ports with ``ipa-neutron-bind`` set
+to ``optional``, or no value for ``ipa-neutron-bind`` provided.
+
+Binding will never be attempted for ports with ``ipa-neutron-bind`` set to
+deny.
+
+Note that if Ironic is only attempting to attach ports with ``pxe_enabled``
+set to ``True`` then only those ports will be considered when determining
+how to apply binding limits.
+
+As above, the same flow and logic applies to *cleaning*, *service*, and
+*rescue* workflows.
 
 How are VIFs configured on the deployed machine
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
