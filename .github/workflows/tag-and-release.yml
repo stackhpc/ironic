@@ -1,4 +1,9 @@
 ---
+# THIS WORKFLOW IS MANAGED BY STACKHPC RELEASE TRAIN
+# https://github.com/stackhpc/stackhpc-release-train
+# Please do not manually edit it
+
+
 name: Tag & Release
 'on':
   push:
