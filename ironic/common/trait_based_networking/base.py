@@ -67,6 +67,11 @@ class Comparator(enum.Enum):
         if isinstance(variable, (frozenset, set, list, tuple)):
             return self._eval_collection(variable, value)
 
+        # Unset variables (e.g. a portgroup's vendor, or a port without a
+        # category) never match, regardless of comparator.
+        if variable is None:
+            return False
+
         match self.name:
             case self.EQUALITY.name:
                 return variable == value
@@ -149,12 +154,7 @@ class Variables(enum.Enum):
 
 def _retrieve_attribute(attribute_name, tbn_obj):
     """Helper method to get an attribute from a TBN related object"""
-    attribute = getattr(tbn_obj, attribute_name, None)
-
-    if attribute is None:
-        raise exc.TBNAttributeRetrievalException(attr_name=attribute_name)
-
-    return attribute
+    return getattr(tbn_obj, attribute_name, '')
 
 
 # Allows special case FilterExpression evaluations where Port does not
@@ -449,7 +449,10 @@ class Port(PrimordialPort):
             id=0,
             uuid="UNIVERSAL",
             address="UNIVERSAL",
-            category=UNIVERSAL_PORT_CATEGORY
+            category=UNIVERSAL_PORT_CATEGORY,
+            physical_network=None,
+            vendor=None,
+            available_for_dynamic_portgroup=True
         )
 
     def is_port(self):
@@ -472,7 +475,8 @@ class Portgroup(PrimordialPort):
             address=ironic_portgroup.address,
             category=ironic_portgroup.category,
             physical_network=ironic_portgroup.physical_network,
-            vendor=ironic_portgroup.vendor,
+            # Portgroups have no vendor field, unlike Ports.
+            vendor=None,
             dynamic_portgroup=ironic_portgroup.dynamic_portgroup
         )
 
@@ -496,9 +500,6 @@ class Network:
     def from_vif_info(cls, vif_info):
         """Helper method to create Networks from vif_info dictionaries"""
         # tags defaults to an empty frozenset (rather than None)
-        # so that filters referencing network.tags don't raise
-        # TBNAttributeRetrievalException just because the vif_attach caller
-        # didn't supply a 'tags' key.
         return cls(vif_info['id'], # vif_info is guaranteed to have 'id'.
                    vif_info.get('name'),
                    frozenset(vif_info.get('tags') or []))
@@ -506,7 +507,7 @@ class Network:
     @classmethod
     def universal_network(cls):
         return cls(
-            id=0,
+            id="0",
             name=UNIVERSAL_NETWORK_NAME,
             tags=frozenset()
         )
