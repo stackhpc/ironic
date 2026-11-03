@@ -1,4 +1,9 @@
 ---
+# THIS WORKFLOW IS MANAGED BY STACKHPC RELEASE TRAIN
+# https://github.com/stackhpc/stackhpc-release-train
+# Please do not manually edit it
+
+
 name: Upstream Sync
 'on':
   schedule:
@@ -13,6 +18,11 @@ jobs:
     uses: stackhpc/.github/.github/workflows/upstream-sync.yml@main
     with:
       release_series: 2025.1
+  synchronise-2026-1:
+    name: Synchronise 2026.1
+    uses: stackhpc/.github/.github/workflows/upstream-sync.yml@main
+    with:
+      release_series: 2026.1
   synchronise-yoga:
     name: Synchronise yoga
     uses: stackhpc/.github/.github/workflows/upstream-sync.yml@main
