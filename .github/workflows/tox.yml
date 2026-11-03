@@ -1,0 +1,11 @@
+---
+# THIS WORKFLOW IS MANAGED BY STACKHPC RELEASE TRAIN
+# https://github.com/stackhpc/stackhpc-release-train
+# Do not make changes to it manually
+
+name: Tox Continuous Integration
+'on':
+  pull_request:
+jobs:
+  tox:
+    uses: stackhpc/.github/.github/workflows/tox.yml@main
