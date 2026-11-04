@@ -284,6 +284,48 @@ def _add_ip_addresses_for_ipv6_stateful(context, port, client):
         update_neutron_port(context, port.id, attrs, client=client)
 
 
+def _agent_limit_ports(ports):
+    """Limit neutron ports to create based on baremetal port configuration.
+
+    Limit which neutron ports to create based on the value of
+    'ipa-neutron-bind' in the extra field of the baremetal ports.
+
+    If there are any ports with 'ipa-neutron-bind=allow' set, only those ports
+    are returned. If not, returns all ports with 'ipa-neutron-bind=optional'
+    or no value for 'ipa-neutron-bind' set. Never returns ports with
+    'ipa-neutron-bind=deny'.
+
+    :param ports: a list of Ironic port objects
+    :returns: a list of Ironic port objects with limits applied
+    :raises: InvalidParameterValue if 'ipa-neutron-bind' is set to a value
+        other than 'allow', 'optional', or 'deny'
+    :raises: NetworkError if there are no ports after limits are applied
+    """
+    allowed_ports = []
+    optional_ports = []
+    for port in ports:
+        boot_permission = port.extra.get('ipa-neutron-bind', 'optional')
+
+        if boot_permission == 'allow':
+            allowed_ports.append(port)
+        elif boot_permission == 'optional':
+            optional_ports.append(port)
+        elif boot_permission != 'deny':
+            msg = (_("Unrecognised value provided for ipa-neutron-bind: "
+                     "%(ipa-val)s") % {'ipa-val': boot_permission})
+            LOG.exception(msg)
+            raise exception.InvalidParameterValue(msg)
+
+    if len(allowed_ports) > 0:
+        return allowed_ports
+    elif len(optional_ports) > 0:
+        return optional_ports
+
+    msg = "All available ports have ipa-neutron-bind=deny set"
+    LOG.exception(msg)
+    raise exception.NetworkError(msg)
+
+
 def add_ports_to_network(task, network_uuid, security_groups=None):
     """Create neutron ports to boot the ramdisk.
 
@@ -337,14 +379,16 @@ def add_ports_to_network(task, network_uuid, security_groups=None):
     portmap = get_node_portmap(task)
 
     if not add_all_ports:
-        ports_to_create = [p for p in task.ports if p.pxe_enabled]
+        ports_to_check = [p for p in task.ports if p.pxe_enabled]
     else:
-        ports_to_create = task.ports
-    if not ports_to_create:
+        ports_to_check = task.ports
+    if not ports_to_check:
         pxe_enabled = 'PXE-enabled ' if not add_all_ports else ''
         raise exception.NetworkError(_(
             "No available %(enabled)s ports on node %(node)s.") %
             {'enabled': pxe_enabled, 'node': node.uuid})
+
+    ports_to_create = _agent_limit_ports(ports_to_check)
 
     for ironic_port in ports_to_create:
         # Start with a clean state for each port

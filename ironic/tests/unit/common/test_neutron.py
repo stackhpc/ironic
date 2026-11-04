@@ -225,7 +225,9 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
     def _test_add_ports_to_network(self, update_mock, is_client_id,
                                    security_groups=None,
                                    add_all_ports=False,
-                                   boot_not_pxe=False):
+                                   boot_not_pxe=False,
+                                   ipa_bind_allow=False,
+                                   ipa_bind_deny=False):
         # Ports will be created only if pxe_enabled is True
         self.node.network_interface = 'neutron'
         self.node.save()
@@ -243,6 +245,16 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
             extra['client-id'] = self._CLIENT_ID
             port.extra = extra
             port.save()
+        if ipa_bind_allow:
+            extra = port.extra
+            extra['ipa-neutron-bind'] = 'allow'
+            port.extra = extra
+            port.save()
+        if ipa_bind_deny:
+            extra = port2.extra
+            extra['ipa-neutron-bind'] = 'deny'
+            port2.extra = extra
+            port2.save()
         expected_create_attrs = {
             'network_id': self.network_uuid,
             'admin_state_up': True,
