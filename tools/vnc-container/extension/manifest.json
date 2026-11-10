@@ -36,6 +36,7 @@
     ],
     "background": {
         "scripts": [
+            "config.js",
             "background.js"
         ],
         "persistent": true

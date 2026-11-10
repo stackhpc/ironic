@@ -31,6 +31,20 @@ to use this image in ``ironic.conf``:
       console_image=localhost/ironic-vnc-container
 
 
+Environment variables
+---------------------
+
+In addition to the application variables set by the container providers,
+two variables control which ports the container listens on:
+
+* ``VNC_PORT`` - the port the VNC server listens on (default 5900). The
+  container-kolla provider sets it, as with host networking the port is a
+  port of the conductor host and must differ between the consoles of one
+  conductor.
+* ``SHUTDOWN_HTTP_PORT`` - the port of the loopback-only HTTP server used
+  for browser shutdown signalling (default 8888). Same consideration as
+  ``VNC_PORT``.
+
 Implementation
 --------------
 

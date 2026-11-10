@@ -18,6 +18,7 @@ from oslo_config import cfg
 from oslo_config import types
 
 from ironic.common.i18n import _
+from ironic.conf.console import PortRange
 
 
 opts = [
@@ -224,7 +225,31 @@ opts = [
              'with shlex ("#" starts a comment) and run with no shell. '
              'The default template requires that "console_image" be set '
              'and runs the container with host networking instead of '
-             'publishing the VNC port.'),
+             'publishing the VNC port. A custom template must keep, as '
+             'rendered by the default template: the container '
+             '"--name", the "org.openstack.ironic.*" labels including '
+             'the "org.openstack.ironic.vnc-port" label, "--detach", '
+             '"--network host", the value-less "--env APP_INFO" entry '
+             '(the credentials are supplied through the CLI\'s process '
+             'environment), and the "--env VNC_PORT" and "--env '
+             'SHUTDOWN_HTTP_PORT" entries which tell the container '
+             'which ports of the conductor host it may listen on.'),
+    cfg.ListOpt(
+        'container_kolla_vnc_port_range',
+        item_type=PortRange(),
+        default=['5900:6000'],
+        help='For the container-kolla provider, the range of VNC ports '
+             'on the conductor host which console containers may '
+             'listen on, in the form of <start>:<stop> or '
+             'comma-separated ranges, where <stop> is exclusive. With '
+             'host networking the container cannot publish its VNC '
+             'port, so each container listens on a port of the '
+             'conductor host, and the provider allocates the lowest '
+             'free port of the range per node, allowing multiple '
+             'consoles per conductor. The ports are unauthenticated '
+             'VNC endpoints, so the range should be exposed only to '
+             'the networks hosting ironic-novncproxy or '
+             'nova-novncproxy. Not used by the other providers.'),
     cfg.StrOpt(
         'cert_file',
         deprecated_name='ssl_cert_file',

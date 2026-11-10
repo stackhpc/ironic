@@ -5,10 +5,12 @@ run --detach --rm
 --label org.openstack.ironic.console=true
 --label org.openstack.ironic.conductor={{ conductor }}
 --label org.openstack.ironic.node={{ uuid }}
+--label org.openstack.ironic.vnc-port={{ vnc_port }}
 --network host
 --pull missing
 --env APP={{ app }}
 --env APP_INFO
 --env READ_ONLY={{ read_only }}
---user root
+--env VNC_PORT={{ vnc_port }}
+--env SHUTDOWN_HTTP_PORT={{ shutdown_http_port }}
 {{ image }}

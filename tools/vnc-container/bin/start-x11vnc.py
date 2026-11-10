@@ -35,6 +35,16 @@ DISPLAY_HEIGHT = os.environ.get('DISPLAY_HEIGHT') or '960'
 FIREFOX = os.environ.get('FIREFOX') or 'firefox'
 FIREFOX_USER = os.environ.get('FIREFOX_USER') or 'firefox'
 
+# Port the VNC server listens on. With host networking (the
+# container-kolla provider) the port is a port of the conductor host,
+# so it must differ between the consoles of one conductor and is set
+# by the provider.
+VNC_PORT = int(os.environ.get('VNC_PORT') or 5900)
+
+# Port of the loopback HTTP server for browser shutdown signalling.
+# Same host port collision consideration as VNC_PORT.
+SHUTDOWN_HTTP_PORT = int(os.environ.get('SHUTDOWN_HTTP_PORT') or 8888)
+
 REDFISH_SUPPORTED = {'Dell', 'Hpe', 'Supermicro'}
 
 
@@ -108,7 +118,9 @@ def write_extension_config(app_name, app_info_raw):
     with open(config_path, 'w') as f:
         f.write('let config = {\n')
         f.write(f'    app: "{app_name}",\n')
-        f.write(f'    app_info: {app_info_raw}\n')
+        f.write(f'    app_info: {app_info_raw},\n')
+        f.write(f'    shutdown_url: '
+                f'"http://localhost:{SHUTDOWN_HTTP_PORT}/browser-shutdown"\n')
         f.write('};\n')
 
 
@@ -205,10 +217,11 @@ def start_http_server():
     The browser extension cannot fetch file:// URLs from its background
     script, so shutdown state is communicated over HTTP instead.
     """
-    server = http.server.HTTPServer(('127.0.0.1', 8888), ShutdownHandler)
+    server = http.server.HTTPServer(('127.0.0.1', SHUTDOWN_HTTP_PORT),
+                                    ShutdownHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    LOG.info('Shutdown HTTP server listening on port 8888')
+    LOG.info('Shutdown HTTP server listening on port %s', SHUTDOWN_HTTP_PORT)
     return server
 
 
@@ -315,6 +328,7 @@ def main():
         'runuser', '-u', FIREFOX_USER, '--',
         'x11vnc',
         '-display', display,
+        '-rfbport', str(VNC_PORT),
     ]
     if READ_ONLY == 'True':
         cmd += ['-viewonly', '-nocursor']
@@ -324,7 +338,7 @@ def main():
         '-gone', 'stop-firefox.sh',
     ]
 
-    LOG.info('Starting x11vnc')
+    LOG.info('Starting x11vnc on port %s', VNC_PORT)
     process = subprocess.Popen(cmd)
 
     # Handle SIGTERM: gracefully close console websockets before

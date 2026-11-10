@@ -1622,31 +1622,91 @@ class TestContainerKollaConsoleContainer(base.TestCase):
     def test__render_template(self):
         CONF.set_override('read_only', True, 'vnc')
 
-        # host networking replaces the published port
+        # host networking replaces the published port, and the allocated
+        # VNC port is passed to the container as environment
         self.assertEqual([
             'run', '--detach', '--rm',
             '--name', 'ironic-console-1234',
             '--label', 'org.openstack.ironic.console=true',
             '--label', 'org.openstack.ironic.conductor=fake-mini',
             '--label', 'org.openstack.ironic.node=1234',
+            '--label', 'org.openstack.ironic.vnc-port=5900',
             '--network', 'host',
             '--pull', 'missing',
             '--env', 'APP=fake-app',
             '--env', 'APP_INFO',
             '--env', 'READ_ONLY=True',
+            '--env', 'VNC_PORT=5900',
+            '--env', 'SHUTDOWN_HTTP_PORT=6900',
             'test-image',
         ], self.provider._render_template('1234', app_name='fake-app'))
 
+    def test__render_template_allocated_port(self):
+        self.assertEqual([
+            'run', '--detach', '--rm',
+            '--name', 'ironic-console-1234',
+            '--label', 'org.openstack.ironic.console=true',
+            '--label', 'org.openstack.ironic.conductor=fake-mini',
+            '--label', 'org.openstack.ironic.node=1234',
+            '--label', 'org.openstack.ironic.vnc-port=5901',
+            '--network', 'host',
+            '--pull', 'missing',
+            '--env', 'APP=fake-app',
+            '--env', 'APP_INFO',
+            '--env', 'READ_ONLY=False',
+            '--env', 'VNC_PORT=5901',
+            '--env', 'SHUTDOWN_HTTP_PORT=6901',
+            'test-image',
+        ], self.provider._render_template('1234', app_name='fake-app',
+                                          vnc_port=5901))
+
     @mock.patch.object(utils, 'execute', autospec=True)
     def test__host_port(self, mock_exec):
-        # with host networking the VNC server listens on port 5900 of the
-        # conductor host, so the endpoint is known without querying the
-        # engine
+        # with host networking the VNC server listens on the port
+        # allocated for the container, recorded in its label, so the
+        # endpoint is read from the engine without port discovery
         CONF.set_override('my_ip', '203.0.113.5')
+        mock_exec.return_value = ('5901\n', None)
         self.assertEqual(
-            ('203.0.113.5', 5900),
+            ('203.0.113.5', 5901),
             self.provider._host_port('ironic-console-1234'))
-        mock_exec.assert_not_called()
+        mock_exec.assert_called_once_with(
+            'docker', 'inspect', '--format',
+            '{{.Config.Labels."org.openstack.ironic.vnc-port"}}',
+            'ironic-console-1234')
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test__host_port_missing_label(self, mock_exec):
+        CONF.set_override('my_ip', '203.0.113.5')
+        mock_exec.return_value = ('<no value>\n', None)
+        self.assertRaisesRegex(
+            exception.ConsoleContainerError,
+            'org.openstack.ironic.vnc-port',
+            self.provider._host_port, 'ironic-console-1234')
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test__allocated_vnc_ports(self, mock_exec):
+        mock_exec.return_value = ('5900\n<no value>\n5902\n', None)
+        self.assertEqual(
+            {5900, 5902}, self.provider._allocated_vnc_ports())
+        mock_exec.assert_called_once_with(
+            'docker', 'ps', '--format',
+            '{{.Label "org.openstack.ironic.vnc-port"}}',
+            '--filter', 'label=org.openstack.ironic.conductor=fake-mini')
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test__allocate_vnc_port_lowest_free(self, mock_exec):
+        mock_exec.return_value = ('5900\n5902\n', None)
+        self.assertEqual(5901, self.provider._allocate_vnc_port())
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test__allocate_vnc_port_no_free_port(self, mock_exec):
+        CONF.set_override('container_kolla_vnc_port_range',
+                          ['5900:5902'], 'vnc')
+        mock_exec.return_value = ('5900\n5901\n', None)
+        self.assertRaisesRegex(
+            exception.ConsoleContainerError, 'No free VNC port',
+            self.provider._allocate_vnc_port)
 
     @mock.patch.object(container_kolla.ContainerKollaConsoleContainer,
                        '_wait_for_listen', autospec=True)
@@ -1657,7 +1717,9 @@ class TestContainerKollaConsoleContainer(base.TestCase):
 
         mock_exec.side_effect = [
             (None, None),             # rm of any stale container
+            ('', None),               # ps for port allocation
             ('cid123\n', None),       # run
+            ('5900\n', None),         # inspect for the endpoint
         ]
 
         self.assertEqual(
@@ -1667,31 +1729,91 @@ class TestContainerKollaConsoleContainer(base.TestCase):
         mock_exec.assert_has_calls([
             mock.call('docker', 'rm', '--force', 'ironic-console-1234',
                       check_exit_code=False),
+            mock.call('docker', 'ps', '--format',
+                      '{{.Label "org.openstack.ironic.vnc-port"}}',
+                      '--filter',
+                      'label=org.openstack.ironic.conductor=fake-mini'),
             mock.call(
                 'docker', 'run', '--detach', '--rm',
                 '--name', 'ironic-console-1234',
                 '--label', 'org.openstack.ironic.console=true',
                 '--label', 'org.openstack.ironic.conductor=fake-mini',
                 '--label', 'org.openstack.ironic.node=1234',
+                '--label', 'org.openstack.ironic.vnc-port=5900',
                 '--network', 'host',
                 '--pull', 'missing',
                 '--env', 'APP=fake-app',
                 '--env', 'APP_INFO',
                 '--env', 'READ_ONLY=False',
+                '--env', 'VNC_PORT=5900',
+                '--env', 'SHUTDOWN_HTTP_PORT=6900',
                 'test-image',
                 env_variables=mock.ANY),
+            mock.call('docker', 'inspect', '--format',
+                      '{{.Config.Labels."org.openstack.ironic.vnc-port"}}',
+                      'ironic-console-1234'),
         ])
         # no published ports, so no port discovery through the engine
         for call in mock_exec.call_args_list:
             self.assertNotIn('port', call.args)
-        mock_wait.assert_called_once_with(self.provider, '203.0.113.5', 5900)
+        mock_wait.assert_called_once_with(self.provider, '203.0.113.5',
+                                          5900)
 
         # app_info is passed through the CLI process environment, never
         # on the command line
-        run_call = mock_exec.call_args_list[1]
+        run_call = mock_exec.call_args_list[2]
         self.assertNotIn('{"foo": "bar"}', run_call.args)
         self.assertEqual(
             '{"foo": "bar"}', run_call.kwargs['env_variables']['APP_INFO'])
+
+    @mock.patch.object(container_kolla.ContainerKollaConsoleContainer,
+                       '_wait_for_listen', autospec=True)
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_start_container_second_console(self, mock_exec, mock_wait):
+        # a second console on the same conductor is allocated the next
+        # free port instead of colliding with the first one
+        CONF.set_override('my_ip', '203.0.113.5')
+        task = mock.Mock(node=mock.Mock(uuid='5678'))
+
+        mock_exec.side_effect = [
+            (None, None),             # rm of any stale container
+            ('5900\n', None),         # ps: 5900 taken by another node
+            ('cid456\n', None),       # run
+            ('5901\n', None),         # inspect for the endpoint
+        ]
+
+        self.assertEqual(
+            ('203.0.113.5', 5901),
+            self.provider.start_container(task, 'fake-app', {}))
+
+        # the container is labelled and told its allocated port
+        args = mock_exec.call_args_list[2].args
+        self.assertIn('--label org.openstack.ironic.vnc-port=5901',
+                      ' '.join(args))
+        self.assertIn('--env VNC_PORT=5901', ' '.join(args))
+        self.assertIn('--env SHUTDOWN_HTTP_PORT=6901', ' '.join(args))
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_start_container_no_free_port(self, mock_exec):
+        CONF.set_override('container_kolla_vnc_port_range',
+                          ['5900:5902'], 'vnc')
+        task = mock.Mock(node=mock.Mock(uuid='1234'))
+
+        mock_exec.side_effect = [
+            (None, None),              # rm of any stale container
+            ('5900\n5901\n', None),    # ps: every port of the range in
+                                       # use
+            ('a log line', None),      # logs
+            (None, None),              # rm
+        ]
+
+        self.assertRaisesRegex(
+            exception.ConsoleContainerError, 'No free VNC port',
+            self.provider.start_container, task, 'fake-app', {})
+
+        # no container was started
+        for call in mock_exec.call_args_list:
+            self.assertNotIn('run', call.args)
 
     @mock.patch.object(utils, 'execute', autospec=True)
     def test_start_container_run_failed(self, mock_exec):
@@ -1699,6 +1821,7 @@ class TestContainerKollaConsoleContainer(base.TestCase):
 
         mock_exec.side_effect = [
             (None, None),  # rm of any stale container
+            ('', None),  # ps for port allocation
             processutils.ProcessExecutionError(stderr='ouch'),  # run
             ('a log line', None),  # logs
             (None, None),  # rm
@@ -1724,7 +1847,9 @@ class TestContainerKollaConsoleContainer(base.TestCase):
 
         mock_exec.side_effect = [
             (None, None),             # rm of any stale container
+            ('', None),               # ps for port allocation
             ('cid123\n', None),       # run
+            ('5900\n', None),         # inspect for the endpoint
             ('a log line', None),     # logs
             (None, None),             # rm
         ]

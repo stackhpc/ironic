@@ -280,10 +280,13 @@ The ``container-kolla`` provider is a variant of the ``container`` provider
 for containerised deployments such as Kolla, where the console container
 cannot publish ports to the host. Instead of port publication, the provider
 runs the console container with host networking (``--network host``), so the
-VNC server listens on port 5900 of the conductor host. The endpoint is then
-known without querying the engine, and ``[vnc]container_publish_port`` does
-not apply. Because the port is fixed, only one console container can be
-running on a conductor host at a time.
+VNC server listens on a port of the conductor host. Because the container
+cannot be told which port to listen on through port publication, the
+provider allocates the lowest free port of
+``[vnc]container_kolla_vnc_port_range`` (default ``5900:6000``) to each
+console, passes it to the container, and records it in a container label.
+``[vnc]container_publish_port`` does not apply, and multiple consoles can
+be running on one conductor at once, one per allocated port.
 
 A minimal configuration:
 
@@ -297,13 +300,20 @@ A minimal configuration:
 The provider otherwise behaves like the ``container`` provider: it invokes
 ``[vnc]container_executable`` (honouring ``[vnc]container_host``) with the
 arguments rendered from ``[vnc]container_kolla_command_template``. The
-engine must run on the conductor host, as the console container joins the
+engine must run on the conductor host, as the console containers join the
 host network.
 
-Note that with host networking the unauthenticated VNC server is bound to
-all interfaces of the conductor host, so port 5900 must be restricted to
-the networks hosting ironic-novncproxy or nova-novncproxy by the
-deployment's network policy or firewall rules.
+The console image must honour the ``VNC_PORT`` and ``SHUTDOWN_HTTP_PORT``
+environment variables set by the provider: the VNC server listens on
+``VNC_PORT`` instead of a fixed port, and the container's loopback-only
+shutdown signalling HTTP server listens on ``SHUTDOWN_HTTP_PORT``. The
+``tools/vnc-container`` image supports both.
+
+Note that with host networking the unauthenticated VNC servers are bound to
+all interfaces of the conductor host, so every port of
+``container_kolla_vnc_port_range`` must be restricted to the networks
+hosting ironic-novncproxy or nova-novncproxy by the deployment's network
+policy or firewall rules.
 
 Creating an external container provider
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -345,8 +355,9 @@ using the Ironic driver.
 For the ``systemd`` and ``container`` providers the VNC server will be
 published on a random high port number. For the ``kubernetes`` pod the VNC
 server is running on port ``5900`` on the pod's ``hostIP``. For the
-``container-kolla`` provider the VNC server is running on port ``5900`` on
-the conductor host.
+``container-kolla`` provider the VNC server is running on the port the
+provider allocated from ``[vnc]container_kolla_vnc_port_range`` on the
+conductor host.
 
 Console containers need access to the management network to access the BMC web
 interface. If driver_info ``redfish_verify_ca=False`` then web requests will
