@@ -13,4 +13,5 @@ run --detach --rm
 --env READ_ONLY={{ read_only }}
 --env VNC_PORT={{ vnc_port }}
 --env SHUTDOWN_HTTP_PORT={{ shutdown_http_port }}
+--user root
 {{ image }}

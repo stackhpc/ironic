@@ -1638,6 +1638,7 @@ class TestContainerKollaConsoleContainer(base.TestCase):
             '--env', 'READ_ONLY=True',
             '--env', 'VNC_PORT=5900',
             '--env', 'SHUTDOWN_HTTP_PORT=6900',
+            '--user', 'root',
             'test-image',
         ], self.provider._render_template('1234', app_name='fake-app'))
 
@@ -1656,6 +1657,7 @@ class TestContainerKollaConsoleContainer(base.TestCase):
             '--env', 'READ_ONLY=False',
             '--env', 'VNC_PORT=5901',
             '--env', 'SHUTDOWN_HTTP_PORT=6901',
+            '--user', 'root',
             'test-image',
         ], self.provider._render_template('1234', app_name='fake-app',
                                           vnc_port=5901))
@@ -1747,6 +1749,7 @@ class TestContainerKollaConsoleContainer(base.TestCase):
                 '--env', 'READ_ONLY=False',
                 '--env', 'VNC_PORT=5900',
                 '--env', 'SHUTDOWN_HTTP_PORT=6900',
+                '--user', 'root',
                 'test-image',
                 env_variables=mock.ANY),
             mock.call('docker', 'inspect', '--format',
