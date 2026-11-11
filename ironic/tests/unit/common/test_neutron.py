@@ -280,7 +280,8 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
             expected_create_attrs2 = copy.deepcopy(expected_create_attrs)
             expected_update_attrs2 = copy.deepcopy(expected_update_attrs)
             expected_update_attrs2['mac_address'] = port2.address
-            expected_create_attrs2['fixed_ips'] = []
+            if not boot_not_pxe:
+                expected_create_attrs2['fixed_ips'] = []
             neutron_port2 = stubs.FakeNeutronPort(
                 id='132f871f-eaec-4fed-9475-0d54465e0f01',
                 mac_address=port2.address,
