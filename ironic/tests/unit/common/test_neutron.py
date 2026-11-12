@@ -225,7 +225,9 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
     def _test_add_ports_to_network(self, update_mock, is_client_id,
                                    security_groups=None,
                                    add_all_ports=False,
-                                   boot_not_pxe=False):
+                                   boot_not_pxe=False,
+                                   ipa_bind_allow=False,
+                                   ipa_bind_deny=False):
         # Ports will be created only if pxe_enabled is True
         self.node.network_interface = 'neutron'
         self.node.save()
@@ -243,6 +245,16 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
             extra['client-id'] = self._CLIENT_ID
             port.extra = extra
             port.save()
+        if ipa_bind_allow:
+            extra = port.extra
+            extra['ipa-neutron-bind'] = 'allow'
+            port.extra = extra
+            port.save()
+        if ipa_bind_deny:
+            extra = port2.extra
+            extra['ipa-neutron-bind'] = 'deny'
+            port2.extra = extra
+            port2.save()
         expected_create_attrs = {
             'network_id': self.network_uuid,
             'admin_state_up': True,
@@ -268,7 +280,8 @@ class TestNeutronNetworkActions(db_base.DbTestCase):
             expected_create_attrs2 = copy.deepcopy(expected_create_attrs)
             expected_update_attrs2 = copy.deepcopy(expected_update_attrs)
             expected_update_attrs2['mac_address'] = port2.address
-            expected_create_attrs2['fixed_ips'] = []
+            if not boot_not_pxe:
+                expected_create_attrs2['fixed_ips'] = []
             neutron_port2 = stubs.FakeNeutronPort(
                 id='132f871f-eaec-4fed-9475-0d54465e0f01',
                 mac_address=port2.address,
