@@ -29,6 +29,7 @@ import futurist
 from futurist import waiters
 from oslo_config import cfg
 import oslo_messaging as messaging
+from oslo_utils import timeutils
 from oslo_utils import uuidutils
 from oslo_versionedobjects import base as ovo_base
 from oslo_versionedobjects import fields
@@ -46,6 +47,7 @@ from ironic.common import indicator_states
 from ironic.common import metrics as ironic_metrics
 from ironic.common import nova
 from ironic.common import states
+from ironic.common import utils as common_utils
 from ironic.conductor import cleaning
 from ironic.conductor import deployments
 from ironic.conductor import inspection
@@ -898,6 +900,53 @@ class UpdateNodeTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         node.extra = {'test': 'two'}
         res = self.service.update_node(self.context, node)
         self.assertEqual({'test': 'two'}, res['extra'])
+
+    def _create_switched_node(self, **kwargs):
+        """Create a node which autodetect has switched to a concrete iface."""
+        return obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            uuid=uuidutils.generate_uuid(),
+            deploy_interface='fake',
+            driver_internal_info={
+                'original_deploy_interface': 'autodetect'},
+            **kwargs)
+
+    def test_update_node_deploy_interface_clears_original(self):
+        """An explicit deploy_interface set outranks the stashed original.
+
+        Otherwise the next cleaning would silently revert the operator's
+        choice back to autodetect.
+        """
+        node = self._create_switched_node()
+
+        node.deploy_interface = 'fake'
+        res = self.service.update_node(self.context, node)
+
+        self.assertEqual('fake', res['deploy_interface'])
+        self.assertNotIn('original_deploy_interface',
+                         res['driver_internal_info'])
+
+    def test_update_node_reset_interfaces_clears_original(self):
+        """reset_interfaces recomputes deploy_interface, so drop the stash."""
+        node = self._create_switched_node()
+
+        node.driver = 'fake-hardware'
+        res = self.service.update_node(self.context, node,
+                                       reset_interfaces=True)
+
+        self.assertNotIn('original_deploy_interface',
+                         res['driver_internal_info'])
+
+    def test_update_node_unrelated_field_keeps_original(self):
+        """An unrelated update must not disturb a pending restore."""
+        node = self._create_switched_node(extra={'test': 'one'})
+
+        node.extra = {'test': 'two'}
+        res = self.service.update_node(self.context, node)
+
+        self.assertEqual(
+            'autodetect',
+            res['driver_internal_info']['original_deploy_interface'])
 
     def test_update_node_maintenance_set_false(self):
         node = obj_utils.create_test_node(self.context,
@@ -2687,6 +2736,32 @@ class DoNodeTearDownTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
 
     def test__do_node_tear_down_with_source_path(self):
         self._test__do_node_tear_down_ok(source_a_path=True)
+
+    @mock.patch('ironic.conductor.cleaning.do_node_clean', autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.tear_down',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.clean_up',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.switch_interface',
+                autospec=True)
+    def test__do_node_tear_down_switches_interface(self, mock_switch,
+                                                   mock_clean_up,
+                                                   mock_tear_down,
+                                                   mock_clean):
+        """Test the deploy interface gets to switch before tearing down."""
+        node = obj_utils.create_test_node(
+            self.context, driver='fake-hardware',
+            provision_state=states.ACTIVE,
+            target_provision_state=states.AVAILABLE,
+            driver_internal_info={'is_whole_disk_image': False})
+
+        self._start_service()
+        self.service.do_node_tear_down(self.context, node.uuid)
+        node.refresh()
+        self.assertEqual(states.CLEANING, node.provision_state)
+        mock_switch.assert_called_once_with(mock.ANY, mock.ANY)
+        self.assertTrue(mock_clean_up.called)
+        self.assertTrue(mock_tear_down.called)
 
     @mock.patch('ironic.drivers.modules.fake.FakeRescue.clean_up',
                 autospec=True)
@@ -5607,6 +5682,33 @@ class VifTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         mock_attach.assert_called_once_with(mock.ANY, mock.ANY, self.vif)
 
     @mock.patch.object(n_flat.FlatNetwork, 'vif_attach', autospec=True)
+    def test_vif_attach_raises_tbn_no_traits_applicable(self, mock_attach,
+                                                        mock_valid):
+        mock_attach.side_effect = exception.TBNNoTraitsApplicableToNode(
+            node='fake-node')
+        node = obj_utils.create_test_node(self.context, driver='fake-hardware')
+        exc = self.assertRaises(messaging.rpc.ExpectedException,
+                                self.service.vif_attach,
+                                self.context, node.uuid, self.vif)
+        # Compare true exception hidden by @messaging.expected_exceptions
+        self.assertEqual(exception.TBNNoTraitsApplicableToNode,
+                         exc.exc_info[0])
+        self.assertEqual(400, exc.exc_info[1].code)
+
+    @mock.patch.object(n_flat.FlatNetwork, 'vif_attach', autospec=True)
+    def test_vif_attach_raises_tbn_no_port_matches(self, mock_attach,
+                                                   mock_valid):
+        mock_attach.side_effect = exception.TBNNoPortMatchesFound(
+            node='fake-node', vif_id='fake-vif')
+        node = obj_utils.create_test_node(self.context, driver='fake-hardware')
+        exc = self.assertRaises(messaging.rpc.ExpectedException,
+                                self.service.vif_attach,
+                                self.context, node.uuid, self.vif)
+        # Compare true exception hidden by @messaging.expected_exceptions
+        self.assertEqual(exception.TBNNoPortMatchesFound, exc.exc_info[0])
+        self.assertEqual(400, exc.exc_info[1].code)
+
+    @mock.patch.object(n_flat.FlatNetwork, 'vif_attach', autospec=True)
     def test_vif_attach_raises_portgroup_physnet_inconsistent(
             self, mock_attach, mock_valid):
         mock_valid.side_effect = exception.PortgroupPhysnetInconsistent(
@@ -8445,6 +8547,26 @@ class DoNodeTakeOverTestCase(mgr_utils.ServiceSetUpMixin, db_base.DbTestCase):
         mock_take_over.assert_called_once_with(task.driver.deploy, task)
         self.assertFalse(mock_start_console.called)
 
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.take_over',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.prepare',
+                autospec=True)
+    @mock.patch('ironic.drivers.modules.fake.FakeDeploy.switch_interface',
+                autospec=True)
+    def test__do_takeover_switches_interface(self, mock_switch, mock_prepare,
+                                             mock_take_over):
+        """Test the deploy interface gets to switch before takeover.
+
+        Takeover is reached from the periodic _sync_local_state without
+        any other opportunity to resolve a concrete interface.
+        """
+        self._start_service()
+        node = obj_utils.create_test_node(self.context, driver='fake-hardware')
+        task = task_manager.TaskManager(self.context, node.uuid)
+
+        self.service._do_takeover(task)
+        mock_switch.assert_called_once_with(task.driver.deploy, task)
+
     @mock.patch.object(notification_utils, 'emit_console_notification',
                        autospec=True)
     @mock.patch('ironic.drivers.modules.fake.FakeConsole.start_console',
@@ -10031,6 +10153,38 @@ class ConductorCleanupTestCase(mgr_utils.ServiceSetUpMixin,
 
         conductor2 = self.dbapi.get_conductor('conductor-2')
         self.assertEqual('conductor-2', conductor2.hostname)
+
+    @mock.patch.object(common_utils, 'is_ironic_using_sqlite', autospec=True)
+    def test_cleanup_stale_conductors_non_sqlite(self, mock_sqlite):
+        """Test the timestamp comparison used for non-SQLite databases."""
+        mock_sqlite.return_value = False
+        self._start_service()
+
+        for hostname in ('conductor-old', 'conductor-new'):
+            self.dbapi.register_conductor({
+                'hostname': hostname,
+                'drivers': ['fake'],
+                'conductor_group': 'group1'
+            })
+            self.dbapi.touch_conductor(hostname, online=False)
+
+        old = (timeutils.utcnow(with_timezone=True)
+               - datetime.timedelta(days=30))
+        with mock.patch.object(self.dbapi, 'get_offline_conductors',
+                               return_value=['conductor-old',
+                                             'conductor-new'],
+                               autospec=True):
+            with mock.patch.object(objects.Conductor, 'get_by_hostname',
+                                   autospec=True) as mock_get:
+                mock_get.side_effect = lambda ctxt, hostname, online=None: (
+                    mock.Mock(updated_at=old if hostname == 'conductor-old'
+                              else timeutils.utcnow(with_timezone=True)))
+                self.service._cleanup_stale_conductors(self.context)
+
+        self.assertRaises(exception.ConductorNotFound,
+                          self.dbapi.get_conductor, 'conductor-old',
+                          online=None)
+        self.dbapi.get_conductor('conductor-new', online=None)
 
     def test_cleanup_stale_conductors_disabled(self):
         """Test that cleanup is disabled when configured to do so."""
